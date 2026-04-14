@@ -1,0 +1,36 @@
+[package]
+name = "smb-msg"
+readme = "README.md"
+description = "SMB Messages and structures for `smb-rs`"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = ["both"]
+client = []
+server = []
+both = ["client", "server"]
+
+[dependencies]
+smb-dtyp = { workspace = true }
+smb-fscc = { workspace = true }
+smb-msg-derive = { workspace = true }
+
+binrw = { workspace = true }
+modular-bitfield = { workspace = true }
+time = { workspace = true }
+pastey = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+smb-tests = { workspace = true }
+const_format = { workspace = true }

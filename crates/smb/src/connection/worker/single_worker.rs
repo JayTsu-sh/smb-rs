@@ -1,0 +1,124 @@
+use crate::{
+    connection::transformer::Transformer,
+    error::*,
+    msg_handler::{IncomingMessage, OutgoingMessage, ReceiveOptions, SendMessageResult},
+};
+use smb_transport::{SmbTransport, TransportError};
+use std::sync::OnceLock;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use super::Worker;
+
+/// Single-threaded worker.
+pub struct SingleWorker {
+    // for trait compatibility, we need to use RefCell here,
+    // since we can't have mutable references to the same object in multiple threads,
+    // which is useful in the async worker.
+    transport: Mutex<OnceLock<Box<dyn SmbTransport>>>,
+    transformer: Transformer,
+    timeout: Mutex<Option<Duration>>,
+}
+
+impl Worker for SingleWorker {
+    fn start(transport: Box<dyn SmbTransport>, timeout: Duration) -> crate::Result<Arc<Self>> {
+        transport.set_read_timeout(timeout)?;
+        Ok(Arc::new(Self {
+            transport: Mutex::new(OnceLock::from(transport)),
+            transformer: Transformer::default(),
+            timeout: Mutex::new(Some(timeout)),
+        }))
+    }
+
+    fn stop(&self) -> crate::Result<()> {
+        self.transport
+            .lock()?
+            .take()
+            .ok_or(crate::Error::ConnectionStopped)?;
+        Ok(())
+    }
+
+    fn send(&self, msg: OutgoingMessage) -> crate::Result<SendMessageResult> {
+        let msg_id = msg.message.header.message_id;
+        let return_raw_data = msg.return_raw_data;
+
+        let msg_to_send = self.transformer.transform_outgoing(msg)?;
+
+        let mut t = self.transport.lock()?;
+        t.get_mut()
+            .ok_or(crate::Error::ConnectionStopped)?
+            .send(&msg_to_send)?;
+
+        let raw_msg = if return_raw_data {
+            Some(msg_to_send)
+        } else {
+            None
+        };
+
+        Ok(SendMessageResult::new(msg_id, raw_msg))
+    }
+
+    fn receive_next(&self, options: &ReceiveOptions<'_>) -> crate::Result<IncomingMessage> {
+        // Receive next message
+        let mut self_mut = self.transport.lock()?;
+        let transport = self_mut.get_mut().ok_or(crate::Error::ConnectionStopped)?;
+
+        // If a per-request timeout is specified, temporarily override the transport's
+        // read timeout, then restore the original after the receive completes.
+        let original_timeout = self.timeout.lock()
+            .map(|v| v.unwrap_or(Duration::ZERO))
+            .unwrap_or(Duration::ZERO);
+        let effective_timeout = options.timeout.unwrap_or(original_timeout);
+
+        if options.timeout.is_some() {
+            transport.set_read_timeout(effective_timeout)?;
+        }
+
+        let msg = transport.receive().map_err(|e| {
+            // Restore original timeout on error path
+            if options.timeout.is_some() {
+                let _ = transport.set_read_timeout(original_timeout);
+            }
+            match e {
+                TransportError::IoError(ioe)
+                    if ioe.kind() == std::io::ErrorKind::WouldBlock
+                        || ioe.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    Error::OperationTimeout(TimedOutTask::ReceiveNextMessage, effective_timeout)
+                }
+                TransportError::IoError(ioe) => crate::Error::IoError(ioe),
+                _ => e.into(),
+            }
+        })?;
+
+        // Restore original timeout after successful receive
+        if options.timeout.is_some() {
+            transport.set_read_timeout(original_timeout)?;
+        }
+        // Transform the message
+        let im = self.transformer.transform_incoming(msg)?;
+        // Make sure this is our message.
+        // In async clients, this is no issue, but here, we can't deal with unordered/unexpected message IDs.
+        if im.message.header.message_id != options.msg_id {
+            return Err(crate::Error::UnexpectedMessageId(
+                im.message.header.message_id,
+                options.msg_id,
+            ));
+        }
+        Ok(im)
+    }
+
+    fn transformer(&self) -> &Transformer {
+        &self.transformer
+    }
+}
+
+impl std::fmt::Debug for SingleWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SingleWorker")
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}

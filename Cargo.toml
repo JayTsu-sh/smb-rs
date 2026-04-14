@@ -1,0 +1,69 @@
+[workspace]
+members = ["crates/*", "smb-cli"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85.0"
+license = "MIT"
+description = "A Pure Rust SMB Client implementation"
+homepage = "https://github.com/afiffon/smb-rs"
+repository = "https://github.com/afiffon/smb-rs"
+authors = ["Aviv N <avivnaaman04@gmail.com>"]
+keywords = ["smb", "network", "file-sharing", "windows"]
+categories = ["network-programming", "parsing", "filesystem"]
+readme = "README.md"
+version = "0.11.1"
+
+[workspace.dependencies]
+# Crates in this workspace
+smb = { path = "crates/smb", version = "=0.11.1", default-features = false }
+smb-tests = { path = "crates/smb-tests", version = "=0.11.1" }
+smb-msg = { path = "crates/smb-msg", version = "=0.11.1", default-features = false, features = [
+    "client",
+] }
+smb-msg-derive = { path = "crates/smb-msg-derive", version = "=0.11.1" }
+smb-dtyp = { path = "crates/smb-dtyp", version = "=0.11.1" }
+smb-dtyp-derive = { path = "crates/smb-dtyp-derive", version = "=0.11.1" }
+smb-rpc = { path = "crates/smb-rpc", version = "=0.11.1" }
+smb-fscc = { path = "crates/smb-fscc", version = "=0.11.1" }
+smb-transport = { path = "crates/smb-transport", version = "=0.11.1", default-features = false }
+
+# Binary encoding/decoding
+binrw = "0.15.0"
+modular-bitfield = "0.11.2"
+
+# Utilities
+bytes = "1"
+thiserror = "2.0"
+pastey = "0.1.1"
+time = { version = "0.3.37", features = ["macros"] }
+rand = "0.8.5"
+log = "0.4.22"
+# Tests
+const_format = "0.2"
+
+# Async
+tokio = { version = "1.43" }
+maybe-async = "0.2"
+futures-util = { version = "0.3" }
+futures-core = { version = "0.3" }
+tokio-util = { version = "0.7" }
+tokio-stream = { version = "0.1" }
+futures = { version = "0.3" }
+
+# TLS
+quinn = { version = "0.11.9" }
+reqwest = { version = "0.12", default-features = false }
+rustls = { version = "0.23", default-features = false }
+rustls-platform-verifier = { version = "0.6.1", default-features = false }
+
+# Proc Macros
+quote = "1"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn = { version = "2", features = ["full", "extra-traits"] }
+
+# Profiling: release (optimized) with debug info
+[profile.profiling]
+inherits = "release"
+debug = true

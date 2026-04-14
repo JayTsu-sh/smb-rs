@@ -1,0 +1,29 @@
+[package]
+name = "smb-rpc"
+description = "MS-RPC implementations for `smb-rs`"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+smb-dtyp = { workspace = true }
+
+binrw = { workspace = true }
+modular-bitfield = { workspace = true }
+time = { workspace = true }
+pastey = { workspace = true }
+maybe-async = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+smb-tests = { workspace = true }
+
+[features]
+default = []
+is_sync = ["maybe-async/is_sync"]

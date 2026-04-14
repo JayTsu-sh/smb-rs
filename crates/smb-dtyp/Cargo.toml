@@ -1,0 +1,23 @@
+[package]
+name = "smb-dtyp"
+description = "Common data types for `smb-rs`"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+binrw = { workspace = true }
+modular-bitfield = { workspace = true }
+time = { workspace = true }
+pastey = { workspace = true }
+rand = { workspace = true }
+smb-dtyp-derive = { workspace = true }
+
+[dev-dependencies]
+smb-tests = { workspace = true }

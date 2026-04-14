@@ -1,0 +1,20 @@
+[package]
+name = "smb-dtyp-derive"
+description = "Derive macros for smb-dtyp, and general smb* crates."
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+quote.workspace = true
+proc-macro2.workspace = true
+syn.workspace = true
