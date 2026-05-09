@@ -309,10 +309,9 @@ where
         if let Some(hash) = self.preauth_hash.take() {
             self.preauth_hash = Some(hash.next(data)?);
         }
-        Ok(self
-            .preauth_hash
+        self.preauth_hash
             .as_ref()
-            .ok_or_else(|| Error::InvalidState("Preauth hash is missing.".to_string()))?)
+            .ok_or_else(|| Error::InvalidState("Preauth hash is missing.".to_string()))
     }
 
     pub fn upstream(&self) -> &'a ChannelUpstream {

@@ -69,9 +69,9 @@ impl Authenticator {
         // Use the first 16 bytes of the session key.
         let key_info = self.ssp.query_context_session_key()?;
         let k = &key_info.session_key.as_ref()[..16];
-        Ok(k.try_into().map_err(|_| {
+        k.try_into().map_err(|_| {
             Error::InvalidState("Session key is shorter than 16 bytes.".to_string())
-        })?)
+        })
     }
 
     fn make_sspi_target_name(server_fqdn: &str) -> String {

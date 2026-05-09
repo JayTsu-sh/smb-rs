@@ -248,15 +248,6 @@ impl SmbTransportWrite for TcpTransport {
         .boxed()
     }
 
-    /// Use write_all_vectored to send all buffers in fewer syscalls.
-    #[cfg(not(feature = "async"))]
-    fn send_all_vectored(&mut self, slices: &mut [std::io::IoSlice<'_>]) -> Result<()> {
-        let writer = self.writer.as_mut().ok_or(TransportError::NotConnected)?;
-        writer
-            .write_all_vectored(slices)
-            .map_err(Self::map_tcp_error)?;
-        Ok(())
-    }
 }
 
 impl SmbTransportRead for TcpTransport {

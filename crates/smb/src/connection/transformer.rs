@@ -252,7 +252,7 @@ impl Transformer {
                             msg_id: Some(msg.message.header.message_id),
                         },
                     ))?;
-                    Ok(encryptor.encrypt_message(&mut outgoing_data, session_id)?)
+                    encryptor.encrypt_message(&mut outgoing_data, session_id)
                 })
                 .await?;
 
@@ -289,7 +289,7 @@ impl Transformer {
                             msg_id: None,
                         },
                     ))?;
-                    Ok(decryptor.decrypt_message(encrypted_message)?)
+                    decryptor.decrypt_message(encrypted_message)
                 })
                 .await?;
             // Decryption returns a new Vec<u8>, convert to Bytes
