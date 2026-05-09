@@ -71,3 +71,12 @@ syn = { version = "2", features = ["full", "extra-traits"] }
 [profile.profiling]
 inherits = "release"
 debug = true
+
+# Debug builds: optimize dependencies to reduce stack frame bloat from
+# deeply nested binrw/sspi/picky-asn1/aes call chains. Workspace code stays
+# unoptimized so incremental compile and breakpoints are unaffected.
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.dev.build-override]
+opt-level = 1
