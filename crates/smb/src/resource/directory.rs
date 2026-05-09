@@ -88,6 +88,10 @@ impl Directory {
                     "Provided query buffer size {buffer_size} is too small to contain directory information"
                 )));
             }
+            Err(e @ Error::UnexpectedMessageStatus(Status::U32_INVALID_INFO_CLASS)) => {
+                tracing::debug!("Error querying directory (server does not support this info class): {e}");
+                return Err(e);
+            }
             Err(e) => {
                 tracing::error!("Error querying directory: {e}");
                 return Err(e);

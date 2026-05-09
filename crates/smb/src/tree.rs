@@ -358,7 +358,7 @@ impl Drop for TreeMessageHandler {
     fn drop(&mut self) {
         self.disconnect()
             .map_err(|e| {
-                tracing::error!("Failed to disconnect from tree {}: {e}", self.tree_name);
+                tracing::warn!("Failed to disconnect from tree {}: {e}", self.tree_name);
                 e
             })
             .ok();
@@ -381,7 +381,7 @@ impl Drop for TreeMessageHandler {
             Self::_disconnect(upstream, tree_id, encrypt)
                 .await
                 .map_err(|e| {
-                    tracing::error!("Failed to disconnect from tree {}: {e}", tree_name);
+                    tracing::warn!("Failed to disconnect from tree {}: {e}", tree_name);
                 })
                 .ok();
         });
