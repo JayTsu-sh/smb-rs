@@ -92,7 +92,7 @@ impl Tree {
                 "Tree ID is not set in the response".to_string(),
             ))?;
 
-        log::info!("Connected to tree {name} (#{tree_id})");
+        tracing::info!("Connected to tree {name} (#{tree_id})");
 
         let tree_connect_info = TreeConnectInfo {
             share_type: content.share_type,
@@ -124,6 +124,7 @@ impl Tree {
     /// This function automatically handles the following:
     /// * *DFS operations*: If the share has been opened as a DFS referral share, the create operation will modify the file name to include the DFS path.
     ///     That is, assuming it is NOT prefixed with "\\". This is rquired for a proper DFS referral file open. ("DFS normalization", MS-SMB2 2.2.13 + 3.3.5.9)
+    #[tracing::instrument(level = "debug", skip_all, fields(file_name = %file_name))]
     pub async fn create(&self, file_name: &str, args: &FileCreateArgs) -> crate::Result<Resource> {
         let info = self.handler.info()?;
         Resource::create(
@@ -139,6 +140,7 @@ impl Tree {
 
     /// A wrapper around [Tree::create] that creates a file on the remote server.
     /// See [Tree::create] for more information.
+    #[tracing::instrument(level = "debug", skip_all, fields(file_name = %file_name))]
     pub async fn create_file(
         &self,
         file_name: &str,
@@ -159,6 +161,7 @@ impl Tree {
 
     /// A wrapper around [Tree::create] that creates a directory on the remote server.
     /// See [Tree::create] for more information.
+    #[tracing::instrument(level = "debug", skip_all, fields(dir_name = %dir_name))]
     pub async fn create_directory(
         &self,
         dir_name: &str,
@@ -179,6 +182,7 @@ impl Tree {
 
     /// A wrapper around [create][crate::tree::Tree::create] that opens an existing file or directory on the remote server.
     /// See [create][crate::tree::Tree::create] for more information.
+    #[tracing::instrument(level = "debug", skip_all, fields(file_name = %file_name))]
     pub async fn open_existing(
         &self,
         file_name: &str,
@@ -215,6 +219,7 @@ impl Tree {
     /// Disconnects from the tree (share) on the server.
     ///
     /// After calling this method, none of the resources held open by the tree are accessible.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn disconnect(&self) -> crate::Result<()> {
         self.handler.disconnect().await?;
         Ok(())
@@ -329,7 +334,8 @@ impl MessageHandler for TreeMessageHandler {
         let msg = self.upstream.recvo(options).await?;
 
         if !msg.message.header.flags.async_command()
-            && msg.message.header.tree_id.unwrap_or_default() != self.tree_id.load(Ordering::Relaxed)
+            && msg.message.header.tree_id.unwrap_or_default()
+                != self.tree_id.load(Ordering::Relaxed)
         {
             return Err(Error::InvalidMessage(
                 "Received message for different tree, or tree disconnecting.".to_string(),
@@ -352,7 +358,7 @@ impl Drop for TreeMessageHandler {
     fn drop(&mut self) {
         self.disconnect()
             .map_err(|e| {
-                log::error!("Failed to disconnect from tree {}: {e}", self.tree_name);
+                tracing::error!("Failed to disconnect from tree {}: {e}", self.tree_name);
                 e
             })
             .ok();
@@ -375,7 +381,7 @@ impl Drop for TreeMessageHandler {
             Self::_disconnect(upstream, tree_id, encrypt)
                 .await
                 .map_err(|e| {
-                    log::error!("Failed to disconnect from tree {}: {e}", tree_name);
+                    tracing::error!("Failed to disconnect from tree {}: {e}", tree_name);
                 })
                 .ok();
         });

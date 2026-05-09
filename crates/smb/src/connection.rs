@@ -66,12 +66,13 @@ impl Connection {
     /// for the specified existing, primary connection.
     ///
     /// Returns the ID of the channel in the existing session.
+    #[tracing::instrument(level = "debug", skip_all, fields(server = %self.server_name, user = %identity.username.account_name()))]
     pub async fn bind_session(
         &self,
         primary_session: &Session,
         identity: sspi::AuthIdentity,
     ) -> crate::Result<u32> {
-        log::debug!("Binding alternate session to new connection");
+        tracing::debug!("Binding alternate session to new connection");
 
         if self.conn_info().is_none() {
             return Err(Error::InvalidState(
@@ -82,7 +83,11 @@ impl Connection {
         if !self
             .conn_info()
             .as_ref()
-            .ok_or_else(|| Error::InvalidState("Connection info not available after negotiation check.".to_string()))?
+            .ok_or_else(|| {
+                Error::InvalidState(
+                    "Connection info not available after negotiation check.".to_string(),
+                )
+            })?
             .negotiation
             .caps
             .multi_channel()
@@ -96,12 +101,15 @@ impl Connection {
             .bind(
                 identity,
                 &self.handler,
-                self.handler.conn_info.get().ok_or_else(|| Error::InvalidState("Connection info not available.".to_string()))?,
+                self.handler.conn_info.get().ok_or_else(|| {
+                    Error::InvalidState("Connection info not available.".to_string())
+                })?,
             )
             .await
     }
 
     /// Connects to the specified server, if it is not already connected, and negotiates the connection.
+    #[tracing::instrument(level = "debug", skip_all, fields(server = %self.server_name))]
     pub async fn connect(&self) -> crate::Result<()> {
         if self.handler.worker().is_some() {
             return Err(Error::InvalidState("Already connected".into()));
@@ -115,15 +123,12 @@ impl Connection {
                 .set_port(self.config.port.unwrap_or_else(|| transport.default_port()));
         }
 
-        log::info!(
-            "Connecting to {} (at {actual_connect_address})...",
-            &self.server_name,
-        );
+        tracing::info!(addr = %actual_connect_address, "Connecting to server");
         transport
             .connect(&self.server_name, actual_connect_address)
             .await?;
 
-        log::info!("Connected to {}. Negotiating.", &self.server_name);
+        tracing::info!("Connected. Negotiating");
         self._negotiate(transport, self.config.smb2_only_negotiate)
             .await?;
 
@@ -157,6 +162,7 @@ impl Connection {
     /// let connection = Connection::from_transport(custom_tcp_transport, "server", Guid::generate(), my_connection_config).await?;
     /// # Ok(())}
     /// ```
+    #[tracing::instrument(level = "debug", skip_all, fields(server = %server))]
     pub async fn from_transport(
         transport: Box<dyn SmbTransport>,
         server: &str,
@@ -175,6 +181,7 @@ impl Connection {
     /// calling this method.
     ///
     /// See also [`Client::close`][`crate::Client::close`].
+    #[tracing::instrument(level = "debug", skip_all, fields(server = %self.server_name))]
     pub async fn close(&self) -> crate::Result<()> {
         match self.handler.worker() {
             Some(c) => c.stop().await,
@@ -192,12 +199,12 @@ impl Connection {
     ) -> crate::Result<Arc<WorkerImpl>> {
         // Multi-protocol negotiation: Begin with SMB1, expect SMB2.
         if !smb2_only_neg {
-            log::debug!("Negotiating multi-protocol: Sending SMB1");
+            tracing::debug!("Negotiating multi-protocol: Sending SMB1");
             // 1. Send SMB1 negotiate request
             let msg_bytes: Vec<u8> = SMB1NegotiateMessage::default().try_into()?;
             transport.send(&IoVec::from(msg_bytes)).await?;
 
-            log::debug!("Sent SMB1 negotiate request, Receieving SMB2 response");
+            tracing::debug!("Sent SMB1 negotiate request, Receieving SMB2 response");
             // 2. Expect SMB2 negotiate response
             let recieved_bytes = transport.receive().await?;
             let response = Response::try_from(recieved_bytes.as_ref())?;
@@ -244,7 +251,7 @@ impl Connection {
             return Err(Error::InvalidState("Already negotiated".into()));
         }
 
-        log::debug!("Negotiating SMB2");
+        tracing::debug!("Negotiating SMB2");
 
         // List possible versions to run with.
         let min_dialect = self.config.min_dialect.unwrap_or(Dialect::MIN);
@@ -322,7 +329,7 @@ impl Connection {
             ));
         }
 
-        log::trace!(
+        tracing::trace!(
             "Negotiated SMB results: dialect={:?}, state={:?}",
             dialect_rev,
             &negotiation
@@ -334,7 +341,9 @@ impl Connection {
                 .expect("Preauth hash must be calculated for supported dialect!");
             request_raw.consolidate();
             PreauthHashState::begin()
-                .next(request_raw.first().ok_or_else(|| Error::InvalidState("Preauth hash request data is empty.".to_string()))?)?
+                .next(request_raw.first().ok_or_else(|| {
+                    Error::InvalidState("Preauth hash request data is empty.".to_string())
+                })?)?
                 .next(&response.raw)?
         } else {
             PreauthHashState::unsupported()
@@ -474,7 +483,10 @@ impl Connection {
             ._negotiate_switch_to_smb2(transport, smb2_only_neg)
             .await?;
 
-        self.handler.worker.set(worker).map_err(|_| Error::InvalidState("Worker already set.".to_string()))?;
+        self.handler
+            .worker
+            .set(worker)
+            .map_err(|_| Error::InvalidState("Worker already set.".to_string()))?;
 
         // Negotiate SMB2
         let info = self._negotiate_smb2(server_address).await?;
@@ -488,14 +500,17 @@ impl Connection {
 
         #[cfg(not(feature = "single_threaded"))]
         if !self.config.disable_notifications && info.negotiation.caps.notifications() {
-            log::debug!("Starting Notification job.");
+            tracing::debug!("Starting Notification job.");
             self.handler.handler.start_notify().await?;
-            log::debug!("Notification job started.");
+            tracing::debug!("Notification job started.");
         }
 
-        self.handler.conn_info.set(Arc::new(info)).map_err(|_| Error::InvalidState("Connection info already set.".to_string()))?;
+        self.handler
+            .conn_info
+            .set(Arc::new(info))
+            .map_err(|_| Error::InvalidState("Connection info already set.".to_string()))?;
 
-        log::debug!("Negotiation successful");
+        tracing::debug!("Negotiation successful");
         Ok(())
     }
 
@@ -511,11 +526,15 @@ impl Connection {
     ///
     /// ## Notes:
     /// * Use the [`ConnectionConfig`] to configure authentication options.
+    #[tracing::instrument(level = "debug", skip_all, fields(server = %self.server_name, user = %identity.username.account_name()))]
     pub async fn authenticate(&self, identity: sspi::AuthIdentity) -> crate::Result<Session> {
         let session = Session::create(
             identity,
             &self.handler,
-            self.handler.conn_info.get().ok_or_else(|| Error::InvalidState("Connection not negotiated.".to_string()))?,
+            self.handler
+                .conn_info
+                .get()
+                .ok_or_else(|| Error::InvalidState("Connection not negotiated.".to_string()))?,
         )
         .await?;
         let session_handler = session.handler.weak();
@@ -690,7 +709,10 @@ impl ConnectionMessageHandler {
 
     #[cfg(feature = "async")]
     async fn start_notify(self: &Arc<Self>) -> crate::Result<()> {
-        let worker = self.worker.get().ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?;
+        let worker = self
+            .worker
+            .get()
+            .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?;
         let worker = worker.clone();
         const CHANNEL_BUFFER_SIZE: usize = 10;
         let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_BUFFER_SIZE);
@@ -701,19 +723,19 @@ impl ConnectionMessageHandler {
             loop {
                 select! {
                     _ = stop_notification.cancelled() => {
-                        log::info!("Notification handler cancelled.");
+                        tracing::info!("Notification handler cancelled.");
                         break;
                     }
                     else => {
                         while let Some(msg) = rx.recv().await {
                             self_clone.notify(msg).await.unwrap_or_else(|e| {
-                                log::error!("Error handling notification: {e:?}");
+                                tracing::error!("Error handling notification: {e:?}");
                             });
                         }
                     }
                 }
             }
-            log::info!("Notification handler thread stopped.");
+            tracing::info!("Notification handler thread stopped.");
         });
         Ok(())
     }
@@ -721,7 +743,10 @@ impl ConnectionMessageHandler {
     #[cfg(feature = "multi_threaded")]
     fn start_notify(self: &Arc<Self>) -> crate::Result<()> {
         let (tx, rx) = mpsc::channel();
-        let worker = self.worker.get().ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?;
+        let worker = self
+            .worker
+            .get()
+            .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?;
         worker.start_notify_channel(tx)?;
 
         const POLLING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -732,14 +757,14 @@ impl ConnectionMessageHandler {
                 match rx.recv_timeout(POLLING_INTERVAL) {
                     Ok(notification) => {
                         self_clone.notify(notification).unwrap_or_else(|e| {
-                            log::error!("Error handling notification: {e:?}");
+                            tracing::error!("Error handling notification: {e:?}");
                         });
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
             }
-            log::info!("Notification handler thread stopped.");
+            tracing::info!("Notification handler thread stopped.");
         });
         Ok(())
     }
@@ -750,7 +775,7 @@ impl ConnectionMessageHandler {
         self.stop_notifications.cancel();
         #[cfg(not(feature = "async"))]
         self.stop_notifications.store(true, Ordering::Relaxed);
-        log::info!("Notification handler stopped.");
+        tracing::info!("Notification handler stopped.");
     }
 }
 
@@ -784,7 +809,12 @@ impl MessageHandler for ConnectionMessageHandler {
 
     #[maybe_async]
     async fn recvo(&self, options: ReceiveOptions<'_>) -> crate::Result<IncomingMessage> {
-        let msg = self.worker.get().ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?.receive(&options).await?;
+        let msg = self
+            .worker
+            .get()
+            .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?
+            .receive(&options)
+            .await?;
 
         // Command matching (if needed).
         if let Some(cmd) = options.cmd {
@@ -823,7 +853,7 @@ impl MessageHandler for ConnectionMessageHandler {
     #[maybe_async]
     async fn notify(&self, msg: IncomingMessage) -> crate::Result<()> {
         if msg.message.header.session_id == 0 {
-            log::warn!("Received notification without session ID: {msg:?}");
+            tracing::warn!("Received notification without session ID: {msg:?}");
             return Ok(());
         }
 
@@ -832,7 +862,7 @@ impl MessageHandler for ConnectionMessageHandler {
             let sessions = self.sessions.lock().await?;
             match sessions.get(&msg.message.header.session_id) {
                 None => {
-                    log::warn!(
+                    tracing::warn!(
                         "Received notification for unknown session ID {}: {msg:?}",
                         msg.message.header.session_id
                     );

@@ -71,7 +71,7 @@ impl RdmaTransport {
     pub const EXPORTED_DEFAULT_PORT: u16 = 0;
 
     pub fn new(config: &super::RdmaConfig, _timeout: std::time::Duration) -> Self {
-        log::warn!(
+        tracing::warn!(
             "Rdma transport is currently alpha-quality and may not work correctly. Do not use it for production applications!"
         );
         // TODO: use config+timeout
@@ -123,6 +123,7 @@ impl RdmaTransport {
     const RECV_CREDIT_LIMIT: u16 = 255;
     const MAX_RECEIVE_SIZE: usize = 0x400;
 
+    #[tracing::instrument(level = "debug", skip_all, fields(addr = %server_address))]
     pub async fn connect_and_negotiate(&mut self, server_address: SocketAddr) -> Result<()> {
         if !matches!(self.state, RdmaTransportState::Init) {
             return Err(RdmaError::AlreadyConnected);
@@ -142,17 +143,17 @@ impl RdmaTransport {
         let node = server_address.ip().to_string() + "\0";
         let service = server_address.port().to_string() + "\0";
 
-        log::debug!("RDMA connecting to {node}:{service}...");
+        tracing::debug!("RDMA connecting");
         let rdma = RdmaBuilder::default()
             .set_conn_type(ConnectionType::RCCM)
             .set_raw(true)
             .set_mr_strategy(async_rdma::MRManageStrategy::Raw) // Jemalloc is buggy here :(
             .cm_connect(&node, &service)
             .await?;
-        log::info!("RDMA connected");
+        tracing::info!("RDMA connected");
         let max_send_size = 0x400;
         let negotiate_result = Self::negotiate_rdma(&rdma, max_send_size).await?;
-        log::info!("RDMA negotiated");
+        tracing::info!("RDMA negotiated");
         let rdma = Arc::new(rdma);
         let cancel = CancellationToken::new();
 
@@ -192,7 +193,7 @@ impl RdmaTransport {
             server_address,
         ));
 
-        log::debug!("RDMA transport state: {:?}", self.state);
+        tracing::debug!("RDMA transport state: {:?}", self.state);
 
         Ok(())
     }
@@ -224,7 +225,7 @@ impl RdmaTransport {
             req.write(&mut cursor).unwrap();
         }
 
-        log::debug!("Sending negotiate request: {:?}", req);
+        tracing::debug!("Sending negotiate request: {:?}", req);
         rdma.send_raw(&neg_req_data).await?;
 
         let neg_res_data = rdma
@@ -252,7 +253,7 @@ impl RdmaTransport {
         }
 
         // TODO: Check and use params!
-        log::debug!("Received negotiate response: {:?}", neg_res);
+        tracing::debug!("Received negotiate response: {:?}", neg_res);
 
         Ok(neg_res)
     }
@@ -275,38 +276,38 @@ impl RdmaTransport {
         negotiate_result: SmbdNegotiateResponse,
         cancel: CancellationToken,
     ) {
-        log::info!("RDMA receive worker started");
+        tracing::info!("RDMA receive worker started");
         let receive_layout = Layout::from_size_align(
             negotiate_result.max_receive_size as usize,
             Self::MR_ALIGN_TO,
         )
         .unwrap();
         loop {
-            log::trace!("Waiting for RDMA data...");
+            tracing::trace!("Waiting for RDMA data...");
             select! {
                 mr_res = rdma.receive_raw(receive_layout) => {
                     match mr_res {
                         Ok(mr) => {
-                            log::trace!("Received RDMA data: {:?}", mr);
+                            tracing::trace!("Received RDMA data: {:?}", mr);
                             if tx.send(mr).await.is_err() {
-                                log::warn!("Receiver dropped, stopping worker");
+                                tracing::warn!("Receiver dropped, stopping worker");
                                 break;
                             }
-                            log::trace!("Sent RDMA data to receiver channel");
+                            tracing::trace!("Sent RDMA data to receiver channel");
                         }
                         Err(e) => {
-                            log::error!("Error receiving data: {:?}", e);
+                            tracing::error!("Error receiving data: {:?}", e);
                             break;
                         }
                     }
                 },
                 _ = cancel.cancelled() => {
-                    log::info!("RDMA receive worker cancelled");
+                    tracing::info!("RDMA receive worker cancelled");
                     break;
                 }
             }
         }
-        log::info!("RDMA receive worker stopped");
+        tracing::info!("RDMA receive worker stopped");
     }
 
     async fn _receive_fragmented_data(&mut self) -> std::result::Result<Vec<u8>, RdmaError> {
@@ -328,7 +329,7 @@ impl RdmaTransport {
 
             let mr_data = mr.as_slice().as_ref();
 
-            log::trace!(
+            tracing::trace!(
                 "Received RDMA message data (len={}): {mr_data:?}",
                 mr_data.len()
             );
@@ -336,11 +337,11 @@ impl RdmaTransport {
             let mut cursor = std::io::Cursor::new(mr_data);
             let message = SmbdDataTransferHeader::read(&mut cursor)?;
 
-            log::trace!("Parsed RDMA message header: {:?}", message);
+            tracing::trace!("Parsed RDMA message header: {:?}", message);
 
             if result.capacity() == 0 {
                 if message.data_length == 0 {
-                    log::trace!("Received empty fragmented data, stopping receive loop.");
+                    tracing::trace!("Received empty fragmented data, stopping receive loop.");
                     assert!(message.remaining_data_length == 0 && message.data_offset == 0);
                     return Ok(result);
                 }
@@ -387,7 +388,7 @@ impl RdmaTransport {
                 std::sync::atomic::Ordering::SeqCst,
             );
 
-            log::debug!(
+            tracing::debug!(
                 "Server granted to client {} credits (total now: {}); server requested {} credits",
                 message.credits_granted,
                 running.credits.send_credits.available_permits(),
@@ -396,20 +397,20 @@ impl RdmaTransport {
 
             if message.remaining_data_length == 0 {
                 // If no more data is expected, we can stop receiving.
-                log::trace!(
+                tracing::trace!(
                     "Received all fragmented data - {} bytes, stopping receive loop.",
                     result.len()
                 );
                 break;
             } else {
-                log::trace!(
+                tracing::trace!(
                     "Received {} bytes of fragmented data, expecting more ({} bytes remaining).",
                     data_length,
                     message.remaining_data_length
                 );
             }
 
-            log::trace!(
+            tracing::trace!(
                 "Dropping RDMA message local MR. Remaining data length: {}",
                 message.remaining_data_length
             );
@@ -423,7 +424,7 @@ impl RdmaTransport {
         &mut self,
         message: &IoVec,
     ) -> std::result::Result<(), RdmaError> {
-        log::trace!(
+        tracing::trace!(
             "RDMA _send_fragmented_data called with message length: {}",
             message.len()
         );
@@ -466,7 +467,7 @@ impl RdmaTransport {
             let data_to_send = &current_buf
                 [current_buf_offset as usize..(current_buf_offset + data_sending) as usize];
 
-            log::trace!(
+            tracing::trace!(
                 "Rdma sending fragment #{fragment_num} (len={} remaining={} total_sent={} total={})",
                 data_to_send.len(),
                 total_remaining,
@@ -528,7 +529,7 @@ impl RdmaTransport {
         let credits_to_request = running.credits.send_credits_target
             - current_credits.min(running.credits.send_credits_target);
 
-        log::debug!(
+        tracing::debug!(
             "Send credits left: {current_credits}, requesting {credits_to_request} more credits; granting to server: {grant_credits} (server requested: {})",
             running
                 .credits

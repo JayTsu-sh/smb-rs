@@ -1,14 +1,16 @@
 use std::error::Error;
+use std::io::IsTerminal;
 
 use clap::Parser;
-use env_logger::Env;
 use maybe_async::*;
 use smb_cli::*;
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::EnvFilter;
 
 #[cfg(not(feature = "async"))]
 fn main() -> Result<(), Box<dyn Error>> {
     _main().map_err(|e| {
-        log::error!("Error: {e}");
+        tracing::error!("Error: {e}");
         e
     })
 }
@@ -17,17 +19,25 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     _main().await.map_err(|e| {
-        log::error!("Error: {e}");
+        tracing::error!("Error: {e}");
         e
     })
 }
 
 #[maybe_async]
 async fn _main() -> Result<(), Box<dyn Error>> {
-    // Use env_logger, and set default log level to info.
-    // This can be overridden by setting the RUST_LOG environment variable.
-    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
-    log::debug!("Starting smb-cli {}", env!("CARGO_PKG_VERSION"));
+    // Default to info; honor RUST_LOG. tracing-log feature captures records from log-based crates.
+    let filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
+    let stderr = std::io::stderr();
+    let ansi = stderr.is_terminal();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(ansi)
+        .init();
+    tracing::debug!("Starting smb-cli {}", env!("CARGO_PKG_VERSION"));
 
     let cli = Cli::parse();
 
@@ -42,18 +52,18 @@ async fn _main() -> Result<(), Box<dyn Error>> {
 
     match &cli.command {
         Commands::Copy(cmd) => {
-            log::info!("Copying {:?} to {:?}", cmd.from, cmd.to);
+            tracing::info!("Copying {:?} to {:?}", cmd.from, cmd.to);
             copy::copy(cmd, &cli).await?;
         }
         Commands::Info(cmd) => {
-            log::info!("Getting info for {:?}", cmd.path);
+            tracing::info!("Getting info for {:?}", cmd.path);
             info::info(cmd, &cli).await?;
         }
         Commands::Security(cmd) => {
             security::security(cmd, &cli).await?;
         }
         Commands::Watch(watch_cmd) => {
-            log::info!("Watching for changes in {:?}", watch_cmd.path);
+            tracing::info!("Watching for changes in {:?}", watch_cmd.path);
             watch::watch(watch_cmd, &cli).await?;
         }
     }

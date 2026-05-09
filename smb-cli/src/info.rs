@@ -59,9 +59,9 @@ pub async fn info(cmd: &InfoCmd, cli: &Cli) -> Result<(), Box<dyn Error>> {
             .ipc_connect(cmd.path.server(), &cli.username, cli.password.clone())
             .await?;
         let shares_info = client.list_shares(cmd.path.server()).await?;
-        log::info!("Available shares on {}: ", cmd.path.server());
+        tracing::info!("Available shares on {}: ", cmd.path.server());
         for share in shares_info {
-            log::info!("  - {}", **share.netname.as_ref().unwrap());
+            tracing::info!("  - {}", **share.netname.as_ref().unwrap());
         }
         return Ok(());
     }
@@ -80,13 +80,13 @@ pub async fn info(cmd: &InfoCmd, cli: &Cli) -> Result<(), Box<dyn Error>> {
         Resource::File(file) => {
             let info: FileBasicInformation = file.query_info().await?;
             let size_kb = file.get_len().await?.div_ceil(1024);
-            log::info!("{}", cmd.path);
-            log::info!("  - Size: ~{size_kb}kB");
-            log::info!("  - Creation time: {}", info.creation_time);
-            log::info!("  - Last write time: {}", info.last_write_time);
-            log::info!("  - Last access time: {}", info.last_access_time);
+            tracing::info!("{}", cmd.path);
+            tracing::info!("  - Size: ~{size_kb}kB");
+            tracing::info!("  - Creation time: {}", info.creation_time);
+            tracing::info!("  - Last write time: {}", info.last_write_time);
+            tracing::info!("  - Last access time: {}", info.last_access_time);
             if cmd.show_ea {
-                log::info!("  - Extended Attributes (EA):");
+                tracing::info!("  - Extended Attributes (EA):");
                 let basic_ea_info = file.query_info::<smb::FileEaInformation>().await?;
                 if basic_ea_info.ea_size > 0 {
                     let ea_info = file
@@ -96,7 +96,7 @@ pub async fn info(cmd: &InfoCmd, cli: &Cli) -> Result<(), Box<dyn Error>> {
                         )
                         .await?;
                     ea_info.iter().for_each(|ea| {
-                        log::info!(
+                        tracing::info!(
                             "       - name='{}', size={} bytes, flags={:?}",
                             ea.ea_name,
                             ea.ea_value.len(),
@@ -104,7 +104,7 @@ pub async fn info(cmd: &InfoCmd, cli: &Cli) -> Result<(), Box<dyn Error>> {
                         );
                     });
                 } else {
-                    log::info!("       (no EAs present)");
+                    tracing::info!("       (no EAs present)");
                 }
             }
             file.close().await?;
@@ -128,7 +128,7 @@ pub async fn info(cmd: &InfoCmd, cli: &Cli) -> Result<(), Box<dyn Error>> {
             dir.close().await?;
         }
         Resource::Pipe(p) => {
-            log::info!("Pipe");
+            tracing::info!("Pipe");
             p.close().await?;
         }
     };
@@ -144,8 +144,8 @@ fn display_item_info(info: &DirectoryInfoQueryType, dir_path: &UncPath) {
     }
 
     match info.file_attributes.directory() {
-        true => log::info!("  - {} {dir_path}/{}/", "(D)", info.file_name),
-        false => log::info!(
+        true => tracing::info!("  - {} {dir_path}/{}/", "(D)", info.file_name),
+        false => tracing::info!(
             "  - {} {dir_path}/{} ~{}",
             "(F)",
             info.file_name,
@@ -157,10 +157,10 @@ fn display_item_info(info: &DirectoryInfoQueryType, dir_path: &UncPath) {
 fn display_quota_info(info: &Vec<smb::FileQuotaInformation>) {
     for quota in info {
         if quota.quota_limit == u64::MAX && quota.quota_threshold == u64::MAX {
-            log::trace!("Skipping quota for SID {} with no limit", quota.sid);
+            tracing::trace!("Skipping quota for SID {} with no limit", quota.sid);
             continue; // No quota set
         }
-        log::info!(
+        tracing::info!(
             "Quota for SID {}: used {}, threshold {}, limit {}",
             quota.sid,
             get_size_string(quota.quota_used),
@@ -272,7 +272,7 @@ async fn handle_iteration_item(
         .await;
 
     if let Err(e) = dir_result {
-        log::warn!("Failed to open directory {}: {}", path_of_subdir, e);
+        tracing::warn!("Failed to open directory {}: {}", path_of_subdir, e);
         return None;
     }
 
@@ -281,7 +281,7 @@ async fn handle_iteration_item(
     let dir: Directory = match dir.try_into() {
         Ok(dir) => dir,
         Err(e) => {
-            log::warn!(
+            tracing::warn!(
                 "Failed to convert resource to directory {}: {}",
                 path_of_subdir,
                 e.0
@@ -314,6 +314,6 @@ async fn try_query_and_show_quota(dir: &Directory) {
         .await
     {
         Ok(qi) => display_quota_info(&qi),
-        Err(e) => log::warn!("Failed to query quota info: {}", e),
+        Err(e) => tracing::warn!("Failed to query quota info: {}", e),
     }
 }

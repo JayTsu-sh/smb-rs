@@ -92,7 +92,7 @@ where
     /// This function sets up a session against a connection, and it is somewhat abstract.
     /// by calling impl functions, this function's behavior is modified to support both new sessions and binding to existing sessions.
     pub(crate) async fn setup(&mut self) -> crate::Result<Arc<RwLock<SessionAndChannel>>> {
-        log::debug!(
+        tracing::debug!(
             "Setting up session for user {} (@{}).",
             self.authenticator.user_name().account_name(),
             self.authenticator.user_name().domain_name().unwrap_or("")
@@ -100,11 +100,13 @@ where
 
         let result = self._setup_loop().await;
         match result {
-            Ok(()) => Ok(self.result.take().ok_or_else(|| Error::InvalidState("Session setup result is missing.".to_string()))?),
+            Ok(()) => Ok(self.result.take().ok_or_else(|| {
+                Error::InvalidState("Session setup result is missing.".to_string())
+            })?),
             Err(e) => {
-                log::error!("Failed to setup session: {}", e);
+                tracing::error!("Failed to setup session: {}", e);
                 if let Err(ce) = T::error_cleanup(self).await {
-                    log::error!("Failed to cleanup after setup error: {}", ce);
+                    tracing::error!("Failed to cleanup after setup error: {}", ce);
                 }
                 Err(e)
             }
@@ -129,7 +131,12 @@ where
             // If keys are exchanged, set them up, to enable validation of next response!
             let request = self.send_setup_request(next_buf).await?;
             if is_auth_done {
-                self.preauth_hash = Some(self.preauth_hash.take().ok_or_else(|| Error::InvalidState("Preauth hash is missing.".to_string()))?.finish()?);
+                self.preauth_hash = Some(
+                    self.preauth_hash
+                        .take()
+                        .ok_or_else(|| Error::InvalidState("Preauth hash is missing.".to_string()))?
+                        .finish()?,
+                );
                 self.make_channel().await?;
             }
 
@@ -144,7 +151,7 @@ where
             // which is required for channel construction and signature validation,
             // the first request must arrive here, and then be validated.
             if self.result.is_none() {
-                log::trace!("Creating session state with id {session_id}.");
+                tracing::trace!("Creating session state with id {session_id}.");
                 self.set_session(T::init_session(self, session_id).await?)
                     .await?;
             }
@@ -173,7 +180,7 @@ where
             "Failed to complete authentication properly.".to_string(),
         ))?;
 
-        log::trace!("setup success, finishing up.");
+        tracing::trace!("setup success, finishing up.");
         T::on_setup_success(self).await?;
 
         Ok(())
@@ -217,7 +224,7 @@ where
         };
         let skip_security_validation = !is_auth_done && !channel_set_up;
         if let Some(handler) = &self.handler {
-            log::trace!(
+            tracing::trace!(
                 "setup loop: receiving with channel handler; skip_security_validation={skip_security_validation}"
             );
             handler
@@ -225,7 +232,7 @@ where
                 .await
         } else {
             assert!(skip_security_validation);
-            log::trace!("setup loop: receiving with upstream handler");
+            tracing::trace!("setup loop: receiving with upstream handler");
             self.upstream.handler.recvo(roptions).await
         }
     }
@@ -236,17 +243,21 @@ where
         let request = T::make_request(self, buf).await?;
 
         let mut send_result = if let Some(handler) = self.handler.as_ref() {
-            log::trace!("setup loop: sending with channel handler");
+            tracing::trace!("setup loop: sending with channel handler");
             handler.sendo(request).await?
         } else {
-            log::trace!("setup loop: sending with upstream handler");
+            tracing::trace!("setup loop: sending with upstream handler");
             self.upstream.sendo(request).await?
         };
 
         {
-            let raw_iovec = send_result.raw.as_mut().ok_or_else(|| Error::InvalidState("Send result raw data is missing.".to_string()))?;
+            let raw_iovec = send_result.raw.as_mut().ok_or_else(|| {
+                Error::InvalidState("Send result raw data is missing.".to_string())
+            })?;
             raw_iovec.consolidate();
-            self.next_preauth_hash(raw_iovec.first().ok_or_else(|| Error::InvalidState("Raw IoVec is empty after consolidation.".to_string()))?)?;
+            self.next_preauth_hash(raw_iovec.first().ok_or_else(|| {
+                Error::InvalidState("Raw IoVec is empty after consolidation.".to_string())
+            })?)?;
         }
         Ok(send_result)
     }
@@ -257,7 +268,7 @@ where
     /// - Calls `T::on_channel_set_up` after setting up the channel.
     async fn make_channel(&mut self) -> crate::Result<()> {
         T::on_session_key_exchanged(self).await?;
-        log::trace!("Session keys are set.");
+        tracing::trace!("Session keys are set.");
 
         let channel_info = ChannelInfo::new(
             self.new_channel_id,
@@ -268,10 +279,19 @@ where
 
         self.channel = Some(channel_info);
 
-        let mut session_lock = self.result.as_ref().ok_or_else(|| Error::InvalidState("Session setup result is missing.".to_string()))?.write().await?;
-        session_lock.set_channel(self.channel.take().ok_or_else(|| Error::InvalidState("Channel info is missing.".to_string()))?);
+        let mut session_lock = self
+            .result
+            .as_ref()
+            .ok_or_else(|| Error::InvalidState("Session setup result is missing.".to_string()))?
+            .write()
+            .await?;
+        session_lock.set_channel(
+            self.channel
+                .take()
+                .ok_or_else(|| Error::InvalidState("Channel info is missing.".to_string()))?,
+        );
 
-        log::trace!("Channel for current setup has been initialized");
+        tracing::trace!("Channel for current setup has been initialized");
         Ok(())
     }
 
@@ -289,7 +309,10 @@ where
         if let Some(hash) = self.preauth_hash.take() {
             self.preauth_hash = Some(hash.next(data)?);
         }
-        Ok(self.preauth_hash.as_ref().ok_or_else(|| Error::InvalidState("Preauth hash is missing.".to_string()))?)
+        Ok(self
+            .preauth_hash
+            .as_ref()
+            .ok_or_else(|| Error::InvalidState("Preauth hash is missing.".to_string()))?)
     }
 
     pub fn upstream(&self) -> &'a ChannelUpstream {
@@ -381,7 +404,7 @@ impl SessionSetupProperties for SmbSessionBind {
         T: SessionSetupProperties,
     {
         if setup.result.is_none() {
-            log::warn!("No session to cleanup in binding.");
+            tracing::warn!("No session to cleanup in binding.");
             return Ok(());
         }
         setup
@@ -419,11 +442,11 @@ impl SessionSetupProperties for SmbSessionNew {
         T: SessionSetupProperties,
     {
         if setup.result.is_none() {
-            log::trace!("No session to cleanup in setup.");
+            tracing::trace!("No session to cleanup in setup.");
             return Ok(());
         }
 
-        log::trace!("Invalidating session before cleanup.");
+        tracing::trace!("Invalidating session before cleanup.");
         let session = setup.result.as_ref().unwrap();
         {
             let session_lock = session.read().await?;
@@ -443,7 +466,7 @@ impl SessionSetupProperties for SmbSessionNew {
         T: SessionSetupProperties,
     {
         // Only on new sessions we need to initialize the session state with the keys.
-        log::trace!("Session keys exchanged. Setting up session state.");
+        tracing::trace!("Session keys exchanged. Setting up session state.");
         setup
             .result
             .as_ref()
@@ -464,7 +487,7 @@ impl SessionSetupProperties for SmbSessionNew {
     where
         T: SessionSetupProperties,
     {
-        log::trace!("Session setup successful");
+        tracing::trace!("Session setup successful");
         let result = setup.result.as_ref().unwrap().read().await?;
         let mut session = result.session.write().await?;
         session.ready(setup.flags.unwrap(), setup.conn_info)

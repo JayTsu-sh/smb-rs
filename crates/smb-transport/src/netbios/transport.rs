@@ -23,14 +23,15 @@ impl NetBiosTransport {
 
     /// Starts the underlying TCP connection, and sends NetBIOS session request and expects a session response.
     #[maybe_async]
+    #[tracing::instrument(level = "debug", skip_all, fields(server = %server_name, addr = %address))]
     async fn do_connect(&mut self, server_name: &str, address: SocketAddr) -> Result<()> {
-        log::debug!("Connecting to NetBIOS Session services TCP...");
+        tracing::debug!("Connecting to NetBIOS Session services TCP...");
         self.tcp.connect(server_name, address).await?;
 
-        log::info!("Performing NetBIOS session setup...");
+        tracing::info!("Performing NetBIOS session setup...");
         self.netbios_session_setup().await?;
 
-        log::debug!("NetBIOS session setup completed.");
+        tracing::debug!("NetBIOS session setup completed.");
         Ok(())
     }
 
@@ -43,7 +44,7 @@ impl NetBiosTransport {
 
         let mut req_buf = Vec::new();
         session_request.write(&mut Cursor::new(&mut req_buf))?;
-        log::debug!("Sending NetBIOS session request");
+        tracing::debug!("Sending NetBIOS session request");
         let mut header_cursor = Cursor::new([0u8; NBSSPacketHeader::SIZE]);
         let header = NBSSPacketHeader {
             ptype: NBSSPacketType::SessionRequest,
@@ -56,7 +57,7 @@ impl NetBiosTransport {
             .await?;
         self.tcp.send_raw(req_buf.as_slice()).await?;
 
-        log::debug!("Waiting for NetBIOS session response");
+        tracing::debug!("Waiting for NetBIOS session response");
         let header = self.netbios_receive_header().await?;
         let mut result_packet = Vec::with_capacity(header.length as usize);
         self.tcp.receive_exact(&mut result_packet).await?;
@@ -66,10 +67,10 @@ impl NetBiosTransport {
 
         match nbss_packet {
             NBSSTrailer::PositiveSessionResponse(_) => {
-                log::debug!("NetBIOS session request succeeded.");
+                tracing::debug!("NetBIOS session request succeeded.");
             }
             x => {
-                log::debug!("NetBIOS session request invalid with packet: {:?}", x);
+                tracing::debug!("NetBIOS session request invalid with packet: {:?}", x);
                 return Err(TransportError::InvalidMessage);
             }
         }

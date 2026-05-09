@@ -71,7 +71,7 @@ mod client_impl {
 
     impl ReqwestNetworkClient {
         pub async fn send<'a>(&'a mut self, request: &'a NetworkRequest) -> Result<Vec<u8>> {
-            log::debug!("Sending SSPI network request to {}", request.url);
+            tracing::debug!("Sending SSPI network request to {}", request.url);
             match &request.protocol {
                 NetworkProtocol::Tcp => self.send_tcp(&request.url, &request.data).await,
                 NetworkProtocol::Udp => self.send_udp(&request.url, &request.data).await,

@@ -149,7 +149,7 @@ impl Resource {
             .await?;
 
         let response = response.message.content.to_create()?;
-        log::debug!("Created file '{}', ({:?})", name, response.file_id);
+        tracing::debug!("Created file '{}', ({:?})", name, response.file_id);
 
         let is_dir = response.file_attributes.directory();
 
@@ -157,7 +157,7 @@ impl Resource {
         let access = CreateContextResponseData::first_mxac(&response.create_contexts)
             .and_then(|r| r.maximal_access())
             .unwrap_or_else(|| {
-                    log::debug!(
+                    tracing::debug!(
                         "No maximal access context found for file '{name}', using default (full access)."
                     );
                     FileAccessMask::from_bytes(u32::MAX.to_be_bytes())
@@ -227,7 +227,9 @@ impl Resource {
     pub fn into_dir(self) -> crate::Result<Directory> {
         match self {
             Resource::Directory(d) => Ok(d),
-            _ => Err(Error::InvalidState("Resource is not a directory".to_string())),
+            _ => Err(Error::InvalidState(
+                "Resource is not a directory".to_string(),
+            )),
         }
     }
 
@@ -243,7 +245,10 @@ impl Resource {
     pub fn unwrap_dir(self) -> Directory {
         match self {
             Resource::Directory(d) => d,
-            other => panic!("Expected Directory, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "Expected Directory, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 }
@@ -344,7 +349,7 @@ impl ResourceHandle {
         let max_transact_size = self.conn_info.negotiation.max_transact_size;
         match requested {
             Some(requested_length) if requested_length > max_transact_size as usize => {
-                log::warn!(
+                tracing::warn!(
                     "Requested transaction size (0x{requested_length:x}) exceeds max transaction size, clamping to 0x{max_transact_size:x}",
                 );
                 max_transact_size
@@ -382,7 +387,12 @@ impl ResourceHandle {
 
         match result {
             Ok(response) => {
-                let status: Status = response.message.header.status.try_into().map_err(|_| Error::InvalidMessage(format!("Unknown status code: 0x{:08x}", response.message.header.status)))?;
+                let status: Status = response.message.header.status.try_into().map_err(|_| {
+                    Error::InvalidMessage(format!(
+                        "Unknown status code: 0x{:08x}",
+                        response.message.header.status
+                    ))
+                })?;
                 match status {
                     Status::Success => {
                         Ok(response.message.content.to_queryinfo()?.parse(info_type)?)
@@ -805,9 +815,9 @@ impl ResourceHandle {
         file_id: FileId,
         handler: &HandlerReference<ResourceMessageHandle>,
     ) -> crate::Result<()> {
-        log::trace!("Send close to file with ID: {file_id:?}");
+        tracing::trace!("Send close to file with ID: {file_id:?}");
         let response = handler.send_recv(CloseRequest { file_id }.into()).await?;
-        log::debug!("Close response received for file ID: {file_id:?}, {response:?}");
+        tracing::debug!("Close response received for file ID: {file_id:?}, {response:?}");
         Ok(())
     }
 
@@ -816,15 +826,16 @@ impl ResourceHandle {
     ///
     /// # Returns
     /// A `Result` indicating success or failure.
+    #[tracing::instrument(level = "debug", skip_all, fields(name = %self.name))]
     pub async fn close(&self) -> crate::Result<()> {
         if !self.open.swap(false, std::sync::atomic::Ordering::Relaxed) {
             return Err(Error::InvalidState("Resource is already closed".into()));
         }
 
-        log::debug!("Closing handle for {} ({:?})", self.name, self._file_id);
+        tracing::debug!(file_id = ?self._file_id, "Closing handle");
         Self::send_close(self._file_id, &self.handler).await?;
 
-        log::debug!("Closed file {}.", self.name);
+        tracing::debug!("Closed");
 
         Ok(())
     }
@@ -927,7 +938,7 @@ impl Drop for ResourceHandle {
             return;
         }
 
-        log::warn!(
+        tracing::warn!(
             "ResourceHandle for '{}' ({}) is being dropped without closing it properly. This may lead to resource leaks.",
             self.name,
             self._file_id
@@ -945,11 +956,11 @@ impl Drop for ResourceHandle {
 
         let file_id = self._file_id;
         let handler = self.handler.clone();
-        log::debug!("Spawning task to close file with ID: {file_id:?}");
+        tracing::debug!("Spawning task to close file with ID: {file_id:?}");
         tokio::task::spawn(async move {
             if file_id != FileId::EMPTY {
                 if let Err(e) = Self::send_close(file_id, &handler).await {
-                    log::error!("Error closing file: {e}");
+                    tracing::error!("Error closing file: {e}");
                 }
             }
         });

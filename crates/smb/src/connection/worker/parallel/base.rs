@@ -1,8 +1,8 @@
-use bytes::Bytes;
 use crate::connection::transformer::Transformer;
 use crate::connection::worker::Worker;
 use crate::msg_handler::ReceiveOptions;
 use crate::sync_helpers::*;
+use bytes::Bytes;
 use maybe_async::*;
 use smb_msg::ResponseContent;
 use smb_transport::{IoVec, SmbTransport, SmbTransportWrite, TransportError};
@@ -98,7 +98,7 @@ where
         self: &Arc<Self>,
         message: Result<Bytes, TransportError>,
     ) -> crate::Result<()> {
-        log::trace!("Received message from server.");
+        tracing::trace!("Received message from server.");
         let message = message?;
 
         // Tranform the message and verify it.
@@ -115,7 +115,7 @@ where
                 None => return Err(Error::TranformFailed(e)),
             },
             Err(e) => {
-                log::error!("Failed to transform message: {e:?}");
+                tracing::error!("Failed to transform message: {e:?}");
                 return Err(e);
             }
         };
@@ -140,14 +140,14 @@ where
             }
 
             if let Some(s2c_channel) = self.notify_messages_channel.get() {
-                log::trace!("Sending notification message to notify channel.");
+                tracing::trace!("Sending notification message to notify channel.");
                 s2c_channel.send(msg).await.map_err(|_| {
                     Error::MessageProcessingError(
                         "Failed to send notification message to notify channel.".to_string(),
                     )
                 })?;
             } else {
-                log::warn!("Received notification message, but no notify channel is set.");
+                tracing::warn!("Received notification message, but no notify channel is set.");
             }
             return Ok(());
         }
@@ -157,11 +157,11 @@ where
         let message_waiter = state.awaiting.remove(&msg_id);
         match message_waiter {
             Some(tx) => {
-                log::trace!("Waking up awaiting task for key {msg_id}.");
+                tracing::trace!("Waking up awaiting task for key {msg_id}.");
                 T::send_notify(tx, msg)?;
             }
             None => {
-                log::trace!("Storing message until awaited: {msg_id}.",);
+                tracing::trace!("Storing message until awaited: {msg_id}.",);
                 state.pending.insert(msg_id, msg);
             }
         }
@@ -251,13 +251,13 @@ where
     }
 
     async fn send(&self, msg: OutgoingMessage) -> crate::Result<SendMessageResult> {
-        log::trace!("ParallelWorker::send({msg:?}) called");
+        tracing::trace!("ParallelWorker::send({msg:?}) called");
         let return_raw_data = msg.return_raw_data;
 
         let id = msg.message.header.message_id;
         let message = { self.transformer.transform_outgoing(msg).await? };
 
-        log::trace!("Message with ID {id} is passed to the worker for sending",);
+        tracing::trace!("Message with ID {id} is passed to the worker for sending",);
 
         // If raw data is requested (e.g. for preauth hash), consolidate into a single
         // Bytes buffer before sending. This avoids cloning the entire IoVec (which would
@@ -285,11 +285,11 @@ where
         let wait_for_receive = {
             let mut state = self.state.lock().await?;
             if self.stopped() {
-                log::trace!("Connection is closed, avoid receiving.");
+                tracing::trace!("Connection is closed, avoid receiving.");
                 return Err(Error::ConnectionStopped);
             }
             if state.pending.contains_key(&options.msg_id) {
-                log::trace!(
+                tracing::trace!(
                     "Message with ID {} is already received, remove from pending.",
                     &options.msg_id
                 );
@@ -299,7 +299,7 @@ where
                 return data;
             }
 
-            log::trace!(
+            tracing::trace!(
                 "Message with ID {} is not received yet, insert channel and await.",
                 options.msg_id
             );
@@ -314,7 +314,7 @@ where
             .unwrap_or_else(|| Duration::from_millis(self.timeout.load(Ordering::Relaxed)));
         let result = T::wait_on_waiter(wait_for_receive, timeout).await?;
 
-        log::trace!("Received message {result:?}");
+        tracing::trace!("Received message {result:?}");
 
         Ok(result)
     }

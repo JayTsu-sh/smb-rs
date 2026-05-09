@@ -38,7 +38,7 @@ impl ThreadingBackend {
             match self.worker.incoming_data_callback(next) {
                 Ok(_) => {}
                 Err(Error::TransportError(TransportError::NotConnected)) => {
-                    log::error!("Connection closed.");
+                    tracing::error!("Connection closed.");
                     self.stopped
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                     break;
@@ -47,11 +47,11 @@ impl ThreadingBackend {
                     break;
                 }
                 Err(e) => {
-                    log::error!("Error in worker recv loop: {e}");
+                    tracing::error!("Error in worker recv loop: {e}");
                 }
             }
         }
-        log::debug!("Receive loop finished. Cleaning up.");
+        tracing::debug!("Receive loop finished. Cleaning up.");
         if let Ok(mut state) = self.worker.state.lock() {
             for (_, tx) in state.awaiting.drain() {
                 let _notify_result = tx.send(Err(Error::ConnectionStopped));
@@ -68,7 +68,7 @@ impl ThreadingBackend {
             match self.loop_send_next(send_channel.recv(), wtransport.as_mut()) {
                 Ok(_) => {}
                 Err(Error::TransportError(TransportError::NotConnected)) => {
-                    log::error!("Connection closed.");
+                    tracing::error!("Connection closed.");
                     self.stopped
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                     break;
@@ -77,11 +77,11 @@ impl ThreadingBackend {
                     break;
                 }
                 Err(e) => {
-                    log::error!("Error in worker send loop: {e}");
+                    tracing::error!("Error in worker send loop: {e}");
                 }
             }
         }
-        log::debug!("Send loop finished.");
+        tracing::debug!("Send loop finished.");
     }
 
     #[inline]
@@ -138,7 +138,7 @@ impl MultiWorkerBackend for ThreadingBackend {
     }
 
     fn stop(&self) -> crate::Result<()> {
-        log::debug!("Stopping worker.");
+        tracing::debug!("Stopping worker.");
 
         self.stopped
             .store(true, std::sync::atomic::Ordering::Relaxed);

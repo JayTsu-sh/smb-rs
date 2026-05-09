@@ -12,7 +12,7 @@ pub fn make_signing_algo(
         return Err(CryptoError::UnsupportedSigningAlgorithm(signing_algorithm));
     }
     if cfg!(feature = "__debug-dump-keys") {
-        log::debug!(
+        tracing::debug!(
             "Using signing algorithm {:?} with key {:02x?}",
             signing_algorithm,
             signing_key

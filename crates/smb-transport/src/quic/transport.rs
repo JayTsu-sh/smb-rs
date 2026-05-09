@@ -80,10 +80,10 @@ impl QuicTransport {
                             roots.add(CertificateDer::from(cert))?;
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            log::info!("local server certificate not found");
+                            tracing::info!("local server certificate not found");
                         }
                         Err(e) => {
-                            log::error!("failed to open local server certificate: {e}");
+                            tracing::error!("failed to open local server certificate: {e}");
                         }
                     }
                 }
@@ -98,6 +98,7 @@ impl QuicTransport {
         )))
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(server = %server_name, addr = %server_address))]
     async fn inner_connect(
         &mut self,
         server_name: &str,
@@ -110,17 +111,17 @@ impl QuicTransport {
             .await
             .map_err(|e| match e {
                 quinn::ConnectionError::TimedOut => {
-                    log::error!("Connection timed out after {:?}", self.timeout);
+                    tracing::error!("Connection timed out after {:?}", self.timeout);
                     crate::TransportError::Timeout(self.timeout)
                 }
                 _ => {
-                    log::error!("Failed to connect to {server_name} at {server_address}: {e}");
+                    tracing::error!("Failed to connect to {server_name} at {server_address}: {e}");
                     QuicError::ConnectionError(e).into()
                 }
             })?;
         let remote_address = connection.remote_address();
         let (send, recv) = connection.open_bi().await.map_err(|e| {
-            log::error!("Failed to open bidirectional stream: {e}");
+            tracing::error!("Failed to open bidirectional stream: {e}");
             QuicError::ConnectionError(e)
         })?;
 
@@ -164,7 +165,7 @@ impl SmbTransport for QuicTransport {
                     res
                 },
                 _ = tokio::time::sleep(timeout) => {
-                    log::debug!("QUIC Connection timed out after {:?}", timeout);
+                    tracing::debug!("QUIC Connection timed out after {:?}", timeout);
                     Err(crate::TransportError::Timeout(timeout))
                 }
             }

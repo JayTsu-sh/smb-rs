@@ -142,9 +142,9 @@ pub async fn get_security(
     let additional_info = AdditionalInfo::new().with_dacl_security_information(cmd.dacl);
     let security_info = resource_handle.query_security_info(additional_info).await?;
 
-    log::info!("Security info for {}:", security_cmd.path);
+    tracing::info!("Security info for {}:", security_cmd.path);
     // TODO: pretty print
-    log::info!("{:#?}", security_info);
+    tracing::info!("{:#?}", security_info);
 
     resource_handle.close().await?;
     Ok(())
@@ -169,17 +169,17 @@ pub async fn set_security(
     let to_set = AdditionalInfo::new().with_dacl_security_information(write_dacl);
 
     if to_set.into_bytes().iter().all(|f| *f == 0u8) {
-        log::debug!("No security information to set.");
+        tracing::debug!("No security information to set.");
         return Ok(());
     }
 
     let current_security_info = resource_handle.query_security_info(to_set).await?;
-    log::debug!("Current security info: {:#?}", current_security_info);
+    tracing::debug!("Current security info: {:#?}", current_security_info);
 
     let mut new_security_info = current_security_info.clone();
     if write_dacl {
         let new_dacl = new_security_info.dacl.as_mut().ok_or_else(|| {
-            log::error!("No DACL present on the object, cannot add entries");
+            tracing::error!("No DACL present on the object, cannot add entries");
             "No DACL present on the object"
         })?;
 
@@ -192,9 +192,9 @@ pub async fn set_security(
                 _ => true,
             });
             if new_dacl.ace.len() == initial_len {
-                log::warn!("No ACE found for SID {}, cannot remove", sid);
+                tracing::warn!("No ACE found for SID {}, cannot remove", sid);
             }
-            log::debug!(
+            tracing::debug!(
                 "Removed {} DACL entries for SID {}",
                 initial_len - new_dacl.ace.len(),
                 sid
@@ -222,14 +222,14 @@ pub async fn set_security(
             });
             if let Some(ace) = existing_ace_to_update {
                 if !cmd.force {
-                    log::warn!(
+                    tracing::warn!(
                         "ACE for SID {} with mask {:x?} already exists, skipping (use --force to overwrite)",
                         entry.sid,
                         entry.mask
                     );
                     continue;
                 }
-                log::debug!(
+                tracing::debug!(
                     "ACE for SID {} already exists, overwriting (mask {:x?})",
                     entry.sid,
                     entry.mask
@@ -239,7 +239,7 @@ pub async fn set_security(
                 new_dacl.order_aces();
             } else {
                 // Insert
-                log::debug!(
+                tracing::debug!(
                     "Adding ACE for SID {} with mask {:x?}",
                     entry.sid,
                     entry.mask
@@ -252,7 +252,7 @@ pub async fn set_security(
         }
     }
 
-    log::debug!("New security info to set: {:#?}", new_security_info);
+    tracing::debug!("New security info to set: {:#?}", new_security_info);
     resource_handle
         .set_security_info(new_security_info, to_set)
         .await?;

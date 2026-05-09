@@ -162,7 +162,12 @@ impl<'a> HeaderAndIoVec<'a> {
 impl bytes::Buf for HeaderAndIoVec<'_> {
     fn remaining(&self) -> usize {
         let header_remaining = self.header.len() - self.header_pos;
-        let iovec_total: usize = self.iovec.iter().skip(self.buf_index).map(|b| b.len()).sum();
+        let iovec_total: usize = self
+            .iovec
+            .iter()
+            .skip(self.buf_index)
+            .map(|b| b.len())
+            .sum();
         let iovec_remaining = iovec_total - self.buf_pos;
         header_remaining + iovec_remaining
     }

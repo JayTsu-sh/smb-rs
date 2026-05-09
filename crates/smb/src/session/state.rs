@@ -46,7 +46,7 @@ impl SessionAlgosFactory {
         }
 
         if cfg!(feature = "__debug-dump-keys") {
-            log::debug!(
+            tracing::debug!(
                 "Building session algorithms for dialect {:?} with session key {:02x?} and preauth hash {:02x?}",
                 info.negotiation.dialect_rev,
                 session_key,
@@ -316,7 +316,7 @@ impl SessionInfo {
         }
 
         let algos = SessionAlgosFactory::new_session(session_key, preauth_hash, info)?;
-        log::trace!("Session algos set up: {algos:?}");
+        tracing::trace!("Session algos set up: {algos:?}");
 
         let info_allows_unsigned = info.config.allow_unsigned_guest_access;
 
@@ -343,7 +343,7 @@ impl SessionInfo {
 
         let force_encryption = if conn_info.config.encryption_mode.is_required() {
             if !flags.encrypt_data() {
-                log::debug!(
+                tracing::debug!(
                     "Note! session does not require encryption, but it is required by the connection config. Forcing encryption."
                 );
             }
@@ -378,14 +378,14 @@ impl SessionInfo {
             }),
             _ => unreachable!(),
         };
-        log::debug!("Session {} flags set: {:?}", self.session_id, flags);
+        tracing::debug!("Session {} flags set: {:?}", self.session_id, flags);
         Ok(())
     }
 
     /// Changes the state of the session to be invalid,
     /// so it can no longer be used.
     pub fn invalidate(&mut self) {
-        log::debug!("Invalidating session {}", self.session_id);
+        tracing::debug!("Invalidating session {}", self.session_id);
         self.state = Some(SessionInfoState::Invalid);
     }
 

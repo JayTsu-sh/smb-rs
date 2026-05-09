@@ -60,7 +60,7 @@ impl PipeRpcConnection {
 
         let bind_ack = match bind_ack.content() {
             DcRpcCoPktResponseContent::BindAck(bind_ack) => {
-                log::debug!("Bounded to pipe with port spec {}", bind_ack.port_spec);
+                tracing::debug!("Bounded to pipe with port spec {}", bind_ack.port_spec);
                 bind_ack
             }
             _ => {
@@ -119,7 +119,7 @@ impl PipeRpcConnection {
                 .starts_with(BIND_TIME_NEGOTIATION_PREFIX)
             {
                 // Bind time feature negotiation element. Currently ignored.
-                log::debug!(
+                tracing::debug!(
                     "Bind time feature negotiation flags: {:?}",
                     ack_context.result as u16
                 );
@@ -140,7 +140,7 @@ impl PipeRpcConnection {
         }
 
         if let Some(context_id) = context_id_selected {
-            log::debug!("Selected context ID: {context_id}");
+            tracing::debug!("Selected context ID: {context_id}");
             Ok(context_id)
         } else {
             Err(crate::Error::InvalidMessage(

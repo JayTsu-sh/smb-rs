@@ -250,7 +250,7 @@ impl MessageHandler for ChannelMessageHandler {
                 }
             }
             _ => {
-                log::warn!(
+                tracing::warn!(
                     "Received unexpected message in session handler: {:?}",
                     msg.message.content
                 );

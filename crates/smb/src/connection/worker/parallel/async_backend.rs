@@ -23,7 +23,7 @@ impl AsyncBackend {
         mut rtransport: Box<dyn SmbTransportRead>,
         worker: Arc<ParallelWorker<Self>>,
     ) {
-        log::debug!("Starting worker loop.");
+        tracing::debug!("Starting worker loop.");
         let self_ref = self.as_ref();
         loop {
             match self_ref
@@ -32,7 +32,7 @@ impl AsyncBackend {
             {
                 Ok(_) => {}
                 Err(Error::TransportError(TransportError::NotConnected)) => {
-                    log::error!("Connection was force-closed by the server.");
+                    tracing::error!("Connection was force-closed by the server.");
                     self_ref.token.cancel();
                     break;
                 }
@@ -40,13 +40,13 @@ impl AsyncBackend {
                     break;
                 }
                 Err(e) => {
-                    log::error!("Error in worker loop: {e}");
+                    tracing::error!("Error in worker loop: {e}");
                 }
             }
         }
 
         // Cleanup
-        log::debug!("Cleaning up worker loop.");
+        tracing::debug!("Cleaning up worker loop.");
         if let Ok(mut state) = worker.state.lock().await {
             for (_, tx) in state.awaiting.drain() {
                 let _notify_result = tx.send(Err(Error::ConnectionStopped));
@@ -60,7 +60,7 @@ impl AsyncBackend {
         mut send_channel: mpsc::Receiver<IoVec>,
         worker: Arc<ParallelWorker<Self>>,
     ) {
-        log::debug!("Starting worker loop.");
+        tracing::debug!("Starting worker loop.");
         let self_ref = self.as_ref();
         loop {
             match self_ref
@@ -69,7 +69,7 @@ impl AsyncBackend {
             {
                 Ok(_) => {}
                 Err(Error::TransportError(TransportError::NotConnected)) => {
-                    log::error!("Connection was force-closed by the server.");
+                    tracing::error!("Connection was force-closed by the server.");
                     self_ref.token.cancel();
                     break;
                 }
@@ -77,7 +77,7 @@ impl AsyncBackend {
                     break;
                 }
                 Err(e) => {
-                    log::error!("Error in worker loop: {e}",);
+                    tracing::error!("Error in worker loop: {e}",);
                 }
             }
         }
@@ -166,7 +166,7 @@ impl MultiWorkerBackend for AsyncBackend {
     }
 
     async fn stop(&self) -> crate::Result<()> {
-        log::debug!("Stopping worker.");
+        tracing::debug!("Stopping worker.");
         self.token.cancel();
         let loop_handles = self
             .loop_handles

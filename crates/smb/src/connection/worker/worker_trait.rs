@@ -109,16 +109,14 @@ pub trait Worker: Sized + std::fmt::Debug {
             return Ok(curr);
         }
 
-        log::debug!(
+        tracing::debug!(
             "Received async pending message with ID {} and status {}.",
             curr.message.header.message_id,
             curr.message.header.status
         );
 
         let async_id = curr.message.header.async_id.ok_or_else(|| {
-            Error::InvalidMessage(
-                "Async ID is None, but async command is set".to_string(),
-            )
+            Error::InvalidMessage("Async ID is None, but async command is set".to_string())
         })?;
 
         if async_id == 0 {
@@ -153,7 +151,7 @@ pub trait Worker: Sized + std::fmt::Debug {
                 return Ok(msg);
             }
 
-            log::debug!(
+            tracing::debug!(
                 "Received another async pending message with ID {} and status {}.",
                 msg.message.header.message_id,
                 msg.message.header.status

@@ -16,7 +16,7 @@ smb-dtyp = { workspace = true }
 smb-msg = { workspace = true, optional = true }
 
 bytes = { workspace = true }
-log = { workspace = true }
+tracing = { workspace = true }
 tokio = { workspace = true, features = [
     "net",
     "macros",

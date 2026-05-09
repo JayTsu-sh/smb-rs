@@ -1,6 +1,6 @@
-use bytes::Bytes;
 use super::file_util::*;
 use super::*;
+use bytes::Bytes;
 #[cfg(not(feature = "async"))]
 use std::io::prelude::*;
 use std::ops::{Deref, DerefMut};
@@ -78,14 +78,16 @@ impl File {
             return Ok(0);
         }
 
-        log::debug!(
+        tracing::debug!(
             "Reading up to {} bytes at offset {} from {}",
             buf.len(),
             pos,
             self.handle.name()
         );
 
-        let response = self.send_read_request(buf.len() as u32, pos, channel, unbuffered).await?;
+        let response = self
+            .send_read_request(buf.len() as u32, pos, channel, unbuffered)
+            .await?;
         let content = response
             .message
             .content
@@ -104,7 +106,7 @@ impl File {
         let raw_data = &response.raw[content.data_offset..data_end];
         let actual_read_length = raw_data.len();
 
-        log::debug!(
+        tracing::debug!(
             "Read {} bytes from {}.",
             actual_read_length,
             self.handle.name()
@@ -141,7 +143,9 @@ impl File {
             return Ok(bytes::Bytes::new());
         }
 
-        let response = self.send_read_request(max_len, pos, channel, unbuffered).await?;
+        let response = self
+            .send_read_request(max_len, pos, channel, unbuffered)
+            .await?;
         let content = response
             .message
             .content
@@ -216,7 +220,8 @@ impl File {
         pos: u64,
         channel: Option<u32>,
     ) -> std::io::Result<usize> {
-        self.write_block_zc(Bytes::copy_from_slice(buf), pos, channel).await
+        self.write_block_zc(Bytes::copy_from_slice(buf), pos, channel)
+            .await
     }
 
     /// Write a block of data to an opened file, without copying the data.
@@ -242,7 +247,7 @@ impl File {
             ));
         }
 
-        log::debug!(
+        tracing::debug!(
             "Writing {} bytes at offset {} to {}",
             buf.len(),
             pos,
@@ -274,7 +279,7 @@ impl File {
             .to_write()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let actual_written_length = content.count as usize;
-        log::debug!(
+        tracing::debug!(
             "Wrote {} bytes to {}.",
             actual_written_length,
             self.handle.name()
@@ -283,6 +288,7 @@ impl File {
     }
 
     /// Sends a flush request to the server to flush the file.
+    #[tracing::instrument(level = "debug", skip_all, fields(name = %self.handle.name()))]
     pub async fn flush(&self) -> std::io::Result<()> {
         let _response = self
             .handle
@@ -296,7 +302,7 @@ impl File {
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        log::debug!("Flushed {}.", self.handle.name());
+        tracing::debug!("Flushed {}.", self.handle.name());
         Ok(())
     }
 
@@ -305,6 +311,7 @@ impl File {
     /// * `from` - The file to copy from.
     /// # Notes
     /// * This copy must be performed against a file from the same share (tree) as this file.
+    #[tracing::instrument(level = "debug", skip_all, fields(to = %self.handle.name(), from = %from.handle.name()))]
     pub async fn srv_copy(&self, from: &File) -> crate::Result<()> {
         if !self.access.file_write_data() {
             return Err(Error::InvalidState(

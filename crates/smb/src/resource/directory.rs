@@ -60,7 +60,7 @@ impl Directory {
             )));
         }
 
-        log::debug!("Querying directory {}", self.handle.name());
+        tracing::debug!("Querying directory {}", self.handle.name());
 
         let response = self
             .handle
@@ -80,7 +80,7 @@ impl Directory {
         let response = match response {
             Ok(res) => res,
             Err(Error::UnexpectedMessageStatus(Status::U32_NO_MORE_FILES)) => {
-                log::debug!("No more files in directory");
+                tracing::debug!("No more files in directory");
                 return Ok(vec![]);
             }
             Err(Error::UnexpectedMessageStatus(Status::U32_INFO_LENGTH_MISMATCH)) => {
@@ -89,7 +89,7 @@ impl Directory {
                 )));
             }
             Err(e) => {
-                log::error!("Error querying directory: {e}");
+                tracing::error!("Error querying directory: {e}");
                 return Err(e);
             }
         };
@@ -158,7 +158,7 @@ impl Directory {
     {
         let max_allowed_buffer_size = this.conn_info.negotiation.max_transact_size;
         if buffer_size > max_allowed_buffer_size {
-            log::warn!(
+            tracing::warn!(
                 "Buffer size {} is larger than max transact size {}. Using minimum.",
                 buffer_size,
                 max_allowed_buffer_size
@@ -218,6 +218,7 @@ impl Directory {
     /// * A vector of [`FileNotifyInformation`] objects, containing the changes that occurred.
     /// # Notes
     /// * This is a long-running operation, and will block until a result is received. See [`watch_timeout`][Self::watch_timeout] for a version that supports a timeout.
+    #[tracing::instrument(level = "debug", skip_all, fields(recursive = recursive))]
     pub async fn watch(
         &self,
         filter: NotifyFilter,
@@ -236,6 +237,7 @@ impl Directory {
     /// * This is a long-running operation, and will block until a result is received or the provided timeout elapses.
     ///  If the timeout elapses, an error of type [`Error::OperationTimeout`] is returned.
     /// * A similar method without timeout is available as [`watch`][Self::watch].
+    #[tracing::instrument(level = "debug", skip_all, fields(recursive = recursive, timeout_ms = timeout.as_millis() as u64))]
     pub async fn watch_timeout(
         &self,
         filter: NotifyFilter,
@@ -334,14 +336,14 @@ impl Directory {
                         biased;
                         _ = sender.closed(), if sender.is_closed() && !cancel.is_cancelled() => {
                             // Sender close. request a cancellation. That triggers the branch above.
-                            log::debug!("Watch receiver closed, stopping watch by raising cancellation.");
+                            tracing::debug!("Watch receiver closed, stopping watch by raising cancellation.");
                             if !cancel_called {
                                 cancel.cancel();
                             }
                         }
                         _ = cancel.cancelled(), if !cancel_called => {
                             // Cancellation step 1: send cancel request to server.
-                            log::debug!("Watch cancelled by user");
+                            tracing::debug!("Watch cancelled by user");
                             directory.send_cancel(receive_options.async_msg_ids.as_ref().unwrap()).await.ok();
                             cancel_called = true;
                             // Now, wait for the server to confirm cancellation.
@@ -351,7 +353,7 @@ impl Directory {
                                 Some(DirectoryWatchResult::Notifications(v)) => {
                                     for item in v {
                                         if sender.send(Ok(item)).await.is_err() {
-                                            log::debug!("Watch notifications receiver closed, stop sending, begin cancellation.");
+                                            tracing::debug!("Watch notifications receiver closed, stop sending, begin cancellation.");
                                             break;
                                         }
                                     }
@@ -359,7 +361,7 @@ impl Directory {
                                 Some(DirectoryWatchResult::Cancelled) => {
                                     if sender.is_closed() {
                                         // Already closed, ignore - cancellation should be complete anyway.
-                                        log::debug!("Watch cancelled after sender closed, ignoring.");
+                                        tracing::debug!("Watch cancelled after sender closed, ignoring.");
                                         break;
                                     }
 
@@ -368,26 +370,26 @@ impl Directory {
                                     }
 
                                     // Cancellation step 2: exit the loop.
-                                    log::debug!("Watch cancellation complete.");
+                                    tracing::debug!("Watch cancellation complete.");
                                     break;
                                 }
                                 Some(DirectoryWatchResult::Cleanup) => {
                                     // Server cleaned up the watch, exit the loop.
-                                    log::debug!("Watch cleaned up by server. Stopping stream.");
+                                    tracing::debug!("Watch cleaned up by server. Stopping stream.");
                                     break;
                                 }
                                 Some(x) => {
                                     let x: crate::Result<_> = x.into();
                                     let x = x.unwrap_err();
-                                    log::debug!("Error watching directory: {x}. Stopping stream.");
+                                    tracing::debug!("Error watching directory: {x}. Stopping stream.");
                                     sender.send(Err(x)).await.map_err(|e| {
-                                        log::debug!("Error watching directory after sender closed: {e}. Ignoring.");
+                                        tracing::debug!("Error watching directory after sender closed: {e}. Ignoring.");
                                         e
                                     }).ok();
                                     break; // Exit on error
                                 },
                                 None => {
-                                    log::debug!("Watch internal task ended, stopping stream.");
+                                    tracing::debug!("Watch internal task ended, stopping stream.");
                                     break; // Internal task ended
                                 }
                             }
@@ -505,14 +507,14 @@ impl Directory {
                     };
                 }
                 s => {
-                    log::debug!("Unexpected status while watching directory: {s:?}");
+                    tracing::debug!("Unexpected status while watching directory: {s:?}");
                     return DirectoryWatchResult::Error(Error::UnexpectedMessageStatus(s));
                 }
             },
             // Other cancellation (token)
             Err(Error::Cancelled(_)) => return DirectoryWatchResult::Cancelled,
             Err(e) => {
-                log::debug!("Error watching directory: {e}");
+                tracing::debug!("Error watching directory: {e}");
                 return DirectoryWatchResult::Error(e);
             }
         };
@@ -889,7 +891,7 @@ mod iter_mtd {
                 directory
                     .send_cancel(&async_msg_ids)
                     .map_err(|e| {
-                        log::error!("Error sending cancel request: {e}");
+                        tracing::error!("Error sending cancel request: {e}");
                         e
                     })
                     .ok()
@@ -979,16 +981,16 @@ mod iter_mtd {
                                 canceller
                                     .notify_cancelled()
                                     .map_err(|e| {
-                                        log::error!("Error notifying cancellation: {e}");
+                                        tracing::error!("Error notifying cancellation: {e}");
                                         e
                                     })
                                     .ok();
-                                log::debug!("Watch cancelled by user");
+                                tracing::debug!("Watch cancelled by user");
                                 break;
                             }
                             Cleanup => {
                                 // Server cleaned up the watch, exit the loop.
-                                log::debug!("Watch cleaned up by server");
+                                tracing::debug!("Watch cleaned up by server");
                                 tx.send(Err(crate::Error::Cancelled("watch cleaned up by server")))
                                     .ok();
                                 break;
@@ -996,7 +998,7 @@ mod iter_mtd {
                             x => {
                                 let x: crate::Result<_> = x.into();
                                 let x = x.unwrap_err();
-                                log::debug!("Error watching directory: {x}");
+                                tracing::debug!("Error watching directory: {x}");
                                 tx.send(Err(x)).ok();
                                 break; // Exit on error
                             }

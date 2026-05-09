@@ -61,13 +61,13 @@ pub async fn make_server_connection_ex(
     let user = var(TestEnv::USER).unwrap_or(TestEnv::DEFAULT_USER.to_string());
     let password = var(TestEnv::PASSWORD).unwrap_or(TestEnv::DEFAULT_PASSWORD.to_string());
     let smb = Client::new(config);
-    log::info!("Connecting to {server}");
+    tracing::info!("Connecting to {server}");
 
     let unc_path = UncPath::new(&server)?.with_share(share)?;
     // Connect & Authenticate
     smb.share_connect(&unc_path, user.as_str(), password.clone())
         .await?;
-    log::info!("Connected to {unc_path}");
+    tracing::info!("Connected to {unc_path}");
     Ok((smb, unc_path))
 }
 

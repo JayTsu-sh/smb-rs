@@ -117,6 +117,7 @@ impl Client {
     /// directly or indirectly.
     ///
     /// See [Drop behavior][Client#drop-behavior] for more information.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn close(&self) -> crate::Result<()> {
         // Close all opened shares
         let mut trees = self.share_connects.lock().await?;
@@ -150,6 +151,7 @@ impl Client {
     }
 
     /// Lists all shares on the specified server.
+    #[tracing::instrument(level = "debug", skip_all, fields(server = %server))]
     pub async fn list_shares(&self, server: &str) -> crate::Result<Vec<ShareInfo1>> {
         let srvsvc_pipe_name: &str = "srvsvc";
         let srvsvc_pipe = self.open_pipe(server, srvsvc_pipe_name).await?;
@@ -177,6 +179,7 @@ impl Client {
     /// ## Prerequisites
     /// The client must have an active IPC$ connection (see [`Client::ipc_connect`]).
     #[maybe_async]
+    #[tracing::instrument(level = "debug", skip_all, fields(server = %server, sid_count = sids.len()))]
     pub async fn lookup_sids(
         &self,
         server: &str,
@@ -184,12 +187,14 @@ impl Client {
     ) -> crate::Result<Vec<Option<TranslatedName>>> {
         let lsa_pipe = self.open_pipe(server, "lsarpc").await?;
         let mut lsa: LsaRpc<_> = lsa_pipe.bind().await?;
-        let handle = lsa.open_policy2(&format!(r"\\{server}")).await.map_err(|e| {
-            Error::InvalidMessage(format!("LsarOpenPolicy2 failed: {e}"))
-        })?;
-        let result = lsa.lookup_sids(&handle, sids).await.map_err(|e| {
-            Error::InvalidMessage(format!("LsarLookupSids failed: {e}"))
-        })?;
+        let handle = lsa
+            .open_policy2(&format!(r"\\{server}"))
+            .await
+            .map_err(|e| Error::InvalidMessage(format!("LsarOpenPolicy2 failed: {e}")))?;
+        let result = lsa
+            .lookup_sids(&handle, sids)
+            .await
+            .map_err(|e| Error::InvalidMessage(format!("LsarLookupSids failed: {e}")))?;
         let _ = lsa.close(handle).await;
         Ok(result)
     }
@@ -229,6 +234,7 @@ impl Client {
     /// let target_path = UncPath::from_str(r"\\server\share").unwrap();
     /// let connection = client.share_connect(&target_path, "username", "password".to_string()).await?;
     /// #   Ok(()) }
+    #[tracing::instrument(level = "debug", skip_all, fields(target = %target, user = %user_name))]
     pub async fn share_connect(
         &self,
         target: &UncPath,
@@ -246,7 +252,7 @@ impl Client {
         let mchannel_map = self._setup_multi_channel(target, &identity).await;
         if let Ok(mchannel_map) = mchannel_map {
             let session = self.get_session(target).await?;
-            log::debug!(
+            tracing::debug!(
                 "Established {} multi-channel connections",
                 mchannel_map.as_ref().map(|m| m.len()).unwrap_or(0)
             );
@@ -258,16 +264,16 @@ impl Client {
                         session_info.session_alt_channels = mchannel_map;
                     }
                 } else {
-                    log::warn!("Session info not found for session {}, but tree has just been created.", session.session_id());
+                    tracing::warn!(
+                        "Session info not found for session {}, but tree has just been created.",
+                        session.session_id()
+                    );
                 }
                 Ok(())
             })
             .await?;
         } else if let Err(e) = mchannel_map {
-            log::warn!(
-                "Failed to establish multi-channel connections: {}",
-                e
-            );
+            tracing::warn!("Failed to establish multi-channel connections: {}", e);
         }
 
         Ok(())
@@ -288,7 +294,7 @@ impl Client {
 
         let already_connected = self._with_tree(&target, |_| Ok(())).await;
         if already_connected.is_ok() {
-            log::debug!(
+            tracing::debug!(
                 "Share {} is already connected. Ignoring duplicate connection attempt.",
                 target
             );
@@ -299,7 +305,7 @@ impl Client {
 
         let session = {
             let session = connection.authenticate(identity.clone()).await?;
-            log::debug!(
+            tracing::debug!(
                 "Successfully authenticated to {} as {}",
                 target.server(),
                 identity.username.account_name()
@@ -341,7 +347,7 @@ impl Client {
             .await?
             .insert(target.clone(), connect_share_info);
 
-        log::debug!(
+        tracing::debug!(
             "Successfully connected to share: {}",
             target.share().unwrap_or("<unknown>")
         );
@@ -380,6 +386,7 @@ impl Client {
     ///
     /// ## Returns
     /// The connected connection, if succeeded. Error if failed to make the connection,
+    #[tracing::instrument(level = "debug", skip_all, fields(server = %server))]
     pub async fn connect(&self, server: &str) -> crate::Result<Arc<Connection>> {
         let server_address = TransportUtils::parse_socket_address(server)?;
         self.connect_to_address(server, server_address).await
@@ -402,6 +409,7 @@ impl Client {
     /// ## Returns
     /// The connected connection, if succeeded. Error if failed to make the connection,
     /// or failed to connect the remote.
+    #[tracing::instrument(level = "debug", skip_all, fields(server = %server, addr = %server_address))]
     pub async fn connect_to_address(
         &self,
         server: &str,
@@ -412,6 +420,7 @@ impl Client {
     }
 
     /// Just like [`Client::connect_to_address`], but allows specifying a custom transport configuration.
+    #[tracing::instrument(level = "debug", skip_all, fields(server = %server, addr = %server_address))]
     pub async fn connect_transport_to_address(
         &self,
         server: &str,
@@ -428,7 +437,7 @@ impl Client {
         server_address: SocketAddr,
         transport: Option<TransportConfig>,
     ) -> crate::Result<Arc<Connection>> {
-        log::debug!("Creating new connection to {server}",);
+        tracing::debug!("Creating new connection to {server}",);
 
         let config = if let Some(transport) = transport {
             ConnectionConfig {
@@ -445,7 +454,7 @@ impl Client {
 
         // TODO: This is a bit racy
         if let Ok(c) = self.get_connection_ip_channel(server_address.ip()).await {
-            log::debug!("Reusing existing connection to {server}",);
+            tracing::debug!("Reusing existing connection to {server}",);
             return Ok(c);
         }
         self._add_connection(conn.clone(), &server_address.ip())
@@ -459,7 +468,7 @@ impl Client {
             connect_ok?;
         }
 
-        log::debug!("Successfully connected to {server}",);
+        tracing::debug!("Successfully connected to {server}",);
 
         Ok(conn)
     }
@@ -484,11 +493,13 @@ impl Client {
 
     /// Returns the underlying [`Connection`] for the specified server,
     /// after a successful call to [`Client::connect`] or [`Client::share_connect`].
+    #[tracing::instrument(level = "debug", skip_all, fields(server = %server))]
     pub async fn get_connection(&self, server: &str) -> crate::Result<Arc<Connection>> {
         let addr = TransportUtils::parse_socket_address(server)?;
         self.get_connection_ip(addr.ip()).await
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(ip = %ip))]
     pub async fn get_connection_ip(&self, ip: IpAddr) -> crate::Result<Arc<Connection>> {
         self.get_connection_ip_channel(ip).await
     }
@@ -512,13 +523,12 @@ impl Client {
         let address = TransportUtils::parse_socket_address(path.server())?;
         let channels = self
             ._with_connection(address.ip(), |c| {
-                let session_info = c.sessions.get(&session.session_id())
-                    .ok_or_else(|| {
-                        Error::NotFound(format!(
-                            "No session found for session ID: {}",
-                            session.session_id()
-                        ))
-                    })?;
+                let session_info = c.sessions.get(&session.session_id()).ok_or_else(|| {
+                    Error::NotFound(format!(
+                        "No session found for session ID: {}",
+                        session.session_id()
+                    ))
+                })?;
 
                 let mut alt_channels = session_info
                     .session_alt_channels
@@ -546,6 +556,7 @@ impl Client {
 
     /// Returns the underlying [`Tree`] for the specified UNC path,
     /// after a successful call to [`Client::share_connect`].
+    #[tracing::instrument(level = "debug", skip_all, fields(path = %path))]
     pub async fn get_tree(&self, path: &UncPath) -> crate::Result<Arc<Tree>> {
         self._with_tree(path, |tree| Ok(tree.tree.clone())).await
     }
@@ -589,6 +600,7 @@ impl Client {
     ///
     /// ## Returns
     /// A result containing the created or opened file resource, or an error.
+    #[tracing::instrument(level = "debug", skip_all, fields(path = %path))]
     pub async fn create_file(
         &self,
         path: &UncPath,
@@ -616,6 +628,7 @@ impl Client {
     /// Similar [`Client::share_connect`], but connects to the SMB pipes share (IPC$).
     ///
     /// After calling this method, the [`Client::open_pipe`] method can be used to open named pipes.
+    #[tracing::instrument(level = "debug", skip_all, fields(server = %server, user = %username))]
     pub async fn ipc_connect(
         &self,
         server: &str,
@@ -648,6 +661,7 @@ impl Client {
     /// ## Notes
     /// before calling this method, you MUST call the [`Client::ipc_connect`] method,
     /// that connects to the IPC$ share on the server, which then allows for communication with the named pipe.
+    #[tracing::instrument(level = "debug", skip_all, fields(server = %server, pipe = %pipe_name))]
     pub async fn open_pipe(&self, server: &str, pipe_name: &str) -> crate::Result<Pipe> {
         let path = UncPath::ipc_share(server)?.with_path(pipe_name);
         let pipe = self
@@ -655,7 +669,7 @@ impl Client {
             .await?;
         match pipe {
             Resource::Pipe(file) => {
-                log::info!("Successfully opened pipe: {pipe_name}",);
+                tracing::info!("Successfully opened pipe: {pipe_name}",);
                 Ok(file)
             }
             _ => crate::Result::Err(Error::InvalidMessage(
@@ -682,7 +696,9 @@ impl Client {
         }
 
         if !self.config.connection.multichannel.is_enabled() {
-            log::debug!("Multi-channel is not enabled in client configuration. Skipping setup.");
+            tracing::debug!(
+                "Multi-channel is not enabled in client configuration. Skipping setup."
+            );
             return Ok(None);
         }
 
@@ -695,11 +711,13 @@ impl Client {
         };
 
         if !primary_conn_info.negotiation.caps.multi_channel() {
-            log::debug!("Multi-channel is not enabled for connection to {unc}. Skipping setup.");
+            tracing::debug!(
+                "Multi-channel is not enabled for connection to {unc}. Skipping setup."
+            );
             return Ok(None);
         }
 
-        log::debug!(
+        tracing::debug!(
             "Multi-channel is enabled for connection to {unc}. Scanning for alternate channels."
         );
 
@@ -707,10 +725,7 @@ impl Client {
         let ipc_share = UncPath::ipc_share(unc.server())?;
         self._ipc_connect(ipc_share.server(), identity).await?;
         let ipc_tree = self.get_tree(&ipc_share).await?;
-        let network_interfaces = ipc_tree
-            .as_ipc_tree()?
-            .query_network_interfaces()
-            .await?;
+        let network_interfaces = ipc_tree.as_ipc_tree()?.query_network_interfaces().await?;
 
         let mut result = HashMap::new();
 
@@ -722,7 +737,7 @@ impl Client {
         )?;
 
         if other_interfaces.is_empty() {
-            log::warn!(
+            tracing::warn!(
                 "Multi-channel setup failed: unable to determine the current primary network interface.
                 This usually means the SMB server is not on the same local network as the client, and multi-channel cannot be used.
                 Available interfaces: {network_interfaces:?}",
@@ -733,7 +748,7 @@ impl Client {
         let session = self.get_session(unc).await?;
         for (if_index, &interface) in other_interfaces.iter() {
             let address = interface.sockaddr.socket_addr();
-            log::debug!("Found alternate interface for multi-channel: {if_index} => {address}");
+            tracing::debug!("Found alternate interface for multi-channel: {if_index} => {address}");
 
             let (connection, channel) = {
                 let connection = if interface.capability.rdma() && cfg!(feature = "rdma") {
@@ -801,7 +816,7 @@ impl<'a> DfsResolver<'a> {
         for ref_unc_path in dfs_ref_paths.iter() {
             // Try opening the share. Log failure, and try next ref.
             if let Err(e) = self.client._share_connect(ref_unc_path, &dfs_creds).await {
-                log::error!("Failed to open DFS referral: {e}",);
+                tracing::error!("Failed to open DFS referral: {e}",);
                 continue;
             };
 
@@ -810,10 +825,10 @@ impl<'a> DfsResolver<'a> {
                 ._create_file(ref_unc_path, args)
                 .await
                 .map_err(|e| {
-                    log::error!("Failed to create file on DFS referral: {e}",);
+                    tracing::error!("Failed to create file on DFS referral: {e}",);
                     e
                 })?;
-            log::info!("Successfully created file on DFS referral: {ref_unc_path}",);
+            tracing::info!("Successfully created file on DFS referral: {ref_unc_path}",);
             return Ok(resource);
         }
         Err(Error::DfsError(dfs_path.clone()))
@@ -822,7 +837,7 @@ impl<'a> DfsResolver<'a> {
     /// Returns a list of DFS referral paths for the given input UNC path.
     #[maybe_async]
     async fn get_dfs_refs(&self, unc: &UncPath) -> crate::Result<Vec<UncPath>> {
-        log::debug!("Resolving DFS referral for {unc}");
+        tracing::debug!("Resolving DFS referral for {unc}");
         let dfs_path_string = unc.to_string();
 
         let dfs_refs = {
@@ -894,7 +909,7 @@ impl<'a> DfsResolver<'a> {
                     + &v4.refs.network_address.to_string()
                     + &dfs_path_string[suffix..];
                 let unc_path = UncPath::from_str(&unc_str_dest)?;
-                log::debug!("Resolved DFS referral to {unc_path}",);
+                tracing::debug!("Resolved DFS referral to {unc_path}",);
                 Ok(unc_path)
             }
             _ => Err(Error::UnsupportedOperation(

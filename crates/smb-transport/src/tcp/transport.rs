@@ -55,18 +55,18 @@ impl TcpTransport {
     #[cfg(not(feature = "async"))]
     fn connect_timeout(&mut self, endpoint: &SocketAddr) -> Result<TcpStream> {
         if self.timeout == Duration::ZERO {
-            log::debug!("Connecting to {endpoint}.");
+            tracing::debug!("Connecting to {endpoint}.");
             return TcpStream::connect(endpoint).map_err(Into::into);
         }
 
-        log::debug!("Connecting to {endpoint} with timeout {:?}.", self.timeout);
+        tracing::debug!("Connecting to {endpoint} with timeout {:?}.", self.timeout);
         TcpStream::connect_timeout(endpoint, self.timeout).map_err(|e| match e.kind() {
             io::ErrorKind::TimedOut => {
-                log::error!("Connection timed out after {:?}", self.timeout);
+                tracing::error!("Connection timed out after {:?}", self.timeout);
                 TransportError::Timeout(self.timeout)
             }
             _ => {
-                log::error!("Failed to connect to {endpoint}: {e}");
+                tracing::error!("Failed to connect to {endpoint}: {e}");
                 e.into()
             }
         })
@@ -78,11 +78,11 @@ impl TcpTransport {
     #[cfg(feature = "async")]
     async fn connect_timeout(&mut self, endpoint: &SocketAddr) -> Result<TcpStream> {
         if self.timeout == Duration::ZERO {
-            log::debug!("Connecting to {endpoint}.",);
+            tracing::debug!("Connecting to {endpoint}.",);
             return TcpStream::connect(&endpoint).await.map_err(Into::into);
         }
 
-        log::debug!("Connecting to {endpoint} with timeout {:?}.", self.timeout);
+        tracing::debug!("Connecting to {endpoint} with timeout {:?}.", self.timeout);
         select! {
             res = TcpStream::connect(&endpoint) => res.map_err(Into::into),
             _ = tokio::time::sleep(self.timeout) => Err(
@@ -122,13 +122,13 @@ impl TcpTransport {
     fn map_tcp_error(e: io::Error) -> TransportError {
         if e.kind() == io::ErrorKind::ConnectionAborted || e.kind() == io::ErrorKind::UnexpectedEof
         {
-            log::error!("Got IO error: {e} -- Connection Error, notify NotConnected!");
+            tracing::error!("Got IO error: {e} -- Connection Error, notify NotConnected!");
             return TransportError::NotConnected;
         }
         if e.kind() == io::ErrorKind::WouldBlock {
-            log::trace!("Got IO error: {e} -- with ErrorKind::WouldBlock.");
+            tracing::trace!("Got IO error: {e} -- with ErrorKind::WouldBlock.");
         } else {
-            log::error!("Got IO error: {e} -- Mapping to IO error.",);
+            tracing::error!("Got IO error: {e} -- Mapping to IO error.",);
         }
         e.into()
     }
@@ -137,19 +137,19 @@ impl TcpTransport {
     #[inline]
     async fn receive_exact(&mut self, out_buf: &mut [u8]) -> Result<()> {
         let reader = self.reader.as_mut().ok_or(TransportError::NotConnected)?;
-        log::trace!("Reading {} bytes.", out_buf.len());
+        tracing::trace!("Reading {} bytes.", out_buf.len());
         reader
             .read_exact(out_buf)
             .await
             .map_err(Self::map_tcp_error)?;
-        log::trace!("Read {} bytes OK.", out_buf.len());
+        tracing::trace!("Read {} bytes OK.", out_buf.len());
         Ok(())
     }
 
     #[maybe_async::maybe_async]
     #[inline]
     async fn send_raw(&mut self, message: &[u8]) -> Result<()> {
-        log::trace!("Sending {} bytes.", message.len());
+        tracing::trace!("Sending {} bytes.", message.len());
         let writer = self.writer.as_mut().ok_or(TransportError::NotConnected)?;
         writer
             .write_all(message)
@@ -160,6 +160,7 @@ impl TcpTransport {
 
     #[maybe_async::maybe_async]
     #[inline]
+    #[tracing::instrument(level = "debug", skip_all, fields(addr = %server_address))]
     async fn do_connect(&mut self, _server_name: &str, server_address: SocketAddr) -> Result<()> {
         let socket = self.connect_timeout(&server_address).await?;
         let (r, w) = Self::split_socket(socket);
@@ -237,7 +238,10 @@ impl SmbTransportWrite for TcpTransport {
 
             let mut buf = HeaderAndIoVec::new(&header_buf, data);
             let writer = self.writer.as_mut().ok_or(TransportError::NotConnected)?;
-            writer.write_all_buf(&mut buf).await.map_err(Self::map_tcp_error)?;
+            writer
+                .write_all_buf(&mut buf)
+                .await
+                .map_err(Self::map_tcp_error)?;
 
             Ok(())
         }

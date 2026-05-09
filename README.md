@@ -21,6 +21,19 @@ cargo run -- --help
 
 Check out the `info` and the `copy` sub-commands for more information.
 
+### Logging
+
+`smb-cli` uses [`tracing`](https://crates.io/crates/tracing) with a `tracing-subscriber` `fmt` layer.
+Logging is controlled via the `RUST_LOG` environment variable (default `info`):
+
+```sh
+# show debug logs from the smb crate and trace logs from smb-transport
+RUST_LOG=smb=debug,smb_transport=trace cargo run -- info \\\\server\\share
+```
+
+Records emitted by third-party crates that still use the `log` crate (e.g. `rustls`)
+are forwarded to `tracing` via the `tracing-log` bridge, so the same `RUST_LOG` filter applies.
+
 ## Features
 
 - ✅ All SMB 2.X & 3.X dialects support.

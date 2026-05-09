@@ -45,7 +45,7 @@ impl MessageEncryptor {
 
         header.signature = result.signature;
 
-        log::debug!("Encrypted message with signature: {:?}", header.signature);
+        tracing::debug!("Encrypted message with signature: {:?}", header.signature);
 
         Ok(header)
     }
@@ -68,10 +68,7 @@ impl MessageDecryptor {
         MessageDecryptor { algo }
     }
 
-    pub fn decrypt_message(
-        &self,
-        msg_in: EncryptedMessage,
-    ) -> crate::Result<(Response, Vec<u8>)> {
+    pub fn decrypt_message(&self, msg_in: EncryptedMessage) -> crate::Result<(Response, Vec<u8>)> {
         // decrypt in-place
         let mut buffer = msg_in.encrypted_message;
         let aead_bytes = msg_in.header.aead_bytes();
@@ -80,11 +77,11 @@ impl MessageDecryptor {
         self.algo
             .decrypt(&mut buffer, &aead_bytes, &nonce, signature)?;
 
-        log::trace!("Decrypted message data bytes: {:x?}", &buffer);
+        tracing::trace!("Decrypted message data bytes: {:x?}", &buffer);
         // deserialize
         let result = Response::read(&mut Cursor::new(&buffer))?;
 
-        log::debug!("Decrypted with signature {}", msg_in.header.signature);
+        tracing::debug!("Decrypted with signature {}", msg_in.header.signature);
         Ok((result, buffer))
     }
 }

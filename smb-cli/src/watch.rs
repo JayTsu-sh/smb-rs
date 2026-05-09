@@ -43,7 +43,7 @@ pub async fn watch(cmd: &WatchCmd, cli: &Cli) -> Result<(), Box<dyn Error>> {
         .map_err(|_| "The specified path is not a directory")?;
     let dir = Arc::new(dir);
 
-    log::info!("Watching directory: {}", cmd.path);
+    tracing::info!("Watching directory: {}", cmd.path);
     watch_dir(
         &dir,
         NotifyFilter::all(),
@@ -70,7 +70,7 @@ async fn watch_dir(
     ctrlc::set_handler({
         let cancellation = cancellation.clone();
         move || {
-            log::info!("Cancellation requested, stopping watch...");
+            tracing::info!("Cancellation requested, stopping watch...");
             cancellation.cancel();
         }
     })?;
@@ -80,10 +80,10 @@ async fn watch_dir(
         .for_each(|res| {
             match res {
                 Ok(info) => {
-                    log::info!("Change detected: {:?}", info);
+                    tracing::info!("Change detected: {:?}", info);
                 }
                 Err(e) => {
-                    log::error!("Error watching directory: {}", e);
+                    tracing::error!("Error watching directory: {}", e);
                 }
             }
             futures::future::ready(())
@@ -106,7 +106,7 @@ fn watch_dir(
     ctrlc::set_handler({
         let canceller = canceller.clone();
         move || {
-            log::info!("Cancellation requested, stopping watch...");
+            tracing::info!("Cancellation requested, stopping watch...");
             canceller.cancel();
         }
     })?;
@@ -114,10 +114,10 @@ fn watch_dir(
     for res in iterator.take(number) {
         match res {
             Ok(info) => {
-                log::info!("Change detected: {:?}", info);
+                tracing::info!("Change detected: {:?}", info);
             }
             Err(e) => {
-                log::error!("Error watching directory: {}", e);
+                tracing::error!("Error watching directory: {}", e);
             }
         }
     }
@@ -132,15 +132,17 @@ fn watch_dir(
     recursive: bool,
     number: usize,
 ) -> Result<(), Box<dyn Error>> {
-    log::warn!("Single-threaded mode does not support clean cancellation. Press Ctrl+C to exit.");
+    tracing::warn!(
+        "Single-threaded mode does not support clean cancellation. Press Ctrl+C to exit."
+    );
 
     for res in Directory::watch_stream(dir, notify_filter, recursive)?.take(number) {
         match res {
             Ok(info) => {
-                log::info!("Change detected: {:?}", info);
+                tracing::info!("Change detected: {:?}", info);
             }
             Err(e) => {
-                log::error!("Error watching directory: {}", e);
+                tracing::error!("Error watching directory: {}", e);
             }
         }
     }

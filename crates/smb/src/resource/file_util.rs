@@ -241,7 +241,9 @@ mod copy {
 
         /// Returns the number of bytes copied so far.
         pub fn bytes_copied(&self) -> u64 {
-            let current_block = self.current_block.load(std::sync::atomic::Ordering::Relaxed);
+            let current_block = self
+                .current_block
+                .load(std::sync::atomic::Ordering::Relaxed);
             if current_block > self.last_block {
                 self.total_size
             } else {
@@ -291,7 +293,7 @@ mod copy {
     ) -> crate::Result<()> {
         let copy_state = prepare_parallel_copy(&from, &to, HashMap::from([(None, jobs)])).await?;
 
-        log::debug!("Starting parallel copy: {copy_state:?}",);
+        tracing::debug!("Starting parallel copy: {copy_state:?}",);
         start_parallel_copy(from, to, Arc::new(copy_state)).await?;
 
         Ok(())
@@ -327,7 +329,7 @@ mod copy {
 
         let copy_state = prepare_parallel_copy(&from, &to, channel_jobs).await?;
 
-        log::debug!("Starting parallel copy: {copy_state:?}",);
+        tracing::debug!("Starting parallel copy: {copy_state:?}",);
         start_parallel_copy(from, to, Arc::new(copy_state)).await?;
 
         Ok(())
@@ -372,7 +374,7 @@ mod copy {
             }
 
             if *jobs == AUTO_JOB_INDICATOR {
-                log::debug!("No jobs specified for channel {channel:?}, using default: 16",);
+                tracing::debug!("No jobs specified for channel {channel:?}, using default: 16",);
                 *jobs = AUTO_JOBS;
             }
         }
@@ -390,7 +392,7 @@ mod copy {
         to.set_len(file_length).await?;
 
         if file_length == 0 {
-            log::debug!("Source file is empty, nothing to copy.");
+            tracing::debug!("Source file is empty, nothing to copy.");
             return Ok(CopyState {
                 current_block: AtomicU64::new(0),
                 last_block: 0,
@@ -490,7 +492,7 @@ mod copy {
         task_id: usize,
         channel_id: Option<u32>,
     ) -> crate::Result<()> {
-        log::debug!("Starting copy task {task_id} of channel {channel_id:?}",);
+        tracing::debug!("Starting copy task {task_id} of channel {channel_id:?}",);
 
         let mut curr_chunk = vec![0u8; state.max_chunk_size as usize];
 
@@ -516,7 +518,7 @@ mod copy {
                 .read_at_channel(&mut curr_chunk[..chunk_size], offset, channel_id)
                 .await?;
             if bytes_read < chunk_size {
-                log::warn!(
+                tracing::warn!(
                     "Task {task_id}@{channel_id:?}: Read less bytes than expected. File might be corrupt. Expected: {chunk_size}: {bytes_read}"
                 );
             }
@@ -524,7 +526,7 @@ mod copy {
             to.write_at_channel(&curr_chunk[..valid_chunk_end], offset, channel_id)
                 .await?;
         }
-        log::debug!("Copy task {task_id}@{channel_id:?} completed",);
+        tracing::debug!("Copy task {task_id}@{channel_id:?} completed",);
         Ok(())
     }
 }
@@ -571,7 +573,7 @@ mod copy {
         to.set_len(file_length)?;
 
         if file_length == 0 {
-            log::debug!("Source file is empty, nothing to copy.");
+            tracing::debug!("Source file is empty, nothing to copy.");
             return Ok(());
         }
 
@@ -587,7 +589,7 @@ mod copy {
             let bytes_read =
                 from.read_at_channel(&mut curr_chunk[..chunk_size], offset, channel)?;
             if bytes_read < chunk_size {
-                log::warn!(
+                tracing::warn!(
                     "Read less bytes than expected. File might be corrupt. Expected: {chunk_size}: {bytes_read}"
                 );
             }

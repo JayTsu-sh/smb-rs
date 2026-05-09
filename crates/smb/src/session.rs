@@ -158,9 +158,9 @@ impl Session {
         {
             let session = setup_result.read().await?;
             let session = session.session.read().await?;
-            log::debug!("Session setup complete.");
+            tracing::debug!("Session setup complete.");
             if session.allow_unsigned()? {
-                log::debug!("Session is guest/anonymous.");
+                tracing::debug!("Session is guest/anonymous.");
             }
         };
 
@@ -177,6 +177,7 @@ impl Session {
     /// Connects to the specified tree on the current session.
     /// ## Arguments
     /// * `name` - The name of the tree to connect to.
+    #[tracing::instrument(level = "debug", skip_all, fields(session_id = self.session_id(), share = %name))]
     pub async fn tree_connect(&self, name: &UncPath) -> crate::Result<Tree> {
         let name = name.clone().with_no_path().to_string();
         let tree = Tree::connect(&name, &self.session_handler, &self.conn_info).await?;
@@ -187,6 +188,7 @@ impl Session {
     ///
     /// Any resources held by the session will be released,
     /// and any [`Tree`] objects and their resources will be unusable.
+    #[tracing::instrument(level = "debug", skip_all, fields(session_id = self.session_id()))]
     pub async fn logoff(&self) -> crate::Result<()> {
         self.session_handler.logoff().await
     }
@@ -259,17 +261,17 @@ impl SessionMessageHandler {
             let state = self.primary_channel.session_state().read().await?;
             let state = state.session.read().await?;
             if !state.is_ready() {
-                log::trace!("Session not ready, or logged-off already, skipping logoff.");
+                tracing::trace!("Session not ready, or logged-off already, skipping logoff.");
                 return Ok(());
             }
         }
 
-        log::debug!("Logging off session.");
+        tracing::debug!("Logging off session.");
 
         let _response = self.send_recv(LogoffRequest {}.into()).await?;
 
         // This also invalidates the session object.
-        log::info!("Session logged off.");
+        tracing::info!("Session logged off.");
         self.primary_channel
             .session_state()
             .read()
@@ -290,7 +292,7 @@ impl SessionMessageHandler {
     #[cfg(feature = "async")]
     async fn logoff_async(&self) {
         self.logoff().await.unwrap_or_else(|e| {
-            log::error!("Failed to logoff: {e}");
+            tracing::error!("Failed to logoff: {e}");
         });
     }
 
@@ -302,7 +304,9 @@ impl SessionMessageHandler {
     ) -> crate::Result<T::Result> {
         let channel_id = match channel_id {
             None => return t.work(&self.primary_channel).await,
-            Some(id) if id == self.primary_channel_id => return t.work(&self.primary_channel).await,
+            Some(id) if id == self.primary_channel_id => {
+                return t.work(&self.primary_channel).await;
+            }
             Some(id) => id,
         };
 
@@ -365,7 +369,7 @@ impl WithChannel for RecvoWithChannel<'_> {
 impl Drop for SessionMessageHandler {
     fn drop(&mut self) {
         self.logoff().unwrap_or_else(|e| {
-            log::error!("Failed to logoff: {e}",);
+            tracing::error!("Failed to logoff: {e}",);
         });
     }
 }

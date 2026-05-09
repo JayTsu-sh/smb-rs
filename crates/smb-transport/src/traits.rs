@@ -119,7 +119,7 @@ pub trait SmbTransportRead: Send {
             let mut data = BytesMut::zeroed(len);
             self.receive_exact(&mut data).await?;
 
-            log::trace!(
+            tracing::trace!(
                 "Received SMB message of {} bytes from server: {:?}",
                 data.len(),
                 &data[..]
@@ -145,7 +145,7 @@ pub trait SmbTransportRead: Send {
         let mut data = BytesMut::zeroed(len);
         self.receive_exact(&mut data)?;
 
-        log::trace!(
+        tracing::trace!(
             "Received SMB message of {} bytes from server: {:?}",
             data.len(),
             &data[..]

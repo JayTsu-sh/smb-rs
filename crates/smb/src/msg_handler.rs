@@ -291,7 +291,7 @@ pub trait MessageHandler {
     /// * Unless the handler finishes handling the message fully, it should call the next handler in the chain.
     /// * Default implementation does nothing.
     async fn notify(&self, msg: IncomingMessage) -> crate::Result<()> {
-        log::debug!("Received notification message: {msg:?}");
+        tracing::debug!("Received notification message: {msg:?}");
         Ok(())
     }
 

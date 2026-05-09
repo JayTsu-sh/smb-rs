@@ -39,7 +39,7 @@ pub fn make_encrypting_algo(
         ));
     }
     if cfg!(feature = "__debug-dump-keys") {
-        log::debug!(
+        tracing::debug!(
             "Using encryption algorithm {:?} with key {:02x?}",
             encrypting_algorithm,
             encrypting_key

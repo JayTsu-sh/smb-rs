@@ -16,7 +16,9 @@ pub struct Decompressor {
 
 impl Decompressor {
     pub fn new(caps: &Arc<CompressionCapabilities>) -> Decompressor {
-        Decompressor { caps: Arc::clone(caps) }
+        Decompressor {
+            caps: Arc::clone(caps),
+        }
     }
 
     pub fn decompress(
@@ -50,7 +52,9 @@ pub struct Compressor {
 
 impl Compressor {
     pub fn new(caps: &Arc<CompressionCapabilities>) -> Compressor {
-        Compressor { caps: Arc::clone(caps) }
+        Compressor {
+            caps: Arc::clone(caps),
+        }
     }
 
     pub fn compress(&self, bytes: &[u8]) -> crate::Result<CompressedMessage> {
@@ -232,7 +236,9 @@ impl CompressionMethod for ChainedCompression {
 
             // Fallback: try PatternV1 if data is a single repeated byte.
             if !compressed && algorithms.contains(&CompressionAlgorithm::PatternV1) {
-                if let Ok(algo_impl) = self.get_compression_algorithm(CompressionAlgorithm::PatternV1) {
+                if let Ok(algo_impl) =
+                    self.get_compression_algorithm(CompressionAlgorithm::PatternV1)
+                {
                     if let Ok(pattern_data) = algo_impl.compress(remaining) {
                         items.push(CompressedChainedItem {
                             compression_algorithm: CompressionAlgorithm::PatternV1,
@@ -528,7 +534,10 @@ mod tests {
             }
         );
         // unwrap & validate read response metadata.
-        let read_response = plain_unwrapped.content.to_read().expect("expected read response");
+        let read_response = plain_unwrapped
+            .content
+            .to_read()
+            .expect("expected read response");
         assert_eq!(read_response.data_length, 0x400);
         // data_offset points to the absolute position within the raw message
         assert!(read_response.data_offset >= smb_msg::Header::STRUCT_SIZE);

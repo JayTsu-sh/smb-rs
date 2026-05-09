@@ -48,7 +48,11 @@ impl MessageSigner {
     }
 
     /// Calculate signature from contiguous bytes (for incoming verification).
-    fn _calculate_signature_bytes(&mut self, header: &mut Header, data: &[u8]) -> crate::Result<u128> {
+    fn _calculate_signature_bytes(
+        &mut self,
+        header: &mut Header,
+        data: &[u8],
+    ) -> crate::Result<u128> {
         // Write header with signature set to 0.
         let signature_backup = header.signature;
         header.signature = 0;
@@ -69,7 +73,11 @@ impl MessageSigner {
     }
 
     /// Calculate signature from IoVec (for outgoing signing).
-    fn _calculate_signature_iovec(&mut self, header: &mut Header, data: &IoVec) -> crate::Result<u128> {
+    fn _calculate_signature_iovec(
+        &mut self,
+        header: &mut Header,
+        data: &IoVec,
+    ) -> crate::Result<u128> {
         // Write header with signature set to 0.
         let signature_backup = header.signature;
         header.signature = 0;
@@ -130,16 +138,24 @@ mod tests {
             make_signing_algo(SigningAlgorithmId::AesGmac, &TEST_SIGNING_KEY).unwrap(),
         );
 
-        let iovec = IoVec::from(vec![IoVecBuf::from(header_data.clone()), IoVecBuf::from(next_data.clone())]);
-        let signature = signer._calculate_signature_iovec(&mut header, &iovec).expect("signature calculation failed");
+        let iovec = IoVec::from(vec![
+            IoVecBuf::from(header_data.clone()),
+            IoVecBuf::from(next_data.clone()),
+        ]);
+        let signature = signer
+            ._calculate_signature_iovec(&mut header, &iovec)
+            .expect("signature calculation failed");
 
         // Also verify the bytes-based path produces the same result.
         let mut signer2 = MessageSigner::new(
-            make_signing_algo(SigningAlgorithmId::AesGmac, &TEST_SIGNING_KEY).expect("algo creation failed"),
+            make_signing_algo(SigningAlgorithmId::AesGmac, &TEST_SIGNING_KEY)
+                .expect("algo creation failed"),
         );
         let mut combined = header_data;
         combined.extend_from_slice(&next_data);
-        let signature2 = signer2._calculate_signature_bytes(&mut header, &combined).expect("bytes signature failed");
+        let signature2 = signer2
+            ._calculate_signature_bytes(&mut header, &combined)
+            .expect("bytes signature failed");
         assert_eq!(signature, 0x28ebd443faf95c8aab512f813c4b2376);
         assert_eq!(signature2, signature);
     }

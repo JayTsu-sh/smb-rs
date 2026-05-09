@@ -15,7 +15,7 @@ use crate::{interface::*, pdu::DceRpcSyntaxId};
 use crate::ndr64::*;
 use binrw::prelude::*;
 use maybe_async::maybe_async;
-use smb_dtyp::{make_guid, SID};
+use smb_dtyp::{SID, make_guid};
 
 // ─── Context handle (20 bytes) ──────────────────────────────────────────────
 
@@ -589,8 +589,7 @@ where
                 }
 
                 let domain_index = entry.domain_index;
-                let domain = if domain_index >= 0
-                    && (domain_index as usize) < output.domains.len()
+                let domain = if domain_index >= 0 && (domain_index as usize) < output.domains.len()
                 {
                     output.domains[domain_index as usize]
                         .name
@@ -652,8 +651,8 @@ mod test {
         LsaHandle {
             context_handle_attributes: 0,
             context_handle_uuid: [
-                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
-                0x0d, 0x0e, 0x0f, 0x10,
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+                0x0f, 0x10,
             ],
         }
     }
@@ -943,9 +942,7 @@ mod test {
             .unwrap();
 
         // Deferred: domain name buffer
-        let domain_buf = LsaUnicodeStringBuffer {
-            chars: domain_name,
-        };
+        let domain_buf = LsaUnicodeStringBuffer { chars: domain_name };
         domain_buf.write_options(&mut c, endian, ()).unwrap();
 
         // Deferred: domain SID (S-1-5-32)
@@ -1127,22 +1124,18 @@ mod test {
             .unwrap();
 
         // Deferred: domain[0] name buffer + SID
-        LsaUnicodeStringBuffer {
-            chars: d0_name,
-        }
-        .write_options(&mut c, endian, ())
-        .unwrap();
+        LsaUnicodeStringBuffer { chars: d0_name }
+            .write_options(&mut c, endian, ())
+            .unwrap();
         SID::from_str("S-1-5-18")
             .unwrap()
             .write_options(&mut c, endian, ())
             .unwrap();
 
         // Deferred: domain[1] name buffer + SID
-        LsaUnicodeStringBuffer {
-            chars: d1_name,
-        }
-        .write_options(&mut c, endian, ())
-        .unwrap();
+        LsaUnicodeStringBuffer { chars: d1_name }
+            .write_options(&mut c, endian, ())
+            .unwrap();
         SID::from_str("S-1-5-21-100-200-300")
             .unwrap()
             .write_options(&mut c, endian, ())
@@ -1339,7 +1332,9 @@ mod test {
     fn test_policy_access_mask_lookup_names() {
         assert_eq!(PolicyAccessMask::LOOKUP_NAMES.0, 0x00000800);
         let mut cursor = Cursor::new(Vec::new());
-        PolicyAccessMask::LOOKUP_NAMES.write_le(&mut cursor).unwrap();
+        PolicyAccessMask::LOOKUP_NAMES
+            .write_le(&mut cursor)
+            .unwrap();
         assert_eq!(cursor.into_inner(), vec![0x00, 0x08, 0x00, 0x00]);
     }
 }

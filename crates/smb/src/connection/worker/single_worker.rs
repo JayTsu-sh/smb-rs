@@ -67,7 +67,9 @@ impl Worker for SingleWorker {
 
         // If a per-request timeout is specified, temporarily override the transport's
         // read timeout, then restore the original after the receive completes.
-        let original_timeout = self.timeout.lock()
+        let original_timeout = self
+            .timeout
+            .lock()
             .map(|v| v.unwrap_or(Duration::ZERO))
             .unwrap_or(Duration::ZERO);
         let effective_timeout = options.timeout.unwrap_or(original_timeout);

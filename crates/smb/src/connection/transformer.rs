@@ -1,8 +1,8 @@
-use bytes::Bytes;
 use crate::session::{SessionAndChannel, SessionInfo};
 use crate::sync_helpers::*;
 use crate::{compression::*, msg_handler::*};
 use binrw::prelude::*;
+use bytes::Bytes;
 use maybe_async::*;
 use smb_msg::*;
 use smb_transport::IoVec;
@@ -48,14 +48,10 @@ impl Transformer {
 
         let mut config = self.config.write().await?;
         if neg_info.dialect.supports_compression() && neg_info.config.compression_enabled {
-            let compress = neg_info
-                .negotiation
-                .compression
-                .as_ref()
-                .map(|c| {
-                    let caps = Arc::new(c.clone());
-                    (Compressor::new(&caps), Decompressor::new(&caps))
-                });
+            let compress = neg_info.negotiation.compression.as_ref().map(|c| {
+                let caps = Arc::new(c.clone());
+                (Compressor::new(&caps), Decompressor::new(&caps))
+            });
             config.compress = compress;
         }
 
@@ -82,7 +78,7 @@ impl Transformer {
             .await?
             .insert(session_id, session.clone());
 
-        log::trace!(
+        tracing::trace!(
             "Session {} started and inserted to worker {:p}.",
             session_id,
             self
@@ -105,7 +101,7 @@ impl Transformer {
                 "Session {session_id} not found!",
             )))?;
 
-        log::trace!(
+        tracing::trace!(
             "Session {} ended and removed from worker {:p}.",
             session_id,
             self
@@ -205,7 +201,7 @@ impl Transformer {
 
             signer.sign_message(&mut msg.message.header, &mut outgoing_data)?;
 
-            log::debug!(
+            tracing::debug!(
                 "Message #{} signed (signature={}).",
                 msg.message.header.message_id,
                 msg.message.header.signature
@@ -221,7 +217,12 @@ impl Transformer {
                     // Build a vector of the entire data. In the future, this may be optimized to avoid copying.
                     // currently, there's not chained compression, and copy will occur anyway.
                     outgoing_data.consolidate();
-                    let compressed = compress.0.compress(outgoing_data.first().ok_or_else(|| crate::Error::InvalidState("Outgoing data is empty after consolidation.".to_string()))?)?;
+                    let compressed =
+                        compress.0.compress(outgoing_data.first().ok_or_else(|| {
+                            crate::Error::InvalidState(
+                                "Outgoing data is empty after consolidation.".to_string(),
+                            )
+                        })?)?;
 
                     let mut compressed_result = IoVec::default();
                     let write_compressed =
@@ -277,19 +278,20 @@ impl Transformer {
             let session_id = encrypted_message.header.session_id;
 
             form.encrypted = true;
-            let (msg, vec) = self._with_session(session_id, |session| {
-                let decryptor = session.decryptor()?.ok_or(crate::Error::TranformFailed(
-                    TransformError {
-                        outgoing: false,
-                        phase: TransformPhase::EncryptDecrypt,
-                        session_id: Some(session_id),
-                        why: "Message is required to be encrypted, but no decryptor is set up!",
-                        msg_id: None,
-                    },
-                ))?;
-                Ok(decryptor.decrypt_message(encrypted_message)?)
-            })
-            .await?;
+            let (msg, vec) = self
+                ._with_session(session_id, |session| {
+                    let decryptor = session.decryptor()?.ok_or(crate::Error::TranformFailed(
+                        TransformError {
+                            outgoing: false,
+                            phase: TransformPhase::EncryptDecrypt,
+                            session_id: Some(session_id),
+                            why: "Message is required to be encrypted, but no decryptor is set up!",
+                            msg_id: None,
+                        },
+                    ))?;
+                    Ok(decryptor.decrypt_message(encrypted_message)?)
+                })
+                .await?;
             // Decryption returns a new Vec<u8>, convert to Bytes
             (msg, Bytes::from(vec))
         } else {
@@ -335,7 +337,7 @@ impl Transformer {
             .verify_plain_incoming(&mut message, &raw, &mut form)
             .await
         {
-            log::error!("Failed to verify incoming message: {e:?}");
+            tracing::error!("Failed to verify incoming message: {e:?}");
             return Err(crate::Error::TranformFailed(TransformError {
                 outgoing: false,
                 phase: TransformPhase::SignVerify,
@@ -389,7 +391,7 @@ impl Transformer {
             .await?;
 
         signer.verify_signature(&mut message.header, raw)?;
-        log::debug!(
+        tracing::debug!(
             "Message #{} verified (signature={}).",
             message.header.message_id,
             message.header.signature
@@ -451,7 +453,11 @@ pub struct TransformError {
 
 impl std::fmt::Display for TransformError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let direction = if self.outgoing { "outgoing" } else { "incoming" };
+        let direction = if self.outgoing {
+            "outgoing"
+        } else {
+            "incoming"
+        };
         write!(
             f,
             "Failed to transform {direction} message: {:?} (session_id: {:?}) - {}",
