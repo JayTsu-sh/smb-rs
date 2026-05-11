@@ -198,7 +198,7 @@ impl File {
         .with_channel_id(channel);
 
         self.handle
-            .sendo_recvo(request, ReceiveOptions::new())
+            .sendo_recvo(request, ReceiveOptions::new().with_allow_async(true))
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))
     }
