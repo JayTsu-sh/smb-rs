@@ -18,13 +18,30 @@ pub enum EncryptionMode {
     Disabled,
 }
 
+/// Configures whether and how SMB Multi-Channel will be used for a connection.
+///
+/// # Semantics
+///
+/// SMB Multi-Channel is a *negotiated* capability — both client and server must
+/// declare support, and the server must additionally expose reachable alternate
+/// network interfaces. As a result, no client-side setting can truly force
+/// "always-on" Multi-Channel; the most we can do is *announce* support in
+/// NEGOTIATE so the server reports its own capability honestly, then let
+/// [`crate::Client`] discover the alternate interfaces and bind them.
+///
+/// Use [`Auto`](Self::Auto) for that "announce + discover" behavior — it is the
+/// recommended setting for normal use and the name that most accurately
+/// describes what happens at runtime.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum MultiChannelConfig {
-    /// Multi-channel is disabled.
+    /// Multi-channel is disabled — NEGOTIATE will not advertise the capability.
     #[default]
     Disabled,
-    /// Multi-channel is always enabled, if supported by the server and client.
-    Always,
+    /// Announce Multi-Channel support and let the protocol decide whether to
+    /// actually use it based on the server's reply and discovered network
+    /// interfaces. This is the recommended default for code that wants
+    /// Multi-Channel where it is available.
+    Auto,
     /// Multi-channel is enabled only if using RDMA transport, and if supported by the server and client.
     #[cfg(feature = "rdma")]
     RdmaOnly,
@@ -34,7 +51,7 @@ impl MultiChannelConfig {
     /// Returns whether multichannel of any form is enabled.
     pub fn is_enabled(&self) -> bool {
         match self {
-            MultiChannelConfig::Always => true,
+            MultiChannelConfig::Auto => true,
             #[cfg(feature = "rdma")]
             MultiChannelConfig::RdmaOnly => true,
             MultiChannelConfig::Disabled => false,

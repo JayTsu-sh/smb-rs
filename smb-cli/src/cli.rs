@@ -82,9 +82,10 @@ pub enum MultiChannelMode {
     /// only if the server supports RDMA and the client has RDMA-capable NICs.
     RdmaOnly,
 
-    /// Try using multichannel if the server supports it,
-    /// and multiple NICs are available on the server.
-    Always,
+    /// Announce multichannel support; whether it is actually used is then
+    /// negotiated with the server and depends on the server exposing reachable
+    /// alternate network interfaces.
+    Auto,
 }
 
 impl From<MultiChannelMode> for MultiChannelConfig {
@@ -93,7 +94,7 @@ impl From<MultiChannelMode> for MultiChannelConfig {
             MultiChannelMode::None => MultiChannelConfig::Disabled,
             #[cfg(feature = "rdma")]
             MultiChannelMode::RdmaOnly => MultiChannelConfig::RdmaOnly,
-            MultiChannelMode::Always => MultiChannelConfig::Always,
+            MultiChannelMode::Auto => MultiChannelConfig::Auto,
         }
     }
 }
@@ -104,7 +105,7 @@ impl std::fmt::Display for MultiChannelMode {
             MultiChannelMode::None => write!(f, "none"),
             #[cfg(feature = "rdma")]
             MultiChannelMode::RdmaOnly => write!(f, "rdma-only"),
-            MultiChannelMode::Always => write!(f, "always"),
+            MultiChannelMode::Auto => write!(f, "auto"),
         }
     }
 }
