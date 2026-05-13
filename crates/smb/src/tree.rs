@@ -154,6 +154,7 @@ impl Tree {
                 options: CreateOptions::new(),
                 desired_access,
                 attributes: FileAttributes::new(),
+                ..Default::default()
             },
         )
         .await
@@ -175,6 +176,7 @@ impl Tree {
                 options: CreateOptions::new().with_directory_file(true),
                 desired_access,
                 attributes: FileAttributes::new().with_directory(true),
+                ..Default::default()
             },
         )
         .await

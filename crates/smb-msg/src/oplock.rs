@@ -69,6 +69,12 @@ pub enum OplockLevel {
     II = 1,
     /// Exclusive oplock is available.
     Exclusive = 2,
+    /// Lease semantics are in effect for this open. Used in
+    /// `CreateRequest::requested_oplock_level` to signal "I'm sending an
+    /// `RqLs` create context; treat this as a lease request rather than an
+    /// oplock". Per MS-SMB2 2.2.13, the server only honors the `RqLs`
+    /// context when this value is set.
+    Lease = 0xFF,
 }
 
 /// Lease state bitfield representing different types of caching permissions.

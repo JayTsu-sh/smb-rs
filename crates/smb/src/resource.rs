@@ -37,6 +37,12 @@ pub struct FileCreateArgs {
     pub attributes: FileAttributes,
     pub options: CreateOptions,
     pub desired_access: FileAccessMask,
+    /// Optional lease request context (`RqLs`) attached to the CREATE.
+    /// Set to `None` (default) to preserve the legacy "no lease" behavior.
+    /// Set to `Some(RequestLease::RqLsReqv2(...))` on SMB 3.x to ask the
+    /// server for read/handle/write caching; the granted state is reported
+    /// back via [`ResourceHandle::lease_granted`].
+    pub lease_request: Option<RequestLease>,
 }
 
 impl FileCreateArgs {
@@ -46,6 +52,7 @@ impl FileCreateArgs {
             attributes: FileAttributes::new(),
             options: CreateOptions::new(),
             desired_access: access,
+            ..Default::default()
         }
     }
 
@@ -57,6 +64,7 @@ impl FileCreateArgs {
             attributes,
             options,
             desired_access: FileAccessMask::new().with_generic_all(true),
+            ..Default::default()
         }
     }
 
@@ -69,6 +77,7 @@ impl FileCreateArgs {
             attributes,
             options,
             desired_access: FileAccessMask::new().with_generic_all(true),
+            ..Default::default()
         }
     }
 
@@ -81,7 +90,16 @@ impl FileCreateArgs {
             desired_access: FileAccessMask::new()
                 .with_generic_read(true)
                 .with_generic_write(true),
+            ..Default::default()
         }
+    }
+
+    /// Attach a lease (`RqLs`) request to a create. Returns `self` for builder-style chaining.
+    /// Caller must ensure the SMB connection negotiated the leasing capability;
+    /// servers that don't support leasing will simply ignore the context.
+    pub fn with_lease(mut self, lease: RequestLease) -> Self {
+        self.lease_request = Some(lease);
+        self
     }
 }
 
@@ -123,9 +141,29 @@ impl Resource {
             ));
         }
 
+        // 标准 create context 列表：MxAc + QFid 始终发送；lease (RqLs) 仅在调用方显式
+        // 请求时附加，保持现有非-lease 调用方零行为变化。
+        let mut contexts: Vec<CreateContextRequest> = vec![
+            QueryMaximalAccessRequest::default().into(),
+            QueryOnDiskIdReq.into(),
+        ];
+        let lease_requested = create_args.lease_request.is_some();
+        if let Some(lease_req) = create_args.lease_request.as_ref() {
+            contexts.push(lease_req.clone().into());
+        }
+
+        // MS-SMB2 2.2.13: server 只在 RequestedOplockLevel = Lease (0xFF) 时把
+        // `RqLs` context 当 lease 处理；任何其他值（含 None）都让 server 静默忽略。
+        // 因此 lease 请求必须把 oplock level 同步切到 Lease。
+        let requested_oplock_level = if lease_requested {
+            OplockLevel::Lease
+        } else {
+            OplockLevel::None
+        };
+
         let mut msg = OutgoingMessage::new(
             CreateRequest {
-                requested_oplock_level: OplockLevel::None,
+                requested_oplock_level,
                 impersonation_level: ImpersonationLevel::Impersonation,
                 desired_access: create_args.desired_access,
                 file_attributes: create_args.attributes,
@@ -133,11 +171,7 @@ impl Resource {
                 create_disposition: create_args.disposition,
                 create_options: create_args.options,
                 name: name.into(),
-                contexts: vec![
-                    QueryMaximalAccessRequest::default().into(),
-                    QueryOnDiskIdReq.into(),
-                ]
-                .into(),
+                contexts: contexts.into(),
             }
             .into(),
         );
@@ -164,6 +198,26 @@ impl Resource {
                 }
             );
 
+        // 仅在 client 显式请求 lease 时才尝试解析 RqLs response context；server 未授予
+        // (None) 与 client 未请求语义等价 —— 上层调用方都按"无 lease"处理。
+        let lease_granted = if lease_requested {
+            let grant = CreateContextResponseData::first_rqls(&response.create_contexts)
+                .map(LeaseGrant::from_response);
+            match &grant {
+                Some(g) => tracing::debug!(
+                    "Lease granted for '{}': key={:#034x}, state={:?}, epoch={}, v2={}",
+                    name, g.key, g.state, g.epoch, g.is_v2
+                ),
+                None => tracing::debug!(
+                    "Lease requested for '{}' but server did not grant one",
+                    name
+                ),
+            }
+            grant
+        } else {
+            None
+        };
+
         // Common information is held in the handle object.
         let handle = ResourceHandle {
             name: name.to_string(),
@@ -173,6 +227,7 @@ impl Resource {
             created: response.creation_time.date_time(),
             modified: response.last_write_time.date_time(),
             access,
+            lease_granted,
             share_type,
             conn_info: conn_info.clone(),
         };
@@ -276,6 +331,43 @@ impl TryInto<$t> for Resource {
 
 make_resource_try_into!(File, Directory, Pipe,);
 
+/// Information about a granted lease, extracted from the `RqLs` create-context
+/// in a `CreateResponse`. Captures only the fields the client needs to track
+/// the lease lifecycle; Phase B/C will key into [`ResourceHandle::lease_granted`]
+/// when wiring break notifications and the lease_table cache.
+#[derive(Debug, Clone, Copy)]
+pub struct LeaseGrant {
+    /// Client-generated key that identifies this lease.
+    pub key: u128,
+    /// The lease state actually granted by the server (may be a subset of
+    /// what was requested).
+    pub state: LeaseState,
+    /// Epoch counter for state changes (always 0 for v1 leases).
+    pub epoch: u16,
+    /// `true` if the response carried a v2 (`RqLsReqv2`) lease, `false` for v1.
+    pub is_v2: bool,
+}
+
+impl LeaseGrant {
+    /// Extract a [`LeaseGrant`] from a parsed `RqLs` response context.
+    pub(crate) fn from_response(r: &RequestLease) -> Self {
+        match r {
+            RequestLease::RqLsReqv1(v1) => Self {
+                key: v1.lease_key,
+                state: v1.lease_state,
+                epoch: 0,
+                is_v2: false,
+            },
+            RequestLease::RqLsReqv2(v2) => Self {
+                key: v2.lease_key,
+                state: v2.lease_state,
+                epoch: v2.epoch,
+                is_v2: true,
+            },
+        }
+    }
+}
+
 /// Holds the common information for an opened SMB resource.
 pub struct ResourceHandle {
     name: String,
@@ -293,6 +385,11 @@ pub struct ResourceHandle {
     share_type: ShareType,
 
     access: FileAccessMask,
+
+    /// Granted lease for this open, when [`FileCreateArgs::lease_request`] was
+    /// `Some` and the server replied with an `RqLs` response context.
+    /// `None` when no lease was requested or the server didn't grant one.
+    lease_granted: Option<LeaseGrant>,
 
     conn_info: Arc<ConnectionInfo>,
 }
@@ -312,6 +409,17 @@ impl ResourceHandle {
     /// Returns the last modified time of the resource.
     pub fn modified(&self) -> PrimitiveDateTime {
         self.modified
+    }
+
+    /// Returns the lease granted for this open, if any.
+    ///
+    /// Returns `None` when no lease was requested via
+    /// [`FileCreateArgs::lease_request`], or when the server did not respond
+    /// with an `RqLs` create context. Callers should treat `None` as
+    /// "the open has no caching guarantees" and fall back to per-operation
+    /// network round-trips.
+    pub fn lease_granted(&self) -> Option<LeaseGrant> {
+        self.lease_granted
     }
 
     /// Returns the current share type of the resource. See [ShareType] for more details.
@@ -964,5 +1072,82 @@ impl Drop for ResourceHandle {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    // `use maybe_async::*;` at the file top brings a `test` macro into our parent
+    // scope, which conflicts with the standard `#[test]` attribute. Pull the
+    // standard one in explicitly so attribute resolution is unambiguous.
+    #[allow(unused_imports)]
+    use core::prelude::v1::test;
+
+    use super::{FileCreateArgs, LeaseGrant};
+    use smb_fscc::FileAccessMask;
+    use smb_msg::{LeaseFlags, LeaseState, RequestLease, RequestLeaseV1, RequestLeaseV2};
+
+    fn make_state(read: bool, handle: bool, write: bool) -> LeaseState {
+        LeaseState::new()
+            .with_read_caching(read)
+            .with_handle_caching(handle)
+            .with_write_caching(write)
+    }
+
+    #[test]
+    fn lease_grant_from_v1() {
+        let v1 = RequestLeaseV1 {
+            lease_key: 0x1122_3344_5566_7788_99AA_BBCC_DDEE_FF00_u128,
+            lease_state: make_state(true, true, false),
+        };
+        let grant = LeaseGrant::from_response(&RequestLease::RqLsReqv1(v1));
+        assert_eq!(grant.key, 0x1122_3344_5566_7788_99AA_BBCC_DDEE_FF00_u128);
+        assert!(grant.state.read_caching());
+        assert!(grant.state.handle_caching());
+        assert!(!grant.state.write_caching());
+        assert_eq!(grant.epoch, 0, "v1 lease has no epoch field");
+        assert!(!grant.is_v2);
+    }
+
+    #[test]
+    fn lease_grant_from_v2() {
+        let v2 = RequestLeaseV2 {
+            lease_key: 0xDEAD_BEEF_CAFE_BABE_1234_5678_9ABC_DEF0_u128,
+            lease_state: make_state(true, true, true),
+            lease_flags: LeaseFlags::new().with_parent_lease_key_set(true),
+            parent_lease_key: 0x0EDC_BA98_7654_3210_FEDC_BA98_7654_3210_u128,
+            epoch: 0x1337,
+        };
+        let grant = LeaseGrant::from_response(&RequestLease::RqLsReqv2(v2));
+        assert_eq!(grant.key, 0xDEAD_BEEF_CAFE_BABE_1234_5678_9ABC_DEF0_u128);
+        assert!(grant.state.read_caching());
+        assert!(grant.state.handle_caching());
+        assert!(grant.state.write_caching());
+        assert_eq!(grant.epoch, 0x1337);
+        assert!(grant.is_v2);
+    }
+
+    #[test]
+    fn file_create_args_with_lease_builder() {
+        let args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true))
+            .with_lease(RequestLease::RqLsReqv2(RequestLeaseV2 {
+                lease_key: 1,
+                lease_state: make_state(true, true, false),
+                lease_flags: LeaseFlags::new(),
+                parent_lease_key: 0,
+                epoch: 0,
+            }));
+        assert!(args.lease_request.is_some(), "with_lease should populate the field");
+        assert!(matches!(
+            args.lease_request.as_ref().unwrap(),
+            RequestLease::RqLsReqv2(_)
+        ));
+    }
+
+    #[test]
+    fn file_create_args_default_has_no_lease() {
+        let args = FileCreateArgs::default();
+        assert!(args.lease_request.is_none(), "default must not request a lease");
     }
 }
