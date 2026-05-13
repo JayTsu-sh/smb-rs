@@ -256,6 +256,20 @@ impl Resource {
         }
     }
 
+    /// Borrow the underlying [`ResourceHandle`] regardless of resource
+    /// kind. Convenience for callers that need handle-level metadata
+    /// (`name`, `lease_granted`, `raw_file_id`) without first matching
+    /// the variant. Returns `None` for variants that don't have a handle
+    /// surface — currently none, but kept as `Option` for forward
+    /// compatibility.
+    pub fn handle(&self) -> Option<&ResourceHandle> {
+        match self {
+            Resource::File(f) => Some(f.handle()),
+            Resource::Directory(d) => Some(d.handle()),
+            Resource::Pipe(p) => Some(p.handle()),
+        }
+    }
+
     pub fn as_dir(&self) -> Option<&Directory> {
         match self {
             Resource::Directory(d) => Some(d),
@@ -419,6 +433,16 @@ impl ResourceHandle {
     /// network round-trips.
     pub fn lease_granted(&self) -> Option<LeaseGrant> {
         self.lease_granted
+    }
+
+    /// Returns the server-assigned `FileId` for this open, *without* the
+    /// "is-open" sanity check. Exposed for the lease-cache (Phase C):
+    /// `Client::create_file` snapshots the FileId at Create time and
+    /// installs it into the connection's `lease_table` so subsequent
+    /// cache hits can reuse the same id. Callers should not use this
+    /// FileId for direct I/O — go through the resource's typed methods.
+    pub fn raw_file_id(&self) -> FileId {
+        self._file_id
     }
 
     /// Returns the current share type of the resource. See [ShareType] for more details.

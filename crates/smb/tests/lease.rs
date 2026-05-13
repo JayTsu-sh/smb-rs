@@ -241,3 +241,149 @@ async fn test_lease_break_notify_fanned_out() -> smb::Result<()> {
     file_a.close().await?;
     Ok(())
 }
+
+/// Phase C.1 (cache table insert):
+///
+/// When `Client::create_file` succeeds with a granted lease, the
+/// connection's `lease_table` must hold an entry keyed by the share-
+/// relative path with a refcount of 1 and `tombstoned == false`. This
+/// is the simplest building block of Phase C — cache hits (C.3),
+/// break-driven tombstoning (C.2), and deferred close (C.4) all build
+/// on this insertion path.
+#[test_log::test(maybe_async::test(
+    not(feature = "async"),
+    async(feature = "async", tokio::test(flavor = "current_thread"))
+))]
+#[serial]
+async fn test_lease_slot_inserted_on_create() -> smb::Result<()> {
+    let share = smb_tests_share();
+    let (client, share_path) = make_server_connection(&share, None).await?;
+    let conn = client.get_connection(share_path.server()).await?;
+    let info = conn.conn_info().expect("connection negotiated");
+    if !info.negotiation.caps.leasing() {
+        tracing::warn!("Server lacks caps.leasing(); skipping C.1 cache-insert test.");
+        return Ok(());
+    }
+
+    // Baseline: cache must start empty for this fresh connection.
+    let baseline = conn.lease_slot_count().await?;
+
+    let path_rel = "lease_phase_c1_insert.txt";
+    let args = FileCreateArgs::make_overwrite(Default::default(), Default::default())
+        .with_lease(make_lease_request());
+    let file = client
+        .create_file(&share_path.with_path(path_rel), &args)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+
+    let grant = file
+        .handle()
+        .lease_granted()
+        .expect("server with caps.leasing() must issue a grant");
+
+    // A slot should now exist for our path.
+    assert_eq!(
+        conn.lease_slot_count().await?,
+        baseline + 1,
+        "Create with lease must add one entry to the per-connection lease_table",
+    );
+    let slot = conn
+        .peek_lease_slot(path_rel)
+        .await?
+        .expect("slot must be reachable by path");
+    assert_eq!(slot.lease_key, grant.key, "slot's lease_key must echo the grant");
+    assert_eq!(
+        slot.refcount.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "initial refcount is the caller's handle",
+    );
+    assert!(
+        !slot.tombstoned.load(std::sync::atomic::Ordering::Relaxed),
+        "fresh slot must not be tombstoned",
+    );
+
+    file.set_info(FileDispositionInformation::default()).await?;
+    file.close().await?;
+    Ok(())
+}
+
+/// Phase C.2 (break-driven tombstone):
+///
+/// Client A opens with HandleCaching; client B opens the same path with
+/// OverwriteIf. Server sends a `LeaseBreakNotify` to A. The per-connection
+/// break-listener spawned during `_negotiate` consumes the event from
+/// `lease_event_tx` and tombstones the matching slot in `lease_table`.
+/// This test polls the slot until tombstoned (or times out) — no event
+/// subscription needed, the test only inspects cache state.
+#[test_log::test(maybe_async::test(
+    not(feature = "async"),
+    async(feature = "async", tokio::test(flavor = "current_thread"))
+))]
+#[serial]
+async fn test_lease_slot_tombstoned_on_break() -> smb::Result<()> {
+    let share = smb_tests_share();
+
+    let (client_a, share_path_a) = make_server_connection(&share, None).await?;
+    let conn_a = client_a.get_connection(share_path_a.server()).await?;
+    let info = conn_a.conn_info().expect("connection negotiated");
+    if !info.negotiation.caps.leasing() {
+        tracing::warn!("Server lacks caps.leasing(); skipping C.2 tombstone test.");
+        return Ok(());
+    }
+
+    let path_rel = "lease_phase_c2_tombstone.txt";
+    let args_a = FileCreateArgs::make_overwrite(Default::default(), Default::default())
+        .with_lease(make_lease_request());
+    let file_a = client_a
+        .create_file(&share_path_a.with_path(path_rel), &args_a)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+
+    let slot = conn_a
+        .peek_lease_slot(path_rel)
+        .await?
+        .expect("slot must exist after Create with grant");
+    assert!(
+        !slot.tombstoned.load(std::sync::atomic::Ordering::Acquire),
+        "slot must start un-tombstoned",
+    );
+
+    // Provoke a break from a second client.
+    let (client_b, share_path_b) = make_server_connection(&share, None).await?;
+    let file_b = client_b
+        .create_file(
+            &share_path_b.with_path(path_rel),
+            &FileCreateArgs::make_overwrite(Default::default(), Default::default()),
+        )
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+
+    // Poll the slot's tombstoned flag with a bounded wait. The listener
+    // task runs on the same tokio runtime; the event flows
+    //   server -> worker -> notify channel -> handle_lease_break
+    //   -> broadcast tx -> listener rx -> apply_lease_break
+    //   -> slot.tombstoned.store(true).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !slot.tombstoned.load(std::sync::atomic::Ordering::Acquire) {
+        if std::time::Instant::now() > deadline {
+            panic!("slot was not tombstoned within 10s of B's conflicting open");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    tracing::info!(
+        "Slot tombstoned: granted_state now {:?}",
+        *slot.granted_state.read().expect("rwlock not poisoned"),
+    );
+
+    // Cleanup.
+    drop(file_b);
+    file_a
+        .set_info(FileDispositionInformation::default())
+        .await?;
+    file_a.close().await?;
+    Ok(())
+}

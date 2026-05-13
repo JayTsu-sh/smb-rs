@@ -369,6 +369,39 @@ impl Client {
     async fn _create_file(&self, path: &UncPath, args: &FileCreateArgs) -> crate::Result<Resource> {
         let tree = self.get_tree(path).await?;
         let resource = tree.create(path.path().unwrap_or(""), args).await?;
+
+        // Phase C.1: install a lease slot into the per-connection cache when
+        // the server granted a lease on this Create. Subsequent micro-steps
+        // (C.3) will check the cache *before* issuing Create at all; for
+        // now we only populate it so the next opens can observe the entry.
+        if let Some(handle) = resource.handle() {
+            if let Some(grant) = handle.lease_granted() {
+                let slot = std::sync::Arc::new(crate::lease::LeaseSlot::new(
+                    path.path().unwrap_or("").to_string(),
+                    tree.tree_id(),
+                    handle.raw_file_id(),
+                    grant.key,
+                    grant.state,
+                ));
+                match self.get_connection(path.server()).await {
+                    Ok(conn) => {
+                        if let Err(e) = conn.insert_lease_slot(slot).await {
+                            tracing::warn!(
+                                path = %path,
+                                error = ?e,
+                                "Failed to install lease slot in cache",
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        path = %path,
+                        error = ?e,
+                        "Cannot resolve connection for lease cache insert",
+                    ),
+                }
+            }
+        }
+
         Ok(resource)
     }
 

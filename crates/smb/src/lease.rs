@@ -1,21 +1,23 @@
-//! Client-side SMB lease lifecycle events.
+//! Client-side SMB lease lifecycle events and cache.
 //!
 //! Phase A wired up the *request + grant* side of SMB Handle Lease via
 //! [`crate::FileCreateArgs::lease_request`] and [`crate::LeaseGrant`].
-//! Phase B (this module) adds the *break* side: the server can, at any time,
-//! notify the client that a previously-granted lease is being revoked or
-//! downgraded (MS-SMB2 2.2.23.2). The client must reply with a
-//! `LeaseBreakAck` within roughly 35 seconds, or the server will revoke the
-//! lease unilaterally.
+//! Phase B added the *break* side: the server can, at any time, notify the
+//! client that a previously-granted lease is being revoked or downgraded
+//! (MS-SMB2 2.2.23.2). This module exposes [`LeaseBreakEvent`] mirroring the
+//! on-wire `LeaseBreakNotify` plus a timestamp.
 //!
-//! This module exposes a [`LeaseBreakEvent`] type that mirrors the on-wire
-//! `LeaseBreakNotify` plus a timestamp, and a broadcast channel on
-//! [`crate::Client`] (via `Client::subscribe_lease_breaks`) so higher layers
-//! (Phase C `lease_table`, Phase D `cifs.rs::handle_cache`) can react to
-//! invalidations.
+//! Phase C introduces the [`LeaseSlot`] cache: when the server grants a
+//! lease, the connection holds onto the FileId so subsequent Opens against
+//! the same path can be served from cache (skipping the Create RT). The
+//! actual `Close` is deferred until either (a) the last live reference
+//! drops *and* the slot has been tombstoned, or (b) an explicit eviction
+//! runs (e.g. before `delete` or `rename`).
 
 use smb_dtyp::Guid;
-use smb_msg::LeaseState;
+use smb_msg::{FileId, LeaseState};
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Instant;
 
 /// A single lease-break notification received from the server, normalized
@@ -53,4 +55,76 @@ pub struct LeaseBreakEvent {
     /// Wall-clock instant the client received the notification, used for
     /// observability and to drive ack-timeout backstops in Phase C.
     pub received_at: Instant,
+}
+
+/// A cached, lease-protected open. Owned by the
+/// connection's `lease_table`; multiple [`crate::ResourceHandle`] instances
+/// may share an `Arc<LeaseSlot>` and operate on the same server-side
+/// `FileId`. The actual `Close` is deferred until both:
+///
+/// 1. The slot's `refcount` drops to zero — no live handle references it.
+/// 2. The slot is `tombstoned` — either by a server-side
+///    `LeaseBreakNotify` that dropped enough caching bits, or by an
+///    explicit `Client::evict_lease` call before a destructive op.
+///
+/// Until both conditions are met, the FileId stays live on the server and
+/// new Opens against the same path hit the cache for free.
+///
+/// Phase C lays down the type and the insert path; cache hits, deferred
+/// close, and break-driven tombstoning land in later micro-steps of the
+/// same phase.
+pub struct LeaseSlot {
+    /// The file path (relative to the share root) the lease was opened
+    /// against. Used as the lookup key inside the per-connection table
+    /// and for diagnostic logs.
+    pub path: String,
+    /// Tree the original Create was issued on. Future cache hits must
+    /// reuse the same tree so per-tree access permissions match.
+    pub tree_id: u32,
+    /// Server-assigned FileId for the open. Cached hits reuse this FileId
+    /// on every operation; the wire `Close` is only sent when the slot is
+    /// destroyed.
+    pub file_id: FileId,
+    /// Client-generated lease key, normalized to u128 so it can be
+    /// matched against [`LeaseBreakEvent::lease_key`] via [`Guid::as_u128`].
+    pub lease_key: u128,
+    /// Current granted lease state. The break-listener task downgrades
+    /// this under `write` when the server's `LeaseBreakNotify` says so.
+    pub granted_state: RwLock<LeaseState>,
+    /// Number of live [`crate::ResourceHandle`] clones referencing this
+    /// slot. The wire `Close` is deferred until this hits zero *and* the
+    /// slot is tombstoned.
+    pub refcount: AtomicUsize,
+    /// `true` once the lease is no longer eligible for new cache hits —
+    /// either a server break dropped caching bits, or the caller
+    /// explicitly evicted. The next `refcount == 0` transition triggers
+    /// the real `Close`.
+    pub tombstoned: AtomicBool,
+    /// Last time the slot was created or hit. Used by
+    /// `flush_idle_leases(Duration)` to evict slots whose lease the
+    /// server may have silently dropped on its side.
+    pub last_used: RwLock<Instant>,
+}
+
+impl LeaseSlot {
+    /// Construct a new slot from a successful Create response. Initial
+    /// refcount is `1` (the caller's handle), not tombstoned.
+    pub fn new(
+        path: String,
+        tree_id: u32,
+        file_id: FileId,
+        lease_key: u128,
+        granted_state: LeaseState,
+    ) -> Self {
+        Self {
+            path,
+            tree_id,
+            file_id,
+            lease_key,
+            granted_state: RwLock::new(granted_state),
+            refcount: AtomicUsize::new(1),
+            tombstoned: AtomicBool::new(false),
+            last_used: RwLock::new(Instant::now()),
+        }
+    }
 }

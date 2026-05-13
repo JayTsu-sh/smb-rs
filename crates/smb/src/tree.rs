@@ -199,6 +199,13 @@ impl Tree {
         Ok(info.share_flags.dfs_root() && info.share_flags.dfs())
     }
 
+    /// Returns the SMB-assigned tree id for this connected share.
+    /// Used by the lease cache (Phase C) so cache hits can match opens
+    /// against the same tree the original Create was issued on.
+    pub fn tree_id(&self) -> u32 {
+        self.handler.tree_id.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn as_dfs_tree(&self) -> crate::Result<DfsRootTreeRef<'_>> {
         if !self.is_dfs_root()? {
             return Err(Error::InvalidState("Tree is not a DFS tree".to_string()));

@@ -7,7 +7,7 @@ pub mod worker;
 use crate::compression;
 use crate::connection::preauth_hash::PreauthHashState;
 use crate::dialects::DialectImpl;
-use crate::lease::LeaseBreakEvent;
+use crate::lease::{LeaseBreakEvent, LeaseSlot};
 use crate::session::ChannelMessageHandler;
 use crate::sync_helpers::*;
 use crate::{Error, crypto, msg_handler::*, session::Session};
@@ -524,6 +524,13 @@ impl Connection {
             );
             self.handler.handler.start_notify().await?;
             tracing::debug!("Notification job started.");
+
+            // Phase C.2: the break-listener consumes the per-connection
+            // lease_event_tx broadcast (fed by handle_lease_break) and
+            // tombstones matching slots in lease_table so new opens
+            // miss the cache after a server-side break.
+            #[cfg(feature = "async")]
+            self.handler.handler.start_lease_break_listener();
         }
 
         self.handler
@@ -581,6 +588,28 @@ impl Connection {
     ) -> tokio::sync::broadcast::Receiver<LeaseBreakEvent> {
         self.handler.subscribe_lease_breaks()
     }
+
+    /// Install a [`crate::lease::LeaseSlot`] into this connection's
+    /// lease cache. See [`ConnectionMessageHandler::insert_lease_slot`].
+    #[maybe_async]
+    pub async fn insert_lease_slot(&self, slot: Arc<LeaseSlot>) -> crate::Result<()> {
+        self.handler.insert_lease_slot(slot).await
+    }
+
+    /// Return the current number of cached lease slots.
+    #[maybe_async]
+    pub async fn lease_slot_count(&self) -> crate::Result<usize> {
+        self.handler.lease_slot_count().await
+    }
+
+    /// Look up a cached lease slot by path; `None` when absent.
+    #[maybe_async]
+    pub async fn peek_lease_slot(
+        &self,
+        path: &str,
+    ) -> crate::Result<Option<Arc<LeaseSlot>>> {
+        self.handler.peek_lease_slot(path).await
+    }
 }
 
 /// This struct is the internal message handler for the SMB client.
@@ -620,6 +649,13 @@ pub(crate) struct ConnectionMessageHandler {
     /// the existing notify path but do not fan them out.
     #[cfg(feature = "async")]
     lease_event_tx: tokio::sync::broadcast::Sender<LeaseBreakEvent>,
+
+    /// Per-connection cache of server-granted leases (Phase C). Keyed by
+    /// the file path relative to the share. Entries are inserted when a
+    /// `CreateResponse` carries an `RqLs` grant and removed when the last
+    /// holder drops *and* the slot is tombstoned. The actual `Close`
+    /// packet is deferred until destruction.
+    lease_table: Mutex<HashMap<String, Arc<LeaseSlot>>>,
 }
 
 impl ConnectionMessageHandler {
@@ -641,6 +677,141 @@ impl ConnectionMessageHandler {
             sessions: Mutex::new(HashMap::with_capacity(1)),
             #[cfg(feature = "async")]
             lease_event_tx,
+            lease_table: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Install a [`LeaseSlot`] into the per-connection cache. Called from
+    /// [`crate::Client::create_file`] after a successful Create that
+    /// carried an `RqLs` grant. Overwrites any prior entry for the same
+    /// path — a stale slot (e.g., a previous open that was closed by the
+    /// other side) is logically equivalent to no cache hit.
+    #[maybe_async]
+    pub async fn insert_lease_slot(&self, slot: Arc<LeaseSlot>) -> crate::Result<()> {
+        let key = slot.path.clone();
+        let mut table = self.lease_table.lock().await?;
+        if let Some(prev) = table.insert(key, slot) {
+            tracing::debug!(
+                path = %prev.path,
+                "Replaced existing lease slot in cache",
+            );
+        }
+        Ok(())
+    }
+
+    /// Return the current number of cached lease slots. Primarily for
+    /// observability and tests; not in any hot path.
+    #[maybe_async]
+    pub async fn lease_slot_count(&self) -> crate::Result<usize> {
+        Ok(self.lease_table.lock().await?.len())
+    }
+
+    /// Look up a cached lease slot by path. Returns `None` when there is
+    /// no entry. Phase C.3 will gate cache hits behind additional checks
+    /// (`tombstoned`, `granted_state` compatibility); this getter is the
+    /// raw lookup used by tests and the break-listener task.
+    #[maybe_async]
+    pub async fn peek_lease_slot(
+        &self,
+        path: &str,
+    ) -> crate::Result<Option<Arc<LeaseSlot>>> {
+        Ok(self.lease_table.lock().await?.get(path).cloned())
+    }
+
+    /// Spawn a long-running task that consumes the lease-break broadcast
+    /// and tombstones matching slots in `lease_table`. Idempotent — only
+    /// the first call subscribes; subsequent calls are no-ops. Async-only:
+    /// the broadcast channel doesn't exist in sync builds.
+    #[cfg(feature = "async")]
+    fn start_lease_break_listener(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        let mut rx = self.lease_event_tx.subscribe();
+        let self_clone = self.clone();
+        let stop = self.stop_notifications.clone();
+        tokio::spawn(async move {
+            loop {
+                select! {
+                    _ = stop.cancelled() => {
+                        tracing::debug!("Lease break listener cancelled.");
+                        break;
+                    }
+                    next = rx.recv() => {
+                        match next {
+                            Ok(event) => {
+                                self_clone.apply_lease_break(&event).await;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                // Listener fell behind the producer. The
+                                // ack for the missed events has already
+                                // been sent by handle_lease_break; the
+                                // only consequence here is that we may
+                                // miss some tombstones. The next break
+                                // for the same lease_key will recover us.
+                                tracing::warn!(
+                                    skipped,
+                                    "Lease break listener lagged; some tombstones may have been missed",
+                                );
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                tracing::debug!(
+                                    "Lease break channel closed; exiting listener.",
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            tracing::debug!("Lease break listener task stopped.");
+            // Suppress unused warning when the underlying ordering import
+            // isn't needed by simpler future code paths.
+            let _ = Ordering::Relaxed;
+        });
+    }
+
+    /// Apply a single [`LeaseBreakEvent`] to the connection's lease table.
+    /// All slots whose `lease_key` matches the event are tombstoned and
+    /// their `granted_state` snapshot is updated to the server's new
+    /// state. Cache hits in C.3 will check `tombstoned` and miss when set.
+    #[cfg(feature = "async")]
+    async fn apply_lease_break(&self, event: &LeaseBreakEvent) {
+        use std::sync::atomic::Ordering;
+        let event_key = event.lease_key.as_u128();
+
+        // Snapshot the matching slots under a short critical section, then
+        // mutate outside the lock to keep the table responsive to other
+        // operations during the broadcast burst.
+        let matching: Vec<Arc<LeaseSlot>> = match self.lease_table.lock().await {
+            Ok(table) => table
+                .values()
+                .filter(|s| s.lease_key == event_key)
+                .cloned()
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = ?e, "lease_table lock poisoned during break apply");
+                return;
+            }
+        };
+
+        if matching.is_empty() {
+            tracing::trace!(
+                lease_key = ?event.lease_key,
+                "Break event has no matching slot in this connection's cache",
+            );
+            return;
+        }
+
+        for slot in matching {
+            slot.tombstoned.store(true, Ordering::Release);
+            if let Ok(mut state) = slot.granted_state.write() {
+                *state = event.new_state;
+            }
+            tracing::debug!(
+                path = %slot.path,
+                lease_key = %slot.lease_key,
+                new_state = ?event.new_state,
+                "Lease slot tombstoned by server break",
+            );
         }
     }
 
