@@ -34,15 +34,15 @@ pub struct OplockBreakMsg {
 pub struct LeaseBreakNotify {
     /// A 16-bit unsigned integer indicating a lease state change by the server.
     /// Only valid for SMB 3.x dialect family. For SMB 2.1, this field is reserved.
-    new_epoch: u16,
+    pub new_epoch: u16,
     /// Flag indicating whether a Lease Break Acknowledgment is required.
-    ack_required: u32,
+    pub ack_required: u32,
     /// The client-generated key that identifies the owner of the lease.
-    lease_key: Guid,
+    pub lease_key: Guid,
     /// The current lease state of the open.
-    current_lease_state: LeaseState,
+    pub current_lease_state: LeaseState,
     /// The new lease state for the open.
-    new_lease_state: LeaseState,
+    pub new_lease_state: LeaseState,
     #[bw(calc = 0)]
     #[br(assert(break_reason == 0))]
     #[br(temp)]
@@ -117,10 +117,10 @@ pub struct LeaseBreakAckResponse {
     reserved: u32,
 
     /// The client-generated key that identifies the owner of the lease.
-    lease_key: Guid,
+    pub lease_key: Guid,
     /// The lease state. For acknowledgments, this must be a subset of the lease state
     /// granted by the server. For responses, this is the requested lease state.
-    lease_state: LeaseState,
+    pub lease_state: LeaseState,
 
     /// Lease duration (reserved)
     reserved: u64,

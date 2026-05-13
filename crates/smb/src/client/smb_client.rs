@@ -514,6 +514,27 @@ impl Client {
         self._with_tree(path, |tree| Ok(tree.session.clone())).await
     }
 
+    /// Subscribe to lease-break notifications for the connection to `server`.
+    ///
+    /// Returns a [`tokio::sync::broadcast::Receiver`] that yields one
+    /// [`crate::LeaseBreakEvent`] per `LeaseBreakNotify` the server sends on
+    /// this connection. The connection task has already replied with a
+    /// `LeaseBreakAck` by the time the event is published, so receivers
+    /// only need to handle the *consequence* of the break (typically:
+    /// drop the cached `FileId` keyed by `lease_key` and force the next
+    /// open to re-issue Create on the wire).
+    ///
+    /// Errors: returns the same set as [`Client::get_connection`]; the
+    /// caller must have already established the connection.
+    #[cfg(feature = "async")]
+    pub async fn subscribe_lease_breaks(
+        &self,
+        server: &str,
+    ) -> crate::Result<tokio::sync::broadcast::Receiver<crate::LeaseBreakEvent>> {
+        let conn = self.get_connection(server).await?;
+        Ok(conn.subscribe_lease_breaks())
+    }
+
     /// Returns a map of channel IDs to their corresponding connections for the specified session,
     pub async fn get_channels(
         &self,

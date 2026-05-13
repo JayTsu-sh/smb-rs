@@ -128,14 +128,17 @@ where
             let msg = msg?;
 
             // Server-to-client commands check.
-            // allow only oplock break and server to client notification.
+            // Allow oplock break / lease break notifications and server-to-client
+            // notifications. (`*Break` ack-response messages carry a regular
+            // request_id and never take this unsolicited branch.)
             if !matches!(
                 msg.message.content,
                 ResponseContent::OplockBreakNotify(_)
+                    | ResponseContent::LeaseBreakNotify(_)
                     | ResponseContent::ServerToClientNotification(_)
             ) {
                 return Err(Error::MessageProcessingError(
-                    "Received notification message, but not an OPLOCK_BREAK or SERVER_TO_CLIENT_NOTIFICATION.".to_string(),
+                    "Received notification message, but not an OPLOCK_BREAK / LEASE_BREAK / SERVER_TO_CLIENT_NOTIFICATION.".to_string(),
                 ));
             }
 

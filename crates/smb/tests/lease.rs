@@ -17,20 +17,12 @@
 //! SMB 2.1+ server advertising `caps.leasing()` is sufficient.
 
 mod common;
-use common::{TestConstants, make_server_connection};
+use common::{make_server_connection, smb_tests_share};
 use serial_test::serial;
 use smb::{FileCreateArgs, RequestLease, RequestLeaseV2};
 use smb_fscc::FileDispositionInformation;
 use smb_msg::{LeaseFlags, LeaseState};
-use std::env;
-
-/// Reads the share name from `SMB_RUST_TESTS_SHARE`, falling back to the
-/// shared `TestConstants::DEFAULT_SHARE` when unset. Allows smoke-testing
-/// against real lease-supporting servers (e.g. `jay_cifs1`) without
-/// rebuilding the test binary.
-fn test_share() -> String {
-    env::var("SMB_RUST_TESTS_SHARE").unwrap_or_else(|_| TestConstants::DEFAULT_SHARE.to_string())
-}
+use std::time::Duration;
 
 /// Random-but-stable 128-bit lease key for the test. A real client would
 /// generate a fresh UUID per open; a constant value is fine in a serial test
@@ -58,7 +50,7 @@ fn make_lease_request() -> RequestLease {
 ))]
 #[serial]
 async fn test_lease_request_create_new() -> smb::Result<()> {
-    let share = test_share();
+    let share = smb_tests_share();
     let (client, share_path) = make_server_connection(&share, None).await?;
 
     // Inspect the negotiated capabilities so we can interpret the result:
@@ -122,7 +114,7 @@ async fn test_no_lease_request_has_no_grant() -> smb::Result<()> {
     // never produce a grant, regardless of server capability. This proves
     // Phase A's `lease_requested` gate correctly suppresses parsing when
     // the client didn't ask.
-    let share = test_share();
+    let share = smb_tests_share();
     let (client, share_path) = make_server_connection(&share, None).await?;
 
     let args = FileCreateArgs::make_overwrite(Default::default(), Default::default());
@@ -141,5 +133,111 @@ async fn test_no_lease_request_has_no_grant() -> smb::Result<()> {
 
     file.set_info(FileDispositionInformation::default()).await?;
     file.close().await?;
+    Ok(())
+}
+
+/// Phase B (LeaseBreakNotify reception + auto-Ack):
+///
+/// Client A opens a file with a HandleCaching+ReadCaching lease, then a
+/// separate Client B opens the same path. The server is required to break
+/// the handle-caching component of A's lease and send a `LeaseBreakNotify`;
+/// the smb-rs connection task receives it, auto-sends a `LeaseBreakAck`,
+/// and fans out a `LeaseBreakEvent` to subscribers — which is what this
+/// test waits for.
+///
+/// This is the end-to-end proof that Phase B's wire-level integration
+/// works: subscription + decode + ack + fan-out. Unit-testable in isolation
+/// is the decode/fan-out; only a real server can drive the break.
+#[test_log::test(maybe_async::test(
+    not(feature = "async"),
+    async(feature = "async", tokio::test(flavor = "current_thread"))
+))]
+#[serial]
+async fn test_lease_break_notify_fanned_out() -> smb::Result<()> {
+    let share = smb_tests_share();
+
+    // Client A: holds the lease, subscribes to breaks.
+    let (client_a, share_path_a) = make_server_connection(&share, None).await?;
+    let conn = client_a.get_connection(share_path_a.server()).await?;
+    let info = conn.conn_info().expect("connection negotiated");
+    if !info.negotiation.caps.leasing() {
+        tracing::warn!(
+            "Server does not advertise caps.leasing(); Phase B break test \
+             cannot run against this server. Skipping."
+        );
+        return Ok(());
+    }
+
+    let mut break_rx = client_a
+        .subscribe_lease_breaks(share_path_a.server())
+        .await?;
+
+    let path = share_path_a.with_path("lease_phase_b_break.txt");
+    let lease = RequestLease::RqLsReqv2(RequestLeaseV2 {
+        lease_key: TEST_LEASE_KEY,
+        lease_state: LeaseState::new()
+            .with_read_caching(true)
+            .with_handle_caching(true),
+        lease_flags: LeaseFlags::new(),
+        parent_lease_key: 0,
+        epoch: 0,
+    });
+    let args_a = FileCreateArgs::make_overwrite(Default::default(), Default::default())
+        .with_lease(lease);
+    let file_a = client_a
+        .create_file(&path, &args_a)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+
+    let grant = file_a
+        .handle()
+        .lease_granted()
+        .expect("server with caps.leasing() must issue a grant");
+    tracing::info!("Client A holds lease: {grant:?}");
+    assert!(
+        grant.state.handle_caching(),
+        "test relies on handle_caching to provoke a break on B's open",
+    );
+
+    // Client B: independent connection to same server, opens the same path
+    // with OverwriteIf + GenericAll — strongly conflicts with A's
+    // HandleCaching+ReadCaching lease. Per MS-SMB2 2.2.23.2 the server must
+    // send a LeaseBreakNotify to A before completing B's Create.
+    let (client_b, share_path_b) = make_server_connection(&share, None).await?;
+    let path_b = share_path_b.with_path("lease_phase_b_break.txt");
+    let file_b = client_b
+        .create_file(
+            &path_b,
+            &FileCreateArgs::make_overwrite(Default::default(), Default::default()),
+        )
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+
+    // Bounded wait so a misbehaving server can't hang CI.
+    let event = tokio::time::timeout(Duration::from_secs(10), break_rx.recv())
+        .await
+        .expect("LeaseBreakNotify must arrive within 10s of B's conflicting open")
+        .expect("broadcast channel must remain open while client A is alive");
+
+    tracing::info!("Client A received break event: {event:?}");
+    assert_eq!(
+        event.lease_key.as_u128(),
+        grant.key,
+        "break must target the lease we acquired (compared via u128 since \
+         LeaseBreakNotify uses Guid while RequestLease uses u128)",
+    );
+    assert!(
+        !event.new_state.handle_caching(),
+        "server must drop handle_caching when another client opens the file",
+    );
+
+    // Cleanup: drop B first so A's set_info can mark the file for delete.
+    drop(file_b);
+    file_a
+        .set_info(FileDispositionInformation::default())
+        .await?;
+    file_a.close().await?;
     Ok(())
 }

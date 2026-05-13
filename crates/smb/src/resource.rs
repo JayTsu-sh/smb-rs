@@ -147,7 +147,6 @@ impl Resource {
             QueryMaximalAccessRequest::default().into(),
             QueryOnDiskIdReq.into(),
         ];
-        let lease_requested = create_args.lease_request.is_some();
         if let Some(lease_req) = create_args.lease_request.as_ref() {
             contexts.push(lease_req.clone().into());
         }
@@ -155,7 +154,7 @@ impl Resource {
         // MS-SMB2 2.2.13: server 只在 RequestedOplockLevel = Lease (0xFF) 时把
         // `RqLs` context 当 lease 处理；任何其他值（含 None）都让 server 静默忽略。
         // 因此 lease 请求必须把 oplock level 同步切到 Lease。
-        let requested_oplock_level = if lease_requested {
+        let requested_oplock_level = if create_args.lease_request.is_some() {
             OplockLevel::Lease
         } else {
             OplockLevel::None
@@ -200,13 +199,13 @@ impl Resource {
 
         // 仅在 client 显式请求 lease 时才尝试解析 RqLs response context；server 未授予
         // (None) 与 client 未请求语义等价 —— 上层调用方都按"无 lease"处理。
-        let lease_granted = if lease_requested {
+        let lease_granted = if create_args.lease_request.is_some() {
             let grant = CreateContextResponseData::first_rqls(&response.create_contexts)
                 .map(LeaseGrant::from_response);
             match &grant {
                 Some(g) => tracing::debug!(
-                    "Lease granted for '{}': key={:#034x}, state={:?}, epoch={}, v2={}",
-                    name, g.key, g.state, g.epoch, g.is_v2
+                    "Lease granted for '{}': key={:#034x}, state={:?}, epoch={}",
+                    name, g.key, g.state, g.epoch
                 ),
                 None => tracing::debug!(
                     "Lease requested for '{}' but server did not grant one",
@@ -335,6 +334,10 @@ make_resource_try_into!(File, Directory, Pipe,);
 /// in a `CreateResponse`. Captures only the fields the client needs to track
 /// the lease lifecycle; Phase B/C will key into [`ResourceHandle::lease_granted`]
 /// when wiring break notifications and the lease_table cache.
+///
+/// `epoch == 0` is valid for either a v1 lease (no epoch field on the wire)
+/// or a v2 lease whose server happens to start at epoch 0. Callers needing
+/// to distinguish should compare against the `RequestLease` variant they sent.
 #[derive(Debug, Clone, Copy)]
 pub struct LeaseGrant {
     /// Client-generated key that identifies this lease.
@@ -342,10 +345,8 @@ pub struct LeaseGrant {
     /// The lease state actually granted by the server (may be a subset of
     /// what was requested).
     pub state: LeaseState,
-    /// Epoch counter for state changes (always 0 for v1 leases).
+    /// Epoch counter for state changes; `0` for v1 leases.
     pub epoch: u16,
-    /// `true` if the response carried a v2 (`RqLsReqv2`) lease, `false` for v1.
-    pub is_v2: bool,
 }
 
 impl LeaseGrant {
@@ -356,13 +357,11 @@ impl LeaseGrant {
                 key: v1.lease_key,
                 state: v1.lease_state,
                 epoch: 0,
-                is_v2: false,
             },
             RequestLease::RqLsReqv2(v2) => Self {
                 key: v2.lease_key,
                 state: v2.lease_state,
                 epoch: v2.epoch,
-                is_v2: true,
             },
         }
     }
@@ -1107,7 +1106,6 @@ mod tests {
         assert!(grant.state.handle_caching());
         assert!(!grant.state.write_caching());
         assert_eq!(grant.epoch, 0, "v1 lease has no epoch field");
-        assert!(!grant.is_v2);
     }
 
     #[test]
@@ -1125,7 +1123,6 @@ mod tests {
         assert!(grant.state.handle_caching());
         assert!(grant.state.write_caching());
         assert_eq!(grant.epoch, 0x1337);
-        assert!(grant.is_v2);
     }
 
     #[test]

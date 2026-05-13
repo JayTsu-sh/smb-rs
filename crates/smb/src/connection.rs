@@ -7,6 +7,7 @@ pub mod worker;
 use crate::compression;
 use crate::connection::preauth_hash::PreauthHashState;
 use crate::dialects::DialectImpl;
+use crate::lease::LeaseBreakEvent;
 use crate::session::ChannelMessageHandler;
 use crate::sync_helpers::*;
 use crate::{Error, crypto, msg_handler::*, session::Session};
@@ -17,7 +18,10 @@ use maybe_async::*;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use smb_dtyp::*;
-use smb_msg::{Command, Response, negotiate::*, plain::*, smb1::SMB1NegotiateMessage};
+use smb_msg::{
+    Command, RequestContent, Response, ResponseContent, negotiate::*,
+    oplock::LeaseBreakAck, smb1::SMB1NegotiateMessage,
+};
 use smb_transport::*;
 use std::cmp::max;
 use std::collections::HashMap;
@@ -25,8 +29,16 @@ use std::net::SocketAddr;
 #[cfg(feature = "multi_threaded")]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::time::Instant;
 pub use transformer::TransformError;
 use worker::{Worker, WorkerImpl};
+
+/// Capacity of the per-connection lease-break broadcast. A handful of slow
+/// subscribers wouldn't trail behind by more than this many events; if they
+/// do, they receive `RecvError::Lagged` and miss the older notifications —
+/// acceptable since the ack itself has already been sent by the connection
+/// task and the subscriber's role is just to invalidate cached state.
+const LEASE_BREAK_CHANNEL_CAPACITY: usize = 64;
 
 /// Represents an SMB connection.
 ///
@@ -498,9 +510,18 @@ impl Connection {
             .negotaite_complete(&info)
             .await;
 
+        // Always start the notify task unless the caller explicitly disabled
+        // it. `caps.notifications()` is the SMB 3.1.1 ChangeNotify capability
+        // and only modern Windows servers advertise it, but OplockBreak /
+        // LeaseBreak notifications are part of the base SMB 2.x protocol and
+        // every server can send them — we must always be ready to receive,
+        // ack, and dispatch them, otherwise lease handling silently breaks.
         #[cfg(not(feature = "single_threaded"))]
-        if !self.config.disable_notifications && info.negotiation.caps.notifications() {
-            tracing::debug!("Starting Notification job.");
+        if !self.config.disable_notifications {
+            tracing::debug!(
+                "Starting Notification job (server notifications cap={}).",
+                info.negotiation.caps.notifications()
+            );
             self.handler.handler.start_notify().await?;
             tracing::debug!("Notification job started.");
         }
@@ -551,6 +572,15 @@ impl Connection {
     pub fn conn_info(&self) -> Option<&Arc<ConnectionInfo>> {
         self.handler.conn_info.get()
     }
+
+    /// Subscribe to lease-break notifications received on this connection.
+    /// See [`ConnectionMessageHandler::subscribe_lease_breaks`] for semantics.
+    #[cfg(feature = "async")]
+    pub fn subscribe_lease_breaks(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<LeaseBreakEvent> {
+        self.handler.subscribe_lease_breaks()
+    }
 }
 
 /// This struct is the internal message handler for the SMB client.
@@ -583,10 +613,21 @@ pub(crate) struct ConnectionMessageHandler {
     /// The number of credits granted to the client by the server, including the being-used ones.
     /// This field is used ONLY when large MTU is enabled.
     credit_pool: AtomicU16,
+
+    /// Broadcasts [`LeaseBreakEvent`] to any [`crate::Client::subscribe_lease_breaks`]
+    /// consumers when the server sends a `LeaseBreakNotify`. Only present
+    /// under the `async` feature — sync builds receive notifications via
+    /// the existing notify path but do not fan them out.
+    #[cfg(feature = "async")]
+    lease_event_tx: tokio::sync::broadcast::Sender<LeaseBreakEvent>,
 }
 
 impl ConnectionMessageHandler {
     fn new(client_guid: Guid, credits_backlog: Option<u16>) -> ConnectionMessageHandler {
+        #[cfg(feature = "async")]
+        let (lease_event_tx, _) =
+            tokio::sync::broadcast::channel(LEASE_BREAK_CHANNEL_CAPACITY);
+
         ConnectionMessageHandler {
             client_guid,
             worker: OnceCell::new(),
@@ -598,7 +639,24 @@ impl ConnectionMessageHandler {
             #[cfg(not(feature = "single_threaded"))]
             stop_notifications: Default::default(),
             sessions: Mutex::new(HashMap::with_capacity(1)),
+            #[cfg(feature = "async")]
+            lease_event_tx,
         }
+    }
+
+    /// Subscribe to lease-break notifications received on this connection.
+    ///
+    /// Each call returns a fresh `Receiver`; sending is broadcast, so multiple
+    /// subscribers each see every event. Lagging subscribers may receive
+    /// `RecvError::Lagged` and skip older events — the connection task has
+    /// already sent the ack by that point, so missing the event only means
+    /// the subscriber's cache invalidation is delayed, never that the
+    /// protocol is left in a bad state.
+    #[cfg(feature = "async")]
+    pub fn subscribe_lease_breaks(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<LeaseBreakEvent> {
+        self.lease_event_tx.subscribe()
     }
 
     pub fn worker(&self) -> Option<&Arc<WorkerImpl>> {
@@ -720,17 +778,34 @@ impl ConnectionMessageHandler {
         let stop_notification = self.stop_notifications.clone();
         let self_clone = self.clone();
         tokio::spawn(async move {
+            // Race the cancellation token against each `rx.recv()` so that
+            // (a) we keep draining notifications as they arrive and
+            // (b) we exit promptly when the connection is shutting down.
+            //
+            // The previous form `select! { _ = cancelled() => break, else => { while let Some() } }`
+            // never entered the inner loop: `select!`'s `else` branch only
+            // fires when all named branches are *disabled* (via `if` guards),
+            // not when they are pending — so the task only waited for
+            // cancellation and never serviced any notification.
             loop {
                 select! {
                     _ = stop_notification.cancelled() => {
                         tracing::info!("Notification handler cancelled.");
                         break;
                     }
-                    else => {
-                        while let Some(msg) = rx.recv().await {
-                            self_clone.notify(msg).await.unwrap_or_else(|e| {
-                                tracing::error!("Error handling notification: {e:?}");
-                            });
+                    next = rx.recv() => {
+                        match next {
+                            Some(msg) => {
+                                if let Err(e) = self_clone.notify(msg).await {
+                                    tracing::error!("Error handling notification: {e:?}");
+                                }
+                            }
+                            None => {
+                                tracing::debug!(
+                                    "Notification channel closed; exiting handler."
+                                );
+                                break;
+                            }
                         }
                     }
                 }
@@ -852,6 +927,15 @@ impl MessageHandler for ConnectionMessageHandler {
 
     #[maybe_async]
     async fn notify(&self, msg: IncomingMessage) -> crate::Result<()> {
+        // Intercept LeaseBreakNotify *before* the session-id sanity check
+        // because the server sends lease breaks with `session_id = 0` per
+        // MS-SMB2 2.2.23.2 — the notification is keyed on lease_key, not
+        // on any particular session. We must ack and fan out the event
+        // promptly to stay within the 35-second break window.
+        if matches!(msg.message.content, ResponseContent::LeaseBreakNotify(_)) {
+            return self.handle_lease_break(msg).await;
+        }
+
         if msg.message.header.session_id == 0 {
             tracing::warn!("Received notification without session ID: {msg:?}");
             return Ok(());
@@ -879,6 +963,134 @@ impl MessageHandler for ConnectionMessageHandler {
 
         session.notify(msg).await?;
         Ok(())
+    }
+}
+
+impl ConnectionMessageHandler {
+    /// Process an incoming `LeaseBreakNotify`. Called from [`Self::notify`]
+    /// before any session forwarding so that:
+    ///
+    /// 1. Subscribers (Phase C `lease_table`, Phase D `cifs.rs::handle_cache`)
+    ///    learn about the broken lease as fast as possible and can flush
+    ///    cached `FileId` entries.
+    /// 2. The required `LeaseBreakAck` is sent back to the server inside
+    ///    the 35-second window, otherwise the server revokes the lease
+    ///    unilaterally and any deferred-close handles error on next use.
+    ///
+    /// Failures sending the ack are logged but not propagated — the
+    /// connection-wide notify loop must keep draining notifications even
+    /// if a single ack fails. Phase C will surface ack failures back to
+    /// the affected handle through the broadcast event.
+    #[maybe_async]
+    async fn handle_lease_break(&self, msg: IncomingMessage) -> crate::Result<()> {
+        let notify = match msg.message.content {
+            ResponseContent::LeaseBreakNotify(n) => n,
+            // SAFETY: caller (`Self::notify`) just matched the variant.
+            other => {
+                return Err(Error::InvalidState(format!(
+                    "handle_lease_break called with non-LeaseBreakNotify content: {other:?}"
+                )));
+            }
+        };
+
+        let ack_required = notify.ack_required != 0;
+        tracing::debug!(
+            lease_key = ?notify.lease_key,
+            current = ?notify.current_lease_state,
+            new = ?notify.new_lease_state,
+            ack_required,
+            "LeaseBreakNotify received"
+        );
+
+        // ACK FIRST (latency-critical path): NetApp-class clustered storage
+        // doesn't always wait the spec-mandated 60s for the ack before
+        // completing the open that caused the break — some tear down the
+        // lease entry as soon as they dispatch the notify, returning
+        // STATUS_NETWORK_NAME_DELETED for a "stale" ack. Send it before
+        // the in-memory broadcast so the wire-time gap is minimal.
+        if ack_required {
+            self.send_lease_break_ack(&notify).await;
+        }
+
+        // FAN OUT EVENT (after ack so wire-time is minimized)
+        //
+        // Subscribers (Phase C lease_table, Phase D cifs handle_cache)
+        // see this event regardless of whether the ack reached the server
+        // — they invalidate their cached state because the lease is
+        // logically broken from this moment on.
+        #[cfg(feature = "async")]
+        {
+            let event = LeaseBreakEvent {
+                lease_key: notify.lease_key,
+                current_state: notify.current_lease_state,
+                new_state: notify.new_lease_state,
+                epoch: notify.new_epoch,
+                ack_required,
+                received_at: Instant::now(),
+            };
+            // send returns Err only when there are zero active receivers,
+            // which is normal during early bring-up; ignore it.
+            let _ = self.lease_event_tx.send(event);
+        }
+
+        Ok(())
+    }
+
+    /// Construct and send a `LeaseBreakAck` for the given notification.
+    ///
+    /// Fire-and-forget (`has_response = false`): the server's
+    /// `LeaseBreakResponse` is purely informational, and waiting for it
+    /// would block the notify task. If it arrives later, the worker's
+    /// response router drops it as unmatched.
+    ///
+    /// The ack is sent through any active session on this connection so
+    /// it gets signed under the session key — sending unsigned via the
+    /// bare connection handler triggers STATUS_NETWORK_NAME_DELETED on
+    /// Samba-based servers. Lease identity is in the lease_key, not the
+    /// session, so the choice of session doesn't matter.
+    #[maybe_async]
+    async fn send_lease_break_ack(&self, notify: &smb_msg::LeaseBreakNotify) {
+        let session_handler = {
+            let sessions = match self.sessions.lock().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        lease_key = ?notify.lease_key,
+                        error = ?e,
+                        "Cannot send LeaseBreakAck: sessions lock poisoned",
+                    );
+                    return;
+                }
+            };
+            sessions.values().find_map(|w| w.upgrade())
+        };
+
+        let Some(h) = session_handler else {
+            tracing::warn!(
+                lease_key = ?notify.lease_key,
+                "Cannot send LeaseBreakAck: no active session on this connection",
+            );
+            return;
+        };
+
+        let ack = LeaseBreakAck {
+            lease_key: notify.lease_key,
+            lease_state: notify.new_lease_state,
+        };
+        let mut out = OutgoingMessage::new(RequestContent::LeaseBreakAck(ack));
+        out.has_response = false;
+        match h.sendo(out).await {
+            Ok(r) => tracing::debug!(
+                lease_key = ?notify.lease_key,
+                msg_id = r.msg_id,
+                "LeaseBreakAck sent (fire-and-forget)",
+            ),
+            Err(e) => tracing::warn!(
+                lease_key = ?notify.lease_key,
+                error = ?e,
+                "LeaseBreakAck send failed — server will revoke the lease",
+            ),
+        }
     }
 }
 

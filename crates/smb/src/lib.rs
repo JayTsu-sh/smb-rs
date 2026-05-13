@@ -25,6 +25,7 @@ pub mod crypto;
 pub mod dialects;
 pub mod docs;
 pub mod error;
+pub mod lease;
 pub mod msg_handler;
 pub mod resource;
 pub mod session;
@@ -33,6 +34,7 @@ pub mod tree;
 pub use client::{Client, ClientConfig, UncPath};
 pub use connection::{Connection, ConnectionConfig};
 pub use error::Error;
+pub use lease::LeaseBreakEvent;
 pub use resource::{
     Directory, File, FileCreateArgs, GetLen, Pipe, PipeRpcConnection, ReadAt, ReadAtChannel,
     Resource, ResourceHandle, WriteAt, WriteAtChannel,
