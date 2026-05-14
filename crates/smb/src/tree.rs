@@ -206,6 +206,15 @@ impl Tree {
         self.handler.tree_id.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Borrow the tree's underlying `Upstream` handler reference.
+    /// Phase C uses this from [`crate::resource::Resource::build_lease_proto`]
+    /// so the lease cache can construct a `ResourceMessageHandle` against
+    /// the same tree the Create was issued on. `pub(crate)` because the
+    /// `HandlerReference` type is internal.
+    pub(crate) fn handler_ref(&self) -> &HandlerReference<TreeMessageHandler> {
+        &self.handler
+    }
+
     pub fn as_dfs_tree(&self) -> crate::Result<DfsRootTreeRef<'_>> {
         if !self.is_dfs_root()? {
             return Err(Error::InvalidState("Tree is not a DFS tree".to_string()));

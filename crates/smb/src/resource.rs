@@ -12,6 +12,7 @@ use time::PrimitiveDateTime;
 use crate::{
     Error,
     connection::connection_info::ConnectionInfo,
+    lease::{LeaseSlot, ResourceProto, SlotReleaseAction},
     msg_handler::{
         AsyncMessageIds, HandlerReference, IncomingMessage, MessageHandler, OutgoingMessage,
         ReceiveOptions, SendMessageResult,
@@ -217,7 +218,10 @@ impl Resource {
             None
         };
 
-        // Common information is held in the handle object.
+        // Common information is held in the handle object. `lease_slot`
+        // defaults to None; if a lease was granted and the higher-level
+        // client opts in, [`Client::_create_file`] will attach a slot via
+        // [`Resource::attach_lease_slot`] after this function returns.
         let handle = ResourceHandle {
             name: name.to_string(),
             handler: ResourceMessageHandle::new(upstream),
@@ -227,6 +231,7 @@ impl Resource {
             modified: response.last_write_time.date_time(),
             access,
             lease_granted,
+            lease_slot: None,
             share_type,
             conn_info: conn_info.clone(),
         };
@@ -268,6 +273,119 @@ impl Resource {
             Resource::Directory(d) => Some(d.handle()),
             Resource::Pipe(p) => Some(p.handle()),
         }
+    }
+
+    /// Mutable counterpart to [`Resource::handle`]. Phase C uses this
+    /// from [`Client::_create_file`] to attach a fresh lease slot to a
+    /// resource that was just opened on the wire — once attached, the
+    /// resource's `close()` and `Drop` participate in deferred-close.
+    pub(crate) fn handle_mut(&mut self) -> Option<&mut ResourceHandle> {
+        match self {
+            Resource::File(f) => Some(&mut f.handle),
+            Resource::Directory(d) => Some(&mut d.handle),
+            Resource::Pipe(p) => Some(&mut p.handle),
+        }
+    }
+
+    /// Phase C.3: install a lease slot on a freshly-created resource so
+    /// its close/Drop will go through the deferred-close path. Called by
+    /// [`Client::_create_file`] right after slot insertion in the
+    /// connection's `lease_table`. Idempotent — overwriting an existing
+    /// slot would be a logic bug (only the original Create attaches one),
+    /// so we don't guard against it.
+    pub(crate) fn attach_lease_slot(&mut self, slot: Arc<LeaseSlot>) {
+        if let Some(h) = self.handle_mut() {
+            h.lease_slot = Some(slot);
+        }
+    }
+
+    /// Phase C.3: materialize a cache-hit resource from an existing
+    /// `LeaseSlot`. Skips the wire `Create` entirely — the returned
+    /// resource reuses the slot's `FileId`, handler chain, and creation
+    /// metadata. The slot's refcount is *not* incremented here; the
+    /// caller (`Client::_create_file`) must have already called
+    /// [`LeaseSlot::try_acquire_for_reuse`] which performs the bump
+    /// atomically with the eligibility check.
+    pub(crate) fn reuse_from_slot(slot: Arc<LeaseSlot>) -> Resource {
+        let proto = slot.proto.clone();
+        let granted_state = slot
+            .granted_state
+            .read()
+            .map(|s| *s)
+            .unwrap_or_else(|p| *p.into_inner());
+
+        let handle = ResourceHandle {
+            name: slot.path.clone(),
+            handler: proto.handler.clone(),
+            open: AtomicBool::new(true),
+            _file_id: slot.file_id,
+            created: proto.created,
+            modified: proto.modified,
+            access: proto.access,
+            lease_granted: Some(LeaseGrant {
+                key: slot.lease_key,
+                state: granted_state,
+                epoch: proto.epoch_at_grant,
+            }),
+            lease_slot: Some(slot.clone()),
+            share_type: proto.share_type,
+            conn_info: proto.conn_info.clone(),
+        };
+
+        if proto.is_dir {
+            Resource::Directory(Directory::new(handle))
+        } else {
+            match proto.share_type {
+                ShareType::Disk => Resource::File(File::new(handle, proto.endof_file)),
+                ShareType::Pipe => Resource::Pipe(Pipe::new(handle)),
+                ShareType::Print => {
+                    // Cache-hit on a Print share is impossible: print
+                    // creates always use `CreateDisposition::Create`,
+                    // which `try_acquire_for_reuse` rejects. Falling
+                    // back to a File wrapper here keeps the type system
+                    // happy without introducing a dead variant.
+                    Resource::File(File::new(handle, proto.endof_file))
+                }
+            }
+        }
+    }
+
+    /// Build a [`ResourceProto`] snapshot from a freshly-created resource
+    /// and an `Upstream` reference. Phase C.1's slot-insert path now
+    /// captures full reconstruction data here instead of the partial
+    /// (file_id, lease_key, state) tuple it carried originally. Returns
+    /// `None` only when the resource has no handle (shouldn't happen for
+    /// successful creates today).
+    ///
+    /// `requested_access` must be the user-facing
+    /// [`FileCreateArgs::desired_access`] from the originating Create
+    /// (pre-server-expansion). Cache-hit eligibility compares the new
+    /// caller's request against this, so passing the server-expanded
+    /// mask here would cause spurious misses for `generic_*` requests.
+    pub(crate) fn build_lease_proto(
+        &self,
+        upstream: &Upstream,
+        requested_access: FileAccessMask,
+    ) -> Option<Arc<ResourceProto>> {
+        let h = self.handle()?;
+        let endof_file = match self {
+            Resource::File(f) => f.end_of_file(),
+            _ => 0,
+        };
+        let is_dir = matches!(self, Resource::Directory(_));
+        let epoch_at_grant = h.lease_granted.map(|g| g.epoch).unwrap_or(0);
+        Some(Arc::new(ResourceProto {
+            handler: ResourceMessageHandle::new(upstream),
+            conn_info: h.conn_info.clone(),
+            created: h.created,
+            modified: h.modified,
+            share_type: h.share_type,
+            endof_file,
+            is_dir,
+            access: h.access,
+            requested_access,
+            epoch_at_grant,
+        }))
     }
 
     pub fn as_dir(&self) -> Option<&Directory> {
@@ -403,6 +521,13 @@ pub struct ResourceHandle {
     /// `Some` and the server replied with an `RqLs` response context.
     /// `None` when no lease was requested or the server didn't grant one.
     lease_granted: Option<LeaseGrant>,
+
+    /// Phase C: when this handle is backed by a cached lease slot, close()
+    /// and Drop release a refcount on the slot instead of sending a wire
+    /// `Close`. The real `Close` is deferred until the slot is tombstoned
+    /// *and* its refcount reaches zero. `None` for opens that didn't
+    /// participate in the lease cache.
+    lease_slot: Option<Arc<LeaseSlot>>,
 
     conn_info: Arc<ConnectionInfo>,
 }
@@ -955,12 +1080,51 @@ impl ResourceHandle {
     /// Closes the resource.
     /// The resource may not be used after calling this method.
     ///
+    /// # Phase C deferred-close
+    ///
+    /// When this handle is backed by a [`LeaseSlot`] (i.e. the original
+    /// Create or a cache-hit reopen attached one), the wire `Close` is
+    /// suppressed: we just flip `open = false` locally and release one
+    /// refcount on the slot. The slot's FileId stays valid on the
+    /// server, available for the next reopen on the same path.
+    ///
+    /// The real `Close` is sent only when [`LeaseSlot::release_one`]
+    /// reports [`SlotReleaseAction::CloseAndEvict`] — i.e. *this* close
+    /// dropped the refcount to zero *and* the slot has been tombstoned
+    /// (server break or explicit eviction).
+    ///
     /// # Returns
     /// A `Result` indicating success or failure.
     #[tracing::instrument(level = "debug", skip_all, fields(name = %self.name))]
     pub async fn close(&self) -> crate::Result<()> {
         if !self.open.swap(false, std::sync::atomic::Ordering::Relaxed) {
             return Err(Error::InvalidState("Resource is already closed".into()));
+        }
+
+        if let Some(slot) = self.lease_slot.as_ref() {
+            match slot.release_one() {
+                SlotReleaseAction::KeepCached => {
+                    tracing::debug!(
+                        path = %slot.path,
+                        file_id = ?self._file_id,
+                        "Deferred close: lease slot still cached",
+                    );
+                    return Ok(());
+                }
+                SlotReleaseAction::CloseAndEvict => {
+                    tracing::debug!(
+                        path = %slot.path,
+                        file_id = ?self._file_id,
+                        "Lease slot evicted; sending deferred Close on the wire",
+                    );
+                    // Fall through to the regular send_close path below.
+                    // The connection-level lease_table cleanup happens on
+                    // the next sweep (Phase C.5 flush_idle_leases) or on
+                    // explicit Client::evict_lease — keeping the entry
+                    // around briefly is harmless because tombstoned slots
+                    // are not eligible for cache hits.
+                }
+            }
         }
 
         tracing::debug!(file_id = ?self._file_id, "Closing handle");
@@ -1029,12 +1193,15 @@ impl ResourceHandle {
     }
 }
 
-struct ResourceMessageHandle {
+// `pub(crate)` so [`crate::lease::ResourceProto`] can hold a `HandlerReference`
+// to it across the cache-hit reconstruction path. The type itself remains
+// invisible to external callers — they only interact through `Resource`.
+pub(crate) struct ResourceMessageHandle {
     upstream: Upstream,
 }
 
 impl ResourceMessageHandle {
-    fn new(upstream: &Upstream) -> HandlerReference<ResourceMessageHandle> {
+    pub(crate) fn new(upstream: &Upstream) -> HandlerReference<ResourceMessageHandle> {
         HandlerReference::new(ResourceMessageHandle {
             upstream: upstream.clone(),
         })
@@ -1083,6 +1250,31 @@ impl Drop for ResourceHandle {
         if !self.open.swap(false, std::sync::atomic::Ordering::Relaxed) {
             // already closed, no problem
             return;
+        }
+
+        // Phase C: if a lease slot is in play, decrement its refcount and
+        // only send the wire `Close` when this drop made the slot
+        // releasable (refcount=0 AND tombstoned). Otherwise the FileId
+        // stays alive for the next cache hit.
+        if let Some(slot) = self.lease_slot.as_ref() {
+            match slot.release_one() {
+                SlotReleaseAction::KeepCached => {
+                    tracing::debug!(
+                        path = %slot.path,
+                        file_id = ?self._file_id,
+                        "Drop: lease slot retained (not tombstoned or refs remain)",
+                    );
+                    return;
+                }
+                SlotReleaseAction::CloseAndEvict => {
+                    tracing::debug!(
+                        path = %slot.path,
+                        file_id = ?self._file_id,
+                        "Drop: lease slot evicted; scheduling wire Close",
+                    );
+                    // Fall through to the legacy spawn-Close branch below.
+                }
+            }
         }
 
         let file_id = self._file_id;

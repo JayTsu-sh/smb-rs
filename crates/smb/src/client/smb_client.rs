@@ -368,31 +368,61 @@ impl Client {
 
     async fn _create_file(&self, path: &UncPath, args: &FileCreateArgs) -> crate::Result<Resource> {
         let tree = self.get_tree(path).await?;
-        let resource = tree.create(path.path().unwrap_or(""), args).await?;
+        let rel = path.path().unwrap_or("").to_string();
 
-        // Phase C.1: install a lease slot into the per-connection cache when
-        // the server granted a lease on this Create. Subsequent micro-steps
-        // (C.3) will check the cache *before* issuing Create at all; for
-        // now we only populate it so the next opens can observe the entry.
-        if let Some(handle) = resource.handle() {
-            if let Some(grant) = handle.lease_granted() {
-                let slot = std::sync::Arc::new(crate::lease::LeaseSlot::new(
-                    path.path().unwrap_or("").to_string(),
+        // Phase C.3 — cache-hit short-circuit. When the caller asked for a
+        // lease, check the per-connection lease_table first; if there's a
+        // live, non-tombstoned slot with a compatible access mask and the
+        // disposition is `Open`, materialize a fresh Resource from the
+        // slot without touching the wire. This is the actual RT-saving
+        // path that the rest of Phase C is built around.
+        if args.lease_request.is_some() {
+            if let Ok(conn) = self.get_connection(path.server()).await {
+                if let Ok(Some(slot)) = conn.peek_lease_slot(&rel).await {
+                    let wants_dir = args.options.directory_file();
+                    if slot.try_acquire_for_reuse(
+                        args.desired_access,
+                        args.disposition,
+                        wants_dir,
+                    ) {
+                        tracing::debug!(
+                            path = %rel,
+                            file_id = ?slot.file_id,
+                            "Lease cache hit; reusing FileId without Create RT",
+                        );
+                        return Ok(Resource::reuse_from_slot(slot));
+                    }
+                }
+            }
+        }
+
+        // Cache miss (or no lease requested): take the regular wire path.
+        let mut resource = tree.create(&rel, args).await?;
+
+        // Phase C.1: install a slot into the per-connection cache so the
+        // *next* call against the same path can hit C.3. Also attach the
+        // slot to the resource we're returning so its close()/Drop go
+        // through the deferred-close path (C.4).
+        let grant = resource.handle().and_then(|h| h.lease_granted());
+        if let Some(grant) = grant {
+            if let Some(proto) = resource.build_lease_proto(tree.handler_ref(), args.desired_access) {
+                let slot = std::sync::Arc::new(crate::lease::LeaseSlot::new_with_proto(
+                    rel.clone(),
                     tree.tree_id(),
-                    handle.raw_file_id(),
+                    resource.handle().map(|h| h.raw_file_id()).unwrap_or_default(),
                     grant.key,
                     grant.state,
+                    proto,
                 ));
                 match self.get_connection(path.server()).await {
-                    Ok(conn) => {
-                        if let Err(e) = conn.insert_lease_slot(slot).await {
-                            tracing::warn!(
-                                path = %path,
-                                error = ?e,
-                                "Failed to install lease slot in cache",
-                            );
-                        }
-                    }
+                    Ok(conn) => match conn.insert_lease_slot(slot.clone()).await {
+                        Ok(()) => resource.attach_lease_slot(slot),
+                        Err(e) => tracing::warn!(
+                            path = %path,
+                            error = ?e,
+                            "Failed to install lease slot in cache",
+                        ),
+                    },
                     Err(e) => tracing::warn!(
                         path = %path,
                         error = ?e,

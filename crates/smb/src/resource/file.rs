@@ -19,7 +19,10 @@ use std::ops::{Deref, DerefMut};
 /// You may not directly create this struct. Instead, use the [Tree::create][crate::tree::Tree::create] method to gain
 /// a proper handle against the server in the shape of a [Resource], that can be then converted to a [File].
 pub struct File {
-    handle: ResourceHandle,
+    // `pub(crate)` so [`crate::resource::Resource::handle_mut`] can take a
+    // mutable borrow during Phase C lease-slot attachment. External callers
+    // still go through [`File::handle()`].
+    pub(crate) handle: ResourceHandle,
 
     #[cfg(not(feature = "async"))]
     pos: u64,
@@ -40,6 +43,14 @@ impl File {
             #[cfg(not(feature = "async"))]
             dirty: false,
         }
+    }
+
+    /// Returns the server-reported size at the moment the file was
+    /// opened. Used by the Phase C lease cache to snapshot the file size
+    /// in [`crate::lease::ResourceProto`] so cache-hit reopens can
+    /// surface the same size without an extra QueryInfo RT.
+    pub(crate) fn end_of_file(&self) -> u64 {
+        self.end_of_file
     }
 
     /// Returns the access mask of the file,

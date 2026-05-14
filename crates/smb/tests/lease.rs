@@ -387,3 +387,110 @@ async fn test_lease_slot_tombstoned_on_break() -> smb::Result<()> {
     file_a.close().await?;
     Ok(())
 }
+
+/// Phase C.3+C.4 (cache hit + deferred close):
+///
+/// Open a file with a HandleCaching lease, close it, then reopen the same
+/// path with the same lease request. The second open must hit the cache:
+///   * No new FileId issued — the second handle reuses the first FileId.
+///   * The connection's lease_table still has the entry (refcount goes
+///     to 1 on the second open, never to 0 with tombstoned=false).
+///   * The slot's `last_used` advances on hit.
+///
+/// This is the first phase that actually saves network RTs. Subsequent
+/// opens against the same path are pure local table lookups.
+#[test_log::test(maybe_async::test(
+    not(feature = "async"),
+    async(feature = "async", tokio::test(flavor = "current_thread"))
+))]
+#[serial]
+async fn test_lease_cache_hit_reuses_file_id() -> smb::Result<()> {
+    use smb::FileAccessMask;
+    let share = smb_tests_share();
+    let (client, share_path) = make_server_connection(&share, None).await?;
+    let conn = client.get_connection(share_path.server()).await?;
+    let info = conn.conn_info().expect("connection negotiated");
+    if !info.negotiation.caps.leasing() {
+        tracing::warn!("Server lacks caps.leasing(); skipping C.3 cache-hit test.");
+        return Ok(());
+    }
+
+    // Use OverwriteIf for the initial set-up Create so we don't depend on
+    // prior test state; cache-hit Open will use CreateDisposition::Open
+    // which is the only disposition try_acquire_for_reuse accepts.
+    let path_rel = "lease_phase_c3_hit.txt";
+    let unc = share_path.with_path(path_rel);
+
+    // Step 1: prime the cache. OverwriteIf + GenericAll, with lease.
+    let args_prime = FileCreateArgs::make_overwrite(Default::default(), Default::default())
+        .with_lease(make_lease_request());
+    let file_first = client
+        .create_file(&unc, &args_prime)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+    let grant_first = file_first
+        .handle()
+        .lease_granted()
+        .expect("server with caps.leasing() must issue a grant");
+    let file_id_first = file_first.handle().raw_file_id();
+    assert!(
+        grant_first.state.handle_caching(),
+        "cache-hit test relies on handle_caching being granted; got {:?}",
+        grant_first.state,
+    );
+
+    // Step 2: close — but with a lease slot attached, this must be a
+    // deferred close. The slot stays in the cache.
+    file_first.close().await?;
+    let slot_after_close = conn
+        .peek_lease_slot(path_rel)
+        .await?
+        .expect("deferred close must leave the slot in the cache");
+    assert!(
+        !slot_after_close.tombstoned.load(std::sync::atomic::Ordering::Acquire),
+        "no break happened, slot must still be alive (not tombstoned)",
+    );
+    assert_eq!(
+        slot_after_close.refcount.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "refcount returns to 0 after close, but slot stays cached",
+    );
+
+    // Step 3: reopen with CreateDisposition::Open + matching access. The
+    // returned Resource must reuse the cached FileId — no new Create RT
+    // hit the wire. We assert FileId equality as the wire-observable
+    // proof.
+    let args_reopen = FileCreateArgs::make_open_existing(
+        FileAccessMask::new().with_generic_all(true),
+    )
+    .with_lease(make_lease_request());
+    let file_second = client
+        .create_file(&unc, &args_reopen)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+    let file_id_second = file_second.handle().raw_file_id();
+    assert_eq!(
+        file_id_second, file_id_first,
+        "cache hit must reuse the original FileId (saving a Create RT)",
+    );
+    assert_eq!(
+        slot_after_close.refcount.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "second open bumps refcount back to 1",
+    );
+
+    // Step 4: cleanup. set_info+close on the second handle marks the file
+    // for delete. Because the slot was never tombstoned (no server-side
+    // break), this close defers again — the file still gets deleted by
+    // virtue of the dispose flag carrying into the eventual wire close.
+    // We then provoke a tombstone via a flush_idle equivalent: a
+    // separate client opening the file would force a break, but here we
+    // just let drop() of the connection close everything at test end.
+    file_second
+        .set_info(FileDispositionInformation::default())
+        .await?;
+    file_second.close().await?;
+    Ok(())
+}

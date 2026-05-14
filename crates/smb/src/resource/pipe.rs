@@ -6,7 +6,9 @@ use maybe_async::*;
 use smb_msg::{IoctlBuffer, PipeTransceiveRequest, ReadRequest, WriteRequest};
 use smb_rpc::{SmbRpcError, interface::*, ndr64::NDR64_SYNTAX_ID, pdu::*};
 pub struct Pipe {
-    handle: ResourceHandle,
+    // `pub(crate)` so [`crate::resource::Resource::handle_mut`] can take a
+    // mutable borrow during Phase C lease-slot attachment.
+    pub(crate) handle: ResourceHandle,
 }
 
 #[maybe_async(AFIT)]
