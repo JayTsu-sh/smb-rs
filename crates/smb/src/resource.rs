@@ -1077,6 +1077,20 @@ impl ResourceHandle {
         Ok(())
     }
 
+    /// Phase C.5: pub(crate) entry point so the lease-eviction path in
+    /// [`crate::Client::flush_eviction`] can send the deferred wire
+    /// `Close` against a slot whose owning [`ResourceHandle`] is already
+    /// gone (refcount was zero at evict time). The handler is pulled
+    /// from `LeaseSlot::proto`, so the close goes through the same
+    /// tree+session as the original Create.
+    #[maybe_async]
+    pub(crate) async fn send_close_external(
+        file_id: FileId,
+        handler: &HandlerReference<ResourceMessageHandle>,
+    ) -> crate::Result<()> {
+        Self::send_close(file_id, handler).await
+    }
+
     /// Closes the resource.
     /// The resource may not be used after calling this method.
     ///

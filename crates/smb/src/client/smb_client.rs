@@ -371,27 +371,29 @@ impl Client {
         let rel = path.path().unwrap_or("").to_string();
 
         // Phase C.3 — cache-hit short-circuit. When the caller asked for a
-        // lease, check the per-connection lease_table first; if there's a
-        // live, non-tombstoned slot with a compatible access mask and the
-        // disposition is `Open`, materialize a fresh Resource from the
-        // slot without touching the wire. This is the actual RT-saving
-        // path that the rest of Phase C is built around.
+        // lease, look up the per-connection `lease_table`; the lookup and
+        // refcount bump happen atomically under the table lock via
+        // `try_acquire_lease`, which serializes us against concurrent
+        // `evict_lease` / `flush_idle_leases` operations so we never
+        // hand out a FileId the evicter has already closed on the wire.
         if args.lease_request.is_some() {
             if let Ok(conn) = self.get_connection(path.server()).await {
-                if let Ok(Some(slot)) = conn.peek_lease_slot(&rel).await {
-                    let wants_dir = args.options.directory_file();
-                    if slot.try_acquire_for_reuse(
+                let wants_dir = args.options.directory_file();
+                if let Ok(Some(slot)) = conn
+                    .try_acquire_lease(
+                        &rel,
                         args.desired_access,
                         args.disposition,
                         wants_dir,
-                    ) {
-                        tracing::debug!(
-                            path = %rel,
-                            file_id = ?slot.file_id,
-                            "Lease cache hit; reusing FileId without Create RT",
-                        );
-                        return Ok(Resource::reuse_from_slot(slot));
-                    }
+                    )
+                    .await
+                {
+                    tracing::debug!(
+                        path = %rel,
+                        file_id = ?slot.file_id,
+                        "Lease cache hit; reusing FileId without Create RT",
+                    );
+                    return Ok(Resource::reuse_from_slot(slot));
                 }
             }
         }
@@ -596,6 +598,92 @@ impl Client {
     ) -> crate::Result<tokio::sync::broadcast::Receiver<crate::LeaseBreakEvent>> {
         let conn = self.get_connection(server).await?;
         Ok(conn.subscribe_lease_breaks())
+    }
+
+    /// Phase C.5: explicit lease eviction for a single path. Tombstones
+    /// the cached slot, removes it from the per-connection table, and
+    /// sends the wire `Close` against the cached `FileId` when this
+    /// caller owns it (no live handles remained at eviction time).
+    ///
+    /// Callers must invoke this *before* destructive operations on the
+    /// path — `delete_file`, `rename`, anything that would invalidate
+    /// the cached FileId server-side — so that subsequent opens don't
+    /// hit a stale entry that the server has already dropped.
+    ///
+    /// Returns `true` when a slot was found and removed, `false` when
+    /// the path had no cached lease (idempotent / safe to call
+    /// preemptively).
+    ///
+    /// The wire `Close` is fire-and-best-effort: failures are logged
+    /// but don't propagate, since the slot is already gone from our
+    /// cache and the path may already be inaccessible (e.g. the
+    /// session lost reconnect, the share dropped).
+    pub async fn evict_lease(&self, path: &UncPath) -> crate::Result<bool> {
+        let rel = path.path().unwrap_or("").to_string();
+        let conn = self.get_connection(path.server()).await?;
+        let Some(eviction) = conn.take_lease_for_evict(&rel).await? else {
+            return Ok(false);
+        };
+        Self::flush_eviction(&path.to_string(), eviction).await;
+        Ok(true)
+    }
+
+    /// Phase C.5: idle-sweep across the connection identified by
+    /// `server`. Tombstones and removes any slot whose `last_used` is
+    /// older than `older_than`; sends the wire `Close` for the ones
+    /// whose refcount was zero at sweep time. Slots with live handles
+    /// stay tombstoned and rely on each handle's deferred-close path.
+    ///
+    /// Returns the number of slots that were tombstoned. A return of
+    /// `0` is normal when no slot has aged past the threshold.
+    pub async fn flush_idle_leases(
+        &self,
+        server: &str,
+        older_than: std::time::Duration,
+    ) -> crate::Result<usize> {
+        let conn = self.get_connection(server).await?;
+        let evictions = conn.sweep_idle_leases(older_than).await?;
+        let count = evictions.len();
+        for eviction in evictions {
+            let label = format!("\\\\{server}\\{}", eviction.slot.path);
+            Self::flush_eviction(&label, eviction).await;
+        }
+        Ok(count)
+    }
+
+    /// Send the wire `Close` for an eviction that owes one. Failures are
+    /// logged at WARN — by the time we reach this point the slot is
+    /// already removed from the cache, so a failed Close just leaks a
+    /// server-side FileId that the session-disconnect will collect.
+    async fn flush_eviction(label: &str, eviction: crate::connection::LeaseEviction) {
+        if !eviction.needs_wire_close {
+            tracing::debug!(
+                path = label,
+                "Eviction handed off to live holder's release_one",
+            );
+            return;
+        }
+        let file_id = eviction.slot.file_id;
+        let handler = eviction.slot.proto.handler.clone();
+        if file_id == smb_msg::FileId::EMPTY {
+            return;
+        }
+        if let Err(e) = crate::resource::ResourceHandle::send_close_external(file_id, &handler)
+            .await
+        {
+            tracing::warn!(
+                path = label,
+                file_id = ?file_id,
+                error = ?e,
+                "Eviction wire Close failed (FileId leaked until session end)",
+            );
+        } else {
+            tracing::debug!(
+                path = label,
+                file_id = ?file_id,
+                "Eviction wire Close sent",
+            );
+        }
     }
 
     /// Returns a map of channel IDs to their corresponding connections for the specified session,

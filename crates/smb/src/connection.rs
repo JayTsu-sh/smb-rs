@@ -610,6 +610,68 @@ impl Connection {
     ) -> crate::Result<Option<Arc<LeaseSlot>>> {
         self.handler.peek_lease_slot(path).await
     }
+
+    /// Atomic cache-hit acquire: peek a slot and bump its refcount inside
+    /// the `lease_table` lock. See
+    /// [`ConnectionMessageHandler::try_acquire_lease`] for semantics and
+    /// the rationale around lock ordering vs eviction.
+    #[maybe_async]
+    pub async fn try_acquire_lease(
+        &self,
+        path: &str,
+        requested_access: smb_fscc::FileAccessMask,
+        requested_disposition: smb_msg::CreateDisposition,
+        wants_directory: bool,
+    ) -> crate::Result<Option<Arc<LeaseSlot>>> {
+        self.handler
+            .try_acquire_lease(path, requested_access, requested_disposition, wants_directory)
+            .await
+    }
+
+    /// Phase C.5: tombstone a lease slot and remove it from the table.
+    /// See [`ConnectionMessageHandler::take_lease_for_evict`] for the
+    /// race-free contract.
+    #[maybe_async]
+    pub async fn take_lease_for_evict(
+        &self,
+        path: &str,
+    ) -> crate::Result<Option<LeaseEviction>> {
+        self.handler.take_lease_for_evict(path).await
+    }
+
+    /// Phase C.5: scan the connection's lease table and tombstone any
+    /// slot whose `last_used` is older than `older_than`. Slots whose
+    /// refcount is zero at sweep time are removed from the table and
+    /// returned for the caller to flush the wire Close. Live-ref slots
+    /// stay in the table tombstoned; their last release_one will send
+    /// the deferred Close through the regular path.
+    #[maybe_async]
+    pub async fn sweep_idle_leases(
+        &self,
+        older_than: std::time::Duration,
+    ) -> crate::Result<Vec<LeaseEviction>> {
+        self.handler.sweep_idle_leases(older_than).await
+    }
+}
+
+/// Phase C.5: a slot that was just removed from the per-connection lease
+/// table because either an explicit `evict_lease` or an idle-sweep
+/// decided to flush it. The caller — `Client::evict_lease` /
+/// `Client::flush_idle_leases` — is responsible for sending the wire
+/// `Close` when `needs_wire_close` is true.
+pub struct LeaseEviction {
+    /// The slot that was removed from the table. Held as `Arc` since
+    /// live `ResourceHandle`s may still reference it; their close()/Drop
+    /// will see `tombstoned == true` and become no-ops on the table
+    /// (we already removed the entry).
+    pub slot: Arc<LeaseSlot>,
+    /// `true` when this eviction owns the wire `Close`: at removal time
+    /// the slot had zero live handles, so no `release_one` path will
+    /// fire it. The caller must send `CloseRequest` against
+    /// `slot.file_id` through `slot.proto.handler`. `false` when at
+    /// least one live handle was present; that handle's
+    /// `release_one` -> `CloseAndEvict` path will own the wire Close.
+    pub needs_wire_close: bool,
 }
 
 /// This struct is the internal message handler for the SMB client.
@@ -707,15 +769,120 @@ impl ConnectionMessageHandler {
     }
 
     /// Look up a cached lease slot by path. Returns `None` when there is
-    /// no entry. Phase C.3 will gate cache hits behind additional checks
-    /// (`tombstoned`, `granted_state` compatibility); this getter is the
-    /// raw lookup used by tests and the break-listener task.
+    /// no entry. Used by tests and the break-listener task; the cache-hit
+    /// fast path in `Client::_create_file` goes through
+    /// [`Self::try_acquire_lease`] instead so the bump is atomic with the
+    /// lookup against concurrent evictions.
     #[maybe_async]
     pub async fn peek_lease_slot(
         &self,
         path: &str,
     ) -> crate::Result<Option<Arc<LeaseSlot>>> {
         Ok(self.lease_table.lock().await?.get(path).cloned())
+    }
+
+    /// Phase C.5 race-free acquire: look up `path` and call
+    /// [`LeaseSlot::try_acquire_for_reuse`] *while still holding the
+    /// `lease_table` lock*. This serializes the refcount bump against
+    /// concurrent [`Self::take_lease_for_evict`] / [`Self::sweep_idle_leases`]
+    /// callers that also take the lock; without the lock the evict path
+    /// could observe `refcount == 0`, send a wire Close, and remove the
+    /// slot between an acquirer's `peek` and `fetch_add`, leaving the
+    /// acquirer with a stale FileId. Returns `Some(slot)` on a successful
+    /// bump, `None` for any non-hit reason.
+    #[maybe_async]
+    pub async fn try_acquire_lease(
+        &self,
+        path: &str,
+        requested_access: smb_fscc::FileAccessMask,
+        requested_disposition: smb_msg::CreateDisposition,
+        wants_directory: bool,
+    ) -> crate::Result<Option<Arc<LeaseSlot>>> {
+        let table = self.lease_table.lock().await?;
+        let Some(slot) = table.get(path).cloned() else {
+            return Ok(None);
+        };
+        if slot.try_acquire_for_reuse(requested_access, requested_disposition, wants_directory) {
+            Ok(Some(slot))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Phase C.5: atomically tombstone a slot keyed by `path`, remove it
+    /// from the table, and report whether the caller owes a wire Close.
+    /// The lock is held across the tombstone-store and the
+    /// `refcount.load`, so an `Acquire`-ordered `try_acquire_for_reuse`
+    /// running on another task either finishes its bump before this
+    /// function reads `refcount` (so we observe > 0 and yield the
+    /// close to that holder's `release_one`) or finds the slot gone
+    /// from the table and falls back to the wire Create path.
+    ///
+    /// Returns `None` when `path` had no entry.
+    #[maybe_async]
+    pub async fn take_lease_for_evict(
+        &self,
+        path: &str,
+    ) -> crate::Result<Option<LeaseEviction>> {
+        use std::sync::atomic::Ordering;
+        let mut table = self.lease_table.lock().await?;
+        let Some(slot) = table.remove(path) else {
+            return Ok(None);
+        };
+        slot.tombstoned.store(true, Ordering::Release);
+        let live = slot.refcount.load(Ordering::Acquire);
+        let needs_wire_close = live == 0;
+        tracing::debug!(
+            path = %slot.path,
+            live_handles = live,
+            needs_wire_close,
+            "Lease slot tombstoned and removed from table",
+        );
+        Ok(Some(LeaseEviction { slot, needs_wire_close }))
+    }
+
+    /// Phase C.5 idle sweep: walk the lease table, tombstone every slot
+    /// whose `last_used` predates `now - older_than`, and remove those
+    /// entries from the table. Slots with zero refcount at sweep time
+    /// are returned in the result so the caller can flush the wire
+    /// Close; slots with live handles stay tombstoned and rely on the
+    /// regular `release_one` -> `CloseAndEvict` path.
+    #[maybe_async]
+    pub async fn sweep_idle_leases(
+        &self,
+        older_than: std::time::Duration,
+    ) -> crate::Result<Vec<LeaseEviction>> {
+        use std::sync::atomic::Ordering;
+        let mut table = self.lease_table.lock().await?;
+        let cutoff = std::time::Instant::now()
+            .checked_sub(older_than)
+            .unwrap_or_else(std::time::Instant::now);
+
+        // Two-phase: collect victims first to avoid mutating while iterating.
+        let victims: Vec<String> = table
+            .iter()
+            .filter_map(|(k, slot)| match slot.last_used.read() {
+                Ok(ts) if *ts <= cutoff => Some(k.clone()),
+                _ => None,
+            })
+            .collect();
+
+        let mut out = Vec::with_capacity(victims.len());
+        for path in victims {
+            if let Some(slot) = table.remove(&path) {
+                slot.tombstoned.store(true, Ordering::Release);
+                let live = slot.refcount.load(Ordering::Acquire);
+                let needs_wire_close = live == 0;
+                tracing::debug!(
+                    path = %slot.path,
+                    live_handles = live,
+                    needs_wire_close,
+                    "Idle lease slot tombstoned and removed",
+                );
+                out.push(LeaseEviction { slot, needs_wire_close });
+            }
+        }
+        Ok(out)
     }
 
     /// Spawn a long-running task that consumes the lease-break broadcast

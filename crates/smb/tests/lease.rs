@@ -494,3 +494,178 @@ async fn test_lease_cache_hit_reuses_file_id() -> smb::Result<()> {
     file_second.close().await?;
     Ok(())
 }
+
+/// Phase C.5 (explicit eviction):
+///
+/// `Client::evict_lease(path)` removes the cached slot and sends the
+/// wire `Close` immediately when no live handle is referencing the
+/// slot. After eviction, a subsequent open with the same lease request
+/// must miss the cache and get a *fresh* FileId, proving the prior
+/// FileId was actually released on the server side.
+///
+/// We also verify the idempotent / safe-on-empty behavior — calling
+/// `evict_lease` twice in a row returns `false` the second time.
+#[test_log::test(maybe_async::test(
+    not(feature = "async"),
+    async(feature = "async", tokio::test(flavor = "current_thread"))
+))]
+#[serial]
+async fn test_evict_lease_releases_slot_and_misses_next_open() -> smb::Result<()> {
+    let share = smb_tests_share();
+    let (client, share_path) = make_server_connection(&share, None).await?;
+    let conn = client.get_connection(share_path.server()).await?;
+    let info = conn.conn_info().expect("connection negotiated");
+    if !info.negotiation.caps.leasing() {
+        tracing::warn!("Server lacks caps.leasing(); skipping C.5 evict test.");
+        return Ok(());
+    }
+
+    let path_rel = "lease_phase_c5_evict.txt";
+    let unc = share_path.with_path(path_rel);
+
+    // Prime the cache: open with HandleCaching, then close — slot stays.
+    let args_prime = FileCreateArgs::make_overwrite(Default::default(), Default::default())
+        .with_lease(make_lease_request());
+    let file_first = client
+        .create_file(&unc, &args_prime)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+    let file_id_first = file_first.handle().raw_file_id();
+    let grant_first = file_first
+        .handle()
+        .lease_granted()
+        .expect("server with caps.leasing() must issue a grant");
+    assert!(
+        grant_first.state.handle_caching(),
+        "evict test relies on handle_caching being granted; got {:?}",
+        grant_first.state,
+    );
+    file_first.close().await?;
+    assert!(
+        conn.peek_lease_slot(path_rel).await?.is_some(),
+        "slot must survive deferred close",
+    );
+
+    // Explicit eviction returns true the first time, false the second
+    // (idempotent), and removes the entry from the table.
+    assert!(
+        client.evict_lease(&unc).await?,
+        "first evict must find and remove the slot",
+    );
+    assert!(
+        !client.evict_lease(&unc).await?,
+        "second evict on the same path is a no-op",
+    );
+    assert!(
+        conn.peek_lease_slot(path_rel).await?.is_none(),
+        "evicted slot must be gone from the table",
+    );
+
+    // After eviction the server has released the FileId; a fresh open
+    // with the same args must get a *new* FileId, not the cached one.
+    let args_reopen = FileCreateArgs::make_overwrite(Default::default(), Default::default())
+        .with_lease(make_lease_request());
+    let file_second = client
+        .create_file(&unc, &args_reopen)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+    let file_id_second = file_second.handle().raw_file_id();
+    assert_ne!(
+        file_id_second, file_id_first,
+        "after eviction the server must allocate a fresh FileId",
+    );
+
+    file_second
+        .set_info(FileDispositionInformation::default())
+        .await?;
+    file_second.close().await?;
+    // Final cleanup: evict so the deferred-close file_id is sent
+    // properly. With dispose set, this completes the delete.
+    let _ = client.evict_lease(&unc).await;
+    Ok(())
+}
+
+/// Phase C.5 (idle sweep):
+///
+/// `Client::flush_idle_leases(server, older_than)` should walk the
+/// per-connection lease table and tombstone+evict slots whose
+/// `last_used` is older than the threshold. The wire `Close` for
+/// refcount-0 slots is sent during the sweep.
+///
+/// We open a file with a lease, close it (slot retained), wait briefly,
+/// then call flush_idle_leases with a very small threshold. The slot
+/// must be gone afterwards and a re-open returns a fresh FileId.
+#[test_log::test(maybe_async::test(
+    not(feature = "async"),
+    async(feature = "async", tokio::test(flavor = "current_thread"))
+))]
+#[serial]
+async fn test_flush_idle_leases_sweeps_old_slots() -> smb::Result<()> {
+    let share = smb_tests_share();
+    let (client, share_path) = make_server_connection(&share, None).await?;
+    let conn = client.get_connection(share_path.server()).await?;
+    let info = conn.conn_info().expect("connection negotiated");
+    if !info.negotiation.caps.leasing() {
+        tracing::warn!("Server lacks caps.leasing(); skipping C.5 idle-sweep test.");
+        return Ok(());
+    }
+
+    let path_rel = "lease_phase_c5_idle.txt";
+    let server = share_path.server().to_string();
+    let unc = share_path.with_path(path_rel);
+
+    let args_prime = FileCreateArgs::make_overwrite(Default::default(), Default::default())
+        .with_lease(make_lease_request());
+    let file = client
+        .create_file(&unc, &args_prime)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+    let file_id_first = file.handle().raw_file_id();
+    file.close().await?;
+
+    // Confirm the slot is there.
+    assert!(
+        conn.peek_lease_slot(path_rel).await?.is_some(),
+        "deferred close must keep the slot cached",
+    );
+
+    // Wait past the threshold then sweep. We use 100ms to keep the test
+    // fast; in production this would be minutes.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let swept = client
+        .flush_idle_leases(&server, Duration::from_millis(50))
+        .await?;
+    assert!(
+        swept >= 1,
+        "sweep must claim at least our own idle slot, got {swept}",
+    );
+    assert!(
+        conn.peek_lease_slot(path_rel).await?.is_none(),
+        "swept slot must be gone from the table",
+    );
+
+    // Confirm the FileId is now stale on the server side: a fresh open
+    // gets a different FileId.
+    let args_reopen = FileCreateArgs::make_overwrite(Default::default(), Default::default())
+        .with_lease(make_lease_request());
+    let file_again = client
+        .create_file(&unc, &args_reopen)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+    assert_ne!(
+        file_again.handle().raw_file_id(),
+        file_id_first,
+        "after idle-sweep, the server has released the original FileId",
+    );
+
+    file_again
+        .set_info(FileDispositionInformation::default())
+        .await?;
+    file_again.close().await?;
+    let _ = client.evict_lease(&unc).await;
+    Ok(())
+}
