@@ -370,20 +370,53 @@ impl Client {
         let tree = self.get_tree(path).await?;
         let rel = path.path().unwrap_or("").to_string();
 
-        // Phase C.3 — cache-hit short-circuit. When the caller asked for a
-        // lease, look up the per-connection `lease_table`; the lookup and
-        // refcount bump happen atomically under the table lock via
-        // `try_acquire_lease`, which serializes us against concurrent
-        // `evict_lease` / `flush_idle_leases` operations so we never
-        // hand out a FileId the evicter has already closed on the wire.
-        if args.lease_request.is_some() {
+        // Phase D — inject the default lease when the caller didn't specify
+        // one and the client config opts in. The synthesized lease key is
+        // a deterministic mix of the client's `lease_key_salt` and the
+        // full UNC path, so repeat opens of the same path within this
+        // Client share a key (and hit the cache); different Clients on
+        // the same machine use different salts and therefore different
+        // keys (no cross-client server-side lease confusion).
+        let owned_args;
+        let effective_args = if args.lease_request.is_none() {
+            if let Some(state) = self.config.default_lease_state {
+                let lease = smb_msg::RequestLease::RqLsReqv2(smb_msg::RequestLeaseV2 {
+                    lease_key: Self::derive_lease_key(self.config.lease_key_salt, path),
+                    lease_state: state,
+                    lease_flags: smb_msg::LeaseFlags::new(),
+                    parent_lease_key: 0,
+                    epoch: 0,
+                });
+                owned_args = FileCreateArgs {
+                    disposition: args.disposition,
+                    attributes: args.attributes,
+                    options: args.options,
+                    desired_access: args.desired_access,
+                    lease_request: Some(lease),
+                };
+                &owned_args
+            } else {
+                args
+            }
+        } else {
+            args
+        };
+
+        // Phase C.3 — cache-hit short-circuit. When the (effective) args
+        // carry a lease request, look up the per-connection `lease_table`;
+        // the lookup and refcount bump happen atomically under the table
+        // lock via `try_acquire_lease`, which serializes us against
+        // concurrent `evict_lease` / `flush_idle_leases` operations so we
+        // never hand out a FileId the evicter has already closed on the
+        // wire.
+        if effective_args.lease_request.is_some() {
             if let Ok(conn) = self.get_connection(path.server()).await {
-                let wants_dir = args.options.directory_file();
+                let wants_dir = effective_args.options.directory_file();
                 if let Ok(Some(slot)) = conn
                     .try_acquire_lease(
                         &rel,
-                        args.desired_access,
-                        args.disposition,
+                        effective_args.desired_access,
+                        effective_args.disposition,
                         wants_dir,
                     )
                     .await
@@ -399,7 +432,7 @@ impl Client {
         }
 
         // Cache miss (or no lease requested): take the regular wire path.
-        let mut resource = tree.create(&rel, args).await?;
+        let mut resource = tree.create(&rel, effective_args).await?;
 
         // Phase C.1: install a slot into the per-connection cache so the
         // *next* call against the same path can hit C.3. Also attach the
@@ -407,7 +440,9 @@ impl Client {
         // through the deferred-close path (C.4).
         let grant = resource.handle().and_then(|h| h.lease_granted());
         if let Some(grant) = grant {
-            if let Some(proto) = resource.build_lease_proto(tree.handler_ref(), args.desired_access) {
+            if let Some(proto) =
+                resource.build_lease_proto(tree.handler_ref(), effective_args.desired_access)
+            {
                 let slot = std::sync::Arc::new(crate::lease::LeaseSlot::new_with_proto(
                     rel.clone(),
                     tree.tree_id(),
@@ -435,6 +470,32 @@ impl Client {
         }
 
         Ok(resource)
+    }
+
+    /// Derive a stable 128-bit lease key from the client's
+    /// `lease_key_salt` and the full UNC path. SipHash-flavored mix
+    /// avoids the bad cache behavior of a plain XOR (paths often share
+    /// long common prefixes) and gives enough entropy for the lease
+    /// cache to dedupe paths within a Client without collisions.
+    fn derive_lease_key(salt: u64, path: &UncPath) -> u128 {
+        use std::hash::{Hash, Hasher};
+        // Two independent hashers seeded with derived salts give us the
+        // two halves of the 128-bit key. Using `DefaultHasher` (SipHash
+        // under the hood) is good enough for collision resistance at
+        // this scale (a single Client rarely caches more than a few
+        // thousand paths).
+        let path_str = path.to_string();
+        let mut h_lo = std::collections::hash_map::DefaultHasher::new();
+        h_lo.write_u64(salt);
+        path_str.hash(&mut h_lo);
+        let lo = h_lo.finish() as u128;
+
+        let mut h_hi = std::collections::hash_map::DefaultHasher::new();
+        h_hi.write_u64(salt.wrapping_mul(0x9E3779B97F4A7C15));
+        path_str.hash(&mut h_hi);
+        let hi = h_hi.finish() as u128;
+
+        (hi << 64) | lo
     }
 
     /// Makes a connection to the specified server.

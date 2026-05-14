@@ -669,3 +669,99 @@ async fn test_flush_idle_leases_sweeps_old_slots() -> smb::Result<()> {
     let _ = client.evict_lease(&unc).await;
     Ok(())
 }
+
+/// Phase D (default lease injection):
+///
+/// `ClientConfig::default_lease_state = Some(...)` makes every
+/// `create_file` call request a lease without the caller having to
+/// build a RequestLease per call. Two opens of the same path on the
+/// same Client should:
+///   1. Get a lease granted on the first call (proving auto-injection
+///      worked end-to-end).
+///   2. Hit the cache on the second call — same FileId — proving the
+///      auto-injected lease keys are stable per path within a Client.
+#[test_log::test(maybe_async::test(
+    not(feature = "async"),
+    async(feature = "async", tokio::test(flavor = "current_thread"))
+))]
+#[serial]
+async fn test_client_default_lease_state_auto_injects() -> smb::Result<()> {
+    use smb::{Client, ClientConfig, FileAccessMask};
+    let share = smb_tests_share();
+    let mut config = ClientConfig::default();
+    let mut conn_config = smb::ConnectionConfig::default();
+    conn_config.timeout = Some(Duration::from_secs(10));
+    conn_config.auth_methods.kerberos = false;
+    conn_config.auth_methods.ntlm = true;
+    config.connection = conn_config;
+    config.default_lease_state = Some(
+        LeaseState::new()
+            .with_read_caching(true)
+            .with_handle_caching(true),
+    );
+
+    let server = std::env::var("SMB_RUST_TESTS_SERVER").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let user = std::env::var("SMB_RUST_TESTS_USER_NAME").unwrap_or_else(|_| "LocalAdmin".to_string());
+    let password =
+        std::env::var("SMB_RUST_TESTS_PASSWORD").unwrap_or_else(|_| "123456".to_string());
+    let client = Client::new(config);
+    let unc_share = smb::UncPath::new(&server)?.with_share(&share)?;
+    client
+        .share_connect(&unc_share, user.as_str(), password)
+        .await?;
+
+    let conn = client.get_connection(&server).await?;
+    let info = conn.conn_info().expect("connection negotiated");
+    if !info.negotiation.caps.leasing() {
+        tracing::warn!("Server lacks caps.leasing(); skipping Phase D auto-inject test.");
+        return Ok(());
+    }
+
+    let path_rel = "lease_phase_d_auto.txt";
+    let unc = unc_share.with_path(path_rel);
+
+    // No `.with_lease(...)` on args — relying purely on config.
+    let args_no_lease = FileCreateArgs::make_overwrite(Default::default(), Default::default());
+    assert!(
+        args_no_lease.lease_request.is_none(),
+        "control: args must not carry a lease at the call site",
+    );
+
+    let file_first = client
+        .create_file(&unc, &args_no_lease)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+    let grant = file_first
+        .handle()
+        .lease_granted()
+        .expect("config.default_lease_state must trigger a grant");
+    assert!(
+        grant.state.handle_caching(),
+        "auto-injected lease must request handle_caching",
+    );
+    let file_id_first = file_first.handle().raw_file_id();
+    file_first.close().await?;
+
+    // Second open also without explicit lease — must hit the cache.
+    let args_reopen = FileCreateArgs::make_open_existing(
+        FileAccessMask::new().with_generic_all(true),
+    );
+    let file_second = client
+        .create_file(&unc, &args_reopen)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+    assert_eq!(
+        file_second.handle().raw_file_id(),
+        file_id_first,
+        "auto-injected lease must yield stable lease key → cache hits",
+    );
+
+    file_second
+        .set_info(FileDispositionInformation::default())
+        .await?;
+    file_second.close().await?;
+    let _ = client.evict_lease(&unc).await;
+    Ok(())
+}
