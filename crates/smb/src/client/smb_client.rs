@@ -5,8 +5,8 @@ use maybe_async::maybe_async;
 use smb_fscc::{ChainedItemList, FileBasicInformation, SetFileInfo, SetFileInfoClass};
 use smb_msg::{
     AdditionalInfo, CloseRequest, CreateRequest, FileId, ImpersonationLevel, NetworkInterfaceInfo,
-    OplockLevel, RawSetInfoData, ReferralEntry, ReferralEntryValue, SetInfoClass, SetInfoData,
-    SetInfoRequest, ShareAccessFlags, Status,
+    OplockLevel, RawSetInfoData, ReferralEntry, ReferralEntryValue, RequestContent, SetInfoClass,
+    SetInfoData, SetInfoRequest, ShareAccessFlags, Status,
 };
 use smb_rpc::interface::{LsaRpc, ShareInfo1, SrvSvc, TranslatedName};
 use smb_transport::TransportConfig;
@@ -757,61 +757,64 @@ impl Client {
         let conn = self.get_connection(path.server()).await?;
         let rel = path.path().unwrap_or("");
 
-        // --- Member 1: Create (Open) ---
-        // No lease context; we want immediate Close, not deferred. No DFS
-        // operations on this path — update_metadata is always against
-        // already-resolved paths under a connected share.
-        let create = CreateRequest {
-            requested_oplock_level: OplockLevel::None,
-            impersonation_level: ImpersonationLevel::Impersonation,
-            desired_access: smb_fscc::FileAccessMask::new().with_file_write_attributes(true),
-            file_attributes: smb_fscc::FileAttributes::new(),
-            share_access: ShareAccessFlags::new()
-                .with_read(true)
-                .with_write(true)
-                .with_delete(true),
-            create_disposition: smb_msg::CreateDisposition::Open,
-            create_options: smb_msg::CreateOptions::new(),
-            name: rel.into(),
-            contexts: ChainedItemList::default(),
+        // Helper: fill in the per-member header fields (tree_id, session_id,
+        // signed flag, related_operations) that the three members of this
+        // chain otherwise duplicate. `related = false` is the start of the
+        // chain (Create); `related = true` for the SetInfo and Close that
+        // depend on Create's returned FileId.
+        let make_member = |req: RequestContent, related: bool| {
+            let mut m = OutgoingMessage::new(req);
+            m.message.header.tree_id = Some(tree_id);
+            m.message.header.session_id = session_id;
+            m.message.header.flags.set_signed(signed);
+            if related {
+                m.message.header.flags.set_related_operations(true);
+            }
+            m
         };
-        let mut create_msg = OutgoingMessage::new(create.into());
-        create_msg.message.header.tree_id = Some(tree_id);
-        create_msg.message.header.session_id = session_id;
-        create_msg.message.header.flags.set_signed(signed);
 
-        // --- Member 2: SetInfo(FileBasicInformation) on the previous handle ---
-        // file_id = FULL + related_operations = true makes the server
-        // substitute Create's returned FileId here.
-        let setinfo = SetInfoRequest {
-            info_class: SetInfoClass::File(SetFileInfoClass::BasicInformation),
-            additional_information: AdditionalInfo::new(),
-            file_id: FileId::FULL,
-            data: SetInfoData::File(RawSetInfoData::from(SetFileInfo::BasicInformation(basic))),
-        };
-        let mut setinfo_msg = OutgoingMessage::new(setinfo.into());
-        setinfo_msg.message.header.tree_id = Some(tree_id);
-        setinfo_msg.message.header.session_id = session_id;
-        setinfo_msg.message.header.flags.set_signed(signed);
-        setinfo_msg
-            .message
-            .header
-            .flags
-            .set_related_operations(true);
+        // Member 1: Create with Open disposition. No lease context — we
+        // want an immediate Close, not deferred. No DFS — update_metadata
+        // is always against already-resolved paths under a connected share.
+        let create_msg = make_member(
+            CreateRequest {
+                requested_oplock_level: OplockLevel::None,
+                impersonation_level: ImpersonationLevel::Impersonation,
+                desired_access: smb_fscc::FileAccessMask::new().with_file_write_attributes(true),
+                file_attributes: smb_fscc::FileAttributes::new(),
+                share_access: ShareAccessFlags::new()
+                    .with_read(true)
+                    .with_write(true)
+                    .with_delete(true),
+                create_disposition: smb_msg::CreateDisposition::Open,
+                create_options: smb_msg::CreateOptions::new(),
+                name: rel.into(),
+                contexts: ChainedItemList::default(),
+            }
+            .into(),
+            false,
+        );
 
-        // --- Member 3: Close on the same chained handle ---
-        let close = CloseRequest {
-            file_id: FileId::FULL,
-        };
-        let mut close_msg = OutgoingMessage::new(close.into());
-        close_msg.message.header.tree_id = Some(tree_id);
-        close_msg.message.header.session_id = session_id;
-        close_msg.message.header.flags.set_signed(signed);
-        close_msg
-            .message
-            .header
-            .flags
-            .set_related_operations(true);
+        // Members 2 & 3: SetInfo + Close with FileId::FULL and
+        // related_operations=true, so the server substitutes Create's
+        // returned FileId here per MS-SMB2 3.3.5.2.7.2.
+        let setinfo_msg = make_member(
+            SetInfoRequest {
+                info_class: SetInfoClass::File(SetFileInfoClass::BasicInformation),
+                additional_information: AdditionalInfo::new(),
+                file_id: FileId::FULL,
+                data: SetInfoData::File(RawSetInfoData::from(SetFileInfo::BasicInformation(basic))),
+            }
+            .into(),
+            true,
+        );
+        let close_msg = make_member(
+            CloseRequest {
+                file_id: FileId::FULL,
+            }
+            .into(),
+            true,
+        );
 
         let responses = conn
             .send_compound(vec![create_msg, setinfo_msg, close_msg])

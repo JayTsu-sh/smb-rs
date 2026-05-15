@@ -237,9 +237,22 @@ impl Transformer {
             member_bufs[i][..Header::STRUCT_SIZE].copy_from_slice(&header_bytes);
         }
 
-        // 3. Sign each member if signing is requested (per-member, over that
-        //    member's bytes only). We snapshot the signer once and reuse it
-        //    for each member (MessageSigner clone is cheap — no heap alloc).
+        // 3. Pad each non-last member to 8-byte alignment FIRST. The
+        //    `next_command` offset we set in step 2 is the padded length,
+        //    and per MS-SMB2 3.1.4.1 the per-member signature MUST cover
+        //    the full byte range the server sees as "this command", i.e.
+        //    the padded buffer. Signing must therefore happen AFTER
+        //    padding so the HMAC input matches what the receiver
+        //    re-hashes during verification.
+        for i in 0..last {
+            let aligned = (member_bufs[i].len() + 7) & !7usize;
+            member_bufs[i].resize(aligned, 0);
+        }
+
+        // 4. Sign each member if signing is requested (per-member, over
+        //    that member's padded bytes). We snapshot the signer once
+        //    and reuse it for each member (MessageSigner clone is cheap
+        //    — no heap alloc).
         let should_sign = msgs[0].message.header.flags.signed();
         if should_sign {
             let session_id = msgs[0].message.header.session_id;
@@ -283,14 +296,6 @@ impl Transformer {
                     msgs[i].message.header.signature,
                 );
             }
-        }
-
-        // 4. Pad each member except the last to 8-byte alignment. The
-        //    `next_command` offset we set in step 2 must match the padded
-        //    length so the server's parser advances to the right place.
-        for i in 0..last {
-            let aligned = (member_bufs[i].len() + 7) & !7usize;
-            member_bufs[i].resize(aligned, 0);
         }
 
         // 5. Concatenate into the output IoVec. Each member is its own

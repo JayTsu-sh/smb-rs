@@ -815,13 +815,44 @@ impl ConnectionMessageHandler {
     /// other side) is logically equivalent to no cache hit.
     #[maybe_async]
     pub async fn insert_lease_slot(&self, slot: Arc<LeaseSlot>) -> crate::Result<()> {
+        use std::sync::atomic::Ordering;
         let key = slot.path.clone();
         let mut table = self.lease_table.lock().await?;
-        if let Some(prev) = table.insert(key, slot) {
+        let displaced = table.insert(key, slot);
+        drop(table);
+        if let Some(prev) = displaced {
+            // Tombstone the displaced slot. If a live ResourceHandle is
+            // still holding it (refcount > 0), its eventual close/Drop
+            // will see `CloseAndEvict` on release_one and send the wire
+            // `Close`. If the handle has already been dropped (refcount
+            // == 0 at displacement time), nobody will call release_one
+            // ever again, so we must send the wire Close ourselves —
+            // otherwise the server-side FileId leaks until session
+            // disconnect.
+            prev.tombstoned.store(true, Ordering::Release);
+            let live = prev.refcount.load(Ordering::Acquire);
             tracing::debug!(
                 path = %prev.path,
-                "Replaced existing lease slot in cache",
+                live_refs = live,
+                "Replaced existing lease slot in cache; old slot tombstoned",
             );
+            #[cfg(feature = "async")]
+            if live == 0 && prev.file_id != smb_msg::FileId::EMPTY {
+                let file_id = prev.file_id;
+                let handler = prev.proto.handler.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        crate::resource::ResourceHandle::send_close_external(file_id, &handler)
+                            .await
+                    {
+                        tracing::warn!(
+                            file_id = ?file_id,
+                            error = ?e,
+                            "Displaced-slot wire Close failed (FileId leaked until session end)",
+                        );
+                    }
+                });
+            }
         }
         Ok(())
     }
@@ -918,10 +949,15 @@ impl ConnectionMessageHandler {
         older_than: std::time::Duration,
     ) -> crate::Result<Vec<LeaseEviction>> {
         use std::sync::atomic::Ordering;
+        // If `older_than` exceeds the elapsed time since this `Instant`
+        // monotonic clock began (e.g. caller passed `Duration::MAX`),
+        // there is nothing older than the cutoff — return immediately
+        // instead of the previous bug where the fallback `now` made
+        // every slot eligible for eviction.
+        let Some(cutoff) = std::time::Instant::now().checked_sub(older_than) else {
+            return Ok(Vec::new());
+        };
         let mut table = self.lease_table.lock().await?;
-        let cutoff = std::time::Instant::now()
-            .checked_sub(older_than)
-            .unwrap_or_else(std::time::Instant::now);
 
         // Two-phase: collect victims first to avoid mutating while iterating.
         let victims: Vec<String> = table
@@ -1002,27 +1038,52 @@ impl ConnectionMessageHandler {
     }
 
     /// Apply a single [`LeaseBreakEvent`] to the connection's lease table.
-    /// All slots whose `lease_key` matches the event are tombstoned and
-    /// their `granted_state` snapshot is updated to the server's new
-    /// state. Cache hits in C.3 will check `tombstoned` and miss when set.
+    /// All slots whose `lease_key` matches the event are tombstoned,
+    /// removed from the table, and their `granted_state` snapshot
+    /// updated to the server's new state.
+    ///
+    /// The tombstone-store, granted_state update, and table removal all
+    /// happen inside the `lease_table` lock so a concurrent
+    /// `try_acquire_lease` either runs first (and gets a still-valid
+    /// slot for which the wire I/O may racily fail — recoverable) or
+    /// runs after (and finds the slot gone, falling back to a fresh
+    /// wire Create). Without this fence the in-flight acquirer could
+    /// observe `tombstoned == false`, bump refcount, and hand out a
+    /// FileId the server has already revoked.
     #[cfg(feature = "async")]
     async fn apply_lease_break(&self, event: &LeaseBreakEvent) {
         use std::sync::atomic::Ordering;
         let event_key = event.lease_key.as_u128();
 
-        // Snapshot the matching slots under a short critical section, then
-        // mutate outside the lock to keep the table responsive to other
-        // operations during the broadcast burst.
-        let matching: Vec<Arc<LeaseSlot>> = match self.lease_table.lock().await {
-            Ok(table) => table
-                .values()
-                .filter(|s| s.lease_key == event_key)
-                .cloned()
-                .collect(),
-            Err(e) => {
-                tracing::warn!(error = ?e, "lease_table lock poisoned during break apply");
-                return;
-            }
+        let matching: Vec<Arc<LeaseSlot>> = {
+            let mut table = match self.lease_table.lock().await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(error = ?e, "lease_table lock poisoned during break apply");
+                    return;
+                }
+            };
+
+            // Two-phase under the same lock: find victim paths first to
+            // sidestep "mutate while iterating", then remove + apply
+            // state transitions. Keeping both phases inside the lock
+            // closes the race against `try_acquire_lease`.
+            let victim_paths: Vec<String> = table
+                .iter()
+                .filter(|(_, slot)| slot.lease_key == event_key)
+                .map(|(k, _)| k.clone())
+                .collect();
+            victim_paths
+                .into_iter()
+                .filter_map(|p| {
+                    let slot = table.remove(&p)?;
+                    slot.tombstoned.store(true, Ordering::Release);
+                    if let Ok(mut state) = slot.granted_state.write() {
+                        *state = event.new_state;
+                    }
+                    Some(slot)
+                })
+                .collect()
         };
 
         if matching.is_empty() {
@@ -1032,17 +1093,12 @@ impl ConnectionMessageHandler {
             );
             return;
         }
-
-        for slot in matching {
-            slot.tombstoned.store(true, Ordering::Release);
-            if let Ok(mut state) = slot.granted_state.write() {
-                *state = event.new_state;
-            }
+        for slot in &matching {
             tracing::debug!(
                 path = %slot.path,
                 lease_key = %slot.lease_key,
                 new_state = ?event.new_state,
-                "Lease slot tombstoned by server break",
+                "Lease slot tombstoned + removed by server break",
             );
         }
     }
