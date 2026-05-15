@@ -155,6 +155,153 @@ impl Transformer {
         f(&session_info)
     }
 
+    /// Build the wire bytes for an SMB2 compound chain (MS-SMB2 3.2.4.1.4):
+    /// multiple SMB2 commands concatenated in one TCP send, each with its own
+    /// header carrying a `NextCommand` offset to the next member.
+    ///
+    /// Behavior summary:
+    /// - Each member is serialized independently (header + content).
+    /// - Each header's `next_command` is set to the 8-byte-aligned length of
+    ///   that member (0 for the last). Headers are re-written to capture this.
+    /// - Each member is then padded to 8-byte alignment as required by the spec.
+    /// - Signing is per-member: each header's signature is computed over just
+    ///   that member's byte slice (header with signature=0 + body), then written
+    ///   back into the header. All members must have the same `signed` flag on
+    ///   the first member (used as the chain-wide policy).
+    /// - The resulting [`IoVec`] is the concatenation of each member's bytes
+    ///   in order, ready for the transport to write.
+    ///
+    /// **Constraints for the current minimal implementation:**
+    /// - No encryption.
+    /// - No compression.
+    /// - No `additional_data` zero-copy bodies (data is whatever each
+    ///   member's `PlainRequest` serializes to).
+    /// - Caller must have already populated `header.message_id`,
+    ///   `tree_id`, `session_id`, and `credit_charge` / `credit_request`
+    ///   per member (typically done by `Connection::process_sequence_outgoing`
+    ///   on each message before this call).
+    /// - Caller is responsible for setting `flags.related_operations` on the
+    ///   2nd..Nth members and the `0xFF…FF` sentinel `FileId` on commands that
+    ///   want to chain context from a prior Create.
+    ///
+    /// Returns `Err(InvalidArgument)` for an empty `msgs` slice or any
+    /// member that requests encryption / additional_data.
+    pub async fn transform_outgoing_compound(
+        &self,
+        mut msgs: Vec<OutgoingMessage>,
+    ) -> crate::Result<IoVec> {
+        if msgs.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "compound chain requires at least one message".to_string(),
+            ));
+        }
+        for (i, m) in msgs.iter().enumerate() {
+            if m.encrypt {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "compound member {i}: encryption is not supported in the current minimal compound path",
+                )));
+            }
+            if m.additional_data.is_some() {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "compound member {i}: additional_data is not supported in compound mode",
+                )));
+            }
+        }
+
+        // 1. Serialize each member's bytes (header + content). Header still
+        //    has its old `next_command = 0` here; we rewrite it in step 2.
+        let mut member_bufs: Vec<Vec<u8>> = Vec::with_capacity(msgs.len());
+        for m in &msgs {
+            let mut buf = Vec::with_capacity(Header::STRUCT_SIZE + 256);
+            m.message.write(&mut Cursor::new(&mut buf))?;
+            member_bufs.push(buf);
+        }
+
+        // 2. Compute next_command offsets and rewrite each member's header bytes.
+        //    For member i (except last): next_command = 8-byte-aligned len of member i's buffer.
+        //    For last member: next_command = 0 (already).
+        let last = msgs.len() - 1;
+        for i in 0..last {
+            let aligned = (member_bufs[i].len() + 7) & !7usize;
+            msgs[i].message.header.next_command = u32::try_from(aligned).map_err(|_| {
+                crate::Error::InvalidState(format!(
+                    "compound member {i}: aligned size {aligned} does not fit in u32",
+                ))
+            })?;
+            // Rewrite the header bytes in-place with the updated next_command.
+            let mut header_bytes = [0u8; Header::STRUCT_SIZE];
+            msgs[i]
+                .message
+                .header
+                .write(&mut Cursor::new(&mut header_bytes[..]))?;
+            member_bufs[i][..Header::STRUCT_SIZE].copy_from_slice(&header_bytes);
+        }
+
+        // 3. Sign each member if signing is requested (per-member, over that
+        //    member's bytes only). We snapshot the signer once and reuse it
+        //    for each member (MessageSigner clone is cheap — no heap alloc).
+        let should_sign = msgs[0].message.header.flags.signed();
+        if should_sign {
+            let session_id = msgs[0].message.header.session_id;
+            let signer = self
+                ._with_channel(session_id, |session| {
+                    let channel_info =
+                        session
+                            .channel
+                            .as_ref()
+                            .ok_or(crate::Error::TranformFailed(TransformError {
+                                outgoing: true,
+                                phase: TransformPhase::SignVerify,
+                                session_id: Some(session_id),
+                                why: "Compound message is signed, but no channel signer is set up",
+                                msg_id: None,
+                            }))?;
+                    Ok(channel_info.signer()?.clone())
+                })
+                .await?;
+
+            for i in 0..msgs.len() {
+                let mut iov: IoVec = IoVec::from(std::mem::take(&mut member_bufs[i]));
+                let mut signer = signer.clone();
+                signer.sign_message(&mut msgs[i].message.header, &mut iov)?;
+                // After sign_message, iov[0] holds the buffer with the signature
+                // written back into the header. Move it back into member_bufs
+                // without copying (IoVecBuf::Owned -> Vec via mem::take).
+                match &mut iov[0] {
+                    smb_transport::IoVecBuf::Owned(v) => {
+                        member_bufs[i] = std::mem::take(v);
+                    }
+                    smb_transport::IoVecBuf::Shared(_) => {
+                        return Err(crate::Error::InvalidState(
+                            "signed compound member buffer was not owned".to_string(),
+                        ));
+                    }
+                }
+                tracing::trace!(
+                    "Compound member {i} (msg_id {}) signed (signature={}).",
+                    msgs[i].message.header.message_id,
+                    msgs[i].message.header.signature,
+                );
+            }
+        }
+
+        // 4. Pad each member except the last to 8-byte alignment. The
+        //    `next_command` offset we set in step 2 must match the padded
+        //    length so the server's parser advances to the right place.
+        for i in 0..last {
+            let aligned = (member_bufs[i].len() + 7) & !7usize;
+            member_bufs[i].resize(aligned, 0);
+        }
+
+        // 5. Concatenate into the output IoVec. Each member is its own
+        //    owned buffer — the transport will gather them on send.
+        let mut out = IoVec::default();
+        for buf in member_bufs {
+            out.add_owned(buf);
+        }
+        Ok(out)
+    }
+
     /// Transforms an outgoing message to a raw SMB message.
     pub async fn transform_outgoing(&self, mut msg: OutgoingMessage) -> crate::Result<IoVec> {
         let should_encrypt = msg.encrypt;

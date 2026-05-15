@@ -91,6 +91,61 @@ where
         self.stopped.load(Ordering::Relaxed)
     }
 
+    /// Send a compound SMB2 request chain (MS-SMB2 3.2.4.1.4): N messages
+    /// stitched together via `Header::next_command`, sent in a single TCP
+    /// write. Returns one [`SendMessageResult`] per member (in order), so
+    /// the caller can later `receive(msg_id)` each member's response
+    /// independently.
+    ///
+    /// Compound responses come back the same way: server packs N
+    /// responses into one frame and the worker's `incoming_data_callback`
+    /// fans each out to its matching `msg_id` waiter via
+    /// `Transformer::transform_incoming_all` — there's nothing extra to
+    /// do on the receive side from the caller.
+    ///
+    /// **The caller is responsible for**:
+    /// - allocating `message_id` (and credit_charge / credit_request) for
+    ///   each member before this call, typically by running each through
+    ///   `Connection::process_sequence_outgoing`;
+    /// - setting `flags.related_operations = true` on members 2..N if the
+    ///   chain is using the related-operations / `FileId::FULL` chaining
+    ///   semantics from MS-SMB2 3.3.5.2.7.2.
+    ///
+    /// **Not supported in the minimal compound path** (will error):
+    /// - per-member encryption,
+    /// - per-member `additional_data` (zero-copy write tails),
+    /// - empty input.
+    pub async fn send_compound(
+        self: &Arc<Self>,
+        msgs: Vec<OutgoingMessage>,
+    ) -> crate::Result<Vec<SendMessageResult>> {
+        if msgs.is_empty() {
+            return Err(Error::InvalidArgument(
+                "send_compound: empty message list".to_string(),
+            ));
+        }
+        // Snapshot ids before consuming `msgs` so we can return them as
+        // SendMessageResult after the transform.
+        let ids: Vec<u64> = msgs
+            .iter()
+            .map(|m| m.message.header.message_id)
+            .collect();
+
+        let raw = self.transformer.transform_outgoing_compound(msgs).await?;
+        tracing::trace!(
+            "Compound chain ({} members, ids={ids:?}) handed to transport.",
+            ids.len()
+        );
+
+        let message = T::wrap_msg_to_send(raw);
+        T::channel_send(&self.sender, message)?;
+
+        Ok(ids
+            .into_iter()
+            .map(|id| SendMessageResult::new(id, None))
+            .collect())
+    }
+
     /// This is a function that should be used by multi worker implementations (async/mtd),
     /// after gettting a messages from the server, this function processes it and
     /// notifies the awaiting tasks.
