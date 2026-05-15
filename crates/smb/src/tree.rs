@@ -154,6 +154,7 @@ impl Tree {
                 options: CreateOptions::new(),
                 desired_access,
                 attributes: FileAttributes::new(),
+                ..Default::default()
             },
         )
         .await
@@ -175,6 +176,7 @@ impl Tree {
                 options: CreateOptions::new().with_directory_file(true),
                 desired_access,
                 attributes: FileAttributes::new().with_directory(true),
+                ..Default::default()
             },
         )
         .await
@@ -195,6 +197,22 @@ impl Tree {
     pub fn is_dfs_root(&self) -> crate::Result<bool> {
         let info = self.handler.info()?;
         Ok(info.share_flags.dfs_root() && info.share_flags.dfs())
+    }
+
+    /// Returns the SMB-assigned tree id for this connected share.
+    /// Used by the lease cache (Phase C) so cache hits can match opens
+    /// against the same tree the original Create was issued on.
+    pub fn tree_id(&self) -> u32 {
+        self.handler.tree_id.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Borrow the tree's underlying `Upstream` handler reference.
+    /// Phase C uses this from [`crate::resource::Resource::build_lease_proto`]
+    /// so the lease cache can construct a `ResourceMessageHandle` against
+    /// the same tree the Create was issued on. `pub(crate)` because the
+    /// `HandlerReference` type is internal.
+    pub(crate) fn handler_ref(&self) -> &HandlerReference<TreeMessageHandler> {
+        &self.handler
     }
 
     pub fn as_dfs_tree(&self) -> crate::Result<DfsRootTreeRef<'_>> {

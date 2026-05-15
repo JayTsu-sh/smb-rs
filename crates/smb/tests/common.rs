@@ -10,6 +10,10 @@ impl TestEnv {
     pub const DEFAULT_USER: &'static str = "LocalAdmin";
     pub const PASSWORD: &'static str = "SMB_RUST_TESTS_PASSWORD";
     pub const DEFAULT_PASSWORD: &'static str = "123456";
+    /// Optional override for the share name used by integration tests
+    /// (e.g. when pointing at a real lease-capable server with a non-default
+    /// share). Falls back to [`TestConstants::DEFAULT_SHARE`] when unset.
+    pub const SHARE: &'static str = "SMB_RUST_TESTS_SHARE";
 
     pub const GUEST_USER: &'static str = "/GUEST";
     pub const GUEST_PASSWORD: &'static str = "";
@@ -20,6 +24,12 @@ pub struct TestConstants;
 impl TestConstants {
     pub const DEFAULT_SHARE: &'static str = "MyShare";
     pub const PUBLIC_GUEST_SHARE: &'static str = "PublicShare";
+}
+
+/// Reads the share name from `SMB_RUST_TESTS_SHARE`, falling back to
+/// [`TestConstants::DEFAULT_SHARE`] when unset.
+pub fn smb_tests_share() -> String {
+    var(TestEnv::SHARE).unwrap_or_else(|_| TestConstants::DEFAULT_SHARE.to_string())
 }
 
 pub fn default_connection_config() -> ConnectionConfig {

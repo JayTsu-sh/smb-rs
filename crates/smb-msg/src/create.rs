@@ -585,6 +585,7 @@ pub struct TimewarpToken {
 ///
 /// Reference: MS-SMB2 2.2.13.2.8, 2.2.13.2.10, 2.2.14.2.10, 2.2.14.2.11
 #[smb_message_binrw]
+#[derive(Clone)]
 pub enum RequestLease {
     RqLsReqv1(RequestLeaseV1),
     RqLsReqv2(RequestLeaseV2),
@@ -595,6 +596,7 @@ pub enum RequestLease {
 ///
 /// Reference: MS-SMB2 2.2.13.2.8, 2.2.14.2.10
 #[smb_message_binrw]
+#[derive(Clone)]
 pub struct RequestLeaseV1 {
     /// Client-generated key that identifies the owner of the lease
     pub lease_key: u128,
@@ -613,6 +615,7 @@ pub struct RequestLeaseV1 {
 ///
 /// Reference: MS-SMB2 2.2.13.2.10, 2.2.14.2.11
 #[smb_message_binrw]
+#[derive(Clone)]
 pub struct RequestLeaseV2 {
     /// Client-generated key that identifies the owner of the lease
     pub lease_key: u128,

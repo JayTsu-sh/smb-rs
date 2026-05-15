@@ -155,6 +155,158 @@ impl Transformer {
         f(&session_info)
     }
 
+    /// Build the wire bytes for an SMB2 compound chain (MS-SMB2 3.2.4.1.4):
+    /// multiple SMB2 commands concatenated in one TCP send, each with its own
+    /// header carrying a `NextCommand` offset to the next member.
+    ///
+    /// Behavior summary:
+    /// - Each member is serialized independently (header + content).
+    /// - Each header's `next_command` is set to the 8-byte-aligned length of
+    ///   that member (0 for the last). Headers are re-written to capture this.
+    /// - Each member is then padded to 8-byte alignment as required by the spec.
+    /// - Signing is per-member: each header's signature is computed over just
+    ///   that member's byte slice (header with signature=0 + body), then written
+    ///   back into the header. All members must have the same `signed` flag on
+    ///   the first member (used as the chain-wide policy).
+    /// - The resulting [`IoVec`] is the concatenation of each member's bytes
+    ///   in order, ready for the transport to write.
+    ///
+    /// **Constraints for the current minimal implementation:**
+    /// - No encryption.
+    /// - No compression.
+    /// - No `additional_data` zero-copy bodies (data is whatever each
+    ///   member's `PlainRequest` serializes to).
+    /// - Caller must have already populated `header.message_id`,
+    ///   `tree_id`, `session_id`, and `credit_charge` / `credit_request`
+    ///   per member (typically done by `Connection::process_sequence_outgoing`
+    ///   on each message before this call).
+    /// - Caller is responsible for setting `flags.related_operations` on the
+    ///   2nd..Nth members and the `0xFF…FF` sentinel `FileId` on commands that
+    ///   want to chain context from a prior Create.
+    ///
+    /// Returns `Err(InvalidArgument)` for an empty `msgs` slice or any
+    /// member that requests encryption / additional_data.
+    pub async fn transform_outgoing_compound(
+        &self,
+        mut msgs: Vec<OutgoingMessage>,
+    ) -> crate::Result<IoVec> {
+        if msgs.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "compound chain requires at least one message".to_string(),
+            ));
+        }
+        for (i, m) in msgs.iter().enumerate() {
+            if m.encrypt {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "compound member {i}: encryption is not supported in the current minimal compound path",
+                )));
+            }
+            if m.additional_data.is_some() {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "compound member {i}: additional_data is not supported in compound mode",
+                )));
+            }
+        }
+
+        // 1. Serialize each member's bytes (header + content). Header still
+        //    has its old `next_command = 0` here; we rewrite it in step 2.
+        let mut member_bufs: Vec<Vec<u8>> = Vec::with_capacity(msgs.len());
+        for m in &msgs {
+            let mut buf = Vec::with_capacity(Header::STRUCT_SIZE + 256);
+            m.message.write(&mut Cursor::new(&mut buf))?;
+            member_bufs.push(buf);
+        }
+
+        // 2. Compute next_command offsets and rewrite each member's header bytes.
+        //    For member i (except last): next_command = 8-byte-aligned len of member i's buffer.
+        //    For last member: next_command = 0 (already).
+        let last = msgs.len() - 1;
+        for i in 0..last {
+            let aligned = (member_bufs[i].len() + 7) & !7usize;
+            msgs[i].message.header.next_command = u32::try_from(aligned).map_err(|_| {
+                crate::Error::InvalidState(format!(
+                    "compound member {i}: aligned size {aligned} does not fit in u32",
+                ))
+            })?;
+            // Rewrite the header bytes in-place with the updated next_command.
+            let mut header_bytes = [0u8; Header::STRUCT_SIZE];
+            msgs[i]
+                .message
+                .header
+                .write(&mut Cursor::new(&mut header_bytes[..]))?;
+            member_bufs[i][..Header::STRUCT_SIZE].copy_from_slice(&header_bytes);
+        }
+
+        // 3. Pad each non-last member to 8-byte alignment FIRST. The
+        //    `next_command` offset we set in step 2 is the padded length,
+        //    and per MS-SMB2 3.1.4.1 the per-member signature MUST cover
+        //    the full byte range the server sees as "this command", i.e.
+        //    the padded buffer. Signing must therefore happen AFTER
+        //    padding so the HMAC input matches what the receiver
+        //    re-hashes during verification.
+        for i in 0..last {
+            let aligned = (member_bufs[i].len() + 7) & !7usize;
+            member_bufs[i].resize(aligned, 0);
+        }
+
+        // 4. Sign each member if signing is requested (per-member, over
+        //    that member's padded bytes). We snapshot the signer once
+        //    and reuse it for each member (MessageSigner clone is cheap
+        //    — no heap alloc).
+        let should_sign = msgs[0].message.header.flags.signed();
+        if should_sign {
+            let session_id = msgs[0].message.header.session_id;
+            let signer = self
+                ._with_channel(session_id, |session| {
+                    let channel_info =
+                        session
+                            .channel
+                            .as_ref()
+                            .ok_or(crate::Error::TranformFailed(TransformError {
+                                outgoing: true,
+                                phase: TransformPhase::SignVerify,
+                                session_id: Some(session_id),
+                                why: "Compound message is signed, but no channel signer is set up",
+                                msg_id: None,
+                            }))?;
+                    Ok(channel_info.signer()?.clone())
+                })
+                .await?;
+
+            for i in 0..msgs.len() {
+                let mut iov: IoVec = IoVec::from(std::mem::take(&mut member_bufs[i]));
+                let mut signer = signer.clone();
+                signer.sign_message(&mut msgs[i].message.header, &mut iov)?;
+                // After sign_message, iov[0] holds the buffer with the signature
+                // written back into the header. Move it back into member_bufs
+                // without copying (IoVecBuf::Owned -> Vec via mem::take).
+                match &mut iov[0] {
+                    smb_transport::IoVecBuf::Owned(v) => {
+                        member_bufs[i] = std::mem::take(v);
+                    }
+                    smb_transport::IoVecBuf::Shared(_) => {
+                        return Err(crate::Error::InvalidState(
+                            "signed compound member buffer was not owned".to_string(),
+                        ));
+                    }
+                }
+                tracing::trace!(
+                    "Compound member {i} (msg_id {}) signed (signature={}).",
+                    msgs[i].message.header.message_id,
+                    msgs[i].message.header.signature,
+                );
+            }
+        }
+
+        // 5. Concatenate into the output IoVec. Each member is its own
+        //    owned buffer — the transport will gather them on send.
+        let mut out = IoVec::default();
+        for buf in member_bufs {
+            out.add_owned(buf);
+        }
+        Ok(out)
+    }
+
     /// Transforms an outgoing message to a raw SMB message.
     pub async fn transform_outgoing(&self, mut msg: OutgoingMessage) -> crate::Result<IoVec> {
         let should_encrypt = msg.encrypt;
@@ -263,6 +415,148 @@ impl Transformer {
         }
 
         Ok(outgoing_data)
+    }
+
+    /// Transforms an incoming message buffer to one or more [`IncomingMessage`]s,
+    /// supporting SMB2 compound responses.
+    ///
+    /// SMB2 compound responses chain multiple commands' responses into a single
+    /// TCP frame using the [`Header::next_command`] field (MS-SMB2 3.2.5.1.9 /
+    /// 3.3.4.1.5). Each member has its own header (including its own signature
+    /// when signing is on); the whole chain is encrypted/compressed as a unit if
+    /// either transformation is active.
+    ///
+    /// This method:
+    /// 1. Decrypts the chain (one shot) if [`Response::Encrypted`].
+    /// 2. Decompresses (one shot) if [`Response::Compressed`].
+    /// 3. Walks the resulting plain bytes, parsing one [`PlainResponse`] per
+    ///    NextCommand-delimited section, verifying each section's signature
+    ///    against just its own byte slice.
+    ///
+    /// Returns a `Vec` with one entry per member (length 1 in the common,
+    /// non-compound case). Member order matches the on-wire order, which the
+    /// server is required to preserve relative to the request chain (MS-SMB2
+    /// 3.3.5.2.7).
+    pub async fn transform_incoming_all(
+        &self,
+        data: Bytes,
+    ) -> crate::Result<Vec<IncomingMessage>> {
+        let message = Response::try_from(data.as_ref())?;
+        let mut form = MessageForm::default();
+
+        // 1. Decrypt (whole chain)
+        let (message, raw) = if let Response::Encrypted(encrypted_message) = message {
+            let session_id = encrypted_message.header.session_id;
+            form.encrypted = true;
+            let (msg, vec) = self
+                ._with_session(session_id, |session| {
+                    let decryptor = session.decryptor()?.ok_or(crate::Error::TranformFailed(
+                        TransformError {
+                            outgoing: false,
+                            phase: TransformPhase::EncryptDecrypt,
+                            session_id: Some(session_id),
+                            why: "Message is required to be encrypted, but no decryptor is set up!",
+                            msg_id: None,
+                        },
+                    ))?;
+                    decryptor.decrypt_message(encrypted_message)
+                })
+                .await?;
+            (msg, Bytes::from(vec))
+        } else {
+            (message, data)
+        };
+
+        // 2. Decompress (whole chain)
+        debug_assert!(!matches!(message, Response::Encrypted(_)));
+        let (message, raw) = if let Response::Compressed(compressed_message) = message {
+            let rconfig = self.config.read().await?;
+            form.compressed = true;
+            match &rconfig.compress {
+                Some(compress) => {
+                    let (msg, vec) = compress.1.decompress(&compressed_message)?;
+                    (msg, Bytes::from(vec))
+                }
+                None => {
+                    return Err(crate::Error::TranformFailed(TransformError {
+                        outgoing: false,
+                        phase: TransformPhase::CompressDecompress,
+                        session_id: None,
+                        why: "Compression is requested, but no decompressor is set up!",
+                        msg_id: None,
+                    }));
+                }
+            }
+        } else {
+            (message, raw)
+        };
+
+        let plain = match message {
+            Response::Plain(p) => p,
+            _ => {
+                return Err(crate::Error::InvalidMessage(
+                    "Expected plain message after decryption/decompression".to_string(),
+                ));
+            }
+        };
+
+        // 3. Walk the compound chain (or return single).
+        //    `next_command == 0` means this is the last (or only) member.
+        let mut out: Vec<IncomingMessage> = Vec::new();
+        let mut current = plain;
+        let mut remaining = raw;
+        loop {
+            let next_offset = current.header.next_command as usize;
+            // The slice belonging to *this* member is `remaining[..next_offset]`
+            // when there's another command after it, else the whole rest of
+            // `remaining`. Signing/verification is per-member over this slice.
+            let this_slice = if next_offset > 0 {
+                if next_offset > remaining.len() {
+                    return Err(crate::Error::InvalidMessage(format!(
+                        "Compound NextCommand offset {next_offset} exceeds remaining buffer {}",
+                        remaining.len()
+                    )));
+                }
+                remaining.slice(0..next_offset)
+            } else {
+                remaining.clone()
+            };
+
+            let mut member_form = form;
+            if let Err(e) = self
+                .verify_plain_incoming(&mut current, &this_slice, &mut member_form)
+                .await
+            {
+                tracing::error!("Failed to verify compound member message: {e:?}");
+                return Err(crate::Error::TranformFailed(TransformError {
+                    outgoing: false,
+                    phase: TransformPhase::SignVerify,
+                    session_id: Some(current.header.session_id),
+                    why: "Failed to verify compound member signature!",
+                    msg_id: Some(current.header.message_id),
+                }));
+            }
+            out.push(IncomingMessage::new(current, this_slice, member_form));
+
+            if next_offset == 0 {
+                break;
+            }
+            remaining = remaining.slice(next_offset..);
+            // Parse next member's header + content from the new slice start.
+            let next_resp = Response::try_from(remaining.as_ref())?;
+            current = match next_resp {
+                Response::Plain(p) => p,
+                _ => {
+                    return Err(crate::Error::InvalidMessage(
+                        "Compound chain member must be a plain SMB2 response \
+                         (encryption/compression apply to the whole chain only)"
+                            .to_string(),
+                    ));
+                }
+            };
+        }
+
+        Ok(out)
     }
 
     /// Transforms an incoming message buffer to an [`IncomingMessage`].

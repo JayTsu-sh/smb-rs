@@ -1,0 +1,862 @@
+//! Integration tests for `FileCreateArgs::lease_request` (Phase A of Handle Lease).
+//!
+//! These tests verify the end-to-end wire behavior against a real SMB server:
+//!  1. Client sends an `RqLs` create context with the Create request.
+//!  2. Server responds with an `RqLs` response context when it supports leasing.
+//!  3. `ResourceHandle::lease_granted()` exposes the parsed grant to callers.
+//!
+//! Phase A is **infrastructure only** — opening with a lease still costs a full
+//! `Create + Close` round-trip. Phases B-D introduce break handling and deferred
+//! close that actually skip RTs.
+//!
+//! ## Running
+//!
+//! These tests connect to whatever server `SMB_RUST_TESTS_SERVER` points at
+//! (defaults to `127.0.0.1`, expecting the docker-compose Samba setup from
+//! `crates/smb/tests/README.md`). They are not gated to any particular IP; any
+//! SMB 2.1+ server advertising `caps.leasing()` is sufficient.
+
+mod common;
+use common::{make_server_connection, smb_tests_share};
+use serial_test::serial;
+use smb::{FileCreateArgs, RequestLease, RequestLeaseV2};
+use smb_fscc::FileDispositionInformation;
+use smb_msg::{LeaseFlags, LeaseState};
+use std::time::Duration;
+
+/// Random-but-stable 128-bit lease key for the test. A real client would
+/// generate a fresh UUID per open; a constant value is fine in a serial test
+/// because the prior test's lease is released when the file is closed.
+const TEST_LEASE_KEY: u128 = 0x4C45_4153_4520_5445_5354_204B_4559_2121_u128;
+
+/// Build a v2 lease request asking for Read + Handle caching. Servers that
+/// don't support leasing will silently omit the response context; we'll
+/// observe that as `lease_granted() == None`.
+fn make_lease_request() -> RequestLease {
+    RequestLease::RqLsReqv2(RequestLeaseV2 {
+        lease_key: TEST_LEASE_KEY,
+        lease_state: LeaseState::new()
+            .with_read_caching(true)
+            .with_handle_caching(true),
+        lease_flags: LeaseFlags::new(),
+        parent_lease_key: 0,
+        epoch: 0,
+    })
+}
+
+#[test_log::test(maybe_async::test(
+    not(feature = "async"),
+    async(feature = "async", tokio::test(flavor = "current_thread"))
+))]
+#[serial]
+async fn test_lease_request_create_new() -> smb::Result<()> {
+    let share = smb_tests_share();
+    let (client, share_path) = make_server_connection(&share, None).await?;
+
+    // Inspect the negotiated capabilities so we can interpret the result:
+    // a server without `caps.leasing()` is expected to return None, and we
+    // skip the positive assertion instead of treating it as a failure.
+    let conn = client.get_connection(share_path.server()).await?;
+    let info = conn.conn_info().expect("share_connect completed → negotiated");
+    let server_supports_leasing = info.negotiation.caps.leasing();
+    tracing::info!(
+        "Negotiated: dialect={:?}, leasing={}, multi_channel={}",
+        info.negotiation.dialect_rev,
+        server_supports_leasing,
+        info.negotiation.caps.multi_channel()
+    );
+
+    // OverwriteIf instead of Create — makes the test idempotent across reruns
+    // (a prior failed run may have left the file behind without deleting it).
+    let args = FileCreateArgs::make_overwrite(Default::default(), Default::default())
+        .with_lease(make_lease_request());
+
+    let file = client
+        .create_file(&share_path.with_path("lease_phase_a.txt"), &args)
+        .await?
+        .into_file()
+        .expect("created resource must be a file");
+
+    let grant = file.handle().lease_granted();
+    tracing::info!("server lease_granted={:?}", grant);
+
+    if server_supports_leasing {
+        let g = grant.expect("server supports leasing → grant must be Some");
+        assert_eq!(g.key, TEST_LEASE_KEY, "server must echo our lease key");
+        // Server may downgrade requested state (e.g., drop handle_caching).
+        // Phase A only verifies the grant was parsed; the actual state is
+        // whatever the server chose to issue.
+        assert!(
+            g.state.read_caching() || g.state.handle_caching() || g.state.write_caching(),
+            "at least one caching bit must be set when grant is Some"
+        );
+    } else {
+        // Servers without leasing capability must not produce a grant.
+        assert!(
+            grant.is_none(),
+            "server lacks leasing capability but produced a grant: {:?}",
+            grant
+        );
+    }
+
+    file.set_info(FileDispositionInformation::default()).await?;
+    file.close().await?;
+    Ok(())
+}
+
+#[test_log::test(maybe_async::test(
+    not(feature = "async"),
+    async(feature = "async", tokio::test(flavor = "current_thread"))
+))]
+#[serial]
+async fn test_no_lease_request_has_no_grant() -> smb::Result<()> {
+    // Control case: default FileCreateArgs (no lease_request) → server must
+    // never produce a grant, regardless of server capability. This proves
+    // Phase A's `lease_requested` gate correctly suppresses parsing when
+    // the client didn't ask.
+    let share = smb_tests_share();
+    let (client, share_path) = make_server_connection(&share, None).await?;
+
+    let args = FileCreateArgs::make_overwrite(Default::default(), Default::default());
+    assert!(args.lease_request.is_none(), "control: args must have no lease");
+
+    let file = client
+        .create_file(&share_path.with_path("lease_phase_a_no_lease.txt"), &args)
+        .await?
+        .into_file()
+        .expect("created resource must be a file");
+
+    assert!(
+        file.handle().lease_granted().is_none(),
+        "no lease_request → grant must be None"
+    );
+
+    file.set_info(FileDispositionInformation::default()).await?;
+    file.close().await?;
+    Ok(())
+}
+
+/// Phase B (LeaseBreakNotify reception + auto-Ack):
+///
+/// Client A opens a file with a HandleCaching+ReadCaching lease, then a
+/// separate Client B opens the same path. The server is required to break
+/// the handle-caching component of A's lease and send a `LeaseBreakNotify`;
+/// the smb-rs connection task receives it, auto-sends a `LeaseBreakAck`,
+/// and fans out a `LeaseBreakEvent` to subscribers — which is what this
+/// test waits for.
+///
+/// This is the end-to-end proof that Phase B's wire-level integration
+/// works: subscription + decode + ack + fan-out. Unit-testable in isolation
+/// is the decode/fan-out; only a real server can drive the break.
+#[test_log::test(maybe_async::test(
+    not(feature = "async"),
+    async(feature = "async", tokio::test(flavor = "current_thread"))
+))]
+#[serial]
+async fn test_lease_break_notify_fanned_out() -> smb::Result<()> {
+    let share = smb_tests_share();
+
+    // Client A: holds the lease, subscribes to breaks.
+    let (client_a, share_path_a) = make_server_connection(&share, None).await?;
+    let conn = client_a.get_connection(share_path_a.server()).await?;
+    let info = conn.conn_info().expect("connection negotiated");
+    if !info.negotiation.caps.leasing() {
+        tracing::warn!(
+            "Server does not advertise caps.leasing(); Phase B break test \
+             cannot run against this server. Skipping."
+        );
+        return Ok(());
+    }
+
+    let mut break_rx = client_a
+        .subscribe_lease_breaks(share_path_a.server())
+        .await?;
+
+    let path = share_path_a.with_path("lease_phase_b_break.txt");
+    let lease = RequestLease::RqLsReqv2(RequestLeaseV2 {
+        lease_key: TEST_LEASE_KEY,
+        lease_state: LeaseState::new()
+            .with_read_caching(true)
+            .with_handle_caching(true),
+        lease_flags: LeaseFlags::new(),
+        parent_lease_key: 0,
+        epoch: 0,
+    });
+    let args_a = FileCreateArgs::make_overwrite(Default::default(), Default::default())
+        .with_lease(lease);
+    let file_a = client_a
+        .create_file(&path, &args_a)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+
+    let grant = file_a
+        .handle()
+        .lease_granted()
+        .expect("server with caps.leasing() must issue a grant");
+    tracing::info!("Client A holds lease: {grant:?}");
+    assert!(
+        grant.state.handle_caching(),
+        "test relies on handle_caching to provoke a break on B's open",
+    );
+
+    // Client B: independent connection to same server, opens the same path
+    // with OverwriteIf + GenericAll — strongly conflicts with A's
+    // HandleCaching+ReadCaching lease. Per MS-SMB2 2.2.23.2 the server must
+    // send a LeaseBreakNotify to A before completing B's Create.
+    let (client_b, share_path_b) = make_server_connection(&share, None).await?;
+    let path_b = share_path_b.with_path("lease_phase_b_break.txt");
+    let file_b = client_b
+        .create_file(
+            &path_b,
+            &FileCreateArgs::make_overwrite(Default::default(), Default::default()),
+        )
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+
+    // Bounded wait so a misbehaving server can't hang CI.
+    let event = tokio::time::timeout(Duration::from_secs(10), break_rx.recv())
+        .await
+        .expect("LeaseBreakNotify must arrive within 10s of B's conflicting open")
+        .expect("broadcast channel must remain open while client A is alive");
+
+    tracing::info!("Client A received break event: {event:?}");
+    assert_eq!(
+        event.lease_key.as_u128(),
+        grant.key,
+        "break must target the lease we acquired (compared via u128 since \
+         LeaseBreakNotify uses Guid while RequestLease uses u128)",
+    );
+    assert!(
+        !event.new_state.handle_caching(),
+        "server must drop handle_caching when another client opens the file",
+    );
+
+    // Cleanup: drop B first so A's set_info can mark the file for delete.
+    drop(file_b);
+    file_a
+        .set_info(FileDispositionInformation::default())
+        .await?;
+    file_a.close().await?;
+    Ok(())
+}
+
+/// Phase C.1 (cache table insert):
+///
+/// When `Client::create_file` succeeds with a granted lease, the
+/// connection's `lease_table` must hold an entry keyed by the share-
+/// relative path with a refcount of 1 and `tombstoned == false`. This
+/// is the simplest building block of Phase C — cache hits (C.3),
+/// break-driven tombstoning (C.2), and deferred close (C.4) all build
+/// on this insertion path.
+#[test_log::test(maybe_async::test(
+    not(feature = "async"),
+    async(feature = "async", tokio::test(flavor = "current_thread"))
+))]
+#[serial]
+async fn test_lease_slot_inserted_on_create() -> smb::Result<()> {
+    let share = smb_tests_share();
+    let (client, share_path) = make_server_connection(&share, None).await?;
+    let conn = client.get_connection(share_path.server()).await?;
+    let info = conn.conn_info().expect("connection negotiated");
+    if !info.negotiation.caps.leasing() {
+        tracing::warn!("Server lacks caps.leasing(); skipping C.1 cache-insert test.");
+        return Ok(());
+    }
+
+    // Baseline: cache must start empty for this fresh connection.
+    let baseline = conn.lease_slot_count().await?;
+
+    let path_rel = "lease_phase_c1_insert.txt";
+    let args = FileCreateArgs::make_overwrite(Default::default(), Default::default())
+        .with_lease(make_lease_request());
+    let file = client
+        .create_file(&share_path.with_path(path_rel), &args)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+
+    let grant = file
+        .handle()
+        .lease_granted()
+        .expect("server with caps.leasing() must issue a grant");
+
+    // A slot should now exist for our path.
+    assert_eq!(
+        conn.lease_slot_count().await?,
+        baseline + 1,
+        "Create with lease must add one entry to the per-connection lease_table",
+    );
+    let slot = conn
+        .peek_lease_slot(path_rel)
+        .await?
+        .expect("slot must be reachable by path");
+    assert_eq!(slot.lease_key, grant.key, "slot's lease_key must echo the grant");
+    assert_eq!(
+        slot.refcount.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "initial refcount is the caller's handle",
+    );
+    assert!(
+        !slot.tombstoned.load(std::sync::atomic::Ordering::Relaxed),
+        "fresh slot must not be tombstoned",
+    );
+
+    file.set_info(FileDispositionInformation::default()).await?;
+    file.close().await?;
+    Ok(())
+}
+
+/// Phase C.2 (break-driven tombstone):
+///
+/// Client A opens with HandleCaching; client B opens the same path with
+/// OverwriteIf. Server sends a `LeaseBreakNotify` to A. The per-connection
+/// break-listener spawned during `_negotiate` consumes the event from
+/// `lease_event_tx` and tombstones the matching slot in `lease_table`.
+/// This test polls the slot until tombstoned (or times out) — no event
+/// subscription needed, the test only inspects cache state.
+#[test_log::test(maybe_async::test(
+    not(feature = "async"),
+    async(feature = "async", tokio::test(flavor = "current_thread"))
+))]
+#[serial]
+async fn test_lease_slot_tombstoned_on_break() -> smb::Result<()> {
+    let share = smb_tests_share();
+
+    let (client_a, share_path_a) = make_server_connection(&share, None).await?;
+    let conn_a = client_a.get_connection(share_path_a.server()).await?;
+    let info = conn_a.conn_info().expect("connection negotiated");
+    if !info.negotiation.caps.leasing() {
+        tracing::warn!("Server lacks caps.leasing(); skipping C.2 tombstone test.");
+        return Ok(());
+    }
+
+    let path_rel = "lease_phase_c2_tombstone.txt";
+    let args_a = FileCreateArgs::make_overwrite(Default::default(), Default::default())
+        .with_lease(make_lease_request());
+    let file_a = client_a
+        .create_file(&share_path_a.with_path(path_rel), &args_a)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+
+    let slot = conn_a
+        .peek_lease_slot(path_rel)
+        .await?
+        .expect("slot must exist after Create with grant");
+    assert!(
+        !slot.tombstoned.load(std::sync::atomic::Ordering::Acquire),
+        "slot must start un-tombstoned",
+    );
+
+    // Provoke a break from a second client.
+    let (client_b, share_path_b) = make_server_connection(&share, None).await?;
+    let file_b = client_b
+        .create_file(
+            &share_path_b.with_path(path_rel),
+            &FileCreateArgs::make_overwrite(Default::default(), Default::default()),
+        )
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+
+    // Poll the slot's tombstoned flag with a bounded wait. The listener
+    // task runs on the same tokio runtime; the event flows
+    //   server -> worker -> notify channel -> handle_lease_break
+    //   -> broadcast tx -> listener rx -> apply_lease_break
+    //   -> slot.tombstoned.store(true).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !slot.tombstoned.load(std::sync::atomic::Ordering::Acquire) {
+        if std::time::Instant::now() > deadline {
+            panic!("slot was not tombstoned within 10s of B's conflicting open");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    tracing::info!(
+        "Slot tombstoned: granted_state now {:?}",
+        *slot.granted_state.read().expect("rwlock not poisoned"),
+    );
+
+    // Cleanup.
+    drop(file_b);
+    file_a
+        .set_info(FileDispositionInformation::default())
+        .await?;
+    file_a.close().await?;
+    Ok(())
+}
+
+/// Phase C.3+C.4 (cache hit + deferred close):
+///
+/// Open a file with a HandleCaching lease, close it, then reopen the same
+/// path with the same lease request. The second open must hit the cache:
+///   * No new FileId issued — the second handle reuses the first FileId.
+///   * The connection's lease_table still has the entry (refcount goes
+///     to 1 on the second open, never to 0 with tombstoned=false).
+///   * The slot's `last_used` advances on hit.
+///
+/// This is the first phase that actually saves network RTs. Subsequent
+/// opens against the same path are pure local table lookups.
+#[test_log::test(maybe_async::test(
+    not(feature = "async"),
+    async(feature = "async", tokio::test(flavor = "current_thread"))
+))]
+#[serial]
+async fn test_lease_cache_hit_reuses_file_id() -> smb::Result<()> {
+    use smb::FileAccessMask;
+    let share = smb_tests_share();
+    let (client, share_path) = make_server_connection(&share, None).await?;
+    let conn = client.get_connection(share_path.server()).await?;
+    let info = conn.conn_info().expect("connection negotiated");
+    if !info.negotiation.caps.leasing() {
+        tracing::warn!("Server lacks caps.leasing(); skipping C.3 cache-hit test.");
+        return Ok(());
+    }
+
+    // Use OverwriteIf for the initial set-up Create so we don't depend on
+    // prior test state; cache-hit Open will use CreateDisposition::Open
+    // which is the only disposition try_acquire_for_reuse accepts.
+    let path_rel = "lease_phase_c3_hit.txt";
+    let unc = share_path.with_path(path_rel);
+
+    // Step 1: prime the cache. OverwriteIf + GenericAll, with lease.
+    let args_prime = FileCreateArgs::make_overwrite(Default::default(), Default::default())
+        .with_lease(make_lease_request());
+    let file_first = client
+        .create_file(&unc, &args_prime)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+    let grant_first = file_first
+        .handle()
+        .lease_granted()
+        .expect("server with caps.leasing() must issue a grant");
+    let file_id_first = file_first.handle().raw_file_id();
+    assert!(
+        grant_first.state.handle_caching(),
+        "cache-hit test relies on handle_caching being granted; got {:?}",
+        grant_first.state,
+    );
+
+    // Step 2: close — but with a lease slot attached, this must be a
+    // deferred close. The slot stays in the cache.
+    file_first.close().await?;
+    let slot_after_close = conn
+        .peek_lease_slot(path_rel)
+        .await?
+        .expect("deferred close must leave the slot in the cache");
+    assert!(
+        !slot_after_close.tombstoned.load(std::sync::atomic::Ordering::Acquire),
+        "no break happened, slot must still be alive (not tombstoned)",
+    );
+    assert_eq!(
+        slot_after_close.refcount.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "refcount returns to 0 after close, but slot stays cached",
+    );
+
+    // Step 3: reopen with CreateDisposition::Open + matching access. The
+    // returned Resource must reuse the cached FileId — no new Create RT
+    // hit the wire. We assert FileId equality as the wire-observable
+    // proof.
+    let args_reopen = FileCreateArgs::make_open_existing(
+        FileAccessMask::new().with_generic_all(true),
+    )
+    .with_lease(make_lease_request());
+    let file_second = client
+        .create_file(&unc, &args_reopen)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+    let file_id_second = file_second.handle().raw_file_id();
+    assert_eq!(
+        file_id_second, file_id_first,
+        "cache hit must reuse the original FileId (saving a Create RT)",
+    );
+    assert_eq!(
+        slot_after_close.refcount.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "second open bumps refcount back to 1",
+    );
+
+    // Step 4: cleanup. set_info+close on the second handle marks the file
+    // for delete. Because the slot was never tombstoned (no server-side
+    // break), this close defers again — the file still gets deleted by
+    // virtue of the dispose flag carrying into the eventual wire close.
+    // We then provoke a tombstone via a flush_idle equivalent: a
+    // separate client opening the file would force a break, but here we
+    // just let drop() of the connection close everything at test end.
+    file_second
+        .set_info(FileDispositionInformation::default())
+        .await?;
+    file_second.close().await?;
+    Ok(())
+}
+
+/// Phase C.5 (explicit eviction):
+///
+/// `Client::evict_lease(path)` removes the cached slot and sends the
+/// wire `Close` immediately when no live handle is referencing the
+/// slot. After eviction, a subsequent open with the same lease request
+/// must miss the cache and get a *fresh* FileId, proving the prior
+/// FileId was actually released on the server side.
+///
+/// We also verify the idempotent / safe-on-empty behavior — calling
+/// `evict_lease` twice in a row returns `false` the second time.
+#[test_log::test(maybe_async::test(
+    not(feature = "async"),
+    async(feature = "async", tokio::test(flavor = "current_thread"))
+))]
+#[serial]
+async fn test_evict_lease_releases_slot_and_misses_next_open() -> smb::Result<()> {
+    let share = smb_tests_share();
+    let (client, share_path) = make_server_connection(&share, None).await?;
+    let conn = client.get_connection(share_path.server()).await?;
+    let info = conn.conn_info().expect("connection negotiated");
+    if !info.negotiation.caps.leasing() {
+        tracing::warn!("Server lacks caps.leasing(); skipping C.5 evict test.");
+        return Ok(());
+    }
+
+    let path_rel = "lease_phase_c5_evict.txt";
+    let unc = share_path.with_path(path_rel);
+
+    // Prime the cache: open with HandleCaching, then close — slot stays.
+    let args_prime = FileCreateArgs::make_overwrite(Default::default(), Default::default())
+        .with_lease(make_lease_request());
+    let file_first = client
+        .create_file(&unc, &args_prime)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+    let file_id_first = file_first.handle().raw_file_id();
+    let grant_first = file_first
+        .handle()
+        .lease_granted()
+        .expect("server with caps.leasing() must issue a grant");
+    assert!(
+        grant_first.state.handle_caching(),
+        "evict test relies on handle_caching being granted; got {:?}",
+        grant_first.state,
+    );
+    file_first.close().await?;
+    assert!(
+        conn.peek_lease_slot(path_rel).await?.is_some(),
+        "slot must survive deferred close",
+    );
+
+    // Explicit eviction returns true the first time, false the second
+    // (idempotent), and removes the entry from the table.
+    assert!(
+        client.evict_lease(&unc).await?,
+        "first evict must find and remove the slot",
+    );
+    assert!(
+        !client.evict_lease(&unc).await?,
+        "second evict on the same path is a no-op",
+    );
+    assert!(
+        conn.peek_lease_slot(path_rel).await?.is_none(),
+        "evicted slot must be gone from the table",
+    );
+
+    // After eviction the server has released the FileId; a fresh open
+    // with the same args must get a *new* FileId, not the cached one.
+    let args_reopen = FileCreateArgs::make_overwrite(Default::default(), Default::default())
+        .with_lease(make_lease_request());
+    let file_second = client
+        .create_file(&unc, &args_reopen)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+    let file_id_second = file_second.handle().raw_file_id();
+    assert_ne!(
+        file_id_second, file_id_first,
+        "after eviction the server must allocate a fresh FileId",
+    );
+
+    file_second
+        .set_info(FileDispositionInformation::default())
+        .await?;
+    file_second.close().await?;
+    // Final cleanup: evict so the deferred-close file_id is sent
+    // properly. With dispose set, this completes the delete.
+    let _ = client.evict_lease(&unc).await;
+    Ok(())
+}
+
+/// Phase C.5 (idle sweep):
+///
+/// `Client::flush_idle_leases(server, older_than)` should walk the
+/// per-connection lease table and tombstone+evict slots whose
+/// `last_used` is older than the threshold. The wire `Close` for
+/// refcount-0 slots is sent during the sweep.
+///
+/// We open a file with a lease, close it (slot retained), wait briefly,
+/// then call flush_idle_leases with a very small threshold. The slot
+/// must be gone afterwards and a re-open returns a fresh FileId.
+#[test_log::test(maybe_async::test(
+    not(feature = "async"),
+    async(feature = "async", tokio::test(flavor = "current_thread"))
+))]
+#[serial]
+async fn test_flush_idle_leases_sweeps_old_slots() -> smb::Result<()> {
+    let share = smb_tests_share();
+    let (client, share_path) = make_server_connection(&share, None).await?;
+    let conn = client.get_connection(share_path.server()).await?;
+    let info = conn.conn_info().expect("connection negotiated");
+    if !info.negotiation.caps.leasing() {
+        tracing::warn!("Server lacks caps.leasing(); skipping C.5 idle-sweep test.");
+        return Ok(());
+    }
+
+    let path_rel = "lease_phase_c5_idle.txt";
+    let server = share_path.server().to_string();
+    let unc = share_path.with_path(path_rel);
+
+    let args_prime = FileCreateArgs::make_overwrite(Default::default(), Default::default())
+        .with_lease(make_lease_request());
+    let file = client
+        .create_file(&unc, &args_prime)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+    let file_id_first = file.handle().raw_file_id();
+    file.close().await?;
+
+    // Confirm the slot is there.
+    assert!(
+        conn.peek_lease_slot(path_rel).await?.is_some(),
+        "deferred close must keep the slot cached",
+    );
+
+    // Wait past the threshold then sweep. We use 100ms to keep the test
+    // fast; in production this would be minutes.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let swept = client
+        .flush_idle_leases(&server, Duration::from_millis(50))
+        .await?;
+    assert!(
+        swept >= 1,
+        "sweep must claim at least our own idle slot, got {swept}",
+    );
+    assert!(
+        conn.peek_lease_slot(path_rel).await?.is_none(),
+        "swept slot must be gone from the table",
+    );
+
+    // Confirm the FileId is now stale on the server side: a fresh open
+    // gets a different FileId.
+    let args_reopen = FileCreateArgs::make_overwrite(Default::default(), Default::default())
+        .with_lease(make_lease_request());
+    let file_again = client
+        .create_file(&unc, &args_reopen)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+    assert_ne!(
+        file_again.handle().raw_file_id(),
+        file_id_first,
+        "after idle-sweep, the server has released the original FileId",
+    );
+
+    file_again
+        .set_info(FileDispositionInformation::default())
+        .await?;
+    file_again.close().await?;
+    let _ = client.evict_lease(&unc).await;
+    Ok(())
+}
+
+/// P2.b: compound Create+SetInfo+Close in a single SMB2 request.
+///
+/// The client builds a 3-member chain (Create with `Open` disposition,
+/// SetInfo of FileBasicInformation, Close) and sends it as one wire
+/// write. The server returns 3 chained responses; the worker dispatches
+/// each by message_id, the helper checks each status, and the new mtime
+/// must be visible on a fresh stat afterward.
+///
+/// We verify three things:
+/// 1. The helper succeeds (all 3 wire responses status=SUCCESS).
+/// 2. The destination file's mtime was actually written (we pick a
+///    distinctive value far enough from "now" that the server's
+///    auto-update on Create can't accidentally match).
+/// 3. creation_time was NOT clobbered (we sent 0 for it, which means
+///    "preserve" per MS-FSCC 2.4.7).
+#[test_log::test(maybe_async::test(
+    not(feature = "async"),
+    async(feature = "async", tokio::test(flavor = "current_thread"))
+))]
+#[serial]
+async fn test_compound_set_basic_info() -> smb::Result<()> {
+    use smb::{FileAccessMask, FileBasicInformation};
+    use smb::binrw_util::file_time::FileTime;
+
+    let share = smb_tests_share();
+    let (client, share_path) = make_server_connection(&share, None).await?;
+
+    let path_rel = "compound_p2b.txt";
+    let unc = share_path.with_path(path_rel);
+
+    // Seed the file so Open will succeed and we have a known starting
+    // state. Capture the original creation_time to assert preservation.
+    let prime_args = FileCreateArgs::make_overwrite(Default::default(), Default::default());
+    let f = client
+        .create_file(&unc, &prime_args)
+        .await?
+        .into_file()
+        .expect("must be file");
+    let creation_before: FileTime = f.handle().created().into();
+    f.close().await?;
+
+    // Pick a distinctive target mtime: 2020-06-15 12:00:00 UTC.
+    // (Unix epoch 1592_222_400 sec → expressed in 100ns Windows FileTime
+    // = (1592222400 + 11644473600) * 10_000_000 = 132373770400000000.)
+    let target_mtime = FileTime::from(132_373_770_400_000_000u64);
+
+    // Build the basic with creation/change/atime/attrs = 0 (preserve)
+    // and last_write_time set to our target. P2.b's compound helper
+    // sends this as one wire RT.
+    let basic = FileBasicInformation {
+        creation_time: FileTime::default(),
+        last_access_time: FileTime::default(),
+        last_write_time: target_mtime,
+        change_time: FileTime::default(),
+        file_attributes: smb_fscc::FileAttributes::new(),
+    };
+    client.compound_set_basic_info(&unc, basic).await?;
+
+    // Verify: open the file, query its FileBasicInformation, and
+    // check both the new mtime stuck AND creation_time was preserved.
+    let verify_args =
+        FileCreateArgs::make_open_existing(FileAccessMask::new().with_file_read_attributes(true));
+    let v = client
+        .create_file(&unc, &verify_args)
+        .await?
+        .into_file()
+        .expect("must be file");
+    let queried: FileBasicInformation = v
+        .handle()
+        .query_info()
+        .await
+        .expect("query basic info");
+    assert_eq!(
+        *queried.last_write_time, *target_mtime,
+        "compound SetInfo's last_write_time must be visible after the chain's Close commits",
+    );
+    assert_eq!(
+        *queried.creation_time, *creation_before,
+        "creation_time = 0 in SetInfo must leave the server's stored creation_time unchanged (MS-FSCC 2.4.7)",
+    );
+    v.close().await?;
+
+    // Cleanup
+    let cleanup_args =
+        FileCreateArgs::make_open_existing(FileAccessMask::new().with_delete(true));
+    let c = client
+        .create_file(&unc, &cleanup_args)
+        .await?
+        .into_file()
+        .expect("must be file");
+    c.set_info(FileDispositionInformation::default()).await?;
+    c.close().await?;
+    Ok(())
+}
+
+/// Phase D (default lease injection):
+///
+/// `ClientConfig::default_lease_state = Some(...)` makes every
+/// `create_file` call request a lease without the caller having to
+/// build a RequestLease per call. Two opens of the same path on the
+/// same Client should:
+///   1. Get a lease granted on the first call (proving auto-injection
+///      worked end-to-end).
+///   2. Hit the cache on the second call — same FileId — proving the
+///      auto-injected lease keys are stable per path within a Client.
+#[test_log::test(maybe_async::test(
+    not(feature = "async"),
+    async(feature = "async", tokio::test(flavor = "current_thread"))
+))]
+#[serial]
+async fn test_client_default_lease_state_auto_injects() -> smb::Result<()> {
+    use smb::{Client, ClientConfig, FileAccessMask};
+    let share = smb_tests_share();
+    let mut config = ClientConfig::default();
+    let mut conn_config = smb::ConnectionConfig::default();
+    conn_config.timeout = Some(Duration::from_secs(10));
+    conn_config.auth_methods.kerberos = false;
+    conn_config.auth_methods.ntlm = true;
+    config.connection = conn_config;
+    config.default_lease_state = Some(
+        LeaseState::new()
+            .with_read_caching(true)
+            .with_handle_caching(true),
+    );
+
+    let server = std::env::var("SMB_RUST_TESTS_SERVER").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let user = std::env::var("SMB_RUST_TESTS_USER_NAME").unwrap_or_else(|_| "LocalAdmin".to_string());
+    let password =
+        std::env::var("SMB_RUST_TESTS_PASSWORD").unwrap_or_else(|_| "123456".to_string());
+    let client = Client::new(config);
+    let unc_share = smb::UncPath::new(&server)?.with_share(&share)?;
+    client
+        .share_connect(&unc_share, user.as_str(), password)
+        .await?;
+
+    let conn = client.get_connection(&server).await?;
+    let info = conn.conn_info().expect("connection negotiated");
+    if !info.negotiation.caps.leasing() {
+        tracing::warn!("Server lacks caps.leasing(); skipping Phase D auto-inject test.");
+        return Ok(());
+    }
+
+    let path_rel = "lease_phase_d_auto.txt";
+    let unc = unc_share.with_path(path_rel);
+
+    // No `.with_lease(...)` on args — relying purely on config.
+    let args_no_lease = FileCreateArgs::make_overwrite(Default::default(), Default::default());
+    assert!(
+        args_no_lease.lease_request.is_none(),
+        "control: args must not carry a lease at the call site",
+    );
+
+    let file_first = client
+        .create_file(&unc, &args_no_lease)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+    let grant = file_first
+        .handle()
+        .lease_granted()
+        .expect("config.default_lease_state must trigger a grant");
+    assert!(
+        grant.state.handle_caching(),
+        "auto-injected lease must request handle_caching",
+    );
+    let file_id_first = file_first.handle().raw_file_id();
+    file_first.close().await?;
+
+    // Second open also without explicit lease — must hit the cache.
+    let args_reopen = FileCreateArgs::make_open_existing(
+        FileAccessMask::new().with_generic_all(true),
+    );
+    let file_second = client
+        .create_file(&unc, &args_reopen)
+        .await?
+        .into_file()
+        .expect("Resource must be a file");
+    assert_eq!(
+        file_second.handle().raw_file_id(),
+        file_id_first,
+        "auto-injected lease must yield stable lease key → cache hits",
+    );
+
+    file_second
+        .set_info(FileDispositionInformation::default())
+        .await?;
+    file_second.close().await?;
+    let _ = client.evict_lease(&unc).await;
+    Ok(())
+}

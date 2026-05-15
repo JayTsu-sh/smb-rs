@@ -1,7 +1,13 @@
 use crate::ConnectionConfig;
+use crate::msg_handler::OutgoingMessage;
 use crate::{Connection, Error, FileCreateArgs, Pipe, Resource, Session, Tree, sync_helpers::*};
 use maybe_async::maybe_async;
-use smb_msg::{NetworkInterfaceInfo, ReferralEntry, ReferralEntryValue, Status};
+use smb_fscc::{ChainedItemList, FileBasicInformation, SetFileInfo, SetFileInfoClass};
+use smb_msg::{
+    AdditionalInfo, CloseRequest, CreateRequest, FileId, ImpersonationLevel, NetworkInterfaceInfo,
+    OplockLevel, RawSetInfoData, ReferralEntry, ReferralEntryValue, RequestContent, SetInfoClass,
+    SetInfoData, SetInfoRequest, ShareAccessFlags, Status,
+};
 use smb_rpc::interface::{LsaRpc, ShareInfo1, SrvSvc, TranslatedName};
 use smb_transport::TransportConfig;
 use smb_transport::utils::TransportUtils;
@@ -368,8 +374,134 @@ impl Client {
 
     async fn _create_file(&self, path: &UncPath, args: &FileCreateArgs) -> crate::Result<Resource> {
         let tree = self.get_tree(path).await?;
-        let resource = tree.create(path.path().unwrap_or(""), args).await?;
+        let rel = path.path().unwrap_or("").to_string();
+
+        // Phase D — inject the default lease when the caller didn't specify
+        // one and the client config opts in. The synthesized lease key is
+        // a deterministic mix of the client's `lease_key_salt` and the
+        // full UNC path, so repeat opens of the same path within this
+        // Client share a key (and hit the cache); different Clients on
+        // the same machine use different salts and therefore different
+        // keys (no cross-client server-side lease confusion).
+        let owned_args;
+        let effective_args = if args.lease_request.is_none() {
+            if let Some(state) = self.config.default_lease_state {
+                let lease = smb_msg::RequestLease::RqLsReqv2(smb_msg::RequestLeaseV2 {
+                    lease_key: Self::derive_lease_key(self.config.lease_key_salt, path),
+                    lease_state: state,
+                    lease_flags: smb_msg::LeaseFlags::new(),
+                    parent_lease_key: 0,
+                    epoch: 0,
+                });
+                owned_args = FileCreateArgs {
+                    disposition: args.disposition,
+                    attributes: args.attributes,
+                    options: args.options,
+                    desired_access: args.desired_access,
+                    lease_request: Some(lease),
+                };
+                &owned_args
+            } else {
+                args
+            }
+        } else {
+            args
+        };
+
+        // Phase C.3 — cache-hit short-circuit. When the (effective) args
+        // carry a lease request, look up the per-connection `lease_table`;
+        // the lookup and refcount bump happen atomically under the table
+        // lock via `try_acquire_lease`, which serializes us against
+        // concurrent `evict_lease` / `flush_idle_leases` operations so we
+        // never hand out a FileId the evicter has already closed on the
+        // wire.
+        if effective_args.lease_request.is_some() {
+            if let Ok(conn) = self.get_connection(path.server()).await {
+                let wants_dir = effective_args.options.directory_file();
+                if let Ok(Some(slot)) = conn
+                    .try_acquire_lease(
+                        &rel,
+                        effective_args.desired_access,
+                        effective_args.disposition,
+                        wants_dir,
+                    )
+                    .await
+                {
+                    tracing::debug!(
+                        path = %rel,
+                        file_id = ?slot.file_id,
+                        "Lease cache hit; reusing FileId without Create RT",
+                    );
+                    return Ok(Resource::reuse_from_slot(slot));
+                }
+            }
+        }
+
+        // Cache miss (or no lease requested): take the regular wire path.
+        let mut resource = tree.create(&rel, effective_args).await?;
+
+        // Phase C.1: install a slot into the per-connection cache so the
+        // *next* call against the same path can hit C.3. Also attach the
+        // slot to the resource we're returning so its close()/Drop go
+        // through the deferred-close path (C.4).
+        let grant = resource.handle().and_then(|h| h.lease_granted());
+        if let Some(grant) = grant {
+            if let Some(proto) =
+                resource.build_lease_proto(tree.handler_ref(), effective_args.desired_access)
+            {
+                let slot = std::sync::Arc::new(crate::lease::LeaseSlot::new_with_proto(
+                    rel.clone(),
+                    tree.tree_id(),
+                    resource.handle().map(|h| h.raw_file_id()).unwrap_or_default(),
+                    grant.key,
+                    grant.state,
+                    proto,
+                ));
+                match self.get_connection(path.server()).await {
+                    Ok(conn) => match conn.insert_lease_slot(slot.clone()).await {
+                        Ok(()) => resource.attach_lease_slot(slot),
+                        Err(e) => tracing::warn!(
+                            path = %path,
+                            error = ?e,
+                            "Failed to install lease slot in cache",
+                        ),
+                    },
+                    Err(e) => tracing::warn!(
+                        path = %path,
+                        error = ?e,
+                        "Cannot resolve connection for lease cache insert",
+                    ),
+                }
+            }
+        }
+
         Ok(resource)
+    }
+
+    /// Derive a stable 128-bit lease key from the client's
+    /// `lease_key_salt` and the full UNC path. SipHash-flavored mix
+    /// avoids the bad cache behavior of a plain XOR (paths often share
+    /// long common prefixes) and gives enough entropy for the lease
+    /// cache to dedupe paths within a Client without collisions.
+    fn derive_lease_key(salt: u64, path: &UncPath) -> u128 {
+        use std::hash::{Hash, Hasher};
+        // Two independent hashers seeded with derived salts give us the
+        // two halves of the 128-bit key. Using `DefaultHasher` (SipHash
+        // under the hood) is good enough for collision resistance at
+        // this scale (a single Client rarely caches more than a few
+        // thousand paths).
+        let path_str = path.to_string();
+        let mut h_lo = std::collections::hash_map::DefaultHasher::new();
+        h_lo.write_u64(salt);
+        path_str.hash(&mut h_lo);
+        let lo = h_lo.finish() as u128;
+
+        let mut h_hi = std::collections::hash_map::DefaultHasher::new();
+        h_hi.write_u64(salt.wrapping_mul(0x9E3779B97F4A7C15));
+        path_str.hash(&mut h_hi);
+        let hi = h_hi.finish() as u128;
+
+        (hi << 64) | lo
     }
 
     /// Makes a connection to the specified server.
@@ -512,6 +644,250 @@ impl Client {
 
     pub async fn get_session(&self, path: &UncPath) -> crate::Result<Arc<Session>> {
         self._with_tree(path, |tree| Ok(tree.session.clone())).await
+    }
+
+    /// Subscribe to lease-break notifications for the connection to `server`.
+    ///
+    /// Returns a [`tokio::sync::broadcast::Receiver`] that yields one
+    /// [`crate::LeaseBreakEvent`] per `LeaseBreakNotify` the server sends on
+    /// this connection. The connection task has already replied with a
+    /// `LeaseBreakAck` by the time the event is published, so receivers
+    /// only need to handle the *consequence* of the break (typically:
+    /// drop the cached `FileId` keyed by `lease_key` and force the next
+    /// open to re-issue Create on the wire).
+    ///
+    /// Errors: returns the same set as [`Client::get_connection`]; the
+    /// caller must have already established the connection.
+    #[cfg(feature = "async")]
+    pub async fn subscribe_lease_breaks(
+        &self,
+        server: &str,
+    ) -> crate::Result<tokio::sync::broadcast::Receiver<crate::LeaseBreakEvent>> {
+        let conn = self.get_connection(server).await?;
+        Ok(conn.subscribe_lease_breaks())
+    }
+
+    /// Phase C.5: explicit lease eviction for a single path. Tombstones
+    /// the cached slot, removes it from the per-connection table, and
+    /// sends the wire `Close` against the cached `FileId` when this
+    /// caller owns it (no live handles remained at eviction time).
+    ///
+    /// Callers must invoke this *before* destructive operations on the
+    /// path — `delete_file`, `rename`, anything that would invalidate
+    /// the cached FileId server-side — so that subsequent opens don't
+    /// hit a stale entry that the server has already dropped.
+    ///
+    /// Returns `true` when a slot was found and removed, `false` when
+    /// the path had no cached lease (idempotent / safe to call
+    /// preemptively).
+    ///
+    /// The wire `Close` is fire-and-best-effort: failures are logged
+    /// but don't propagate, since the slot is already gone from our
+    /// cache and the path may already be inaccessible (e.g. the
+    /// session lost reconnect, the share dropped).
+    pub async fn evict_lease(&self, path: &UncPath) -> crate::Result<bool> {
+        let rel = path.path().unwrap_or("").to_string();
+        let conn = self.get_connection(path.server()).await?;
+        let Some(eviction) = conn.take_lease_for_evict(&rel).await? else {
+            return Ok(false);
+        };
+        Self::flush_eviction(&path.to_string(), eviction).await;
+        Ok(true)
+    }
+
+    /// Phase C.5: idle-sweep across the connection identified by
+    /// `server`. Tombstones and removes any slot whose `last_used` is
+    /// older than `older_than`; sends the wire `Close` for the ones
+    /// whose refcount was zero at sweep time. Slots with live handles
+    /// stay tombstoned and rely on each handle's deferred-close path.
+    ///
+    /// Returns the number of slots that were tombstoned. A return of
+    /// `0` is normal when no slot has aged past the threshold.
+    pub async fn flush_idle_leases(
+        &self,
+        server: &str,
+        older_than: std::time::Duration,
+    ) -> crate::Result<usize> {
+        let conn = self.get_connection(server).await?;
+        let evictions = conn.sweep_idle_leases(older_than).await?;
+        let count = evictions.len();
+        for eviction in evictions {
+            let label = format!("\\\\{server}\\{}", eviction.slot.path);
+            Self::flush_eviction(&label, eviction).await;
+        }
+        Ok(count)
+    }
+
+    /// P2.b: compound `Create` + `SetInfo(FileBasicInformation)` + `Close`
+    /// into a single SMB2 compound request (MS-SMB2 3.2.4.1.4), saving
+    /// 2 wire round-trips compared with the open/set/close sequence
+    /// `update_metadata` would otherwise issue.
+    ///
+    /// Semantics:
+    /// - Opens `path` with `disposition = Open` and `access =
+    ///   FILE_WRITE_ATTRIBUTES` (the minimum to drive a SetInfo on
+    ///   FileBasicInformation per MS-SMB2 2.2.13.1.1).
+    /// - Issues SetInfo with the caller-provided `basic`. Per
+    ///   MS-FSCC 2.4.7, time-field values of 0 mean "preserve on the
+    ///   server" — callers can leave creation/change_time/file_attributes
+    ///   zeroed and only fill `last_access_time` / `last_write_time`.
+    /// - Closes the resulting handle immediately, so the SetInfo's
+    ///   sticky LastWriteTime gets committed to disk before this
+    ///   function returns. There is no lease, no deferred close, and
+    ///   no need for an `evict_lease` bracket around this call.
+    ///
+    /// The chain uses SMB2 related-operations semantics: the SetInfo and
+    /// Close members carry `FileId::FULL` (all-1s) and
+    /// `flags.related_operations = true`, telling the server to substitute
+    /// the FileId returned by the preceding Create (MS-SMB2 3.3.5.2.7.2).
+    ///
+    /// Returns `Err` if any of the three responses carries a non-success
+    /// status (the Create / SetInfo error is surfaced; the Close status is
+    /// checked last so a Close failure is reported separately).
+    pub async fn compound_set_basic_info(
+        &self,
+        path: &UncPath,
+        basic: FileBasicInformation,
+    ) -> crate::Result<()> {
+        let tree = self.get_tree(path).await?;
+        let tree_id = tree.tree_id();
+        let session = self.get_session(path).await?;
+        let session_id = session.session_id();
+        let signed = !session.allow_unsigned().await?;
+        let conn = self.get_connection(path.server()).await?;
+        let rel = path.path().unwrap_or("");
+
+        // Helper: fill in the per-member header fields (tree_id, session_id,
+        // signed flag, related_operations) that the three members of this
+        // chain otherwise duplicate. `related = false` is the start of the
+        // chain (Create); `related = true` for the SetInfo and Close that
+        // depend on Create's returned FileId.
+        let make_member = |req: RequestContent, related: bool| {
+            let mut m = OutgoingMessage::new(req);
+            m.message.header.tree_id = Some(tree_id);
+            m.message.header.session_id = session_id;
+            m.message.header.flags.set_signed(signed);
+            if related {
+                m.message.header.flags.set_related_operations(true);
+            }
+            m
+        };
+
+        // Member 1: Create with Open disposition. No lease context — we
+        // want an immediate Close, not deferred. No DFS — update_metadata
+        // is always against already-resolved paths under a connected share.
+        let create_msg = make_member(
+            CreateRequest {
+                requested_oplock_level: OplockLevel::None,
+                impersonation_level: ImpersonationLevel::Impersonation,
+                desired_access: smb_fscc::FileAccessMask::new().with_file_write_attributes(true),
+                file_attributes: smb_fscc::FileAttributes::new(),
+                share_access: ShareAccessFlags::new()
+                    .with_read(true)
+                    .with_write(true)
+                    .with_delete(true),
+                create_disposition: smb_msg::CreateDisposition::Open,
+                create_options: smb_msg::CreateOptions::new(),
+                name: rel.into(),
+                contexts: ChainedItemList::default(),
+            }
+            .into(),
+            false,
+        );
+
+        // Members 2 & 3: SetInfo + Close with FileId::FULL and
+        // related_operations=true, so the server substitutes Create's
+        // returned FileId here per MS-SMB2 3.3.5.2.7.2.
+        let setinfo_msg = make_member(
+            SetInfoRequest {
+                info_class: SetInfoClass::File(SetFileInfoClass::BasicInformation),
+                additional_information: AdditionalInfo::new(),
+                file_id: FileId::FULL,
+                data: SetInfoData::File(RawSetInfoData::from(SetFileInfo::BasicInformation(basic))),
+            }
+            .into(),
+            true,
+        );
+        let close_msg = make_member(
+            CloseRequest {
+                file_id: FileId::FULL,
+            }
+            .into(),
+            true,
+        );
+
+        let responses = conn
+            .send_compound(vec![create_msg, setinfo_msg, close_msg])
+            .await?;
+
+        // Validate each member's status. We surface the first non-success
+        // response (Create or SetInfo) explicitly because those are the
+        // path the caller cares about; a Close failure means we issued an
+        // orphan handle, which we want to know about but not as a primary
+        // error path.
+        if responses.len() != 3 {
+            return Err(Error::InvalidState(format!(
+                "compound_set_basic_info expected 3 responses, got {}",
+                responses.len()
+            )));
+        }
+        for (i, resp) in responses.iter().take(2).enumerate() {
+            let status = resp.message.header.status()?;
+            if !matches!(status, Status::Success) {
+                let kind = if i == 0 { "Create" } else { "SetInfo" };
+                tracing::error!(
+                    path = %path,
+                    member = kind,
+                    status = ?status,
+                    "compound_set_basic_info failed",
+                );
+                return Err(Error::UnexpectedMessageStatus(resp.message.header.status));
+            }
+        }
+        let close_status = responses[2].message.header.status()?;
+        if !matches!(close_status, Status::Success) {
+            tracing::warn!(
+                path = %path,
+                status = ?close_status,
+                "compound_set_basic_info: Close failed (server-side handle may leak until session end)",
+            );
+        }
+        Ok(())
+    }
+
+    /// Send the wire `Close` for an eviction that owes one. Failures are
+    /// logged at WARN — by the time we reach this point the slot is
+    /// already removed from the cache, so a failed Close just leaks a
+    /// server-side FileId that the session-disconnect will collect.
+    async fn flush_eviction(label: &str, eviction: crate::connection::LeaseEviction) {
+        if !eviction.needs_wire_close {
+            tracing::debug!(
+                path = label,
+                "Eviction handed off to live holder's release_one",
+            );
+            return;
+        }
+        let file_id = eviction.slot.file_id;
+        let handler = eviction.slot.proto.handler.clone();
+        if file_id == smb_msg::FileId::EMPTY {
+            return;
+        }
+        if let Err(e) = crate::resource::ResourceHandle::send_close_external(file_id, &handler)
+            .await
+        {
+            tracing::warn!(
+                path = label,
+                file_id = ?file_id,
+                error = ?e,
+                "Eviction wire Close failed (FileId leaked until session end)",
+            );
+        } else {
+            tracing::debug!(
+                path = label,
+                file_id = ?file_id,
+                "Eviction wire Close sent",
+            );
+        }
     }
 
     /// Returns a map of channel IDs to their corresponding connections for the specified session,

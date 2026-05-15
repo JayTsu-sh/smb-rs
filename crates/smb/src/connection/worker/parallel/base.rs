@@ -91,6 +91,61 @@ where
         self.stopped.load(Ordering::Relaxed)
     }
 
+    /// Send a compound SMB2 request chain (MS-SMB2 3.2.4.1.4): N messages
+    /// stitched together via `Header::next_command`, sent in a single TCP
+    /// write. Returns one [`SendMessageResult`] per member (in order), so
+    /// the caller can later `receive(msg_id)` each member's response
+    /// independently.
+    ///
+    /// Compound responses come back the same way: server packs N
+    /// responses into one frame and the worker's `incoming_data_callback`
+    /// fans each out to its matching `msg_id` waiter via
+    /// `Transformer::transform_incoming_all` — there's nothing extra to
+    /// do on the receive side from the caller.
+    ///
+    /// **The caller is responsible for**:
+    /// - allocating `message_id` (and credit_charge / credit_request) for
+    ///   each member before this call, typically by running each through
+    ///   `Connection::process_sequence_outgoing`;
+    /// - setting `flags.related_operations = true` on members 2..N if the
+    ///   chain is using the related-operations / `FileId::FULL` chaining
+    ///   semantics from MS-SMB2 3.3.5.2.7.2.
+    ///
+    /// **Not supported in the minimal compound path** (will error):
+    /// - per-member encryption,
+    /// - per-member `additional_data` (zero-copy write tails),
+    /// - empty input.
+    pub async fn send_compound(
+        self: &Arc<Self>,
+        msgs: Vec<OutgoingMessage>,
+    ) -> crate::Result<Vec<SendMessageResult>> {
+        if msgs.is_empty() {
+            return Err(Error::InvalidArgument(
+                "send_compound: empty message list".to_string(),
+            ));
+        }
+        // Snapshot ids before consuming `msgs` so we can return them as
+        // SendMessageResult after the transform.
+        let ids: Vec<u64> = msgs
+            .iter()
+            .map(|m| m.message.header.message_id)
+            .collect();
+
+        let raw = self.transformer.transform_outgoing_compound(msgs).await?;
+        tracing::trace!(
+            "Compound chain ({} members, ids={ids:?}) handed to transport.",
+            ids.len()
+        );
+
+        let message = T::wrap_msg_to_send(raw);
+        T::channel_send(&self.sender, message)?;
+
+        Ok(ids
+            .into_iter()
+            .map(|id| SendMessageResult::new(id, None))
+            .collect())
+    }
+
     /// This is a function that should be used by multi worker implementations (async/mtd),
     /// after gettting a messages from the server, this function processes it and
     /// notifies the awaiting tasks.
@@ -101,17 +156,19 @@ where
         tracing::trace!("Received message from server.");
         let message = message?;
 
-        // Tranform the message and verify it.
-        let msg = self.transformer.transform_incoming(message).await;
-        let (msg, msg_id) = match msg {
-            // Good flow, message is OK.
-            Ok(msg) => {
-                let msg_id = msg.message.header.message_id;
-                (Ok(msg), msg_id)
-            }
-            // If we have a message ID to notify the error, use it.
+        // Transform the message(s). A single NetBIOS frame can contain a
+        // compound chain of N responses (SMB2 NextCommand); we dispatch each
+        // chained response to its own awaiter independently.
+        let msgs = match self.transformer.transform_incoming_all(message).await {
+            Ok(v) => v,
+            // If the transformer can attribute the failure to a single
+            // message id, route the error to that awaiter; otherwise propagate.
             Err(crate::Error::TranformFailed(e)) => match e.msg_id {
-                Some(msg_id) => (Err(crate::Error::TranformFailed(e)), msg_id),
+                Some(msg_id) => {
+                    return self
+                        .dispatch_one(msg_id, Err(crate::Error::TranformFailed(e)))
+                        .await;
+                }
                 None => return Err(Error::TranformFailed(e)),
             },
             Err(e) => {
@@ -120,22 +177,35 @@ where
             }
         };
 
+        for msg in msgs {
+            let msg_id = msg.message.header.message_id;
+            self.dispatch_one(msg_id, Ok(msg)).await?;
+        }
+        Ok(())
+    }
+
+    /// Route a single parsed message (or transform error) to its awaiting
+    /// caller. msg_id == u64::MAX is the unsolicited-notification path
+    /// (oplock/lease break, server-to-client).
+    async fn dispatch_one(
+        self: &Arc<Self>,
+        msg_id: u64,
+        msg: crate::Result<IncomingMessage>,
+    ) -> crate::Result<()> {
         // Message ID (-1) is used and valid for notifications -
         // OPLOCK_BREAK or SERVER_TO_CLIENT_NOTIFICATION only.
         if msg_id == u64::MAX {
-            // Nothing's waiting, so if there was an error, return it --
-            // no need to notify anyone else.
             let msg = msg?;
 
             // Server-to-client commands check.
-            // allow only oplock break and server to client notification.
             if !matches!(
                 msg.message.content,
                 ResponseContent::OplockBreakNotify(_)
+                    | ResponseContent::LeaseBreakNotify(_)
                     | ResponseContent::ServerToClientNotification(_)
             ) {
                 return Err(Error::MessageProcessingError(
-                    "Received notification message, but not an OPLOCK_BREAK or SERVER_TO_CLIENT_NOTIFICATION.".to_string(),
+                    "Received notification message, but not an OPLOCK_BREAK / LEASE_BREAK / SERVER_TO_CLIENT_NOTIFICATION.".to_string(),
                 ));
             }
 
