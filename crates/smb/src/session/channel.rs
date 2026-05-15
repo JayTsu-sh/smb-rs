@@ -46,6 +46,20 @@ impl Channel {
     pub fn channel_id(&self) -> u32 {
         self.channel_id
     }
+
+    /// Returns `true` when the session permits unsigned messages.
+    ///
+    /// Mirrors the check used inside [`ChannelMessageHandler::sendo`]: a
+    /// session enforces signing iff `allow_unsigned()` is `false` after
+    /// it reaches `is_ready()`. Exposed publicly for callers that build
+    /// SMB2 compound chains (P2.b) and need to set the `signed` flag on
+    /// each chained header before going through the worker directly.
+    #[maybe_async]
+    pub async fn allow_unsigned(&self) -> crate::Result<bool> {
+        let state = self.handler.session_state.read().await?;
+        let session = state.session.read().await?;
+        session.allow_unsigned()
+    }
 }
 
 /// Message handler a specific channel.

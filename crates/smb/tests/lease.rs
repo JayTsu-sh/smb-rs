@@ -670,6 +670,101 @@ async fn test_flush_idle_leases_sweeps_old_slots() -> smb::Result<()> {
     Ok(())
 }
 
+/// P2.b: compound Create+SetInfo+Close in a single SMB2 request.
+///
+/// The client builds a 3-member chain (Create with `Open` disposition,
+/// SetInfo of FileBasicInformation, Close) and sends it as one wire
+/// write. The server returns 3 chained responses; the worker dispatches
+/// each by message_id, the helper checks each status, and the new mtime
+/// must be visible on a fresh stat afterward.
+///
+/// We verify three things:
+/// 1. The helper succeeds (all 3 wire responses status=SUCCESS).
+/// 2. The destination file's mtime was actually written (we pick a
+///    distinctive value far enough from "now" that the server's
+///    auto-update on Create can't accidentally match).
+/// 3. creation_time was NOT clobbered (we sent 0 for it, which means
+///    "preserve" per MS-FSCC 2.4.7).
+#[test_log::test(maybe_async::test(
+    not(feature = "async"),
+    async(feature = "async", tokio::test(flavor = "current_thread"))
+))]
+#[serial]
+async fn test_compound_set_basic_info() -> smb::Result<()> {
+    use smb::{FileAccessMask, FileBasicInformation};
+    use smb::binrw_util::file_time::FileTime;
+
+    let share = smb_tests_share();
+    let (client, share_path) = make_server_connection(&share, None).await?;
+
+    let path_rel = "compound_p2b.txt";
+    let unc = share_path.with_path(path_rel);
+
+    // Seed the file so Open will succeed and we have a known starting
+    // state. Capture the original creation_time to assert preservation.
+    let prime_args = FileCreateArgs::make_overwrite(Default::default(), Default::default());
+    let f = client
+        .create_file(&unc, &prime_args)
+        .await?
+        .into_file()
+        .expect("must be file");
+    let creation_before: FileTime = f.handle().created().into();
+    f.close().await?;
+
+    // Pick a distinctive target mtime: 2020-06-15 12:00:00 UTC.
+    // (Unix epoch 1592_222_400 sec → expressed in 100ns Windows FileTime
+    // = (1592222400 + 11644473600) * 10_000_000 = 132373770400000000.)
+    let target_mtime = FileTime::from(132_373_770_400_000_000u64);
+
+    // Build the basic with creation/change/atime/attrs = 0 (preserve)
+    // and last_write_time set to our target. P2.b's compound helper
+    // sends this as one wire RT.
+    let basic = FileBasicInformation {
+        creation_time: FileTime::default(),
+        last_access_time: FileTime::default(),
+        last_write_time: target_mtime,
+        change_time: FileTime::default(),
+        file_attributes: smb_fscc::FileAttributes::new(),
+    };
+    client.compound_set_basic_info(&unc, basic).await?;
+
+    // Verify: open the file, query its FileBasicInformation, and
+    // check both the new mtime stuck AND creation_time was preserved.
+    let verify_args =
+        FileCreateArgs::make_open_existing(FileAccessMask::new().with_file_read_attributes(true));
+    let v = client
+        .create_file(&unc, &verify_args)
+        .await?
+        .into_file()
+        .expect("must be file");
+    let queried: FileBasicInformation = v
+        .handle()
+        .query_info()
+        .await
+        .expect("query basic info");
+    assert_eq!(
+        *queried.last_write_time, *target_mtime,
+        "compound SetInfo's last_write_time must be visible after the chain's Close commits",
+    );
+    assert_eq!(
+        *queried.creation_time, *creation_before,
+        "creation_time = 0 in SetInfo must leave the server's stored creation_time unchanged (MS-FSCC 2.4.7)",
+    );
+    v.close().await?;
+
+    // Cleanup
+    let cleanup_args =
+        FileCreateArgs::make_open_existing(FileAccessMask::new().with_delete(true));
+    let c = client
+        .create_file(&unc, &cleanup_args)
+        .await?
+        .into_file()
+        .expect("must be file");
+    c.set_info(FileDispositionInformation::default()).await?;
+    c.close().await?;
+    Ok(())
+}
+
 /// Phase D (default lease injection):
 ///
 /// `ClientConfig::default_lease_state = Some(...)` makes every

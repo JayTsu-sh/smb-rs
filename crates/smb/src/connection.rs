@@ -652,6 +652,71 @@ impl Connection {
     ) -> crate::Result<Vec<LeaseEviction>> {
         self.handler.sweep_idle_leases(older_than).await
     }
+
+    /// Send an SMB2 compound chain through this connection's worker and
+    /// receive each member's response.
+    ///
+    /// For each message in `msgs` (in order) this:
+    /// 1. Sets `priority_mask` per the negotiated dialect — matches the
+    ///    single-message [`crate::msg_handler::MessageHandler::sendo`]
+    ///    path.
+    /// 2. Calls [`ConnectionMessageHandler::process_sequence_outgoing`]
+    ///    to allocate `message_id` + credit_charge / credit_request.
+    ///    Same accounting as a single-shot send, so server-side credit
+    ///    windows stay consistent.
+    /// 3. After all members are prepared, hands the whole batch to
+    ///    [`crate::connection::worker::WorkerImpl::send_compound`] for
+    ///    the single TCP write.
+    /// 4. Awaits each member's response separately via
+    ///    `Worker::receive` — server splits the compound response into
+    ///    N parts; our compound-aware incoming-side parser routes each
+    ///    part by message_id, and these receives just consume the
+    ///    pre-routed entries.
+    /// 5. Calls `process_sequence_incoming` on each response to return
+    ///    credits to the pool (mirroring the single-message path).
+    ///
+    /// The caller owns everything semantic: setting
+    /// `flags.related_operations` on members 2..N to chain off the
+    /// previous command's FileId/TreeId/SessionId, setting
+    /// `FileId::FULL` on commands that should reuse the prior result,
+    /// and validating each response's status code.
+    ///
+    /// On success returns `responses.len() == msgs.len()` in input order.
+    #[maybe_async]
+    pub async fn send_compound(
+        &self,
+        mut msgs: Vec<OutgoingMessage>,
+    ) -> crate::Result<Vec<IncomingMessage>> {
+        let priority_value = match self.handler.conn_info.get() {
+            Some(neg_info) => match neg_info.negotiation.dialect_rev {
+                Dialect::Smb0311 => 1,
+                _ => 0,
+            },
+            None => 0,
+        };
+        for m in msgs.iter_mut() {
+            m.message.header.flags = m.message.header.flags.with_priority_mask(priority_value);
+            self.handler.process_sequence_outgoing(m).await?;
+        }
+
+        let worker = self
+            .handler
+            .worker
+            .get()
+            .ok_or(Error::InvalidState("Worker is uninitialized".into()))?;
+        let send_results = worker.send_compound(msgs).await?;
+
+        let mut responses = Vec::with_capacity(send_results.len());
+        for r in send_results {
+            let mut opts = ReceiveOptions::new();
+            opts.msg_id = r.msg_id;
+            opts.allow_async = true;
+            let incoming = worker.receive(&opts).await?;
+            self.handler.process_sequence_incoming(&incoming).await?;
+            responses.push(incoming);
+        }
+        Ok(responses)
+    }
 }
 
 /// Phase C.5: a slot that was just removed from the per-connection lease

@@ -1,7 +1,13 @@
 use crate::ConnectionConfig;
+use crate::msg_handler::OutgoingMessage;
 use crate::{Connection, Error, FileCreateArgs, Pipe, Resource, Session, Tree, sync_helpers::*};
 use maybe_async::maybe_async;
-use smb_msg::{NetworkInterfaceInfo, ReferralEntry, ReferralEntryValue, Status};
+use smb_fscc::{ChainedItemList, FileBasicInformation, SetFileInfo, SetFileInfoClass};
+use smb_msg::{
+    AdditionalInfo, CloseRequest, CreateRequest, FileId, ImpersonationLevel, NetworkInterfaceInfo,
+    OplockLevel, RawSetInfoData, ReferralEntry, ReferralEntryValue, SetInfoClass, SetInfoData,
+    SetInfoRequest, ShareAccessFlags, Status,
+};
 use smb_rpc::interface::{LsaRpc, ShareInfo1, SrvSvc, TranslatedName};
 use smb_transport::TransportConfig;
 use smb_transport::utils::TransportUtils;
@@ -710,6 +716,140 @@ impl Client {
             Self::flush_eviction(&label, eviction).await;
         }
         Ok(count)
+    }
+
+    /// P2.b: compound `Create` + `SetInfo(FileBasicInformation)` + `Close`
+    /// into a single SMB2 compound request (MS-SMB2 3.2.4.1.4), saving
+    /// 2 wire round-trips compared with the open/set/close sequence
+    /// `update_metadata` would otherwise issue.
+    ///
+    /// Semantics:
+    /// - Opens `path` with `disposition = Open` and `access =
+    ///   FILE_WRITE_ATTRIBUTES` (the minimum to drive a SetInfo on
+    ///   FileBasicInformation per MS-SMB2 2.2.13.1.1).
+    /// - Issues SetInfo with the caller-provided `basic`. Per
+    ///   MS-FSCC 2.4.7, time-field values of 0 mean "preserve on the
+    ///   server" — callers can leave creation/change_time/file_attributes
+    ///   zeroed and only fill `last_access_time` / `last_write_time`.
+    /// - Closes the resulting handle immediately, so the SetInfo's
+    ///   sticky LastWriteTime gets committed to disk before this
+    ///   function returns. There is no lease, no deferred close, and
+    ///   no need for an `evict_lease` bracket around this call.
+    ///
+    /// The chain uses SMB2 related-operations semantics: the SetInfo and
+    /// Close members carry `FileId::FULL` (all-1s) and
+    /// `flags.related_operations = true`, telling the server to substitute
+    /// the FileId returned by the preceding Create (MS-SMB2 3.3.5.2.7.2).
+    ///
+    /// Returns `Err` if any of the three responses carries a non-success
+    /// status (the Create / SetInfo error is surfaced; the Close status is
+    /// checked last so a Close failure is reported separately).
+    pub async fn compound_set_basic_info(
+        &self,
+        path: &UncPath,
+        basic: FileBasicInformation,
+    ) -> crate::Result<()> {
+        let tree = self.get_tree(path).await?;
+        let tree_id = tree.tree_id();
+        let session = self.get_session(path).await?;
+        let session_id = session.session_id();
+        let signed = !session.allow_unsigned().await?;
+        let conn = self.get_connection(path.server()).await?;
+        let rel = path.path().unwrap_or("");
+
+        // --- Member 1: Create (Open) ---
+        // No lease context; we want immediate Close, not deferred. No DFS
+        // operations on this path — update_metadata is always against
+        // already-resolved paths under a connected share.
+        let create = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: smb_fscc::FileAccessMask::new().with_file_write_attributes(true),
+            file_attributes: smb_fscc::FileAttributes::new(),
+            share_access: ShareAccessFlags::new()
+                .with_read(true)
+                .with_write(true)
+                .with_delete(true),
+            create_disposition: smb_msg::CreateDisposition::Open,
+            create_options: smb_msg::CreateOptions::new(),
+            name: rel.into(),
+            contexts: ChainedItemList::default(),
+        };
+        let mut create_msg = OutgoingMessage::new(create.into());
+        create_msg.message.header.tree_id = Some(tree_id);
+        create_msg.message.header.session_id = session_id;
+        create_msg.message.header.flags.set_signed(signed);
+
+        // --- Member 2: SetInfo(FileBasicInformation) on the previous handle ---
+        // file_id = FULL + related_operations = true makes the server
+        // substitute Create's returned FileId here.
+        let setinfo = SetInfoRequest {
+            info_class: SetInfoClass::File(SetFileInfoClass::BasicInformation),
+            additional_information: AdditionalInfo::new(),
+            file_id: FileId::FULL,
+            data: SetInfoData::File(RawSetInfoData::from(SetFileInfo::BasicInformation(basic))),
+        };
+        let mut setinfo_msg = OutgoingMessage::new(setinfo.into());
+        setinfo_msg.message.header.tree_id = Some(tree_id);
+        setinfo_msg.message.header.session_id = session_id;
+        setinfo_msg.message.header.flags.set_signed(signed);
+        setinfo_msg
+            .message
+            .header
+            .flags
+            .set_related_operations(true);
+
+        // --- Member 3: Close on the same chained handle ---
+        let close = CloseRequest {
+            file_id: FileId::FULL,
+        };
+        let mut close_msg = OutgoingMessage::new(close.into());
+        close_msg.message.header.tree_id = Some(tree_id);
+        close_msg.message.header.session_id = session_id;
+        close_msg.message.header.flags.set_signed(signed);
+        close_msg
+            .message
+            .header
+            .flags
+            .set_related_operations(true);
+
+        let responses = conn
+            .send_compound(vec![create_msg, setinfo_msg, close_msg])
+            .await?;
+
+        // Validate each member's status. We surface the first non-success
+        // response (Create or SetInfo) explicitly because those are the
+        // path the caller cares about; a Close failure means we issued an
+        // orphan handle, which we want to know about but not as a primary
+        // error path.
+        if responses.len() != 3 {
+            return Err(Error::InvalidState(format!(
+                "compound_set_basic_info expected 3 responses, got {}",
+                responses.len()
+            )));
+        }
+        for (i, resp) in responses.iter().take(2).enumerate() {
+            let status = resp.message.header.status()?;
+            if !matches!(status, Status::Success) {
+                let kind = if i == 0 { "Create" } else { "SetInfo" };
+                tracing::error!(
+                    path = %path,
+                    member = kind,
+                    status = ?status,
+                    "compound_set_basic_info failed",
+                );
+                return Err(Error::UnexpectedMessageStatus(resp.message.header.status));
+            }
+        }
+        let close_status = responses[2].message.header.status()?;
+        if !matches!(close_status, Status::Success) {
+            tracing::warn!(
+                path = %path,
+                status = ?close_status,
+                "compound_set_basic_info: Close failed (server-side handle may leak until session end)",
+            );
+        }
+        Ok(())
     }
 
     /// Send the wire `Close` for an eviction that owes one. Failures are
