@@ -265,6 +265,148 @@ impl Transformer {
         Ok(outgoing_data)
     }
 
+    /// Transforms an incoming message buffer to one or more [`IncomingMessage`]s,
+    /// supporting SMB2 compound responses.
+    ///
+    /// SMB2 compound responses chain multiple commands' responses into a single
+    /// TCP frame using the [`Header::next_command`] field (MS-SMB2 3.2.5.1.9 /
+    /// 3.3.4.1.5). Each member has its own header (including its own signature
+    /// when signing is on); the whole chain is encrypted/compressed as a unit if
+    /// either transformation is active.
+    ///
+    /// This method:
+    /// 1. Decrypts the chain (one shot) if [`Response::Encrypted`].
+    /// 2. Decompresses (one shot) if [`Response::Compressed`].
+    /// 3. Walks the resulting plain bytes, parsing one [`PlainResponse`] per
+    ///    NextCommand-delimited section, verifying each section's signature
+    ///    against just its own byte slice.
+    ///
+    /// Returns a `Vec` with one entry per member (length 1 in the common,
+    /// non-compound case). Member order matches the on-wire order, which the
+    /// server is required to preserve relative to the request chain (MS-SMB2
+    /// 3.3.5.2.7).
+    pub async fn transform_incoming_all(
+        &self,
+        data: Bytes,
+    ) -> crate::Result<Vec<IncomingMessage>> {
+        let message = Response::try_from(data.as_ref())?;
+        let mut form = MessageForm::default();
+
+        // 1. Decrypt (whole chain)
+        let (message, raw) = if let Response::Encrypted(encrypted_message) = message {
+            let session_id = encrypted_message.header.session_id;
+            form.encrypted = true;
+            let (msg, vec) = self
+                ._with_session(session_id, |session| {
+                    let decryptor = session.decryptor()?.ok_or(crate::Error::TranformFailed(
+                        TransformError {
+                            outgoing: false,
+                            phase: TransformPhase::EncryptDecrypt,
+                            session_id: Some(session_id),
+                            why: "Message is required to be encrypted, but no decryptor is set up!",
+                            msg_id: None,
+                        },
+                    ))?;
+                    decryptor.decrypt_message(encrypted_message)
+                })
+                .await?;
+            (msg, Bytes::from(vec))
+        } else {
+            (message, data)
+        };
+
+        // 2. Decompress (whole chain)
+        debug_assert!(!matches!(message, Response::Encrypted(_)));
+        let (message, raw) = if let Response::Compressed(compressed_message) = message {
+            let rconfig = self.config.read().await?;
+            form.compressed = true;
+            match &rconfig.compress {
+                Some(compress) => {
+                    let (msg, vec) = compress.1.decompress(&compressed_message)?;
+                    (msg, Bytes::from(vec))
+                }
+                None => {
+                    return Err(crate::Error::TranformFailed(TransformError {
+                        outgoing: false,
+                        phase: TransformPhase::CompressDecompress,
+                        session_id: None,
+                        why: "Compression is requested, but no decompressor is set up!",
+                        msg_id: None,
+                    }));
+                }
+            }
+        } else {
+            (message, raw)
+        };
+
+        let plain = match message {
+            Response::Plain(p) => p,
+            _ => {
+                return Err(crate::Error::InvalidMessage(
+                    "Expected plain message after decryption/decompression".to_string(),
+                ));
+            }
+        };
+
+        // 3. Walk the compound chain (or return single).
+        //    `next_command == 0` means this is the last (or only) member.
+        let mut out: Vec<IncomingMessage> = Vec::new();
+        let mut current = plain;
+        let mut remaining = raw;
+        loop {
+            let next_offset = current.header.next_command as usize;
+            // The slice belonging to *this* member is `remaining[..next_offset]`
+            // when there's another command after it, else the whole rest of
+            // `remaining`. Signing/verification is per-member over this slice.
+            let this_slice = if next_offset > 0 {
+                if next_offset > remaining.len() {
+                    return Err(crate::Error::InvalidMessage(format!(
+                        "Compound NextCommand offset {next_offset} exceeds remaining buffer {}",
+                        remaining.len()
+                    )));
+                }
+                remaining.slice(0..next_offset)
+            } else {
+                remaining.clone()
+            };
+
+            let mut member_form = form;
+            if let Err(e) = self
+                .verify_plain_incoming(&mut current, &this_slice, &mut member_form)
+                .await
+            {
+                tracing::error!("Failed to verify compound member message: {e:?}");
+                return Err(crate::Error::TranformFailed(TransformError {
+                    outgoing: false,
+                    phase: TransformPhase::SignVerify,
+                    session_id: Some(current.header.session_id),
+                    why: "Failed to verify compound member signature!",
+                    msg_id: Some(current.header.message_id),
+                }));
+            }
+            out.push(IncomingMessage::new(current, this_slice, member_form));
+
+            if next_offset == 0 {
+                break;
+            }
+            remaining = remaining.slice(next_offset..);
+            // Parse next member's header + content from the new slice start.
+            let next_resp = Response::try_from(remaining.as_ref())?;
+            current = match next_resp {
+                Response::Plain(p) => p,
+                _ => {
+                    return Err(crate::Error::InvalidMessage(
+                        "Compound chain member must be a plain SMB2 response \
+                         (encryption/compression apply to the whole chain only)"
+                            .to_string(),
+                    ));
+                }
+            };
+        }
+
+        Ok(out)
+    }
+
     /// Transforms an incoming message buffer to an [`IncomingMessage`].
     ///
     /// Accepts `Bytes` for zero-copy slicing of the raw data in downstream consumers.

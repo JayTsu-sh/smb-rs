@@ -102,7 +102,7 @@ impl IncomingMessage {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct MessageForm {
     pub compressed: bool,
     pub encrypted: bool,

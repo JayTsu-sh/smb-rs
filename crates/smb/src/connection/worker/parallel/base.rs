@@ -101,17 +101,19 @@ where
         tracing::trace!("Received message from server.");
         let message = message?;
 
-        // Tranform the message and verify it.
-        let msg = self.transformer.transform_incoming(message).await;
-        let (msg, msg_id) = match msg {
-            // Good flow, message is OK.
-            Ok(msg) => {
-                let msg_id = msg.message.header.message_id;
-                (Ok(msg), msg_id)
-            }
-            // If we have a message ID to notify the error, use it.
+        // Transform the message(s). A single NetBIOS frame can contain a
+        // compound chain of N responses (SMB2 NextCommand); we dispatch each
+        // chained response to its own awaiter independently.
+        let msgs = match self.transformer.transform_incoming_all(message).await {
+            Ok(v) => v,
+            // If the transformer can attribute the failure to a single
+            // message id, route the error to that awaiter; otherwise propagate.
             Err(crate::Error::TranformFailed(e)) => match e.msg_id {
-                Some(msg_id) => (Err(crate::Error::TranformFailed(e)), msg_id),
+                Some(msg_id) => {
+                    return self
+                        .dispatch_one(msg_id, Err(crate::Error::TranformFailed(e)))
+                        .await;
+                }
                 None => return Err(Error::TranformFailed(e)),
             },
             Err(e) => {
@@ -120,17 +122,27 @@ where
             }
         };
 
+        for msg in msgs {
+            let msg_id = msg.message.header.message_id;
+            self.dispatch_one(msg_id, Ok(msg)).await?;
+        }
+        Ok(())
+    }
+
+    /// Route a single parsed message (or transform error) to its awaiting
+    /// caller. msg_id == u64::MAX is the unsolicited-notification path
+    /// (oplock/lease break, server-to-client).
+    async fn dispatch_one(
+        self: &Arc<Self>,
+        msg_id: u64,
+        msg: crate::Result<IncomingMessage>,
+    ) -> crate::Result<()> {
         // Message ID (-1) is used and valid for notifications -
         // OPLOCK_BREAK or SERVER_TO_CLIENT_NOTIFICATION only.
         if msg_id == u64::MAX {
-            // Nothing's waiting, so if there was an error, return it --
-            // no need to notify anyone else.
             let msg = msg?;
 
             // Server-to-client commands check.
-            // Allow oplock break / lease break notifications and server-to-client
-            // notifications. (`*Break` ack-response messages carry a regular
-            // request_id and never take this unsolicited branch.)
             if !matches!(
                 msg.message.content,
                 ResponseContent::OplockBreakNotify(_)
