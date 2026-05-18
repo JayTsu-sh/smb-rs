@@ -206,7 +206,10 @@ impl Resource {
             match &grant {
                 Some(g) => tracing::debug!(
                     "Lease granted for '{}': key={:#034x}, state={:?}, epoch={}",
-                    name, g.key, g.state, g.epoch
+                    name,
+                    g.key,
+                    g.state,
+                    g.epoch
                 ),
                 None => tracing::debug!(
                     "Lease requested for '{}' but server did not grant one",
@@ -308,11 +311,22 @@ impl Resource {
     /// atomically with the eligibility check.
     pub(crate) fn reuse_from_slot(slot: Arc<LeaseSlot>) -> Resource {
         let proto = slot.proto.clone();
-        let granted_state = slot
-            .granted_state
-            .read()
-            .map(|s| *s)
-            .unwrap_or_else(|p| *p.into_inner());
+        // A poisoned RwLock here means a previous writer panicked while
+        // updating `granted_state` (e.g. inside `apply_lease_break`).
+        // The last-written value is still safe to read for cache-hit
+        // semantics — we just lose visibility into the panic. Surface
+        // it at WARN so operators see the chain of events instead of a
+        // silent state corruption.
+        let granted_state = match slot.granted_state.read() {
+            Ok(s) => *s,
+            Err(p) => {
+                tracing::warn!(
+                    path = %slot.path,
+                    "LeaseSlot.granted_state RwLock was poisoned; reusing last-written state",
+                );
+                *p.into_inner()
+            }
+        };
 
         let handle = ResourceHandle {
             name: slot.path.clone(),
@@ -1357,15 +1371,19 @@ mod tests {
 
     #[test]
     fn file_create_args_with_lease_builder() {
-        let args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true))
-            .with_lease(RequestLease::RqLsReqv2(RequestLeaseV2 {
-                lease_key: 1,
-                lease_state: make_state(true, true, false),
-                lease_flags: LeaseFlags::new(),
-                parent_lease_key: 0,
-                epoch: 0,
-            }));
-        assert!(args.lease_request.is_some(), "with_lease should populate the field");
+        let args =
+            FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true))
+                .with_lease(RequestLease::RqLsReqv2(RequestLeaseV2 {
+                    lease_key: 1,
+                    lease_state: make_state(true, true, false),
+                    lease_flags: LeaseFlags::new(),
+                    parent_lease_key: 0,
+                    epoch: 0,
+                }));
+        assert!(
+            args.lease_request.is_some(),
+            "with_lease should populate the field"
+        );
         assert!(matches!(
             args.lease_request.as_ref().unwrap(),
             RequestLease::RqLsReqv2(_)
@@ -1375,6 +1393,9 @@ mod tests {
     #[test]
     fn file_create_args_default_has_no_lease() {
         let args = FileCreateArgs::default();
-        assert!(args.lease_request.is_none(), "default must not request a lease");
+        assert!(
+            args.lease_request.is_none(),
+            "default must not request a lease"
+        );
     }
 }

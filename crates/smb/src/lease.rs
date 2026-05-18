@@ -58,8 +58,14 @@ pub struct LeaseBreakEvent {
     /// 35-second timeout. `false` indicates the server is just informing
     /// us of an unconditional downgrade; no reply is required.
     pub ack_required: bool,
-    /// Wall-clock instant the client received the notification, used for
-    /// observability and to drive ack-timeout backstops in Phase C.
+    /// Wall-clock instant the client received the notification. Today
+    /// this is purely observational (surfaced in tracing on the
+    /// listener task); kept on the event so the future ack-timeout
+    /// monitor can stamp "how long ago did this fire" without
+    /// re-snapshotting an Instant per subscriber.
+    // TODO: feed an explicit ack-timeout backstop monitor when one
+    // exists. The 35s window from MS-SMB2 2.2.23.2 is currently
+    // bounded only by the connection-wide notify task latency.
     pub received_at: Instant,
 }
 
@@ -121,6 +127,32 @@ pub(crate) struct ResourceProto {
 ///
 /// Until both conditions are met, the FileId stays live on the server and
 /// new Opens against the same path hit the cache for free.
+///
+/// # Lock ordering (load-bearing — read before adding a third locker)
+///
+/// Three locks may be held concurrently across this type and the
+/// per-connection `lease_table`:
+///
+/// 1. `ConnectionMessageHandler::lease_table` (outer; `Mutex<HashMap<…>>`).
+/// 2. `LeaseSlot::granted_state` (`RwLock<LeaseState>`).
+/// 3. `LeaseSlot::last_used` (`RwLock<Instant>`).
+///
+/// They MUST be acquired in that order. The existing call sites already
+/// obey it:
+/// * `apply_lease_break` takes `lease_table.lock()`, then writes
+///   `granted_state` while still holding the outer lock.
+/// * `try_acquire_for_reuse` is called *inside* `try_acquire_lease`'s
+///   `lease_table.lock()` guard and only reads `granted_state` /
+///   writes `last_used` after that.
+/// * `take_lease_for_evict` / `sweep_idle_leases` only touch atomic
+///   fields after removing the entry from the table, so they don't
+///   re-enter the inner locks.
+///
+/// Adding a fourth path that, say, reads `granted_state` first and then
+/// `lease_table` would invert order #1 ↔ #2 and risk a deadlock under
+/// concurrent break + reuse traffic. When in doubt, gate the new path
+/// through `Connection::try_acquire_lease` or `take_lease_for_evict`
+/// rather than holding the inner RwLocks directly.
 pub struct LeaseSlot {
     /// The file path (relative to the share root) the lease was opened
     /// against. Used as the lookup key inside the per-connection table

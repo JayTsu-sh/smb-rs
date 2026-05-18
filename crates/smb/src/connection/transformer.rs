@@ -244,16 +244,35 @@ impl Transformer {
         //    the padded buffer. Signing must therefore happen AFTER
         //    padding so the HMAC input matches what the receiver
         //    re-hashes during verification.
-        for i in 0..last {
-            let aligned = (member_bufs[i].len() + 7) & !7usize;
-            member_bufs[i].resize(aligned, 0);
+        for buf in member_bufs.iter_mut().take(last) {
+            let aligned = (buf.len() + 7) & !7usize;
+            buf.resize(aligned, 0);
         }
 
         // 4. Sign each member if signing is requested (per-member, over
         //    that member's padded bytes). We snapshot the signer once
         //    and reuse it for each member (MessageSigner clone is cheap
         //    — no heap alloc).
+        //
+        // Sign policy is chain-wide: the first member's `signed` flag is
+        // the source of truth. We *also* enforce that every member
+        // agrees with it — mixing signed and unsigned members in a
+        // single chain produces a payload the server will reject as
+        // soon as it verifies any member's signature (signed members
+        // need a real signature, unsigned ones must carry the all-zero
+        // sentinel). Catching this here yields a clearer error than the
+        // server-side STATUS_ACCESS_DENIED that would otherwise come back.
         let should_sign = msgs[0].message.header.flags.signed();
+        if msgs
+            .iter()
+            .any(|m| m.message.header.flags.signed() != should_sign)
+        {
+            return Err(crate::Error::InvalidArgument(
+                "compound chain has inconsistent `signed` flags across members; \
+                 all members must opt in or opt out together"
+                    .to_string(),
+            ));
+        }
         if should_sign {
             let session_id = msgs[0].message.header.session_id;
             let signer = self
@@ -280,6 +299,21 @@ impl Transformer {
                 // After sign_message, iov[0] holds the buffer with the signature
                 // written back into the header. Move it back into member_bufs
                 // without copying (IoVecBuf::Owned -> Vec via mem::take).
+                //
+                // We rely on the signer leaving the IoVec as a single owned
+                // segment (sign_message writes the signature back into the
+                // header bytes that live in iov[0] — no splitting). If a
+                // future signer change starts appending segments, only
+                // iov[0] would be taken back here and the trailing bytes
+                // would silently drop on the floor. Guard against that
+                // regression with an explicit length check.
+                if iov.len() != 1 {
+                    return Err(crate::Error::InvalidState(format!(
+                        "signer split compound member buffer into {} segments; \
+                         exactly 1 expected",
+                        iov.len()
+                    )));
+                }
                 match &mut iov[0] {
                     smb_transport::IoVecBuf::Owned(v) => {
                         member_bufs[i] = std::mem::take(v);
@@ -437,10 +471,7 @@ impl Transformer {
     /// non-compound case). Member order matches the on-wire order, which the
     /// server is required to preserve relative to the request chain (MS-SMB2
     /// 3.3.5.2.7).
-    pub async fn transform_incoming_all(
-        &self,
-        data: Bytes,
-    ) -> crate::Result<Vec<IncomingMessage>> {
+    pub async fn transform_incoming_all(&self, data: Bytes) -> crate::Result<Vec<IncomingMessage>> {
         let message = Response::try_from(data.as_ref())?;
         let mut form = MessageForm::default();
 
