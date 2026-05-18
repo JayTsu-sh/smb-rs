@@ -177,6 +177,7 @@ impl Cli {
                 multichannel: self.multichannel.into(),
                 ..Default::default()
             },
+            ..Default::default()
         })
     }
 }
