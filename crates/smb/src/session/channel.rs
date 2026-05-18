@@ -60,6 +60,28 @@ impl Channel {
         let session = state.session.read().await?;
         session.allow_unsigned()
     }
+
+    /// Returns `true` when the session requires every outgoing request to be
+    /// encrypted (either the session flags carry `encrypt_data` or the
+    /// connection config forces it).
+    ///
+    /// Mirrors the check used inside [`ChannelMessageHandler::sendo`]: when
+    /// `should_encrypt()` is `true`, the single-message path sets
+    /// `msg.encrypt = true` instead of merely signing. Callers that build
+    /// SMB2 compound chains directly (e.g. P2.b) must inspect this *before*
+    /// going through the worker, because the compound transformer does not
+    /// yet support per-member encryption and would otherwise leak the
+    /// compound's headers/body in cleartext on an encryption-required
+    /// session.
+    ///
+    /// Errors with `InvalidState` when the underlying session has not
+    /// reached the Ready state, matching `SessionInfo::should_encrypt`.
+    #[maybe_async]
+    pub async fn should_encrypt(&self) -> crate::Result<bool> {
+        let state = self.handler.session_state.read().await?;
+        let session = state.session.read().await?;
+        session.should_encrypt()
+    }
 }
 
 /// Message handler a specific channel.

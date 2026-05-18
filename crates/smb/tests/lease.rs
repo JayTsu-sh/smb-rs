@@ -57,7 +57,9 @@ async fn test_lease_request_create_new() -> smb::Result<()> {
     // a server without `caps.leasing()` is expected to return None, and we
     // skip the positive assertion instead of treating it as a failure.
     let conn = client.get_connection(share_path.server()).await?;
-    let info = conn.conn_info().expect("share_connect completed → negotiated");
+    let info = conn
+        .conn_info()
+        .expect("share_connect completed → negotiated");
     let server_supports_leasing = info.negotiation.caps.leasing();
     tracing::info!(
         "Negotiated: dialect={:?}, leasing={}, multi_channel={}",
@@ -118,7 +120,10 @@ async fn test_no_lease_request_has_no_grant() -> smb::Result<()> {
     let (client, share_path) = make_server_connection(&share, None).await?;
 
     let args = FileCreateArgs::make_overwrite(Default::default(), Default::default());
-    assert!(args.lease_request.is_none(), "control: args must have no lease");
+    assert!(
+        args.lease_request.is_none(),
+        "control: args must have no lease"
+    );
 
     let file = client
         .create_file(&share_path.with_path("lease_phase_a_no_lease.txt"), &args)
@@ -182,8 +187,8 @@ async fn test_lease_break_notify_fanned_out() -> smb::Result<()> {
         parent_lease_key: 0,
         epoch: 0,
     });
-    let args_a = FileCreateArgs::make_overwrite(Default::default(), Default::default())
-        .with_lease(lease);
+    let args_a =
+        FileCreateArgs::make_overwrite(Default::default(), Default::default()).with_lease(lease);
     let file_a = client_a
         .create_file(&path, &args_a)
         .await?
@@ -292,7 +297,10 @@ async fn test_lease_slot_inserted_on_create() -> smb::Result<()> {
         .peek_lease_slot(path_rel)
         .await?
         .expect("slot must be reachable by path");
-    assert_eq!(slot.lease_key, grant.key, "slot's lease_key must echo the grant");
+    assert_eq!(
+        slot.lease_key, grant.key,
+        "slot's lease_key must echo the grant"
+    );
     assert_eq!(
         slot.refcount.load(std::sync::atomic::Ordering::Relaxed),
         1,
@@ -448,11 +456,15 @@ async fn test_lease_cache_hit_reuses_file_id() -> smb::Result<()> {
         .await?
         .expect("deferred close must leave the slot in the cache");
     assert!(
-        !slot_after_close.tombstoned.load(std::sync::atomic::Ordering::Acquire),
+        !slot_after_close
+            .tombstoned
+            .load(std::sync::atomic::Ordering::Acquire),
         "no break happened, slot must still be alive (not tombstoned)",
     );
     assert_eq!(
-        slot_after_close.refcount.load(std::sync::atomic::Ordering::Acquire),
+        slot_after_close
+            .refcount
+            .load(std::sync::atomic::Ordering::Acquire),
         0,
         "refcount returns to 0 after close, but slot stays cached",
     );
@@ -461,10 +473,9 @@ async fn test_lease_cache_hit_reuses_file_id() -> smb::Result<()> {
     // returned Resource must reuse the cached FileId — no new Create RT
     // hit the wire. We assert FileId equality as the wire-observable
     // proof.
-    let args_reopen = FileCreateArgs::make_open_existing(
-        FileAccessMask::new().with_generic_all(true),
-    )
-    .with_lease(make_lease_request());
+    let args_reopen =
+        FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_all(true))
+            .with_lease(make_lease_request());
     let file_second = client
         .create_file(&unc, &args_reopen)
         .await?
@@ -476,7 +487,9 @@ async fn test_lease_cache_hit_reuses_file_id() -> smb::Result<()> {
         "cache hit must reuse the original FileId (saving a Create RT)",
     );
     assert_eq!(
-        slot_after_close.refcount.load(std::sync::atomic::Ordering::Acquire),
+        slot_after_close
+            .refcount
+            .load(std::sync::atomic::Ordering::Acquire),
         1,
         "second open bumps refcount back to 1",
     );
@@ -691,8 +704,8 @@ async fn test_flush_idle_leases_sweeps_old_slots() -> smb::Result<()> {
 ))]
 #[serial]
 async fn test_compound_set_basic_info() -> smb::Result<()> {
-    use smb::{FileAccessMask, FileBasicInformation};
     use smb::binrw_util::file_time::FileTime;
+    use smb::{FileAccessMask, FileBasicInformation};
 
     let share = smb_tests_share();
     let (client, share_path) = make_server_connection(&share, None).await?;
@@ -737,11 +750,7 @@ async fn test_compound_set_basic_info() -> smb::Result<()> {
         .await?
         .into_file()
         .expect("must be file");
-    let queried: FileBasicInformation = v
-        .handle()
-        .query_info()
-        .await
-        .expect("query basic info");
+    let queried: FileBasicInformation = v.handle().query_info().await.expect("query basic info");
     assert_eq!(
         *queried.last_write_time, *target_mtime,
         "compound SetInfo's last_write_time must be visible after the chain's Close commits",
@@ -753,8 +762,7 @@ async fn test_compound_set_basic_info() -> smb::Result<()> {
     v.close().await?;
 
     // Cleanup
-    let cleanup_args =
-        FileCreateArgs::make_open_existing(FileAccessMask::new().with_delete(true));
+    let cleanup_args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_delete(true));
     let c = client
         .create_file(&unc, &cleanup_args)
         .await?
@@ -796,7 +804,8 @@ async fn test_client_default_lease_state_auto_injects() -> smb::Result<()> {
     );
 
     let server = std::env::var("SMB_RUST_TESTS_SERVER").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let user = std::env::var("SMB_RUST_TESTS_USER_NAME").unwrap_or_else(|_| "LocalAdmin".to_string());
+    let user =
+        std::env::var("SMB_RUST_TESTS_USER_NAME").unwrap_or_else(|_| "LocalAdmin".to_string());
     let password =
         std::env::var("SMB_RUST_TESTS_PASSWORD").unwrap_or_else(|_| "123456".to_string());
     let client = Client::new(config);
@@ -839,9 +848,8 @@ async fn test_client_default_lease_state_auto_injects() -> smb::Result<()> {
     file_first.close().await?;
 
     // Second open also without explicit lease — must hit the cache.
-    let args_reopen = FileCreateArgs::make_open_existing(
-        FileAccessMask::new().with_generic_all(true),
-    );
+    let args_reopen =
+        FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_all(true));
     let file_second = client
         .create_file(&unc, &args_reopen)
         .await?

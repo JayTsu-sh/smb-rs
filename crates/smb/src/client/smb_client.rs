@@ -452,7 +452,10 @@ impl Client {
                 let slot = std::sync::Arc::new(crate::lease::LeaseSlot::new_with_proto(
                     rel.clone(),
                     tree.tree_id(),
-                    resource.handle().map(|h| h.raw_file_id()).unwrap_or_default(),
+                    resource
+                        .handle()
+                        .map(|h| h.raw_file_id())
+                        .unwrap_or_default(),
                     grant.key,
                     grant.state,
                     proto,
@@ -479,29 +482,37 @@ impl Client {
     }
 
     /// Derive a stable 128-bit lease key from the client's
-    /// `lease_key_salt` and the full UNC path. SipHash-flavored mix
-    /// avoids the bad cache behavior of a plain XOR (paths often share
-    /// long common prefixes) and gives enough entropy for the lease
-    /// cache to dedupe paths within a Client without collisions.
+    /// `lease_key_salt` and the full UNC path.
+    ///
+    /// **Stability contract:** the algorithm (SipHash-2-4, keyed) is
+    /// version-stable through the `siphasher` crate, so the same
+    /// `(salt, path)` pair yields the same key across Rust toolchain
+    /// upgrades. This is load-bearing for callers that persist
+    /// `lease_key_salt` and expect a previously-granted lease to remain
+    /// recoverable by key after a rebuild — the previous implementation
+    /// used `std::collections::hash_map::DefaultHasher`, whose
+    /// underlying algorithm is *not* covered by Rust's stability
+    /// guarantees and has already changed once.
+    ///
+    /// Salt is split into two independent 64-bit keys via golden-ratio
+    /// multiplication so the two halves of the 128-bit output don't
+    /// trivially correlate when `salt` has structure (e.g. low entropy
+    /// in test pins). Both halves come from one keyed pass of SipHash
+    /// (`sip128::SipHasher24`), which is enough for collision
+    /// resistance at this scale — a single Client rarely caches more
+    /// than a few thousand paths, well below the birthday bound on
+    /// 128 bits.
     fn derive_lease_key(salt: u64, path: &UncPath) -> u128 {
-        use std::hash::{Hash, Hasher};
-        // Two independent hashers seeded with derived salts give us the
-        // two halves of the 128-bit key. Using `DefaultHasher` (SipHash
-        // under the hood) is good enough for collision resistance at
-        // this scale (a single Client rarely caches more than a few
-        // thousand paths).
-        let path_str = path.to_string();
-        let mut h_lo = std::collections::hash_map::DefaultHasher::new();
-        h_lo.write_u64(salt);
-        path_str.hash(&mut h_lo);
-        let lo = h_lo.finish() as u128;
-
-        let mut h_hi = std::collections::hash_map::DefaultHasher::new();
-        h_hi.write_u64(salt.wrapping_mul(0x9E3779B97F4A7C15));
-        path_str.hash(&mut h_hi);
-        let hi = h_hi.finish() as u128;
-
-        (hi << 64) | lo
+        use siphasher::sip128::{Hasher128, SipHasher24};
+        use std::hash::Hasher;
+        let k0 = salt;
+        let k1 = salt.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut h = SipHasher24::new_with_keys(k0, k1);
+        // Hash the path as raw bytes rather than via `str::hash`, which
+        // prefixes a length tag whose encoding is also not promised to
+        // be stable. Raw bytes are the most stable thing we can feed.
+        h.write(path.to_string().as_bytes());
+        h.finish128().as_u128()
     }
 
     /// Makes a connection to the specified server.
@@ -753,6 +764,21 @@ impl Client {
         let tree_id = tree.tree_id();
         let session = self.get_session(path).await?;
         let session_id = session.session_id();
+        // Refuse to send a compound chain on a session that requires
+        // encryption — the current minimal compound transformer rejects
+        // per-member `encrypt = true` (see Transformer::transform_outgoing_compound),
+        // so silently falling through here would either leak the chain in
+        // plaintext (on a permissive server) or fail at the transformer
+        // with a less obvious error. Bail loudly with the same intent as
+        // ChannelMessageHandler::sendo, which prefers encryption over
+        // signing on such sessions.
+        if session.should_encrypt().await? {
+            return Err(Error::UnsupportedOperation(
+                "compound_set_basic_info: session requires encryption, but the compound \
+                 path does not yet support per-member encryption"
+                    .to_string(),
+            ));
+        }
         let signed = !session.allow_unsigned().await?;
         let conn = self.get_connection(path.server()).await?;
         let rel = path.path().unwrap_or("");
@@ -776,16 +802,23 @@ impl Client {
         // Member 1: Create with Open disposition. No lease context — we
         // want an immediate Close, not deferred. No DFS — update_metadata
         // is always against already-resolved paths under a connected share.
+        //
+        // `share_access` is fixed at the minimum a SetInfo+Close round
+        // needs: allow concurrent read/write so other handles aren't
+        // locked out for the duration of the chain. We deliberately
+        // do *not* request `delete` share access — this Create is for a
+        // metadata edit, not a delete bracket, and asking for delete
+        // would unnecessarily widen the share permissions a peer holder
+        // must grant us. Callers needing deeper share-mode control
+        // should reach for `update_metadata` directly instead of this
+        // fixed-policy compound helper.
         let create_msg = make_member(
             CreateRequest {
                 requested_oplock_level: OplockLevel::None,
                 impersonation_level: ImpersonationLevel::Impersonation,
                 desired_access: smb_fscc::FileAccessMask::new().with_file_write_attributes(true),
                 file_attributes: smb_fscc::FileAttributes::new(),
-                share_access: ShareAccessFlags::new()
-                    .with_read(true)
-                    .with_write(true)
-                    .with_delete(true),
+                share_access: ShareAccessFlags::new().with_read(true).with_write(true),
                 create_disposition: smb_msg::CreateDisposition::Open,
                 create_options: smb_msg::CreateOptions::new(),
                 name: rel.into(),
@@ -846,11 +879,24 @@ impl Client {
         }
         let close_status = responses[2].message.header.status()?;
         if !matches!(close_status, Status::Success) {
+            // The SetInfo has already committed server-side (it's response
+            // #2 and status was Success). The Close failure means the
+            // server-side FileId stays open until the session disconnects,
+            // which over batch workloads (terrasync-rs syncing tens of
+            // thousands of files) accumulates against the per-session
+            // open-handle limit. Surface this as an error so callers can
+            // decide whether to ignore (best-effort metadata sweep) or
+            // bounce the session. Retrying the whole call is safe — the
+            // SetInfo is idempotent given the same `basic`.
             tracing::warn!(
                 path = %path,
                 status = ?close_status,
-                "compound_set_basic_info: Close failed (server-side handle may leak until session end)",
+                "compound_set_basic_info: SetInfo committed but Close failed; \
+                 server-side FileId will leak until session end",
             );
+            return Err(Error::UnexpectedMessageStatus(
+                responses[2].message.header.status,
+            ));
         }
         Ok(())
     }
@@ -872,8 +918,8 @@ impl Client {
         if file_id == smb_msg::FileId::EMPTY {
             return;
         }
-        if let Err(e) = crate::resource::ResourceHandle::send_close_external(file_id, &handler)
-            .await
+        if let Err(e) =
+            crate::resource::ResourceHandle::send_close_external(file_id, &handler).await
         {
             tracing::warn!(
                 path = label,
