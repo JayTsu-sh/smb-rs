@@ -89,7 +89,9 @@ impl Directory {
                 )));
             }
             Err(e @ Error::UnexpectedMessageStatus(Status::U32_INVALID_INFO_CLASS)) => {
-                tracing::debug!("Error querying directory (server does not support this info class): {e}");
+                tracing::debug!(
+                    "Error querying directory (server does not support this info class): {e}"
+                );
                 return Err(e);
             }
             Err(e) => {

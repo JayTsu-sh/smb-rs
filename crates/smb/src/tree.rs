@@ -203,7 +203,9 @@ impl Tree {
     /// Used by the lease cache (Phase C) so cache hits can match opens
     /// against the same tree the original Create was issued on.
     pub fn tree_id(&self) -> u32 {
-        self.handler.tree_id.load(std::sync::atomic::Ordering::Relaxed)
+        self.handler
+            .tree_id
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Borrow the tree's underlying `Upstream` handler reference.

@@ -126,10 +126,7 @@ where
         }
         // Snapshot ids before consuming `msgs` so we can return them as
         // SendMessageResult after the transform.
-        let ids: Vec<u64> = msgs
-            .iter()
-            .map(|m| m.message.header.message_id)
-            .collect();
+        let ids: Vec<u64> = msgs.iter().map(|m| m.message.header.message_id).collect();
 
         let raw = self.transformer.transform_outgoing_compound(msgs).await?;
         tracing::trace!(

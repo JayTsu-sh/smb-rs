@@ -247,7 +247,6 @@ impl SmbTransportWrite for TcpTransport {
         }
         .boxed()
     }
-
 }
 
 impl SmbTransportRead for TcpTransport {
