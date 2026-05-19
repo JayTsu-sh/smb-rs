@@ -79,17 +79,24 @@ async fn windows_dc_signing_required_signs_final_session_setup() {
     );
     let auth_result = conn.authenticate_with_gss(gss).await;
 
-    // The mock server's final SessionSetup Response carries an unsigned
-    // success status, which the production driver rejects with
-    // `Expected a signed message!` — that's *correct* behaviour and
-    // independent of the client-side bug we're asserting below. We
-    // capture but don't fail on this Err; the real assertion is on the
-    // client-emitted frames.
-    if let Err(e) = &auth_result {
-        eprintln!(
-            "authenticate_with_gss returned Err (expected for now — the test asserts \
-             a separate property below): {e}"
-        );
+    // The mock server's final SessionSetup Response is intentionally
+    // emitted unsigned (MockGss doesn't derive a real MAC key), so the
+    // production driver correctly rejects it with
+    // `SetupError::UnsignedFinalResponse`. That assertion doubles as a
+    // regression test on S6 — the user-facing error must be the
+    // protocol-specific variant, not a bare `InvalidMessage("Expected
+    // a signed message!")` string.
+    match &auth_result {
+        Err(smb::Error::Setup(smb::error::SetupError::UnsignedFinalResponse)) => {
+            // expected — proceed to the client-side assertions below
+        }
+        Err(other) => panic!(
+            "expected `SetupError::UnsignedFinalResponse` from the mock-server path, got: {other:?}"
+        ),
+        Ok(_) => panic!(
+            "authenticate_with_gss unexpectedly succeeded — the mock server's response \
+             is unsigned, so the driver must reject it"
+        ),
     }
 
     // -- 4. Inspect what the client put on the wire. --

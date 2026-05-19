@@ -1,3 +1,4 @@
+use crate::error::TimedOutTask;
 use crate::session::authenticator::Authenticator;
 use crate::session::gss::GssState;
 
@@ -188,9 +189,7 @@ where
                     .is_guest_or_null_session()
                     && !message_form.signed_or_encrypted()
                 {
-                    return Err(Error::InvalidMessage(
-                        "Expected a signed message!".to_string(),
-                    ));
+                    return Err(crate::error::SetupError::UnsignedFinalResponse.into());
                 }
             } else {
                 self.next_preauth_hash(&response.raw)?;
@@ -247,7 +246,7 @@ where
             None => false,
         };
         let skip_security_validation = !is_auth_done && !channel_set_up;
-        if let Some(handler) = &self.handler {
+        let result = if let Some(handler) = &self.handler {
             tracing::trace!(
                 "setup loop: receiving with channel handler; skip_security_validation={skip_security_validation}"
             );
@@ -258,7 +257,34 @@ where
             assert!(skip_security_validation);
             tracing::trace!("setup loop: receiving with upstream handler");
             self.upstream.handler.recvo(roptions).await
-        }
+        };
+
+        // Upgrade generic transport / channel-layer errors to
+        // setup-phase-specific SetupError variants so callers
+        // (data-mover and friends) get a concrete remediation hint
+        // instead of the raw "Operation timed out" / "Message not
+        // signed or encrypted" strings.
+        //
+        // The `InvalidMessage` string match targets the rejection in
+        // `ChannelMessageHandler::_verify_incoming`: on the final
+        // SessionSetup Response that arrived unsigned, the channel
+        // verifies *before* `_setup_loop` reaches its own sanity
+        // check, so we re-tag the error here. (Long-term S5/S7 will
+        // replace string-matching with a typed error from the channel
+        // layer.)
+        result.map_err(|e| match e {
+            Error::OperationTimeout(TimedOutTask::ReceiveNextMessage, elapsed) => {
+                crate::error::SetupError::Timeout { elapsed }.into()
+            }
+            Error::InvalidMessage(msg)
+                if is_auth_done
+                    && msg.contains("not signed or encrypted")
+                    && msg.contains("signing is required") =>
+            {
+                crate::error::SetupError::UnsignedFinalResponse.into()
+            }
+            other => other,
+        })
     }
 
     async fn send_setup_request(&mut self, buf: Vec<u8>) -> crate::Result<SendMessageResult> {
