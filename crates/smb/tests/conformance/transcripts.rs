@@ -144,6 +144,66 @@ pub fn session_setup_response_final(session_id: u64) -> Bytes {
     ))
 }
 
+/// Build a SessionSetup Response #2 (final round) reporting success
+/// **on an anonymous session** — `session_flags.is_null_session = true`.
+///
+/// MS-SMB2 §3.2.5.3.1 lets the driver accept an unsigned final
+/// response in this case (no SessionKey is derived, so signing isn't
+/// possible). Used by the `conformance_anonymous` test to verify that
+/// the SessionSetup path doesn't over-eagerly reject the success
+/// reply.
+pub fn session_setup_response_final_anonymous(session_id: u64) -> Bytes {
+    let content = SessionSetupResponse {
+        session_flags: SessionFlags::new().with_is_null_session(true),
+        buffer: vec![],
+    };
+    encode(make_response_with_session(
+        ResponseContent::SessionSetup(content),
+        2,
+        Status::Success,
+        session_id,
+    ))
+}
+
+/// Variant of [`negotiate_response_windows_dc`] modeling a permissive
+/// server: signing is *enabled* but **not required**. Identical
+/// dialect / capability shape otherwise. Used by the anonymous-session
+/// test where the client must still send + sign per spec, but the
+/// server policy doesn't force it.
+pub fn negotiate_response_signing_optional() -> Bytes {
+    let content = NegotiateResponse {
+        security_mode: NegotiateSecurityMode::new().with_signing_enabled(true),
+        // signing_required omitted (defaults false) — the difference
+        // from `negotiate_response_windows_dc` is this single bit.
+        dialect_revision: NegotiateDialect::Smb0311,
+        server_guid: smb_dtyp::Guid::from([
+            0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
+        ]),
+        capabilities: GlobalCapabilities::new()
+            .with_dfs(true)
+            .with_leasing(true)
+            .with_large_mtu(true)
+            .with_directory_leasing(true),
+        max_transact_size: 8 * 1024 * 1024,
+        max_read_size: 8 * 1024 * 1024,
+        max_write_size: 8 * 1024 * 1024,
+        system_time: smb_dtyp::binrw_util::file_time::FileTime::default(),
+        server_start_time: smb_dtyp::binrw_util::file_time::FileTime::default(),
+        buffer: vec![0x60, 0x18, 0x06, 0x06, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x02],
+        negotiate_context_list: Some(vec![
+            negotiate_ctx_preauth(),
+            negotiate_ctx_encryption(),
+            negotiate_ctx_signing(),
+        ]),
+    };
+    encode(make_response(
+        ResponseContent::Negotiate(content),
+        0,
+        Status::Success,
+    ))
+}
+
 fn make_response(content: ResponseContent, message_id: u64, status: Status) -> PlainResponse {
     let mut resp = PlainResponse::new(content);
     // Only patch the fields that differ from the defaulted header
