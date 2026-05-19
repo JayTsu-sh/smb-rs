@@ -28,6 +28,17 @@ pub struct OutgoingMessage {
 
     /// Channel ID to use for this message, if any.
     pub channel_id: Option<u32>,
+
+    /// Internal: when `true`, [`ConnectionMessageHandler::sendo`] skips
+    /// priority/credit/msg_id assignment because the caller has already
+    /// invoked [`ConnectionMessageHandler::prepare_outgoing`]. Set by
+    /// the session-setup driver when it needs the wire-bytes of the
+    /// final SessionSetup Request to be determinable *before* the
+    /// preauth-hash + signing-key derivation step. Crate-private to
+    /// keep the "prepared" invariant under in-crate control; external
+    /// code that needs to construct a pre-stamped, signed message goes
+    /// through [`OutgoingMessage::into_signed_pre_prepared`].
+    pub(crate) pre_processed: bool,
 }
 
 impl OutgoingMessage {
@@ -40,6 +51,7 @@ impl OutgoingMessage {
             has_response: true,
             additional_data: None,
             channel_id: None,
+            pre_processed: false,
         }
     }
 
@@ -60,6 +72,26 @@ impl OutgoingMessage {
 
     pub fn with_channel_id(mut self, channel_id: Option<u32>) -> Self {
         self.channel_id = channel_id;
+        self
+    }
+
+    /// Internal: hand off a fully-stamped, sign-on-the-wire message to
+    /// the worker. The session-setup driver invokes this on the *final*
+    /// SessionSetup Request after it has manually run
+    /// [`ConnectionMessageHandler::prepare_outgoing`] and installed a
+    /// channel SigningKey via `make_channel`. Calling this method
+    /// atomically establishes the two invariants the worker relies on:
+    /// `pre_processed = true` (so `sendo` does not re-stamp msg_id /
+    /// credits) and `header.flags.signed = true` (so the transformer
+    /// signs with the channel signer instead of producing a plain
+    /// frame). Splitting these into two separate `pub` operations
+    /// would leak an intermediate state where the message looks
+    /// pre-processed but is not yet marked signed — a footgun that
+    /// would silently re-introduce the Windows-DC bug.
+    #[doc(hidden)]
+    pub fn into_signed_pre_prepared(mut self) -> Self {
+        self.pre_processed = true;
+        self.message.header.flags.set_signed(true);
         self
     }
 }

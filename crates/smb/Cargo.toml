@@ -74,7 +74,7 @@ lz4_flex = { version = "0.11", default-features = false, features = [
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 serial_test = "3.2"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 
 [features]
 default = ["sign", "encrypt", "compress", "async", "std-fs-impls", "netbios-transport"]
@@ -135,6 +135,13 @@ ksmbd-multichannel-compat = []
 
 # Debugging
 __debug-dump-keys = []
+
+# Test-only API surface: exposes session-setup internals (GssState,
+# authenticate_with_gss) and pulls in the smb-msg `server` feature so
+# integration tests can construct server-direction frames (e.g. a
+# scripted NegotiateResponse) via BinWrite. Never enable in production
+# — the re-exported items are not subject to SemVer.
+test-support = ["smb-msg/server"]
 
 # Tests
 test-multichannel = []

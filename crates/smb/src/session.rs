@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 mod authenticator;
 mod channel;
 mod encryptor_decryptor;
+pub(crate) mod gss;
 mod setup;
 mod signer;
 #[cfg(feature = "kerberos")]
@@ -39,6 +40,15 @@ pub use signer::MessageSigner;
 pub use state::{ChannelInfo, SessionInfo};
 
 use setup::*;
+
+/// Channel id assigned to a session's primary channel.
+///
+/// Multichannel-bound alternate channels are allocated by
+/// `channel_counter` starting from `PRIMARY_CHANNEL_ID + 1`. Kept
+/// `pub(crate)` so [`Session::create`] / [`Session::create_with_gss`] /
+/// [`Session::bind`] all agree on the same value without duplicating it
+/// as a local constant in each call site.
+pub(crate) const PRIMARY_CHANNEL_ID: u32 = 0;
 
 pub struct Session {
     primary_channel: Channel,
@@ -60,17 +70,49 @@ impl Session {
         upstream: &ChannelUpstream,
         conn_info: &Arc<ConnectionInfo>,
     ) -> crate::Result<Session> {
-        const FIRST_CHANNEL_ID: u32 = 0;
-
         let setup_result = SessionSetup::<SmbSessionNew>::new(
             identity,
             upstream,
             conn_info,
-            FIRST_CHANNEL_ID,
+            PRIMARY_CHANNEL_ID,
             None,
         )
         .await?;
 
+        Self::_finish_create(setup_result).await
+    }
+
+    /// Test-only: drive `SessionSetup` with a caller-supplied
+    /// [`GssState`][crate::session::gss::GssState] implementor instead
+    /// of an sspi-backed `Authenticator`. See
+    /// [`Connection::authenticate_with_gss`] for the rationale.
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn create_with_gss<G>(
+        gss: G,
+        upstream: &ChannelUpstream,
+        conn_info: &Arc<ConnectionInfo>,
+    ) -> crate::Result<Session>
+    where
+        G: crate::session::gss::GssState + 'static,
+    {
+        let setup_result = SessionSetup::<SmbSessionNew, G>::with_gss(
+            gss,
+            upstream,
+            conn_info,
+            PRIMARY_CHANNEL_ID,
+            None,
+        )
+        .await?;
+
+        Self::_finish_create(setup_result).await
+    }
+
+    async fn _finish_create<G>(
+        setup_result: SessionSetup<'_, SmbSessionNew, G>,
+    ) -> crate::Result<Session>
+    where
+        G: crate::session::gss::GssState,
+    {
         let primary_channel = Self::_common_setup(setup_result).await?;
 
         let handler =
@@ -80,7 +122,7 @@ impl Session {
             session_handler: handler,
             primary_channel,
             alt_channels: Default::default(),
-            channel_counter: AtomicU32::new(FIRST_CHANNEL_ID + 1),
+            channel_counter: AtomicU32::new(PRIMARY_CHANNEL_ID + 1),
         })
     }
 
@@ -149,9 +191,12 @@ impl Session {
         Ok(new_channel_id)
     }
 
-    async fn _common_setup<T>(mut session_setup: SessionSetup<'_, T>) -> crate::Result<Channel>
+    async fn _common_setup<T, G>(
+        mut session_setup: SessionSetup<'_, T, G>,
+    ) -> crate::Result<Channel>
     where
         T: SessionSetupProperties,
+        G: crate::session::gss::GssState,
     {
         let setup_result = session_setup.setup().await?;
 

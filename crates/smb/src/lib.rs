@@ -31,6 +31,18 @@ pub mod resource;
 pub mod session;
 pub mod tree;
 
+/// Test-only API surface.
+///
+/// Enabled by the `test-support` cargo feature, this module re-exports
+/// internals required for deterministic SessionSetup transcript-replay
+/// tests (see `tests/conformance/`). Items here are **not** part of
+/// the stable public API — they may change without a SemVer bump and
+/// must never be relied upon by downstream code outside of test fixtures.
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    pub use crate::session::gss::GssState;
+}
+
 pub use client::{Client, ClientConfig, UncPath};
 pub use connection::{Connection, ConnectionConfig};
 pub use error::Error;
