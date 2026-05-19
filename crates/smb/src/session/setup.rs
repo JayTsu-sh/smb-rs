@@ -341,7 +341,9 @@ where
             .session_id;
         request.message.header.session_id = session_id;
 
-        request.setup_phase_signing_key = Some(self.session_key()?);
+        request.security = Some(crate::msg_handler::Protection::SnapshotKdfSign {
+            session_key: self.session_key()?,
+        });
         let mut request = request.into_signed_pre_prepared();
         // Inhibit any future encryption attempt on this message (Sign
         // and Encrypt are mutually exclusive per the transformer's

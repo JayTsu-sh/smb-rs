@@ -40,15 +40,35 @@ pub struct OutgoingMessage {
     /// through [`OutgoingMessage::into_signed_pre_prepared`].
     pub(crate) pre_processed: bool,
 
-    /// Internal: signals the transformer to take the "setup-phase
-    /// signing" code path for this message — derive a one-shot signer
-    /// from `(this key, finalized preauth hash after ingesting THIS
-    /// request's plain bytes)` and sign with it, instead of looking up
-    /// a cached channel signer from `session_state`. Used exclusively
-    /// for the final SessionSetup Request, where no channel exists in
-    /// the session table yet but MS-SMB2 §3.3.5.5.3 still requires the
-    /// request to be signed.
-    pub(crate) setup_phase_signing_key: Option<crate::crypto::KeyToDerive>,
+    /// Internal: explicit, sealed-at-construction safety policy. When
+    /// `Some`, the transformer dispatches on this *instead of*
+    /// inferring sign/encrypt from session state — eliminating the
+    /// class of bug where `ChannelMessageHandler::sendo` looks at
+    /// `session.state` to decide and gets it wrong (e.g. the
+    /// Windows-DC unsigned-final-request regression).
+    ///
+    /// Today only the SessionSetup driver populates this, for the
+    /// final SessionSetup Request. S5-T2 will extend the same
+    /// mechanism to the rest of the send paths and retire the
+    /// state-inference branch in `ChannelMessageHandler::sendo`.
+    pub(crate) security: Option<Protection>,
+}
+
+/// Explicit security treatment for an [`OutgoingMessage`].
+///
+/// Sealed at construction by the caller, so the transformer doesn't
+/// need to re-derive the choice from mutable session state at send
+/// time. See [`OutgoingMessage::security`] for the rationale.
+#[derive(Debug, Clone)]
+pub enum Protection {
+    /// Sign this request with a one-shot key derived from the given
+    /// GSS-supplied SessionKey and the transformer's currently
+    /// finalized preauth hash (after the request's own plain bytes
+    /// are ingested). Used exclusively for the final SessionSetup
+    /// Request — see MS-SMB2 §3.3.5.5.3.
+    SnapshotKdfSign {
+        session_key: crate::crypto::KeyToDerive,
+    },
 }
 
 impl OutgoingMessage {
@@ -62,7 +82,7 @@ impl OutgoingMessage {
             additional_data: None,
             channel_id: None,
             pre_processed: false,
-            setup_phase_signing_key: None,
+            security: None,
         }
     }
 

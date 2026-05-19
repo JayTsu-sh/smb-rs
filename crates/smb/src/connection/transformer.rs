@@ -492,7 +492,9 @@ impl Transformer {
                 "Should not sign and encrypt at the same time!"
             );
 
-            let mut signer = if let Some(session_key) = msg.setup_phase_signing_key.take() {
+            let mut signer = if let Some(Protection::SnapshotKdfSign { session_key }) =
+                msg.security.take()
+            {
                 // Setup-phase path: the final SessionSetup Request signs
                 // itself with a one-shot key derived from
                 // KDF(SessionKey, finalized preauth hash AFTER this
