@@ -163,7 +163,7 @@ pub trait Worker: Sized + std::fmt::Debug {
     fn transformer(&self) -> &Transformer;
 
     #[maybe_async]
-    async fn negotaite_complete(&self, neg: &ConnectionInfo) {
+    async fn negotaite_complete(&self, neg: &Arc<ConnectionInfo>) {
         self.transformer().negotiated(neg).await.unwrap();
     }
 

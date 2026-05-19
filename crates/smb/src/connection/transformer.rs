@@ -1,3 +1,4 @@
+use crate::connection::preauth_hash::{PreauthHashState, PreauthHashValue};
 use crate::session::{SessionAndChannel, SessionInfo};
 use crate::sync_helpers::*;
 use crate::{compression::*, msg_handler::*};
@@ -22,6 +23,18 @@ pub struct Transformer {
     sessions: RwLock<HashMap<u64, Arc<RwLock<SessionAndChannel>>>>,
 
     config: RwLock<TransformerConfig>,
+
+    /// Connection-level preauth integrity hash (SMB 3.1.1). The
+    /// transformer is the single authoritative owner per MS-SMB2
+    /// §3.1.4.2: ingested automatically from Negotiate / SessionSetup
+    /// plain bytes during `transform_outgoing` / `transform_incoming`,
+    /// and surfaced via [`Self::snapshot_preauth_finalized`] for
+    /// signing-key derivation during the final SessionSetup round.
+    ///
+    /// Empty before [`Self::negotiated`] runs; seeded from
+    /// `ConnectionInfo::preauth_hash` (which already includes the
+    /// Negotiate Req + Resp) at that point.
+    preauth_hash: Mutex<PreauthHashState>,
 }
 
 #[derive(Default, Debug)]
@@ -30,13 +43,19 @@ struct TransformerConfig {
     compress: Option<(Compressor, Decompressor)>,
 
     negotiated: bool,
+
+    /// Cached snapshot of the negotiated dialect/signing/encryption
+    /// parameters. Populated by [`Transformer::negotiated`] and read by
+    /// the setup-phase signing path so the transformer doesn't need to
+    /// re-borrow `ConnectionInfo` from the worker on every send.
+    conn_info: Option<Arc<ConnectionInfo>>,
 }
 
 #[maybe_async(AFIT)]
 impl Transformer {
     /// Notifies that the connection negotiation has been completed,
     /// with the given [`ConnectionInfo`].
-    pub async fn negotiated(&self, neg_info: &ConnectionInfo) -> crate::Result<()> {
+    pub async fn negotiated(&self, neg_info: &Arc<ConnectionInfo>) -> crate::Result<()> {
         {
             let config = self.config.read().await?;
             if config.negotiated {
@@ -55,9 +74,95 @@ impl Transformer {
             config.compress = compress;
         }
 
+        // Seed the connection-level preauth hash from the value the
+        // negotiator built out of the Negotiate Req + Resp wire bytes.
+        // From now on the transformer is the sole owner: all subsequent
+        // SessionSetup Req/Resp ingestion happens inside
+        // `transform_outgoing` / `transform_incoming`.
+        *self.preauth_hash.lock().await? = neg_info.preauth_hash.clone();
+
+        config.conn_info = Some(neg_info.clone());
         config.negotiated = true;
 
         Ok(())
+    }
+
+    /// Returns a clone of the current preauth hash, advanced to its
+    /// `Finished` form for key-derivation use. `Ok(None)` is returned
+    /// when the negotiated dialect doesn't support preauth integrity
+    /// (i.e. anything below SMB 3.1.1).
+    ///
+    /// This is the public surface for the session-setup driver: it
+    /// invokes this after the final SessionSetup Request has been
+    /// dispatched (the transformer auto-ingested the plain bytes during
+    /// `transform_outgoing`), and uses the value to derive the channel
+    /// SigningKey.
+    pub async fn snapshot_preauth_finalized(&self) -> crate::Result<Option<PreauthHashValue>> {
+        let snapshot = self.preauth_hash.lock().await?.clone();
+        match snapshot.finish()? {
+            PreauthHashState::Finished(v) => Ok(Some(v)),
+            PreauthHashState::Unsupported => Ok(None),
+            PreauthHashState::InProgress(_) => Err(crate::Error::InvalidState(
+                "PreauthHashState::finish() returned InProgress — should be unreachable".into(),
+            )),
+        }
+    }
+
+    /// Cached `ConnectionInfo` captured by `negotiated`. None before
+    /// negotiation completes. Used by the setup-phase signing path
+    /// (S4-T3) to derive the dialect / signing algorithm without
+    /// re-borrowing from the worker on every send.
+    #[allow(dead_code)] // wired up in S4-T3
+    async fn conn_info(&self) -> crate::Result<Option<Arc<ConnectionInfo>>> {
+        Ok(self.config.read().await?.conn_info.clone())
+    }
+
+    /// Derive a one-shot [`MessageSigner`] for the final SessionSetup
+    /// Request, using the snapshot of the preauth hash that already
+    /// includes this request's plain bytes (auto-ingested above) and
+    /// the GSS-supplied SessionKey provided by the setup driver.
+    ///
+    /// Mirrors `ChannelInfo::new`'s key derivation so the signer is
+    /// byte-identical to the one the server independently derives.
+    async fn derive_setup_phase_signer(
+        &self,
+        session_key: &crate::crypto::KeyToDerive,
+    ) -> crate::Result<crate::session::MessageSigner> {
+        let conn_info = self.conn_info().await?.ok_or_else(|| {
+            crate::Error::InvalidState(
+                "setup-phase signing requested before `negotiated` ran".into(),
+            )
+        })?;
+        let preauth_snapshot = self.snapshot_preauth_finalized().await?;
+        let channel_info = crate::session::ChannelInfo::new(
+            // The id only matters for in-session channel tracking; a
+            // setup-phase signer is anonymous (no session table entry
+            // yet), so any sentinel will do.
+            u32::MAX,
+            session_key,
+            &preauth_snapshot,
+            &conn_info,
+        )?;
+        Ok(channel_info.signer()?.clone())
+    }
+
+    /// MS-SMB2 §3.1.4.2: client-side rule for which **outgoing**
+    /// messages get folded into Connection.PreauthIntegrityHashValue.
+    fn participates_in_preauth_outgoing(header: &Header) -> bool {
+        matches!(header.command, Command::Negotiate | Command::SessionSetup)
+    }
+
+    /// MS-SMB2 §3.1.4.2: client-side rule for which **incoming**
+    /// messages get folded into the hash. Negotiate Response is always
+    /// included; SessionSetup Response only when it carries
+    /// MORE_PROCESSING_REQUIRED (i.e. it isn't the final ACK that
+    /// closes the chain).
+    fn participates_in_preauth_incoming(header: &Header) -> bool {
+        match header.command {
+            Command::Negotiate => true,
+            Command::SessionSetup => header.status == Status::MoreProcessingRequired as u32,
+            _ => false,
+        }
     }
 
     /// Notifies that a session has started.
@@ -348,11 +453,31 @@ impl Transformer {
         let session_id = msg.message.header.session_id;
 
         let mut outgoing_data = IoVec::default();
-        // Plain header + content
+        // Plain header + content (signature is still zero at this point —
+        // `sign_message` patches it back into the buffer below, after the
+        // preauth-hash ingest sees the unsigned bytes).
         {
             let buffer = outgoing_data.add_owned(Vec::with_capacity(Header::STRUCT_SIZE));
             msg.message.write(&mut Cursor::new(buffer))?;
         }
+
+        // Per MS-SMB2 §3.1.4.2, Negotiate Requests and *all*
+        // SessionSetup Requests participate in the connection-level
+        // preauth integrity hash. We ingest the plain (signature=0)
+        // bytes here so the hash is identical to what the server
+        // computes on receive. Doing it inside the transformer
+        // centralises the contract: the session-setup driver doesn't
+        // need to know which messages count.
+        if Self::participates_in_preauth_outgoing(&msg.message.header) {
+            if let Some(plain) = outgoing_data.first() {
+                let mut hash = self.preauth_hash.lock().await?;
+                // Clone-then-replace: if `next` errors we want to keep
+                // the previous hash state intact, not corrupt it to a
+                // default `Unsupported`.
+                *hash = hash.clone().next(plain)?;
+            }
+        }
+
         // Additional data, if any (zero-copy via Bytes)
         if let Some(data) = msg.additional_data.take() {
             if !data.is_empty() {
@@ -367,8 +492,17 @@ impl Transformer {
                 "Should not sign and encrypt at the same time!"
             );
 
-            let mut signer = self
-                ._with_channel(session_id, |session| {
+            let mut signer = if let Some(session_key) = msg.setup_phase_signing_key.take() {
+                // Setup-phase path: the final SessionSetup Request signs
+                // itself with a one-shot key derived from
+                // KDF(SessionKey, finalized preauth hash AFTER this
+                // request's plain bytes), per MS-SMB2 §3.2.4.1.7. No
+                // channel exists in `session_state` yet (it'll be
+                // installed by the driver immediately after dispatch
+                // for the response-verify path).
+                self.derive_setup_phase_signer(&session_key).await?
+            } else {
+                self._with_channel(session_id, |session| {
                     let channel_info =
                         session
                             .channel
@@ -383,7 +517,8 @@ impl Transformer {
 
                     Ok(channel_info.signer()?.clone())
                 })
-                .await?;
+                .await?
+            };
 
             signer.sign_message(&mut msg.message.header, &mut outgoing_data)?;
 
@@ -656,6 +791,19 @@ impl Transformer {
                 ));
             }
         };
+
+        // Per MS-SMB2 §3.1.4.2 fold qualifying responses into the
+        // connection-level preauth hash *before* signature verification:
+        // (a) so the Final SessionSetup Response we're about to verify
+        // sees the same hash the server used to derive its signing key,
+        // and (b) so future channel-binding setups picking up the
+        // snapshot see Negotiate Resp / intermediate SessionSetup Resp
+        // bytes included.
+        if Self::participates_in_preauth_incoming(&message.header) {
+            let mut hash = self.preauth_hash.lock().await?;
+            // Clone-then-replace; see `transform_outgoing` for rationale.
+            *hash = hash.clone().next(&raw)?;
+        }
 
         // Verify signature directly from raw bytes (no IoVec copy needed).
         if let Err(e) = self

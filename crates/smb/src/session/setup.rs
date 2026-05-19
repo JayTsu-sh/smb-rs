@@ -23,10 +23,6 @@ where
 
     handler: Option<ChannelMessageHandler>,
 
-    /// should always be set; this is Option to allow moving it out during setup,
-    /// when it is being updated.
-    preauth_hash: Option<PreauthHashState>,
-
     result: Option<Arc<RwLock<SessionAndChannel>>>,
 
     authenticator: G,
@@ -85,7 +81,6 @@ where
             flags: None,
             result: None,
             handler: None,
-            preauth_hash: Some(conn_info.preauth_hash.clone()),
             authenticator,
             upstream,
             conn_info,
@@ -191,9 +186,10 @@ where
                 {
                     return Err(crate::error::SetupError::UnsignedFinalResponse.into());
                 }
-            } else {
-                self.next_preauth_hash(&response.raw)?;
             }
+            // Intermediate response preauth ingest is now done inside
+            // `Transformer::transform_incoming` (S4-T2); no driver-side
+            // bookkeeping needed.
 
             self.flags = Some(session_setup_response.session_flags);
             self.last_setup_response = Some(session_setup_response)
@@ -298,29 +294,20 @@ where
         }
     }
 
-    /// Never signed, so wire bytes == plain bytes (`signature = 0`),
-    /// and the preauth hash can be updated from `send_result.raw`
-    /// after the fact without diverging from the server's hash.
+    /// Never signed, so wire bytes == plain bytes (`signature = 0`).
+    /// The connection-level preauth hash is fed by
+    /// `Transformer::transform_outgoing` (S4-T2); the driver is hands-off.
     async fn send_intermediate_setup_request(
         &mut self,
         request: OutgoingMessage,
     ) -> crate::Result<SendMessageResult> {
-        let mut send_result = if let Some(handler) = self.handler.as_ref() {
+        if let Some(handler) = self.handler.as_ref() {
             tracing::trace!("setup loop: sending intermediate with channel handler");
-            handler.sendo(request).await?
+            handler.sendo(request).await
         } else {
             tracing::trace!("setup loop: sending intermediate with upstream handler");
-            self.upstream.sendo(request).await?
-        };
-
-        let raw_iovec = send_result.raw.as_mut().ok_or_else(|| {
-            Error::InvalidState("Send result raw data is missing.".to_string())
-        })?;
-        raw_iovec.consolidate();
-        self.next_preauth_hash(raw_iovec.first().ok_or_else(|| {
-            Error::InvalidState("Raw IoVec is empty after consolidation.".to_string())
-        })?)?;
-        Ok(send_result)
+            self.upstream.sendo(request).await
+        }
     }
 
     /// Final SessionSetup Request (the one carrying the GSS authenticator
@@ -328,21 +315,16 @@ where
     ///
     /// Per MS-SMB2 §3.3.5.5.3 the server **requires** this request to
     /// be signed on any non-anonymous SMB 3.x session (Windows DCs in
-    /// particular drop it silently otherwise). Per §3.2.4.1 the
-    /// SigningKey must be derived from the preauth hash *including*
-    /// this request's plain bytes — so we must serialize the request
-    /// once (with `signature = 0`) before computing the hash, then
-    /// have the transformer serialize it a second time to produce the
-    /// wire bytes it actually signs. Both serializations are
-    /// byte-identical (deterministic `binrw` output), so the
-    /// client-side and server-side hashes match.
+    /// particular drop it silently otherwise). The transformer owns
+    /// the preauth-hash plumbing: we just attach the GSS-derived
+    /// SessionKey to the outgoing message via `setup_phase_signing_key`,
+    /// and `Transformer::transform_outgoing` ingests the plain bytes,
+    /// derives a one-shot signer from the resulting finalized hash, and
+    /// signs in place — all in one pass.
     async fn send_final_setup_request(
         &mut self,
         mut request: OutgoingMessage,
     ) -> crate::Result<SendMessageResult> {
-        use binrw::prelude::*;
-        use std::io::Cursor;
-
         self.upstream
             .handler
             .prepare_outgoing(&mut request)
@@ -359,33 +341,29 @@ where
             .session_id;
         request.message.header.session_id = session_id;
 
-        let mut plain_bytes: Vec<u8> = Vec::with_capacity(256);
-        request
-            .message
-            .write(&mut Cursor::new(&mut plain_bytes))?;
+        request.setup_phase_signing_key = Some(self.session_key()?);
+        let mut request = request.into_signed_pre_prepared();
+        // Inhibit any future encryption attempt on this message (Sign
+        // and Encrypt are mutually exclusive per the transformer's
+        // own debug_assert).
+        request.encrypt = false;
 
-        self.next_preauth_hash(&plain_bytes)?;
-        self.preauth_hash = Some(
-            self.preauth_hash
-                .take()
-                .ok_or_else(|| {
-                    Error::InvalidState("Preauth hash is missing before finalize".to_string())
-                })?
-                .finish()?,
-        );
-
-        // Channel must be installed into session_state before dispatch:
-        // the transformer reads channel.signer from there to sign the
-        // request right after re-serializing it.
-        self.make_channel().await?;
-
-        let request = request.into_signed_pre_prepared();
         tracing::trace!(
             "setup loop: dispatching final signed SessionSetup msg_id={} session_id={:#x}",
             request.message.header.message_id,
             session_id
         );
-        self.upstream.handler.dispatch_outgoing(request).await
+        let result = self.upstream.handler.dispatch_outgoing(request).await?;
+
+        // Install the channel into session_state *after* dispatch so
+        // the receive path can verify the matching signed Response —
+        // the channel signer is derived from the same preauth hash the
+        // transformer used a moment ago (it's stable now: the
+        // SessionSetup Response with status=Success does NOT update
+        // the hash per MS-SMB2 §3.1.4.2).
+        self.make_channel().await?;
+
+        Ok(result)
     }
 
     /// Initializes the channel that is resulted from the current session setup.
@@ -396,10 +374,20 @@ where
         T::on_session_key_exchanged(self).await?;
         tracing::trace!("Session keys are set.");
 
+        // The preauth hash is owned by the transformer (S4-T1); snapshot
+        // its current finalized value to derive the channel SigningKey.
+        let preauth_snapshot = self
+            .upstream
+            .worker()
+            .ok_or_else(|| Error::InvalidState("Worker not available!".to_string()))?
+            .transformer()
+            .snapshot_preauth_finalized()
+            .await?;
+
         let channel_info = ChannelInfo::new(
             self.new_channel_id,
             &self.session_key()?,
-            &self.preauth_hash_value(),
+            &preauth_snapshot,
             self.conn_info,
         )?;
 
@@ -425,19 +413,16 @@ where
         self.authenticator.session_key()
     }
 
-    fn preauth_hash_value(&self) -> Option<PreauthHashValue> {
-        self.preauth_hash
-            .as_ref()
-            .and_then(|h| h.unwrap_final_hash().ok().flatten().copied())
-    }
-
-    fn next_preauth_hash(&mut self, data: &[u8]) -> crate::Result<&PreauthHashState> {
-        if let Some(hash) = self.preauth_hash.take() {
-            self.preauth_hash = Some(hash.next(data)?);
-        }
-        self.preauth_hash
-            .as_ref()
-            .ok_or_else(|| Error::InvalidState("Preauth hash is missing.".to_string()))
+    /// Snapshot the connection-level preauth hash from the transformer
+    /// (S4-T1). Used by `SmbSessionNew::on_session_key_exchanged` to
+    /// derive the per-session keys.
+    async fn preauth_hash_snapshot(&self) -> crate::Result<Option<PreauthHashValue>> {
+        self.upstream
+            .worker()
+            .ok_or_else(|| Error::InvalidState("Worker not available!".to_string()))?
+            .transformer()
+            .snapshot_preauth_finalized()
+            .await
     }
 
     pub fn upstream(&self) -> &'a ChannelUpstream {
@@ -618,7 +603,7 @@ impl SessionSetupProperties for SmbSessionNew {
             .await?
             .setup(
                 &setup.session_key()?,
-                &setup.preauth_hash_value(),
+                &setup.preauth_hash_snapshot().await?,
                 setup.conn_info,
             )
     }

@@ -39,6 +39,16 @@ pub struct OutgoingMessage {
     /// code that needs to construct a pre-stamped, signed message goes
     /// through [`OutgoingMessage::into_signed_pre_prepared`].
     pub(crate) pre_processed: bool,
+
+    /// Internal: signals the transformer to take the "setup-phase
+    /// signing" code path for this message — derive a one-shot signer
+    /// from `(this key, finalized preauth hash after ingesting THIS
+    /// request's plain bytes)` and sign with it, instead of looking up
+    /// a cached channel signer from `session_state`. Used exclusively
+    /// for the final SessionSetup Request, where no channel exists in
+    /// the session table yet but MS-SMB2 §3.3.5.5.3 still requires the
+    /// request to be signed.
+    pub(crate) setup_phase_signing_key: Option<crate::crypto::KeyToDerive>,
 }
 
 impl OutgoingMessage {
@@ -52,6 +62,7 @@ impl OutgoingMessage {
             additional_data: None,
             channel_id: None,
             pre_processed: false,
+            setup_phase_signing_key: None,
         }
     }
 

@@ -6,9 +6,12 @@ pub type PreauthHashValue = [u8; 64];
 
 pub const SUPPORTED_ALGOS: &[HashAlgorithm] = &[HashAlgorithm::Sha512];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum PreauthHashState {
     /// This state always transitions to itself, and calling `unwrap_final_hash` returns `None`.
+    /// Also the `Default` so that holders constructed before `negotiated()`
+    /// runs are in the safest possible state (no integrity tracking).
+    #[default]
     Unsupported,
 
     InProgress(PreauthHashValue),
