@@ -574,6 +574,41 @@ impl Connection {
         Ok(session)
     }
 
+    /// Test-only: drive SessionSetup with a caller-supplied [`GssState`]
+    /// implementor.
+    ///
+    /// Production code paths go through [`Self::authenticate`], which
+    /// builds an sspi-backed `Authenticator` from the user's credentials.
+    /// This method bypasses sspi entirely and is intended for
+    /// deterministic transcript-replay tests where the GSS exchange
+    /// must produce a known sequence of bytes.
+    ///
+    /// Behaviour, error semantics, and bookkeeping (session table,
+    /// handler weak ref) are identical to [`Self::authenticate`].
+    #[cfg(feature = "test-support")]
+    #[tracing::instrument(level = "debug", skip_all, fields(server = %self.server_name))]
+    pub async fn authenticate_with_gss<G>(&self, gss: G) -> crate::Result<Session>
+    where
+        G: crate::session::gss::GssState + 'static,
+    {
+        let session = Session::create_with_gss(
+            gss,
+            &self.handler,
+            self.handler
+                .conn_info
+                .get()
+                .ok_or_else(|| Error::InvalidState("Connection not negotiated.".to_string()))?,
+        )
+        .await?;
+        let session_handler = session.handler.weak();
+        self.handler
+            .sessions
+            .lock()
+            .await?
+            .insert(session.session_id(), session_handler);
+        Ok(session)
+    }
+
     /// Returns the connection information, if the connection has been negotiated.
     /// Otherwise, returns `None`.
     pub fn conn_info(&self) -> Option<&Arc<ConnectionInfo>> {
@@ -1160,6 +1195,58 @@ impl ConnectionMessageHandler {
     const CREDIT_CALC_RATIO: u32 = 65536;
     const CREDITS_PER_MSG_NO_LARGE_MTU: u32 = 1;
 
+    /// Stamp an [`OutgoingMessage`] with priority, credit charge, and a
+    /// fresh message_id. Idempotent guard: callers should set
+    /// [`OutgoingMessage::pre_processed`] to `true` after invoking, so
+    /// downstream [`Self::sendo`] doesn't re-run the sequencing logic
+    /// (which would consume an extra msg_id and an extra credit slot).
+    ///
+    /// Used by the session-setup driver, which needs the message's
+    /// final on-wire `header.message_id` *before* the wire bytes are
+    /// hashed into the SMB 3.1.1 preauth integrity chain.
+    #[maybe_async]
+    pub(crate) async fn prepare_outgoing(
+        &self,
+        msg: &mut OutgoingMessage,
+    ) -> crate::Result<()> {
+        let priority_value = match self.conn_info.get() {
+            Some(neg_info) => match neg_info.negotiation.dialect_rev {
+                Dialect::Smb0311 => 1,
+                _ => 0,
+            },
+            None => 0,
+        };
+        msg.message.header.flags = msg.message.header.flags.with_priority_mask(priority_value);
+
+        let is_cancel = msg.message.content.as_cancel().is_ok();
+        if !is_cancel {
+            self.process_sequence_outgoing(msg).await?;
+        } else if msg.message.header.message_id == 0 {
+            return Err(Error::InvalidState(
+                "Cancel message must have a valid message ID".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Hand a pre-prepared [`OutgoingMessage`] to the worker for
+    /// transformation (sign/compress/encrypt) and transmission. Callers
+    /// must have invoked [`Self::prepare_outgoing`] first (or set
+    /// [`OutgoingMessage::pre_processed`] to `true` if they manually
+    /// stamped the header). [`Self::sendo`] is the public, all-in-one
+    /// entry point that combines both.
+    #[maybe_async]
+    pub(crate) async fn dispatch_outgoing(
+        &self,
+        msg: OutgoingMessage,
+    ) -> crate::Result<SendMessageResult> {
+        self.worker
+            .get()
+            .ok_or(Error::InvalidState("Worker is uninitialized".into()))?
+            .send(msg)
+            .await
+    }
+
     #[maybe_async]
     async fn process_sequence_outgoing(&self, msg: &mut OutgoingMessage) -> crate::Result<()> {
         if let Some(neg) = self.conn_info.get() {
@@ -1344,29 +1431,10 @@ impl ConnectionMessageHandler {
 impl MessageHandler for ConnectionMessageHandler {
     #[maybe_async]
     async fn sendo(&self, mut msg: OutgoingMessage) -> crate::Result<SendMessageResult> {
-        let priority_value = match self.conn_info.get() {
-            Some(neg_info) => match neg_info.negotiation.dialect_rev {
-                Dialect::Smb0311 => 1,
-                _ => 0,
-            },
-            None => 0,
-        };
-        msg.message.header.flags = msg.message.header.flags.with_priority_mask(priority_value);
-
-        let is_cancel = msg.message.content.as_cancel().is_ok();
-        if !is_cancel {
-            self.process_sequence_outgoing(&mut msg).await?;
-        } else if msg.message.header.message_id == 0 {
-            return Err(Error::InvalidState(
-                "Cancel message must have a valid message ID".into(),
-            ));
+        if !msg.pre_processed {
+            self.prepare_outgoing(&mut msg).await?;
         }
-
-        self.worker
-            .get()
-            .ok_or(Error::InvalidState("Worker is uninitialized".into()))?
-            .send(msg)
-            .await
+        self.dispatch_outgoing(msg).await
     }
 
     #[maybe_async]

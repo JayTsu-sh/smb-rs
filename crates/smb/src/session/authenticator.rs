@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::Error;
 use crate::connection::AuthMethodsConfig;
 use crate::connection::connection_info::ConnectionInfo;
+use crate::session::gss::GssState;
 use maybe_async::*;
 use sspi::{
     AcquireCredentialsHandleResult, AuthIdentity, BufferType, ClientRequestFlags, CredentialUse,
@@ -54,25 +55,6 @@ impl Authenticator {
         })
     }
 
-    pub fn user_name(&self) -> &Username {
-        &self.user_name
-    }
-
-    pub fn is_authenticated(&self) -> crate::Result<bool> {
-        match &self.current_state {
-            None => Ok(false),
-            Some(state) => Ok(state.status == sspi::SecurityStatus::Ok),
-        }
-    }
-
-    pub fn session_key(&self) -> crate::Result<[u8; 16]> {
-        // Use the first 16 bytes of the session key.
-        let key_info = self.ssp.query_context_session_key()?;
-        let k = &key_info.session_key.as_ref()[..16];
-        k.try_into()
-            .map_err(|_| Error::InvalidState("Session key is shorter than 16 bytes.".to_string()))
-    }
-
     fn make_sspi_target_name(server_fqdn: &str) -> String {
         format!("cifs/{server_fqdn}")
     }
@@ -87,8 +69,63 @@ impl Authenticator {
 
     const SSPI_REQ_DATA_REPRESENTATION: DataRepresentation = DataRepresentation::Native;
 
-    #[maybe_async]
-    pub async fn next(&mut self, gss_token: &[u8]) -> crate::Result<Vec<u8>> {
+    /// This method, despite being very similar to [`sspi::generator::Generator::resolve_with_async_client`],
+    /// adds the `Send` bound to the network client, which is required for our async code.
+    ///
+    /// See [<https://github.com/Devolutions/sspi-rs/issues/526>] for more details.
+    #[cfg(all(feature = "kerberos", feature = "async"))]
+    async fn _resolve_with_async_client(
+        generator: &mut sspi::generator::GeneratorInitSecurityContext<'_>, // Generator returned from `sspi-rs`.
+        network_client: &mut super::sspi_network_client::ReqwestNetworkClient, // Your custom network client.
+    ) -> sspi::Result<InitializeSecurityContextResult> {
+        let mut state = generator.start();
+
+        use sspi::generator::GeneratorState::*;
+        loop {
+            match state {
+                Suspended(ref request) => {
+                    state = generator.resume(network_client.send(request).await);
+                }
+                Completed(client_state) => {
+                    return client_state;
+                }
+            }
+        }
+    }
+
+    fn get_available_ssp_pkgs(config: &AuthMethodsConfig) -> String {
+        let krb_pku2u_config = if cfg!(feature = "kerberos") && config.kerberos {
+            "kerberos,!pku2u"
+        } else {
+            "!kerberos,!pku2u"
+        };
+        let ntlm_config = if config.ntlm { "ntlm" } else { "!ntlm" };
+        format!("{ntlm_config},{krb_pku2u_config}")
+    }
+}
+
+#[maybe_async(AFIT)]
+impl GssState for Authenticator {
+    fn user_name(&self) -> &Username {
+        &self.user_name
+    }
+
+    fn is_authenticated(&self) -> crate::Result<bool> {
+        match &self.current_state {
+            None => Ok(false),
+            Some(state) => Ok(state.status == sspi::SecurityStatus::Ok),
+        }
+    }
+
+    fn session_key(&self) -> crate::Result<[u8; 16]> {
+        // Use the first 16 bytes of the session key.
+        let key_info = self.ssp.query_context_session_key()?;
+        let k = &key_info.session_key.as_ref()[..16];
+        k.try_into()
+            .map_err(|_| Error::InvalidState("Session key is shorter than 16 bytes.".to_string()))
+    }
+
+    async fn next(&mut self, gss_token: &[u8]) -> crate::Result<Vec<u8>> {
         if self.is_authenticated()? {
             return Err(Error::InvalidState("Authentication already done.".into()));
         }
@@ -156,39 +193,5 @@ impl Authenticator {
             .buffer;
 
         Ok(output_buffer)
-    }
-
-    /// This method, despite being very similar to [`sspi::generator::Generator::resolve_with_async_client`],
-    /// adds the `Send` bound to the network client, which is required for our async code.
-    ///
-    /// See [<https://github.com/Devolutions/sspi-rs/issues/526>] for more details.
-    #[cfg(all(feature = "kerberos", feature = "async"))]
-    async fn _resolve_with_async_client(
-        generator: &mut sspi::generator::GeneratorInitSecurityContext<'_>, // Generator returned from `sspi-rs`.
-        network_client: &mut super::sspi_network_client::ReqwestNetworkClient, // Your custom network client.
-    ) -> sspi::Result<InitializeSecurityContextResult> {
-        let mut state = generator.start();
-
-        use sspi::generator::GeneratorState::*;
-        loop {
-            match state {
-                Suspended(ref request) => {
-                    state = generator.resume(network_client.send(request).await);
-                }
-                Completed(client_state) => {
-                    return client_state;
-                }
-            }
-        }
-    }
-
-    fn get_available_ssp_pkgs(config: &AuthMethodsConfig) -> String {
-        let krb_pku2u_config = if cfg!(feature = "kerberos") && config.kerberos {
-            "kerberos,!pku2u"
-        } else {
-            "!kerberos,!pku2u"
-        };
-        let ntlm_config = if config.ntlm { "ntlm" } else { "!ntlm" };
-        format!("{ntlm_config},{krb_pku2u_config}")
     }
 }

@@ -11,6 +11,49 @@ pub enum TimedOutTask {
     ReceiveNextMessage,
 }
 
+/// Fine-grained classification of session-setup failures.
+///
+/// These map the most common observable symptoms of an SMB SessionSetup
+/// breaking down (timeout, unsigned response, etc.) onto the most
+/// likely protocol-level root causes, so that users get an actionable
+/// hint instead of a generic transport error.
+#[derive(Error, Debug)]
+pub enum SetupError {
+    /// The server returned a final SessionSetup Response with no
+    /// signature on a non-anonymous SMB 3.x session, in violation of
+    /// MS-SMB2 §3.3.5.5.3. This is either a buggy server, or — more
+    /// commonly — the connection-level preauth integrity hash
+    /// diverged between client and server: each side then derives a
+    /// different SigningKey and the server's response, while
+    /// "correctly signed" by its computation, fails the client's
+    /// verification, or vice versa.
+    #[error(
+        "Server returned an unsigned final SessionSetup Response on a non-anonymous \
+         session. This is either a buggy server, or the preauth-integrity hash \
+         diverged between client and server (each side would then derive a different \
+         SigningKey)."
+    )]
+    UnsignedFinalResponse,
+
+    /// SessionSetup phase timed out waiting for the server. The most
+    /// likely root cause is a server-side silent drop of one of our
+    /// requests: hardened servers (Windows AD DCs, Samba with
+    /// `server signing = mandatory`, etc.) discard requests whose
+    /// signing / preauth-hash policy doesn't match without ever
+    /// replying. The timeout itself is indistinguishable from a real
+    /// transport failure, but the surrounding setup state lets us
+    /// surface this strong hint to the caller.
+    #[error(
+        "SessionSetup timed out after {elapsed:?} waiting for the server. Likely \
+         cause: server silently dropped a SessionSetup Request — typical when (a) \
+         the server enforces signing_required and the client failed to sign the \
+         final SessionSetup Request, or (b) the connection-level preauth-integrity \
+         hash diverged between client and server. Re-run with trace logging on \
+         `smb::session::setup` to confirm which request the server stopped acknowledging."
+    )]
+    Timeout { elapsed: std::time::Duration },
+}
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("Unexpected Message, {0}")]
@@ -124,6 +167,11 @@ pub enum Error {
 
     #[error("Other error: {0}")]
     Other(&'static str),
+
+    /// Session-setup-phase failure with a protocol-level explanation.
+    /// See [`SetupError`] for the recognised symptom → root-cause map.
+    #[error(transparent)]
+    Setup(#[from] SetupError),
 }
 
 impl<T> From<PoisonError<T>> for Error {
