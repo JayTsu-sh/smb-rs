@@ -5,7 +5,7 @@
 
 use crate::UncPath;
 use crate::connection::connection_info::ConnectionInfo;
-use crate::connection::preauth_hash::{PreauthHashState, PreauthHashValue};
+use crate::connection::preauth_hash::PreauthHashValue;
 use crate::connection::worker::Worker;
 use crate::{
     Error,
