@@ -70,12 +70,13 @@ impl Session {
         upstream: &ChannelUpstream,
         conn_info: &Arc<ConnectionInfo>,
     ) -> crate::Result<Session> {
-        let setup_result = SessionSetup::<SmbSessionNew>::new(
+        let setup_result = SessionSetup::new(
             identity,
             upstream,
             conn_info,
             PRIMARY_CHANNEL_ID,
             None,
+            SetupKind::New,
         )
         .await?;
 
@@ -95,12 +96,13 @@ impl Session {
     where
         G: crate::session::gss::GssState + 'static,
     {
-        let setup_result = SessionSetup::<SmbSessionNew, G>::with_gss(
+        let setup_result = SessionSetup::with_gss(
             gss,
             upstream,
             conn_info,
             PRIMARY_CHANNEL_ID,
             None,
+            SetupKind::New,
         )
         .await?;
 
@@ -108,7 +110,7 @@ impl Session {
     }
 
     async fn _finish_create<G>(
-        setup_result: SessionSetup<'_, SmbSessionNew, G>,
+        setup_result: SessionSetup<'_, G>,
     ) -> crate::Result<Session>
     where
         G: crate::session::gss::GssState,
@@ -165,12 +167,13 @@ impl Session {
             .channel_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let setup_result = SessionSetup::<SmbSessionBind>::new(
+        let setup_result = SessionSetup::new(
             identity,
             handler,
             conn_info,
             new_channel_id,
             Some(self.handler.session_state()),
+            SetupKind::Bind,
         )
         .await?;
 
@@ -191,11 +194,10 @@ impl Session {
         Ok(new_channel_id)
     }
 
-    async fn _common_setup<T, G>(
-        mut session_setup: SessionSetup<'_, T, G>,
+    async fn _common_setup<G>(
+        mut session_setup: SessionSetup<'_, G>,
     ) -> crate::Result<Channel>
     where
-        T: SessionSetupProperties,
         G: crate::session::gss::GssState,
     {
         let setup_result = session_setup.setup().await?;
