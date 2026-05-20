@@ -4,18 +4,38 @@ use crate::session::gss::GssState;
 
 use super::*;
 
+/// Distinguishes the two SessionSetup flavours that share the same GSS
+/// drive loop but differ in their session-state bookkeeping. Used by
+/// [`SessionSetup`] to inline-dispatch the small per-flavour deltas
+/// (request flags, cleanup behaviour, post-success hooks) instead of
+/// the previous trait + marker-struct dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetupKind {
+    /// Brand-new session — `init_session` creates a fresh
+    /// [`SessionInfo`] on the first response, `on_session_key_exchanged`
+    /// transitions it to `SettingUp` and installs the cipher pair,
+    /// `on_setup_success` flips it to `Ready`, and `error_cleanup`
+    /// invalidates the session before ending it.
+    New,
+    /// Multichannel bind — the [`SessionInfo`] is provided in the
+    /// constructor (no `init_session` is ever needed), keys/cipher
+    /// pair are already on the primary session so there's nothing to
+    /// install, and `error_cleanup` ends the session **without**
+    /// invalidating it (the primary session remains usable on its
+    /// original channel).
+    Bind,
+}
+
 /// Session setup processor.
 ///
-/// This is an internal structure.
-/// It is assume that T is properly implemented and tested in-crate,
-/// and so, the wide use of unwrap() is acceptable.
-///
-/// `G` is the GSS-API authentication mechanism. Production builds pin
-/// it to [`Authenticator`] via [`Self::new`]; tests inject a mock
-/// implementor of [`GssState`] via [`Self::with_gss`].
-pub(crate) struct SessionSetup<'a, T, G = Authenticator>
+/// Drives the GSS exchange (NTLM or Kerberos) plus the surrounding SMB
+/// SessionSetup Request/Response chain. `G` is the GSS-API
+/// implementation; production builds pin it to [`Authenticator`] via
+/// [`Self::new`], tests inject a scripted mock via [`Self::with_gss`].
+/// The `kind` field selects between the new-session and channel-
+/// binding sub-flows — see [`SetupKind`].
+pub(crate) struct SessionSetup<'a, G = Authenticator>
 where
-    T: SessionSetupProperties,
     G: GssState,
 {
     last_setup_response: Option<SessionSetupResponse>,
@@ -33,14 +53,11 @@ where
     channel: Option<ChannelInfo>,
     new_channel_id: u32,
 
-    _phantom: std::marker::PhantomData<T>,
+    kind: SetupKind,
 }
 
 #[maybe_async]
-impl<'a, T> SessionSetup<'a, T, Authenticator>
-where
-    T: SessionSetupProperties,
-{
+impl<'a> SessionSetup<'a, Authenticator> {
     /// sspi-backed convenience over [`Self::with_gss`].
     pub async fn new(
         identity: sspi::AuthIdentity,
@@ -48,6 +65,7 @@ where
         conn_info: &'a Arc<ConnectionInfo>,
         new_channel_id: u32,
         primary_session: Option<&Arc<RwLock<SessionAndChannel>>>,
+        kind: SetupKind,
     ) -> crate::Result<Self> {
         let authenticator = Authenticator::build(identity, conn_info)?;
         Self::with_gss(
@@ -56,15 +74,15 @@ where
             conn_info,
             new_channel_id,
             primary_session,
+            kind,
         )
         .await
     }
 }
 
 #[maybe_async]
-impl<'a, T, G> SessionSetup<'a, T, G>
+impl<'a, G> SessionSetup<'a, G>
 where
-    T: SessionSetupProperties,
     G: GssState,
 {
     /// Accepts any [`GssState`] implementor — production goes through
@@ -75,7 +93,13 @@ where
         conn_info: &'a Arc<ConnectionInfo>,
         new_channel_id: u32,
         primary_session: Option<&Arc<RwLock<SessionAndChannel>>>,
+        kind: SetupKind,
     ) -> crate::Result<Self> {
+        debug_assert!(
+            (kind == SetupKind::Bind) == primary_session.is_some(),
+            "SetupKind::Bind requires a primary_session; SetupKind::New must not be given one"
+        );
+
         let mut result = Self {
             last_setup_response: None,
             flags: None,
@@ -86,7 +110,7 @@ where
             conn_info,
             channel: None,
             new_channel_id,
-            _phantom: std::marker::PhantomData,
+            kind,
         };
 
         if let Some(primary_session) = primary_session {
@@ -115,10 +139,13 @@ where
         Ok(result)
     }
 
-    /// Common session setup logic.
+    /// Drive the SessionSetup state machine to completion.
     ///
-    /// This function sets up a session against a connection, and it is somewhat abstract.
-    /// by calling impl functions, this function's behavior is modified to support both new sessions and binding to existing sessions.
+    /// Loops on the GSS exchange, sending intermediate / final
+    /// SessionSetup Requests and consuming their responses, until the
+    /// GSS layer reports authentication complete. On any error the
+    /// matching [`SetupKind`]-specific cleanup runs before propagating
+    /// the error out.
     pub(crate) async fn setup(&mut self) -> crate::Result<Arc<RwLock<SessionAndChannel>>> {
         tracing::debug!(
             "Setting up session for user {} (@{}).",
@@ -133,7 +160,7 @@ where
             })?),
             Err(e) => {
                 tracing::error!("Failed to setup session: {}", e);
-                if let Err(ce) = T::error_cleanup(self).await {
+                if let Err(ce) = self.error_cleanup().await {
                     tracing::error!("Failed to cleanup after setup error: {}", ce);
                 }
                 Err(e)
@@ -141,14 +168,10 @@ where
         }
     }
 
-    /// *DO NOT OVERLOAD*
-    ///
-    /// Performs the session setup negotiation.
-    ///
-    /// This function loops until the authentication is complete, requesting GSS tokens
-    /// and passing them to the server.
+    /// Inner GSS drive loop. Sends successive SessionSetup Requests
+    /// (intermediate then final) until the authenticator reports
+    /// completion, consuming each matching response in between.
     async fn _setup_loop(&mut self) -> crate::Result<()> {
-        // While there's a response to process, do so.
         while !self.authenticator.is_authenticated()? {
             let next_buf = match self.last_setup_response.as_ref() {
                 Some(response) => self.authenticator.next(&response.buffer).await?,
@@ -172,20 +195,19 @@ where
             // the first request must arrive here, and then be validated.
             if self.result.is_none() {
                 tracing::trace!("Creating session state with id {session_id}.");
-                self.set_session(T::init_session(self, session_id).await?)
-                    .await?;
+                let session_info = self.init_session(session_id).await?;
+                self.set_session(session_info).await?;
             }
 
-            if is_auth_done {
-                // Important: If we did NOT make sure the message's signature is valid,
-                // we should do it now, as long as the session is not anonymous or guest.
-                if !session_setup_response
+            if is_auth_done
+                && !session_setup_response
                     .session_flags
                     .is_guest_or_null_session()
-                    && !message_form.signed_or_encrypted()
-                {
-                    return Err(crate::error::SetupError::UnsignedFinalResponse.into());
-                }
+                && !message_form.signed_or_encrypted()
+            {
+                // Important: If we did NOT make sure the message's signature is valid,
+                // we should do it now, as long as the session is not anonymous or guest.
+                return Err(crate::error::SetupError::UnsignedFinalResponse.into());
             }
             // Intermediate response preauth ingest is now done inside
             // `Transformer::transform_incoming` (S4-T2); no driver-side
@@ -200,10 +222,147 @@ where
         ))?;
 
         tracing::trace!("setup success, finishing up.");
-        T::on_setup_success(self).await?;
+        self.on_setup_success().await?;
 
         Ok(())
     }
+
+    // -------------------------------------------------------------------
+    // Inlined hooks (formerly `SessionSetupProperties` trait + 2 markers).
+    // -------------------------------------------------------------------
+
+    /// Build the SessionSetup Request for the current GSS round. The
+    /// only per-flavour delta is whether the `binding` flag in
+    /// `SessionSetupRequest.flags` is set — true for channel binds,
+    /// false for new sessions.
+    fn make_request(&self, buffer: Vec<u8>) -> OutgoingMessage {
+        let has_dfs = self.conn_info.negotiation.caps.dfs();
+        let mut msg = OutgoingMessage::new(
+            SessionSetupRequest::new(
+                buffer,
+                SessionSecurityMode::new().with_signing_enabled(true),
+                SetupRequestFlags::new(),
+                NegotiateCapabilities::new().with_dfs(has_dfs),
+            )
+            .into(),
+        )
+        .with_return_raw_data(true);
+
+        if self.kind == SetupKind::Bind {
+            // TODO: what about DFS in previous session?
+            msg.message
+                .content
+                .as_mut_sessionsetup()
+                .unwrap()
+                .flags
+                .set_binding(true);
+        }
+
+        msg
+    }
+
+    /// Create or fetch the [`SessionInfo`] for the just-assigned
+    /// session_id. Only called on the first response and only for new
+    /// sessions; bind flows must have been constructed with a
+    /// `primary_session` (asserted in the constructor).
+    async fn init_session(
+        &self,
+        session_id: u64,
+    ) -> crate::Result<Arc<RwLock<SessionInfo>>> {
+        match self.kind {
+            SetupKind::New => {
+                let session_info = SessionInfo::new(session_id);
+                Ok(Arc::new(RwLock::new(session_info)))
+            }
+            SetupKind::Bind => panic!(
+                "(Primary) Session should be provided in construction, rather than during setup!"
+            ),
+        }
+    }
+
+    /// Run after the GSS layer reports completion but before the
+    /// SignatureKey-bearing channel is built. For new sessions this
+    /// transitions the session state to `SettingUp` and installs the
+    /// cipher pair; for binds it's a no-op (the primary session
+    /// already carries its keys).
+    async fn on_session_key_exchanged(&mut self) -> crate::Result<()> {
+        if self.kind == SetupKind::New {
+            // Only on new sessions we need to initialize the session state with the keys.
+            tracing::trace!("Session keys exchanged. Setting up session state.");
+            let session_key = self.session_key()?;
+            let preauth_hash = self.preauth_hash_snapshot().await?;
+            let conn_info = self.conn_info;
+            self.result
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::InvalidState("Session state must be set before keys exchange".into())
+                })?
+                .read()
+                .await?
+                .session
+                .write()
+                .await?
+                .setup(&session_key, &preauth_hash, conn_info)?;
+        }
+        Ok(())
+    }
+
+    /// Run on the `Ok` exit of [`Self::_setup_loop`]. For new sessions
+    /// this flips the session state to `Ready` with the negotiated
+    /// flags; for binds it's a no-op.
+    async fn on_setup_success(&mut self) -> crate::Result<()> {
+        if self.kind == SetupKind::New {
+            tracing::trace!("Session setup successful");
+            let flags = self.flags.ok_or_else(|| {
+                Error::InvalidState("flags must be set before on_setup_success".into())
+            })?;
+            let result = self
+                .result
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::InvalidState("Session state must be set on success path".into())
+                })?
+                .read()
+                .await?;
+            let mut session = result.session.write().await?;
+            session.ready(flags, self.conn_info)?;
+        }
+        Ok(())
+    }
+
+    /// Run on the `Err` exit of [`Self::_setup_loop`]. New-session
+    /// cleanup invalidates the session before notifying the worker;
+    /// bind cleanup only notifies the worker (the primary session
+    /// stays usable on its original channel).
+    async fn error_cleanup(&mut self) -> crate::Result<()> {
+        let session = match self.result.as_ref() {
+            Some(s) => s,
+            None => {
+                match self.kind {
+                    SetupKind::New => tracing::trace!("No session to cleanup in setup."),
+                    SetupKind::Bind => tracing::warn!("No session to cleanup in binding."),
+                }
+                return Ok(());
+            }
+        };
+
+        if self.kind == SetupKind::New {
+            tracing::trace!("Invalidating session before cleanup.");
+            let session_lock = session.read().await?;
+            session_lock.session.write().await?.invalidate();
+        }
+
+        self.upstream
+            .worker()
+            .ok_or_else(|| Error::InvalidState("Worker not available!".to_string()))?
+            .session_ended(session)
+            .await
+    }
+
+    // -------------------------------------------------------------------
+    // Common helpers (unchanged from the pre-S3c state, just no longer
+    // generic over the marker trait).
+    // -------------------------------------------------------------------
 
     async fn set_session(&mut self, session: Arc<RwLock<SessionInfo>>) -> crate::Result<()> {
         let session_id = session.read().await?.id();
@@ -284,7 +443,7 @@ where
     }
 
     async fn send_setup_request(&mut self, buf: Vec<u8>) -> crate::Result<SendMessageResult> {
-        let request = T::make_request(self, buf).await?;
+        let request = self.make_request(buf);
         let is_auth_done = self.authenticator.is_authenticated()?;
 
         if is_auth_done {
@@ -368,23 +527,18 @@ where
         Ok(result)
     }
 
-    /// Initializes the channel that is resulted from the current session setup.
-    /// - Calls `T::on_session_key_exchanged` before setting up the channel.
-    /// - Sets `self.channel` to the instantiated channel.
-    /// - Calls `T::on_channel_set_up` after setting up the channel.
+    /// Builds the [`ChannelInfo`] for this session's primary channel
+    /// (or the bound channel) using the GSS SessionKey and the
+    /// transformer's finalized preauth hash, then installs it into the
+    /// shared `session_state` so the transformer can find the signer
+    /// for the upcoming final SessionSetup Response.
     async fn make_channel(&mut self) -> crate::Result<()> {
-        T::on_session_key_exchanged(self).await?;
+        self.on_session_key_exchanged().await?;
         tracing::trace!("Session keys are set.");
 
         // The preauth hash is owned by the transformer (S4-T1); snapshot
         // its current finalized value to derive the channel SigningKey.
-        let preauth_snapshot = self
-            .upstream
-            .worker()
-            .ok_or_else(|| Error::InvalidState("Worker not available!".to_string()))?
-            .transformer()
-            .snapshot_preauth_finalized()
-            .await?;
+        let preauth_snapshot = self.preauth_hash_snapshot().await?;
 
         let channel_info = ChannelInfo::new(
             self.new_channel_id,
@@ -416,8 +570,7 @@ where
     }
 
     /// Snapshot the connection-level preauth hash from the transformer
-    /// (S4-T1). Used by `SmbSessionNew::on_session_key_exchanged` to
-    /// derive the per-session keys.
+    /// (S4-T1).
     async fn preauth_hash_snapshot(&self) -> crate::Result<Option<PreauthHashValue>> {
         self.upstream
             .worker()
@@ -433,205 +586,5 @@ where
 
     pub fn conn_info(&self) -> &'a Arc<ConnectionInfo> {
         self.conn_info
-    }
-}
-
-#[maybe_async(AFIT)]
-pub(crate) trait SessionSetupProperties {
-    /// This function is called when setup error is encountered, to perform any necessary cleanup.
-    async fn error_cleanup<T, G>(setup: &mut SessionSetup<'_, T, G>) -> crate::Result<()>
-    where
-        T: SessionSetupProperties,
-        G: GssState;
-
-    fn _make_default_request(buffer: Vec<u8>, dfs: bool) -> OutgoingMessage {
-        OutgoingMessage::new(
-            SessionSetupRequest::new(
-                buffer,
-                SessionSecurityMode::new().with_signing_enabled(true),
-                SetupRequestFlags::new(),
-                NegotiateCapabilities::new().with_dfs(dfs),
-            )
-            .into(),
-        )
-        .with_return_raw_data(true)
-    }
-
-    async fn make_request<T, G>(
-        _setup: &mut SessionSetup<'_, T, G>,
-        buffer: Vec<u8>,
-    ) -> crate::Result<OutgoingMessage>
-    where
-        T: SessionSetupProperties,
-        G: GssState,
-    {
-        let has_dfs = _setup.conn_info().negotiation.caps.dfs();
-        Ok(Self::_make_default_request(buffer, has_dfs))
-    }
-
-    async fn init_session<T, G>(
-        _setup: &'_ SessionSetup<'_, T, G>,
-        _session_id: u64,
-    ) -> crate::Result<Arc<RwLock<SessionInfo>>>
-    where
-        T: SessionSetupProperties,
-        G: GssState;
-
-    async fn on_session_key_exchanged<T, G>(
-        _setup: &mut SessionSetup<'_, T, G>,
-    ) -> crate::Result<()>
-    where
-        T: SessionSetupProperties,
-        G: GssState,
-    {
-        // Default implementation does nothing.
-        Ok(())
-    }
-
-    async fn on_setup_success<T, G>(_setup: &mut SessionSetup<'_, T, G>) -> crate::Result<()>
-    where
-        T: SessionSetupProperties,
-        G: GssState;
-}
-
-pub(crate) struct SmbSessionBind;
-
-#[maybe_async(AFIT)]
-impl SessionSetupProperties for SmbSessionBind {
-    async fn make_request<T, G>(
-        _setup: &mut SessionSetup<'_, T, G>,
-        buffer: Vec<u8>,
-    ) -> crate::Result<OutgoingMessage>
-    where
-        T: SessionSetupProperties,
-        G: GssState,
-    {
-        // TODO: what about DFS in previous session?
-        let has_dfs = _setup.conn_info().negotiation.caps.dfs();
-        let mut request = Self::_make_default_request(buffer, has_dfs);
-        request
-            .message
-            .content
-            .as_mut_sessionsetup()
-            .unwrap()
-            .flags
-            .set_binding(true);
-        Ok(request)
-    }
-
-    async fn error_cleanup<T, G>(setup: &mut SessionSetup<'_, T, G>) -> crate::Result<()>
-    where
-        T: SessionSetupProperties,
-        G: GssState,
-    {
-        if setup.result.is_none() {
-            tracing::warn!("No session to cleanup in binding.");
-            return Ok(());
-        }
-        setup
-            .upstream
-            .worker()
-            .ok_or_else(|| Error::InvalidState("Worker not available!".to_string()))?
-            .session_ended(setup.result.as_ref().unwrap())
-            .await
-    }
-
-    async fn init_session<T, G>(
-        _setup: &SessionSetup<'_, T, G>,
-        _session_id: u64,
-    ) -> crate::Result<Arc<RwLock<SessionInfo>>>
-    where
-        T: SessionSetupProperties,
-        G: GssState,
-    {
-        panic!("(Primary) Session should be provided in construction, rather than during setup!");
-    }
-
-    async fn on_setup_success<T, G>(_setup: &mut SessionSetup<'_, T, G>) -> crate::Result<()>
-    where
-        T: SessionSetupProperties,
-        G: GssState,
-    {
-        Ok(())
-    }
-}
-
-pub(crate) struct SmbSessionNew;
-
-#[maybe_async(AFIT)]
-impl SessionSetupProperties for SmbSessionNew {
-    async fn error_cleanup<T, G>(setup: &mut SessionSetup<'_, T, G>) -> crate::Result<()>
-    where
-        T: SessionSetupProperties,
-        G: GssState,
-    {
-        if setup.result.is_none() {
-            tracing::trace!("No session to cleanup in setup.");
-            return Ok(());
-        }
-
-        tracing::trace!("Invalidating session before cleanup.");
-        let session = setup.result.as_ref().unwrap();
-        {
-            let session_lock = session.read().await?;
-            session_lock.session.write().await?.invalidate();
-        }
-
-        setup
-            .upstream
-            .worker()
-            .ok_or_else(|| Error::InvalidState("Worker not available!".to_string()))?
-            .session_ended(setup.result.as_ref().unwrap())
-            .await
-    }
-
-    async fn on_session_key_exchanged<T, G>(
-        setup: &mut SessionSetup<'_, T, G>,
-    ) -> crate::Result<()>
-    where
-        T: SessionSetupProperties,
-        G: GssState,
-    {
-        // Only on new sessions we need to initialize the session state with the keys.
-        tracing::trace!("Session keys exchanged. Setting up session state.");
-        setup
-            .result
-            .as_ref()
-            .unwrap()
-            .read()
-            .await?
-            .session
-            .write()
-            .await?
-            .setup(
-                &setup.session_key()?,
-                &setup.preauth_hash_snapshot().await?,
-                setup.conn_info,
-            )
-    }
-
-    async fn on_setup_success<T, G>(setup: &mut SessionSetup<'_, T, G>) -> crate::Result<()>
-    where
-        T: SessionSetupProperties,
-        G: GssState,
-    {
-        tracing::trace!("Session setup successful");
-        let result = setup.result.as_ref().unwrap().read().await?;
-        let mut session = result.session.write().await?;
-        session.ready(setup.flags.unwrap(), setup.conn_info)
-    }
-
-    async fn init_session<T, G>(
-        _setup: &SessionSetup<'_, T, G>,
-        session_id: u64,
-    ) -> crate::Result<Arc<RwLock<SessionInfo>>>
-    where
-        T: SessionSetupProperties,
-        G: GssState,
-    {
-        let session_info = SessionInfo::new(session_id);
-        let session_info = Arc::new(RwLock::new(session_info));
-
-        Ok(session_info)
     }
 }
