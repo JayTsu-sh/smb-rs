@@ -77,6 +77,51 @@ pub fn negotiate_response_windows_dc() -> Bytes {
     encode(make_response(ResponseContent::Negotiate(content), 0, Status::Success))
 }
 
+/// Variant of [`negotiate_response_windows_dc`] modeling a server
+/// that negotiates **SMB 3.0.2** instead of 3.1.1. Materially:
+///
+/// - No PreauthIntegrityCapabilities / EncryptionCapabilities /
+///   SigningCapabilities — those negotiate contexts are 3.1.1-only.
+/// - `negotiate_context_list = None` (3.0.2 doesn't carry one).
+/// - The connection-level preauth hash stays at
+///   `PreauthHashState::Unsupported`, which exercises the
+///   transformer's noop-ingest path that the post-S4 refactor
+///   introduced but no other test covers.
+/// - Channel signing key still gets derived (it's the
+///   `SmbSign\x00` static-context branch in
+///   `SessionAlgosFactory::smb3xx_make_signer`), so the final
+///   SessionSetup Request must still be signed per MS-SMB2 §3.3.5.5.3.
+pub fn negotiate_response_smb302_signing_required() -> Bytes {
+    let content = NegotiateResponse {
+        security_mode: NegotiateSecurityMode::new()
+            .with_signing_enabled(true)
+            .with_signing_required(true),
+        dialect_revision: NegotiateDialect::Smb0302,
+        server_guid: Guid::from([
+            0x30, 0x02, 0x30, 0x02, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x02,
+        ]),
+        capabilities: GlobalCapabilities::new()
+            .with_dfs(true)
+            .with_leasing(true)
+            .with_large_mtu(true)
+            .with_directory_leasing(true),
+        max_transact_size: 8 * 1024 * 1024,
+        max_read_size: 8 * 1024 * 1024,
+        max_write_size: 8 * 1024 * 1024,
+        system_time: FileTime::default(),
+        server_start_time: FileTime::default(),
+        buffer: vec![0x60, 0x18, 0x06, 0x06, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x02],
+        // SMB 3.0.2 negotiates without a context list.
+        negotiate_context_list: None,
+    };
+    encode(make_response(
+        ResponseContent::Negotiate(content),
+        0,
+        Status::Success,
+    ))
+}
+
 fn negotiate_ctx_preauth() -> NegotiateContext {
     PreauthIntegrityCapabilities {
         hash_algorithms: vec![HashAlgorithm::Sha512],
