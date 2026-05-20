@@ -39,6 +39,36 @@ pub struct OutgoingMessage {
     /// code that needs to construct a pre-stamped, signed message goes
     /// through [`OutgoingMessage::into_signed_pre_prepared`].
     pub(crate) pre_processed: bool,
+
+    /// Internal: explicit, sealed-at-construction safety policy. When
+    /// `Some`, the transformer dispatches on this *instead of*
+    /// inferring sign/encrypt from session state — eliminating the
+    /// class of bug where `ChannelMessageHandler::sendo` looks at
+    /// `session.state` to decide and gets it wrong (e.g. the
+    /// Windows-DC unsigned-final-request regression).
+    ///
+    /// Today only the SessionSetup driver populates this, for the
+    /// final SessionSetup Request. S5-T2 will extend the same
+    /// mechanism to the rest of the send paths and retire the
+    /// state-inference branch in `ChannelMessageHandler::sendo`.
+    pub(crate) security: Option<Protection>,
+}
+
+/// Explicit security treatment for an [`OutgoingMessage`].
+///
+/// Sealed at construction by the caller, so the transformer doesn't
+/// need to re-derive the choice from mutable session state at send
+/// time. See [`OutgoingMessage::security`] for the rationale.
+#[derive(Debug, Clone)]
+pub enum Protection {
+    /// Sign this request with a one-shot key derived from the given
+    /// GSS-supplied SessionKey and the transformer's currently
+    /// finalized preauth hash (after the request's own plain bytes
+    /// are ingested). Used exclusively for the final SessionSetup
+    /// Request — see MS-SMB2 §3.3.5.5.3.
+    SnapshotKdfSign {
+        session_key: crate::crypto::KeyToDerive,
+    },
 }
 
 impl OutgoingMessage {
@@ -52,6 +82,7 @@ impl OutgoingMessage {
             additional_data: None,
             channel_id: None,
             pre_processed: false,
+            security: None,
         }
     }
 

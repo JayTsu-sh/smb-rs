@@ -501,7 +501,7 @@ impl Connection {
             .map_err(|_| Error::InvalidState("Worker already set.".to_string()))?;
 
         // Negotiate SMB2
-        let info = self._negotiate_smb2(server_address).await?;
+        let info = Arc::new(self._negotiate_smb2(server_address).await?);
 
         self.handler
             .worker
@@ -535,7 +535,7 @@ impl Connection {
 
         self.handler
             .conn_info
-            .set(Arc::new(info))
+            .set(info)
             .map_err(|_| Error::InvalidState("Connection info already set.".to_string()))?;
 
         tracing::debug!("Negotiation successful");
