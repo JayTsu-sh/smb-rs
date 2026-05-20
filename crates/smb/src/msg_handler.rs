@@ -56,11 +56,22 @@ pub struct OutgoingMessage {
 
 /// Explicit security treatment for an [`OutgoingMessage`].
 ///
-/// Sealed at construction by the caller, so the transformer doesn't
-/// need to re-derive the choice from mutable session state at send
-/// time. See [`OutgoingMessage::security`] for the rationale.
+/// Sealed at construction by the caller (or, for legacy paths,
+/// inferred by `ChannelMessageHandler::sendo` from session state and
+/// stamped into the message before it leaves the channel layer), so
+/// the transformer can dispatch purely on this enum without
+/// inspecting other mutable state.
 #[derive(Debug, Clone)]
 pub enum Protection {
+    /// No transport-layer protection. Used for Negotiate and the
+    /// pre-channel SessionSetup exchanges where signing keys don't
+    /// yet exist, plus anonymous / guest sessions where signing is
+    /// allowed to be skipped.
+    None,
+    /// Sign this request with the channel's cached signer (the
+    /// production wire-secured path). Looked up from
+    /// `session_state.channel.signer` at sign time.
+    SignWithChannel,
     /// Sign this request with a one-shot key derived from the given
     /// GSS-supplied SessionKey and the transformer's currently
     /// finalized preauth hash (after the request's own plain bytes
@@ -69,6 +80,11 @@ pub enum Protection {
     SnapshotKdfSign {
         session_key: crate::crypto::KeyToDerive,
     },
+    /// Encrypt this request with the session's cached encryptor.
+    /// Mutually exclusive with the signing variants per MS-SMB2
+    /// §3.1.4.1 (a transport-encrypted message carries its
+    /// confidentiality MAC, no separate signature).
+    Encrypt,
 }
 
 impl OutgoingMessage {

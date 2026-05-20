@@ -1,3 +1,5 @@
+use crate::msg_handler::Protection;
+
 use super::*;
 
 pub(crate) type ChannelUpstream = HandlerReference<ConnectionMessageHandler>;
@@ -235,34 +237,58 @@ impl ChannelMessageHandler {
 #[maybe_async(AFIT)]
 impl MessageHandler for ChannelMessageHandler {
     async fn sendo(&self, mut msg: OutgoingMessage) -> crate::Result<SendMessageResult> {
-        {
+        // If the caller already sealed a [`Protection`] decision (e.g.
+        // the session-setup driver attaching `SnapshotKdfSign`), honor
+        // it as-is. Otherwise translate the session state into a
+        // matching `Protection` variant here, once, so the transformer
+        // doesn't have to re-derive it from `msg.encrypt` /
+        // `header.flags.signed` later.
+        if msg.security.is_none() {
             let session = self.session_state.read().await?;
             let session = session.session.read().await?;
             if session.is_invalid() {
                 return Err(Error::InvalidState("Session is invalid".to_string()));
             }
 
-            // It is possible for a lower level to request encryption.
+            // It is possible for a lower-level / builder caller to
+            // pre-request encryption via `with_encrypt(true)`; convert
+            // it to the matching Protection variant. The session must
+            // be ready to actually serve an encryptor.
             if msg.encrypt {
-                // Session must be ready to encrypt messages.
                 if !session.is_ready() {
                     return Err(Error::InvalidState(
                         "Session is not ready, cannot encrypt message".to_string(),
                     ));
                 }
-            }
-            // Otherwise, we should check the session's configuration.
-            else if session.is_ready() || session.is_setting_up() {
-                // Encrypt if configured for the session,
+                msg.security = Some(Protection::Encrypt);
+            } else if session.is_ready() || session.is_setting_up() {
                 if session.is_ready() && session.should_encrypt()? {
-                    msg.encrypt = true;
+                    msg.security = Some(Protection::Encrypt);
+                } else if !session.allow_unsigned()? {
+                    msg.security = Some(Protection::SignWithChannel);
+                } else {
+                    msg.security = Some(Protection::None);
                 }
-                // Sign
-                else if !session.allow_unsigned()? {
-                    msg.message.header.flags.set_signed(true);
-                }
+            } else {
+                msg.security = Some(Protection::None);
             }
         }
+
+        // Mirror the chosen Protection onto the legacy hint fields so
+        // compound paths and worker logging that still read those
+        // fields see consistent state. Removing these reads is
+        // deferred to S7's transformer rework.
+        match &msg.security {
+            Some(Protection::SignWithChannel) | Some(Protection::SnapshotKdfSign { .. }) => {
+                msg.message.header.flags.set_signed(true);
+                msg.encrypt = false;
+            }
+            Some(Protection::Encrypt) => {
+                msg.encrypt = true;
+            }
+            Some(Protection::None) | None => {}
+        }
+
         msg.message.header.session_id = self.session_id;
         self.upstream.sendo(msg).await
     }

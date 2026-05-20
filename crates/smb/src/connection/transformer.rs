@@ -448,8 +448,20 @@ impl Transformer {
 
     /// Transforms an outgoing message to a raw SMB message.
     pub async fn transform_outgoing(&self, mut msg: OutgoingMessage) -> crate::Result<IoVec> {
-        let should_encrypt = msg.encrypt;
-        let should_sign = msg.message.header.flags.signed();
+        // Single source of truth for what to do with this message: the
+        // sealed `Protection` enum. Callers that haven't been migrated
+        // off the legacy `encrypt: bool` / `flags.signed()` hint fields
+        // fall through to a compatibility branch that mirrors the old
+        // behaviour — most of those callers (Negotiate Request) want
+        // no protection at all.
+        let (should_sign, should_encrypt) = match &msg.security {
+            Some(Protection::None) => (false, false),
+            Some(Protection::SignWithChannel) | Some(Protection::SnapshotKdfSign { .. }) => {
+                (true, false)
+            }
+            Some(Protection::Encrypt) => (false, true),
+            None => (msg.message.header.flags.signed(), msg.encrypt),
+        };
         let session_id = msg.message.header.session_id;
 
         let mut outgoing_data = IoVec::default();
