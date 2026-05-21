@@ -55,6 +55,19 @@ struct TranscriptInner {
     /// shutdown that interrupts the client *before* it gets to send
     /// the next request.
     frame_pushed: Notify,
+    /// Notified by `MockWrite::feed` each time a complete client frame
+    /// is captured. Lets tests await "the production driver has written
+    /// at least N frames" without polling, closing the race between
+    /// `worker.send()` (which returns as soon as the IoVec is queued on
+    /// the send channel, *before* the worker task issues `send_raw`)
+    /// and the test asserting on `captured_client_frames()`.
+    ///
+    /// In a real wire setup the response cannot arrive before the
+    /// request goes out, so the race is invisible. MockTransport
+    /// delivers pre-queued responses immediately on read, decoupling
+    /// the two halves and exposing the production-side fire-and-forget
+    /// send semantics. This Notify lets the test synchronise explicitly.
+    frame_captured: Notify,
 }
 
 impl TranscriptControl {
@@ -103,6 +116,41 @@ impl TranscriptControl {
             .expect("transcript mutex poisoned")
             .len()
     }
+
+    /// Wait until at least `min_frames` client frames have been
+    /// captured, or `timeout` elapses. Returns `true` if the threshold
+    /// was reached, `false` on timeout.
+    ///
+    /// Closes the production-side fire-and-forget send race: the
+    /// driver's `worker.send()` returns when the message is queued on
+    /// the send channel, *not* when `send_raw` actually completes — so
+    /// the test must wait for the side effect explicitly before
+    /// reading captured frames. See [`TranscriptInner::frame_captured`]
+    /// for the longer explanation.
+    pub async fn wait_for_captured_frames(
+        &self,
+        min_frames: usize,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // Acquire the notification before the count check, per
+            // tokio's documented race-free pattern.
+            let notified = self.inner.frame_captured.notified();
+            tokio::pin!(notified);
+
+            if self.client_frame_count() >= min_frames {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            if tokio::time::timeout(remaining, notified).await.is_err() {
+                return self.client_frame_count() >= min_frames;
+            }
+        }
+    }
 }
 
 /// Full-duplex mock. Implements [`SmbTransport`] so it can be passed to
@@ -141,9 +189,7 @@ impl SmbTransport for MockTransport {
         445
     }
 
-    fn split(
-        self: Box<Self>,
-    ) -> Result<(Box<dyn SmbTransportRead>, Box<dyn SmbTransportWrite>)> {
+    fn split(self: Box<Self>) -> Result<(Box<dyn SmbTransportRead>, Box<dyn SmbTransportWrite>)> {
         let me = *self;
         Ok((Box::new(me.read), Box::new(me.write)))
     }
@@ -306,14 +352,18 @@ impl MockWrite {
                     self.body_accumulator.extend_from_slice(&buf[..take]);
                     let new_remaining = remaining - take;
                     if new_remaining == 0 {
-                        let frame =
-                            Bytes::from(std::mem::take(&mut self.body_accumulator));
+                        let frame = Bytes::from(std::mem::take(&mut self.body_accumulator));
                         self.control
                             .inner
                             .client_frames
                             .lock()
                             .expect("transcript mutex poisoned")
                             .push(frame);
+                        // Wake any test that's awaiting on
+                        // `wait_for_captured_frames` (closes the race
+                        // against `worker.send()` returning before the
+                        // worker task actually issues `send_raw`).
+                        self.control.inner.frame_captured.notify_waiters();
                         self.phase = SendPhase::AwaitingHeader;
                     } else {
                         self.phase = SendPhase::AwaitingBody {

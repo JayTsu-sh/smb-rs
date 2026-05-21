@@ -25,9 +25,7 @@ use conformance::transcripts::{
     negotiate_response_smb302_signing_required, session_setup_response_final,
     session_setup_response_intermediate,
 };
-use conformance::{
-    MockGss, MockTransport, ScriptedGssStep, assert_signed_final_session_setup,
-};
+use conformance::{MockGss, MockTransport, ScriptedGssStep, assert_signed_final_session_setup};
 use smb::{Connection, ConnectionConfig};
 use smb_dtyp::Guid;
 
@@ -78,6 +76,17 @@ async fn smb302_signing_required_signs_final_session_setup() {
         ),
     }
 
+    // worker.send() returns once the message is queued on the worker's
+    // send channel, before the worker task issues send_raw — wait for
+    // the wire-side effect explicitly to avoid races with the
+    // pre-queued mock responses. See `TranscriptControl::wait_for_captured_frames`.
+    assert!(
+        control
+            .wait_for_captured_frames(3, std::time::Duration::from_secs(2))
+            .await,
+        "timed out waiting for 3 client frames; got {}",
+        control.client_frame_count()
+    );
     let frames = control.captured_client_frames();
     drop(conn);
 
