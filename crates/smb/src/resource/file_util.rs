@@ -1,5 +1,4 @@
 use crate::sync_helpers::*;
-use maybe_async::*;
 
 /// This trait describes an object that can perform read operations at a specific offset,
 /// optionally using a specific channel ID.
@@ -116,13 +115,11 @@ impl<T: WriteAtChannel + ?Sized> WriteAt for T {
     }
 }
 
-#[maybe_async(AFIT)]
 #[allow(async_fn_in_trait)]
 pub trait GetLen {
     async fn get_len(&self) -> crate::Result<u64>;
 }
 
-#[maybe_async(AFIT)]
 #[allow(async_fn_in_trait)]
 pub trait SetLen {
     async fn set_len(&self, len: u64) -> crate::Result<()>;
@@ -149,7 +146,6 @@ mod impls {
     pub trait ReadSeek: Read + Seek {}
     impl ReadSeek for File {}
     impl<F: ReadSeek + Send> ReadAtChannel for Mutex<F> {
-        #[maybe_async]
         async fn read_at_channel(
             &self,
             buf: &mut [u8],
@@ -171,7 +167,6 @@ mod impls {
     pub trait WriteSeek: Write + Seek {}
     impl WriteSeek for File {}
     impl<F: WriteSeek + Send> WriteAtChannel for Mutex<F> {
-        #[maybe_async]
         async fn write_at_channel(
             &self,
             buf: &[u8],
@@ -188,7 +183,6 @@ mod impls {
     }
 
     impl GetLen for Mutex<File> {
-        #[maybe_async]
         async fn get_len(&self) -> crate::Result<u64> {
             let file = self
                 .lock()
@@ -199,7 +193,6 @@ mod impls {
     }
 
     impl SetLen for Mutex<File> {
-        #[maybe_async]
         async fn set_len(&self, len: u64) -> crate::Result<()> {
             let file = self
                 .lock()
@@ -282,7 +275,6 @@ mod copy {
     ///   use that to report progress while the copy is running.
     /// - This function performs operations against the default chanel of the connection.
     ///   To specify the number of jobs per channel, use the [`block_copy_channel`] function instead.
-    #[maybe_async]
     pub async fn block_copy<
         F: ReadAtChannel + GetLen + Send + Sync + 'static,
         T: WriteAtChannel + SetLen + Send + Sync + 'static,
@@ -313,7 +305,6 @@ mod copy {
     /// # Notes
     /// - To report progress, use the [`prepare_parallel_copy`] function to get a `CopyState`, and then
     ///   use that to report progress while the copy is running.
-    #[maybe_async]
     pub async fn block_copy_channel<
         F: ReadAtChannel + GetLen + Send + Sync + 'static,
         T: WriteAtChannel + SetLen + Send + Sync + 'static,
@@ -350,7 +341,6 @@ mod copy {
     ///   Use `None` as the key for the default channel. The total number of jobs will be the sum of all values in the map.
     ///   If the map is empty, a default value will be used. Setting both None and Some values is allowed, and the default channel
     ///   will use the total number of jobs specified for it. If any channel is specified with 0 jobs, it will use the default number of jobs.
-    #[maybe_async]
     pub async fn prepare_parallel_copy<
         F: ReadAtChannel + GetLen + Send + Sync + 'static,
         T: WriteAtChannel + SetLen + Send + Sync + 'static,
@@ -481,7 +471,6 @@ mod copy {
         Ok(())
     }
 
-    #[maybe_async]
     async fn block_copy_task<
         F: ReadAtChannel + GetLen + Send + Sync,
         T: WriteAtChannel + SetLen + Send + Sync,

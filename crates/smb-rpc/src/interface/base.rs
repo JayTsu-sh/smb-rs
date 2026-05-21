@@ -1,5 +1,4 @@
 use binrw::prelude::*;
-use maybe_async::*;
 
 use crate::pdu::DceRpcSyntaxId;
 
@@ -30,7 +29,6 @@ pub trait RpcCall: for<'a> BinWrite<Args<'a> = ()> {
     }
 }
 
-#[maybe_async(AFIT)]
 #[allow(async_fn_in_trait)]
 pub trait BoundRpcConnection {
     async fn send_receive<S>(&mut self, stub_input: S) -> crate::Result<S::ResponseType>

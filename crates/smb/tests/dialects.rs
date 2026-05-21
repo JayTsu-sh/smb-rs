@@ -14,10 +14,7 @@ macro_rules! basic_test {
     ([$dialect:ident], [$($encrypt_mode:ident),*]) => {
         $(
             pastey::paste! {
-                #[test_log::test(maybe_async::test(
-                    not(feature = "async"),
-                    async(feature = "async", tokio::test(flavor = "multi_thread"))
-                ))]
+                #[test_log::test(tokio::test(flavor = "multi_thread"))]
                 #[serial]
                 pub async fn [<test_smbint_ $dialect:lower _e $encrypt_mode:lower>]() -> Result<(), Box<dyn std::error::Error>> {
                     test_smb_integration_dialect_encrpytion_mode(Dialect::$dialect, EncryptionMode::$encrypt_mode).await
@@ -42,7 +39,6 @@ basic_test!([Smb030, Smb0302, Smb0311], [Disabled]);
 
 basic_test!([Smb0202, Smb021], [Disabled]);
 
-#[maybe_async::maybe_async]
 async fn test_smb_integration_dialect_encrpytion_mode(
     force_dialect: Dialect,
     encryption_mode: EncryptionMode,

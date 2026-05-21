@@ -5,7 +5,6 @@ use smb_dtyp::make_guid;
 
 use crate::ndr64::*;
 use binrw::prelude::*;
-use maybe_async::maybe_async;
 use modular_bitfield::prelude::*;
 /// [SHARE_ENUM_STRUCT](<https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-srvs/79ee052e-e16b-4ec5-b4b7-e99777c26eca>)
 #[binrw::binrw]
@@ -178,7 +177,6 @@ impl<T> SrvSvc<T>
 where
     T: BoundRpcConnection,
 {
-    #[maybe_async]
     pub async fn netr_share_enum(&mut self, server_name: &str) -> crate::Result<Vec<ShareInfo1>> {
         let input_struct = NetrShareEnumIn {
             server_name: NdrPtr::from(server_name.parse::<NdrString<u16>>().unwrap()).into(),

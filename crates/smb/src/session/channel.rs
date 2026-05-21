@@ -12,7 +12,6 @@ pub struct Channel {
 }
 
 impl Channel {
-    #[maybe_async]
     pub(crate) async fn new(
         upstream: &ChannelUpstream,
         conn_info: &Arc<ConnectionInfo>,
@@ -56,7 +55,6 @@ impl Channel {
     /// it reaches `is_ready()`. Exposed publicly for callers that build
     /// SMB2 compound chains (P2.b) and need to set the `signed` flag on
     /// each chained header before going through the worker directly.
-    #[maybe_async]
     pub async fn allow_unsigned(&self) -> crate::Result<bool> {
         let state = self.handler.session_state.read().await?;
         let session = state.session.read().await?;
@@ -78,7 +76,6 @@ impl Channel {
     ///
     /// Errors with `InvalidState` when the underlying session has not
     /// reached the Ready state, matching `SessionInfo::should_encrypt`.
-    #[maybe_async]
     pub async fn should_encrypt(&self) -> crate::Result<bool> {
         let state = self.handler.session_state.read().await?;
         let session = state.session.read().await?;
@@ -98,7 +95,6 @@ pub struct ChannelMessageHandler {
     session_state: Arc<RwLock<SessionAndChannel>>,
 }
 
-#[maybe_async(AFIT)]
 impl ChannelMessageHandler {
     fn new(
         session_id: u64,
@@ -137,7 +133,6 @@ impl ChannelMessageHandler {
     /// * `incoming` - The incoming message to verify.
     /// # Returns
     /// An empty [`crate::Result`] if the message is valid, or an error if the message is invalid.
-    #[maybe_async]
     async fn _verify_incoming(&self, incoming: &IncomingMessage) -> crate::Result<()> {
         // allow unsigned messages only if the session is anonymous or guest.
         // this is enforced against configuration when setting up the session.
@@ -185,7 +180,6 @@ impl ChannelMessageHandler {
     ///   This shall only be used when authentication is still being set up.
     /// # Returns
     /// An [`IncomingMessage`] if the message is valid, or an error if the message is invalid.
-    #[maybe_async]
     pub(crate) async fn recvo_internal(
         &self,
         options: ReceiveOptions<'_>,
@@ -234,7 +228,6 @@ impl ChannelMessageHandler {
     }
 }
 
-#[maybe_async(AFIT)]
 impl MessageHandler for ChannelMessageHandler {
     async fn sendo(&self, mut msg: OutgoingMessage) -> crate::Result<SendMessageResult> {
         // If the caller already sealed a [`Protection`] decision (e.g.

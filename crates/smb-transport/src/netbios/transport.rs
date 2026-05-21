@@ -8,7 +8,7 @@ use binrw::{BinRead, BinWrite};
 use futures_core::future::BoxFuture;
 #[cfg(feature = "async")]
 use futures_util::FutureExt;
-use maybe_async::*;
+
 pub struct NetBiosTransport {
     tcp: Box<dyn SmbTransport>,
 }
@@ -22,7 +22,6 @@ impl NetBiosTransport {
     }
 
     /// Starts the underlying TCP connection, and sends NetBIOS session request and expects a session response.
-    #[maybe_async]
     #[tracing::instrument(level = "debug", skip_all, fields(server = %server_name, addr = %address))]
     async fn do_connect(&mut self, server_name: &str, address: SocketAddr) -> Result<()> {
         tracing::debug!("Connecting to NetBIOS Session services TCP...");
@@ -35,7 +34,6 @@ impl NetBiosTransport {
         Ok(())
     }
 
-    #[maybe_async]
     async fn netbios_session_setup(&mut self) -> Result<()> {
         let session_request = NBSessionRequest {
             called_name: NetBiosName::new("*SMBSERVER".to_string(), 0x20),
@@ -78,7 +76,6 @@ impl NetBiosTransport {
         Ok(())
     }
 
-    #[maybe_async]
     async fn netbios_receive_header(&mut self) -> Result<NBSSPacketHeader> {
         let mut header = [0u8; NBSSPacketHeader::SIZE];
         self.tcp.receive_exact(&mut header).await?;

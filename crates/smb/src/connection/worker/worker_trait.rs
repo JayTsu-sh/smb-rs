@@ -6,7 +6,6 @@ use crate::{
 };
 use smb_transport::SmbTransport;
 
-use maybe_async::*;
 use smb_msg::Status;
 
 use crate::{
@@ -19,7 +18,6 @@ use crate::{
 /// Each Implementation of this trait is responsible for handling the connection to the server,
 /// sending messages, and redirecting correct messages when received,
 /// if using async, to the correct pending task.
-#[maybe_async(AFIT)]
 #[allow(async_fn_in_trait)]
 pub trait Worker: Sized + std::fmt::Debug {
     /// Instantiates a new connection worker.
@@ -162,17 +160,14 @@ pub trait Worker: Sized + std::fmt::Debug {
     /// Get the transformer for this worker.
     fn transformer(&self) -> &Transformer;
 
-    #[maybe_async]
     async fn negotaite_complete(&self, neg: &Arc<ConnectionInfo>) {
         self.transformer().negotiated(neg).await.unwrap();
     }
 
-    #[maybe_async]
     async fn session_started(&self, info: &Arc<RwLock<SessionAndChannel>>) -> crate::Result<()> {
         self.transformer().session_started(info).await
     }
 
-    #[maybe_async]
     async fn session_ended(&self, info: &Arc<RwLock<SessionAndChannel>>) -> crate::Result<()> {
         self.transformer().session_ended(info).await
     }

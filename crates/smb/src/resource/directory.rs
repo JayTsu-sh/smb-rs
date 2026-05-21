@@ -2,7 +2,6 @@ use super::ResourceHandle;
 use crate::Error;
 use crate::msg_handler::{MessageHandler, ReceiveOptions};
 use crate::sync_helpers::*;
-use maybe_async::*;
 use smb_fscc::*;
 use smb_msg::*;
 use std::ops::{Deref, DerefMut};
@@ -21,7 +20,6 @@ pub struct Directory {
     query_lock: Mutex<()>,
 }
 
-#[maybe_async(AFIT)]
 impl Directory {
     pub fn new(handle: ResourceHandle) -> Self {
         let access: DirAccessMask = handle.access.into();

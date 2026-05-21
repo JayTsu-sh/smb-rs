@@ -2,14 +2,12 @@
 
 use std::sync::Arc;
 
-use maybe_async::maybe_async;
 use serial_test::serial;
 mod common;
 use common::{TestConstants, make_server_connection};
 use smb::{Client, Connection, File, FileCreateArgs, Session, Tree};
 use smb_fscc::{FileBasicInformation, FileDispositionInformation};
 
-#[maybe_async]
 async fn _close_tests_helper()
 -> smb::Result<(Client, Arc<Connection>, Arc<Session>, Arc<Tree>, File)> {
     let (client, unc) =
@@ -30,10 +28,7 @@ async fn _close_tests_helper()
     Ok((client, connection, session, tree, file))
 }
 
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "multi_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[serial]
 async fn test_client_close() -> smb::Result<()> {
     let (client, _connection, _session, _tree, file) = _close_tests_helper().await?;
@@ -46,10 +41,7 @@ async fn test_client_close() -> smb::Result<()> {
     Ok(())
 }
 
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "multi_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[serial]
 async fn test_conn_close() -> smb::Result<()> {
     let (_client, connection, _session, _tree, file) = _close_tests_helper().await?;
@@ -62,10 +54,7 @@ async fn test_conn_close() -> smb::Result<()> {
     Ok(())
 }
 
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "multi_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[serial]
 async fn test_session_logoff() -> smb::Result<()> {
     let (_client, _connection, session, _tree, file) = _close_tests_helper().await?;
@@ -78,10 +67,7 @@ async fn test_session_logoff() -> smb::Result<()> {
     Ok(())
 }
 
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "multi_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[serial]
 async fn test_tree_close() -> smb::Result<()> {
     let (_client, _connection, _session, tree, file) = _close_tests_helper().await?;

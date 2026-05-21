@@ -2,7 +2,6 @@ use crate::Cli;
 use clap::{Parser, ValueEnum};
 #[cfg(feature = "async")]
 use futures_util::StreamExt;
-use maybe_async::*;
 use smb::{Client, FileAccessMask, FileBasicInformation, QueryQuotaInfo, UncPath, resource::*};
 use std::collections::VecDeque;
 use std::fmt::Display;
@@ -50,7 +49,6 @@ pub struct InfoCmd {
     pub show_ea: bool,
 }
 
-#[maybe_async]
 pub async fn info(cmd: &InfoCmd, cli: &Cli) -> Result<(), Box<dyn Error>> {
     let client = Client::new(cli.make_smb_client_config()?);
 
@@ -194,7 +192,6 @@ struct IteratedItem {
     path: UncPath,
 }
 
-#[maybe_async]
 async fn iterate_directory(
     dir: &Arc<Directory>,
     dir_path: &UncPath,
@@ -215,7 +212,6 @@ async fn iterate_directory(
     Ok(())
 }
 
-#[async_impl]
 async fn iterate_dir_items(
     item: &IteratedItem,
     pattern: &str,
@@ -231,7 +227,6 @@ async fn iterate_dir_items(
     Ok(())
 }
 
-#[maybe_async]
 async fn handle_iteration_item(
     info: &DirectoryInfoQueryType,
     dir_path: &UncPath,
@@ -292,7 +287,6 @@ async fn handle_iteration_item(
     }
 }
 
-#[maybe_async]
 async fn try_query_and_show_quota(dir: &Directory) {
     match dir
         .query_quota_info(QueryQuotaInfo::new(false, true, vec![]))

@@ -2,7 +2,6 @@ use std::ops::{Deref, DerefMut};
 
 use super::ResourceHandle;
 use crate::msg_handler::{OutgoingMessage, ReceiveOptions};
-use maybe_async::*;
 use smb_msg::{IoctlBuffer, PipeTransceiveRequest, ReadRequest, WriteRequest};
 use smb_rpc::{SmbRpcError, interface::*, ndr64::NDR64_SYNTAX_ID, pdu::*};
 pub struct Pipe {
@@ -11,7 +10,6 @@ pub struct Pipe {
     pub(crate) handle: ResourceHandle,
 }
 
-#[maybe_async(AFIT)]
 impl Pipe {
     pub fn new(handle: ResourceHandle) -> Self {
         Pipe { handle }
@@ -35,7 +33,6 @@ pub struct PipeRpcConnection {
     _server_max_recv_frag: u16,
 }
 
-#[maybe_async(AFIT)]
 impl PipeRpcConnection {
     pub async fn bind<I>(mut pipe: Pipe) -> crate::Result<I>
     where
@@ -153,7 +150,6 @@ impl PipeRpcConnection {
 
     pub const PACKED_DREP: u32 = 0x10;
     /// Performs a read+write operation on the pipe, sending a request and receiving it's response.
-    #[maybe_async]
     async fn rpc_rw(
         pipe: &mut Pipe,
         call_id: u32,
@@ -232,7 +228,6 @@ impl PipeRpcConnection {
 }
 
 impl BoundRpcConnection for PipeRpcConnection {
-    #[maybe_async]
     async fn send_receive_raw(
         &mut self,
         opnum: u16,

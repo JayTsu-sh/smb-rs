@@ -4,7 +4,6 @@ use crate::Error;
 use crate::connection::AuthMethodsConfig;
 use crate::connection::connection_info::ConnectionInfo;
 use crate::session::gss::GssState;
-use maybe_async::*;
 use sspi::{
     AcquireCredentialsHandleResult, AuthIdentity, BufferType, ClientRequestFlags, CredentialUse,
     DataRepresentation, InitializeSecurityContextResult, Negotiate, SecurityBuffer, Sspi,
@@ -104,7 +103,6 @@ impl Authenticator {
     }
 }
 
-#[maybe_async(AFIT)]
 impl GssState for Authenticator {
     fn user_name(&self) -> &Username {
         &self.user_name

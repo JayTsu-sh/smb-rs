@@ -4,7 +4,6 @@ use crate::sync_helpers::*;
 use crate::{compression::*, msg_handler::*};
 use binrw::prelude::*;
 use bytes::Bytes;
-use maybe_async::*;
 use smb_msg::*;
 use smb_transport::IoVec;
 use std::{collections::HashMap, io::Cursor, sync::Arc};
@@ -51,7 +50,6 @@ struct TransformerConfig {
     conn_info: Option<Arc<ConnectionInfo>>,
 }
 
-#[maybe_async(AFIT)]
 impl Transformer {
     /// Notifies that the connection negotiation has been completed,
     /// with the given [`ConnectionInfo`].
@@ -221,7 +219,6 @@ impl Transformer {
     /// and invokes the provided closure with the channel information.
     ///
     /// Note: this function WILL deadlock if any lock attempt is performed within the closure on `self.sessions`.
-    #[maybe_async]
     #[inline]
     async fn _with_channel<F, R>(&self, session_id: u64, f: F) -> crate::Result<R>
     where
@@ -243,7 +240,6 @@ impl Transformer {
     /// and invokes the provided closure with the session information.
     ///
     /// Note: this function WILL deadlock if any lock attempt is performed within the closure on `self.sessions`.
-    #[maybe_async]
     #[inline]
     async fn _with_session<F, R>(&self, session_id: u64, f: F) -> crate::Result<R>
     where
@@ -504,35 +500,32 @@ impl Transformer {
                 "Should not sign and encrypt at the same time!"
             );
 
-            let mut signer = if let Some(Protection::SnapshotKdfSign { session_key }) =
-                msg.security.take()
-            {
-                // Setup-phase path: the final SessionSetup Request signs
-                // itself with a one-shot key derived from
-                // KDF(SessionKey, finalized preauth hash AFTER this
-                // request's plain bytes), per MS-SMB2 §3.2.4.1.7. No
-                // channel exists in `session_state` yet (it'll be
-                // installed by the driver immediately after dispatch
-                // for the response-verify path).
-                self.derive_setup_phase_signer(&session_key).await?
-            } else {
-                self._with_channel(session_id, |session| {
-                    let channel_info =
-                        session
-                            .channel
-                            .as_ref()
-                            .ok_or(crate::Error::TranformFailed(TransformError {
+            let mut signer =
+                if let Some(Protection::SnapshotKdfSign { session_key }) = msg.security.take() {
+                    // Setup-phase path: the final SessionSetup Request signs
+                    // itself with a one-shot key derived from
+                    // KDF(SessionKey, finalized preauth hash AFTER this
+                    // request's plain bytes), per MS-SMB2 §3.2.4.1.7. No
+                    // channel exists in `session_state` yet (it'll be
+                    // installed by the driver immediately after dispatch
+                    // for the response-verify path).
+                    self.derive_setup_phase_signer(&session_key).await?
+                } else {
+                    self._with_channel(session_id, |session| {
+                        let channel_info = session.channel.as_ref().ok_or(
+                            crate::Error::TranformFailed(TransformError {
                                 outgoing: true,
                                 phase: TransformPhase::SignVerify,
                                 session_id: Some(session_id),
                                 why: "Message is required to be signed, but no channel is set up!",
                                 msg_id: Some(msg.message.header.message_id),
-                            }))?;
+                            }),
+                        )?;
 
-                    Ok(channel_info.signer()?.clone())
-                })
-                .await?
-            };
+                        Ok(channel_info.signer()?.clone())
+                    })
+                    .await?
+                };
 
             signer.sign_message(&mut msg.message.header, &mut outgoing_data)?;
 
@@ -842,7 +835,6 @@ impl Transformer {
     /// A helper method to verify the incoming message.
     /// This method is used to verify the signature of the incoming message,
     /// if such verification is required.
-    #[maybe_async]
     async fn verify_plain_incoming(
         &self,
         message: &mut PlainResponse,
@@ -897,7 +889,6 @@ impl Transformer {
     // must also be enabled, or else this code will not be compiled.
     // This behavior is actually against the spec - MS-SMB2 3.2.4.1.1:
     // > "If the client signs the request, it MUST set the SMB2_FLAGS_SIGNED bit in the Flags field of the SMB2 header."
-    #[maybe_async]
     async fn is_message_signed_ksmbd(&self, _message: &PlainResponse) -> bool {
         #[cfg(feature = "ksmbd-multichannel-compat")]
         {

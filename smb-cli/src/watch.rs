@@ -1,6 +1,5 @@
 use crate::Cli;
 use clap::Parser;
-use maybe_async::*;
 use smb::{Client, DirAccessMask, NotifyFilter, UncPath, resource::*, sync_helpers::*};
 use std::error::Error;
 
@@ -18,7 +17,6 @@ pub struct WatchCmd {
     pub number: Option<usize>,
 }
 
-#[maybe_async]
 pub async fn watch(cmd: &WatchCmd, cli: &Cli) -> Result<(), Box<dyn Error>> {
     if cmd.path.share().is_none() || cmd.path.share().unwrap().is_empty() {
         return Err("Path must include a share name".into());

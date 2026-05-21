@@ -56,7 +56,6 @@ where
     kind: SetupKind,
 }
 
-#[maybe_async]
 impl<'a> SessionSetup<'a, Authenticator> {
     /// sspi-backed convenience over [`Self::with_gss`].
     pub async fn new(
@@ -80,7 +79,6 @@ impl<'a> SessionSetup<'a, Authenticator> {
     }
 }
 
-#[maybe_async]
 impl<'a, G> SessionSetup<'a, G>
 where
     G: GssState,
@@ -265,10 +263,7 @@ where
     /// session_id. Only called on the first response and only for new
     /// sessions; bind flows must have been constructed with a
     /// `primary_session` (asserted in the constructor).
-    async fn init_session(
-        &self,
-        session_id: u64,
-    ) -> crate::Result<Arc<RwLock<SessionInfo>>> {
+    async fn init_session(&self, session_id: u64) -> crate::Result<Arc<RwLock<SessionInfo>>> {
         match self.kind {
             SetupKind::New => {
                 let session_info = SessionInfo::new(session_id);
@@ -484,10 +479,7 @@ where
         &mut self,
         mut request: OutgoingMessage,
     ) -> crate::Result<SendMessageResult> {
-        self.upstream
-            .handler
-            .prepare_outgoing(&mut request)
-            .await?;
+        self.upstream.handler.prepare_outgoing(&mut request).await?;
 
         let session_id = self
             .result

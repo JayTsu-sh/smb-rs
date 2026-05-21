@@ -3,7 +3,6 @@ use crate::{SmbTransport, SmbTransportRead, SmbTransportWrite};
 
 #[cfg(feature = "async")]
 use futures_core::future::BoxFuture;
-use maybe_async::*;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -133,7 +132,6 @@ impl TcpTransport {
         e.into()
     }
 
-    #[maybe_async]
     #[inline]
     async fn receive_exact(&mut self, out_buf: &mut [u8]) -> Result<()> {
         let reader = self.reader.as_mut().ok_or(TransportError::NotConnected)?;
@@ -146,7 +144,6 @@ impl TcpTransport {
         Ok(())
     }
 
-    #[maybe_async::maybe_async]
     #[inline]
     async fn send_raw(&mut self, message: &[u8]) -> Result<()> {
         tracing::trace!("Sending {} bytes.", message.len());
@@ -158,7 +155,6 @@ impl TcpTransport {
         Ok(())
     }
 
-    #[maybe_async::maybe_async]
     #[inline]
     #[tracing::instrument(level = "debug", skip_all, fields(addr = %server_address))]
     async fn do_connect(&mut self, _server_name: &str, server_address: SocketAddr) -> Result<()> {

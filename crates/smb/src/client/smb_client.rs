@@ -1,7 +1,6 @@
 use crate::ConnectionConfig;
 use crate::msg_handler::OutgoingMessage;
 use crate::{Connection, Error, FileCreateArgs, Pipe, Resource, Session, Tree, sync_helpers::*};
-use maybe_async::maybe_async;
 use smb_fscc::{ChainedItemList, FileBasicInformation, SetFileInfo, SetFileInfoClass};
 use smb_msg::{
     AdditionalInfo, CloseRequest, CreateRequest, FileId, ImpersonationLevel, NetworkInterfaceInfo,
@@ -102,7 +101,6 @@ pub struct AltChannelInfo {
     connection: Arc<Connection>,
 }
 
-#[maybe_async(AFIT)]
 impl Client {
     /// Creates a new `Client` instance with the given configuration.
     pub fn new(config: ClientConfig) -> Self {
@@ -184,7 +182,6 @@ impl Client {
     ///
     /// ## Prerequisites
     /// The client must have an active IPC$ connection (see [`Client::ipc_connect`]).
-    #[maybe_async]
     #[tracing::instrument(level = "debug", skip_all, fields(server = %server, sid_count = sids.len()))]
     pub async fn lookup_sids(
         &self,
@@ -616,7 +613,6 @@ impl Client {
         Ok(conn)
     }
 
-    #[maybe_async]
     async fn _add_connection(&self, to_add: Arc<Connection>, ip: &IpAddr) -> crate::Result<()> {
         let mut connections = self.connections.write().await?;
         if connections.contains_key(ip) {
@@ -647,7 +643,6 @@ impl Client {
         self.get_connection_ip_channel(ip).await
     }
 
-    #[maybe_async]
     async fn get_connection_ip_channel(&self, ip: IpAddr) -> crate::Result<Arc<Connection>> {
         self._with_connection(ip, |c| Ok(c.connection.clone()))
             .await
@@ -983,7 +978,6 @@ impl Client {
         self._with_tree(path, |tree| Ok(tree.tree.clone())).await
     }
 
-    #[maybe_async]
     async fn _with_connection<F, R>(&self, ip: IpAddr, f: F) -> crate::Result<R>
     where
         F: FnOnce(&mut ClientConnectionInfo) -> crate::Result<R>,
@@ -997,7 +991,6 @@ impl Client {
 
     /// Locks `share_connects`, locates the tree for the specified path,
     /// and calls the specified closure with the tree.
-    #[maybe_async]
     async fn _with_tree<F, R>(&self, path: &UncPath, f: F) -> crate::Result<R>
     where
         F: FnOnce(&mut ClientConectedTree) -> crate::Result<R>,
@@ -1105,7 +1098,6 @@ impl Client {
     /// using a different network interface, if available.
     ///
     /// This method returns a map of channel IDs to their corresponding connections.
-    #[maybe_async]
     async fn _setup_multi_channel(
         &self,
         unc: &UncPath,
@@ -1223,7 +1215,6 @@ impl<'a> DfsResolver<'a> {
     }
 
     /// Resolves the DFS referral for the given UNC path and re-creates a file on the resolved path.
-    #[maybe_async]
     async fn resolve_to_dfs_file(
         &self,
         dfs_path: &UncPath,
@@ -1257,7 +1248,6 @@ impl<'a> DfsResolver<'a> {
     }
 
     /// Returns a list of DFS referral paths for the given input UNC path.
-    #[maybe_async]
     async fn get_dfs_refs(&self, unc: &UncPath) -> crate::Result<Vec<UncPath>> {
         tracing::debug!("Resolving DFS referral for {unc}");
         let dfs_path_string = unc.to_string();

@@ -12,7 +12,6 @@
 //! without depending on a live KDC or NTLM password-derived secrets.
 
 use crate::crypto::KeyToDerive;
-use maybe_async::*;
 use sspi::Username;
 
 /// Abstract GSS-API authentication state.
@@ -26,7 +25,6 @@ use sspi::Username;
 /// The trait is `Send` so that drivers can `.await` across it in async
 /// builds and so that mock implementors can be moved into spawned tasks
 /// for parallel scenarios.
-#[maybe_async(AFIT)]
 #[allow(async_fn_in_trait)]
 pub trait GssState: std::fmt::Debug + Send {
     /// User identity used by the driver for logging only.

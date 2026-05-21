@@ -1,7 +1,6 @@
 use crate::{Cli, path::*};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use maybe_async::*;
 use smb::sync_helpers::*;
 use smb::{Client, CreateOptions, FileAccessMask, FileAttributes, resource::*};
 use std::collections::HashMap;
@@ -39,7 +38,6 @@ struct CopyFile {
 }
 
 impl CopyFile {
-    #[maybe_async]
     async fn open(
         path: &Path,
         client: &Client,
@@ -92,7 +90,6 @@ impl CopyFile {
     }
 
     #[cfg(not(feature = "single_threaded"))]
-    #[maybe_async]
     async fn _get_channel_to_jobs_map(
         &self,
         to: &CopyFile,
@@ -146,7 +143,6 @@ impl CopyFile {
         Ok(HashMap::from([(None, 1)]))
     }
 
-    #[maybe_async]
     async fn copy_to(self, to: CopyFile, client: &Client) -> Result<(), smb::Error> {
         use CopyFileValue::*;
 
@@ -176,7 +172,6 @@ impl CopyFile {
         Ok(())
     }
 
-    #[maybe_async]
     #[cfg(not(feature = "single_threaded"))]
     pub async fn do_copy<
         F: ReadAtChannel + GetLen + Send + Sync + 'static,
@@ -231,7 +226,6 @@ impl CopyFile {
 
     /// Thread/task entrypoint for measuring and displaying copy progress.
     #[cfg(not(feature = "single_threaded"))]
-    #[maybe_async]
     async fn progress_loop(state: Arc<CopyState>) {
         let progress_bar = Self::make_progress_bar(state.total_size());
         loop {
@@ -254,7 +248,6 @@ impl CopyFile {
     }
 }
 
-#[maybe_async]
 pub async fn copy(cmd: &CopyCmd, cli: &Cli) -> Result<(), Box<dyn Error>> {
     if matches!(cmd.from, Path::Local(_)) && matches!(cmd.to, Path::Local(_)) {
         return Err("Copying between two local files is not supported. Use `cp` or `copy` shell commands instead :)".into());

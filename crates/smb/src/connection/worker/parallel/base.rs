@@ -3,7 +3,6 @@ use crate::connection::worker::Worker;
 use crate::msg_handler::ReceiveOptions;
 use crate::sync_helpers::*;
 use bytes::Bytes;
-use maybe_async::*;
 use smb_msg::ResponseContent;
 use smb_transport::{IoVec, SmbTransport, SmbTransportWrite, TransportError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -80,7 +79,6 @@ where
     }
 }
 
-#[maybe_async(AFIT)]
 impl<T> ParallelWorker<T>
 where
     T: MultiWorkerBackend + std::fmt::Debug,
@@ -271,7 +269,6 @@ where
     }
 }
 
-#[maybe_async(AFIT)]
 impl<T> Worker for ParallelWorker<T>
 where
     T: MultiWorkerBackend + std::fmt::Debug,

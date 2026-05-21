@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use maybe_async::*;
 use smb_msg::{Command, PlainRequest, PlainResponse, RequestContent, Status};
 use smb_transport::IoVec;
 #[cfg(not(feature = "async"))]
@@ -343,8 +342,7 @@ impl<'a> Default for ReceiveOptions<'a> {
 
 /// Chain-of-responsibility pattern trait for handling SMB messages
 /// outgoing from the client or incoming from the server.
-#[maybe_async(AFIT)]
-#[allow(async_fn_in_trait)] // We need `async`-ed trait functions for the #[maybe_async] macro.
+#[allow(async_fn_in_trait)]
 pub trait MessageHandler {
     /// Send a message to the server, returning the result.
     /// This must be implemented. Each handler in the chain must call the next handler,
@@ -375,19 +373,16 @@ pub trait MessageHandler {
     }
 
     // -- Utility functions, accessible from references via Deref.
-    #[maybe_async]
     #[inline]
     async fn send(&self, msg: RequestContent) -> crate::Result<SendMessageResult> {
         self.sendo(OutgoingMessage::new(msg)).await
     }
 
-    #[maybe_async]
     #[inline]
     async fn recv(&self, cmd: Command) -> crate::Result<IncomingMessage> {
         self.recvo(ReceiveOptions::new().with_cmd(Some(cmd))).await
     }
 
-    #[maybe_async]
     #[inline]
     async fn sendor_recvo(
         &self,
@@ -405,7 +400,6 @@ pub trait MessageHandler {
         Ok((send_result, in_result))
     }
 
-    #[maybe_async]
     #[inline]
     async fn sendo_recvo(
         &self,
@@ -415,7 +409,6 @@ pub trait MessageHandler {
         self.sendor_recvo(msg, options).await.map(|(_, r)| r)
     }
 
-    #[maybe_async]
     #[inline]
     async fn send_recvo(
         &self,
@@ -425,7 +418,6 @@ pub trait MessageHandler {
         self.sendo_recvo(OutgoingMessage::new(msg), options).await
     }
 
-    #[maybe_async]
     #[inline]
     async fn sendo_recv(&self, msg: OutgoingMessage) -> crate::Result<IncomingMessage> {
         let cmd = msg.message.content.associated_cmd();
@@ -433,13 +425,11 @@ pub trait MessageHandler {
         self.sendo_recvo(msg, options).await
     }
 
-    #[maybe_async]
     #[inline]
     async fn send_recv(&self, msg: RequestContent) -> crate::Result<IncomingMessage> {
         self.sendo_recv(OutgoingMessage::new(msg)).await
     }
 
-    #[maybe_async]
     #[inline]
     async fn sendor_recv(
         &self,

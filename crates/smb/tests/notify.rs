@@ -25,10 +25,7 @@ macro_rules! make_smb_notify_test {
     ) => {
         pastey::paste!{
             $(
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "multi_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[serial]
 async fn [<test_smb_notify $watch_callback>]() -> Result<(), Box<dyn std::error::Error>> {
     do_test_smb_notify($watch_callback).await
@@ -40,7 +37,6 @@ async fn [<test_smb_notify $watch_callback>]() -> Result<(), Box<dyn std::error:
 
 make_smb_notify_test!(legacy_watch, stream_iter_watch,);
 
-#[maybe_async::maybe_async]
 async fn do_test_smb_notify(
     f_start_notify_task: fn(Arc<Semaphore>, Directory),
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -105,7 +101,6 @@ async fn do_test_smb_notify(
     Ok(())
 }
 
-#[maybe_async::async_impl]
 async fn delete_many_files(share_path: &'static str, rng_numbers: &[u32]) -> smb::Result<()> {
     // for each number, iterate and call delete_from_another_connection. Wait for all at the end.
     use futures_util::future::join_all;
@@ -145,7 +140,6 @@ async fn delete_many_files(share_path: &'static str, rng_numbers: &[u32]) -> smb
     Ok(())
 }
 
-#[maybe_async::async_impl]
 fn legacy_watch(sem: Arc<Semaphore>, r: Directory) {
     tokio::spawn(async move {
         loop {
@@ -155,7 +149,6 @@ fn legacy_watch(sem: Arc<Semaphore>, r: Directory) {
         }
     });
 }
-#[maybe_async::async_impl]
 fn stream_iter_watch(sem: Arc<Semaphore>, r: Directory) {
     use futures_util::TryStreamExt;
     tokio::spawn(async move {
@@ -181,7 +174,6 @@ fn on_notification(sem: Arc<Semaphore>, notification: FileNotifyInformation) {
     }
 }
 
-#[maybe_async::maybe_async]
 async fn delete_file_from_another_connection(
     client: Arc<smb::Client>,
     share_path: smb::UncPath,

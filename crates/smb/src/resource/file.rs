@@ -32,7 +32,6 @@ pub struct File {
     end_of_file: u64,
 }
 
-#[maybe_async(AFIT)]
 impl File {
     pub fn new(handle: ResourceHandle, end_of_file: u64) -> Self {
         File {
@@ -223,7 +222,6 @@ impl File {
     /// # Note
     /// This method copies the data from `buf`. To avoid this copy,
     /// use [`File::write_block_zc`] with a pre-existing `Bytes` buffer.
-    #[maybe_async]
     #[inline]
     pub async fn write_block(
         &self,
@@ -448,7 +446,6 @@ impl Write for File {
 }
 
 impl ReadAtChannel for File {
-    #[maybe_async]
     async fn read_at_channel(
         &self,
         buf: &mut [u8],
@@ -462,7 +459,6 @@ impl ReadAtChannel for File {
 }
 
 impl WriteAtChannel for File {
-    #[maybe_async]
     async fn write_at_channel(
         &self,
         buf: &[u8],
@@ -476,14 +472,12 @@ impl WriteAtChannel for File {
 }
 
 impl GetLen for File {
-    #[maybe_async]
     async fn get_len(&self) -> crate::Result<u64> {
         Ok(self.end_of_file)
     }
 }
 
 impl SetLen for File {
-    #[maybe_async]
     async fn set_len(&self, len: u64) -> crate::Result<()> {
         self.set_info(FileEndOfFileInformation { end_of_file: len })
             .await

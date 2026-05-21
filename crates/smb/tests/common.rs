@@ -42,7 +42,6 @@ pub fn default_connection_config() -> ConnectionConfig {
 
 /// Creates a new SMB client and connects to the specified share on the server.
 /// Returns the client and the UNC path used for the connection's share.
-#[maybe_async::maybe_async]
 pub async fn make_server_connection(
     share: &str,
     config: Option<ConnectionConfig>,
@@ -62,7 +61,6 @@ pub fn smb_tests_server() -> String {
     var(TestEnv::SERVER).unwrap_or("127.0.0.1".to_string())
 }
 
-#[maybe_async::maybe_async]
 pub async fn make_server_connection_ex(
     share: &str,
     config: ClientConfig,

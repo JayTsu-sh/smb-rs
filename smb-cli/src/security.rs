@@ -81,7 +81,6 @@ impl FromStr for DaclEntryArg {
     }
 }
 
-#[maybe_async::maybe_async]
 pub async fn security(
     cmd: &SecurityCmd,
     cli: &Cli,
@@ -92,7 +91,6 @@ pub async fn security(
     }
 }
 
-#[maybe_async::maybe_async]
 async fn open_resource(
     security_cmd: &SecurityCmd,
     cli: &Cli,
@@ -129,7 +127,6 @@ fn resource_handle(resource: &Resource) -> &ResourceHandle {
     }
 }
 
-#[maybe_async::maybe_async]
 pub async fn get_security(
     cmd: &GetSecurityCmd,
     security_cmd: &SecurityCmd,
@@ -150,7 +147,6 @@ pub async fn get_security(
     Ok(())
 }
 
-#[maybe_async::maybe_async]
 pub async fn set_security(
     cmd: &SetSecurityCmd,
     security_cmd: &SecurityCmd,

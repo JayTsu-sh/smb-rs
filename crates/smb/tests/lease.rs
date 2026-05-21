@@ -44,10 +44,7 @@ fn make_lease_request() -> RequestLease {
     })
 }
 
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "current_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 #[serial]
 async fn test_lease_request_create_new() -> smb::Result<()> {
     let share = smb_tests_share();
@@ -106,10 +103,7 @@ async fn test_lease_request_create_new() -> smb::Result<()> {
     Ok(())
 }
 
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "current_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 #[serial]
 async fn test_no_lease_request_has_no_grant() -> smb::Result<()> {
     // Control case: default FileCreateArgs (no lease_request) → server must
@@ -153,10 +147,7 @@ async fn test_no_lease_request_has_no_grant() -> smb::Result<()> {
 /// This is the end-to-end proof that Phase B's wire-level integration
 /// works: subscription + decode + ack + fan-out. Unit-testable in isolation
 /// is the decode/fan-out; only a real server can drive the break.
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "current_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 #[serial]
 async fn test_lease_break_notify_fanned_out() -> smb::Result<()> {
     let share = smb_tests_share();
@@ -255,10 +246,7 @@ async fn test_lease_break_notify_fanned_out() -> smb::Result<()> {
 /// is the simplest building block of Phase C — cache hits (C.3),
 /// break-driven tombstoning (C.2), and deferred close (C.4) all build
 /// on this insertion path.
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "current_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 #[serial]
 async fn test_lease_slot_inserted_on_create() -> smb::Result<()> {
     let share = smb_tests_share();
@@ -324,10 +312,7 @@ async fn test_lease_slot_inserted_on_create() -> smb::Result<()> {
 /// `lease_event_tx` and tombstones the matching slot in `lease_table`.
 /// This test polls the slot until tombstoned (or times out) — no event
 /// subscription needed, the test only inspects cache state.
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "current_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 #[serial]
 async fn test_lease_slot_tombstoned_on_break() -> smb::Result<()> {
     let share = smb_tests_share();
@@ -407,10 +392,7 @@ async fn test_lease_slot_tombstoned_on_break() -> smb::Result<()> {
 ///
 /// This is the first phase that actually saves network RTs. Subsequent
 /// opens against the same path are pure local table lookups.
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "current_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 #[serial]
 async fn test_lease_cache_hit_reuses_file_id() -> smb::Result<()> {
     use smb::FileAccessMask;
@@ -518,10 +500,7 @@ async fn test_lease_cache_hit_reuses_file_id() -> smb::Result<()> {
 ///
 /// We also verify the idempotent / safe-on-empty behavior — calling
 /// `evict_lease` twice in a row returns `false` the second time.
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "current_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 #[serial]
 async fn test_evict_lease_releases_slot_and_misses_next_open() -> smb::Result<()> {
     let share = smb_tests_share();
@@ -610,10 +589,7 @@ async fn test_evict_lease_releases_slot_and_misses_next_open() -> smb::Result<()
 /// We open a file with a lease, close it (slot retained), wait briefly,
 /// then call flush_idle_leases with a very small threshold. The slot
 /// must be gone afterwards and a re-open returns a fresh FileId.
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "current_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 #[serial]
 async fn test_flush_idle_leases_sweeps_old_slots() -> smb::Result<()> {
     let share = smb_tests_share();
@@ -698,10 +674,7 @@ async fn test_flush_idle_leases_sweeps_old_slots() -> smb::Result<()> {
 ///    auto-update on Create can't accidentally match).
 /// 3. creation_time was NOT clobbered (we sent 0 for it, which means
 ///    "preserve" per MS-FSCC 2.4.7).
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "current_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 #[serial]
 async fn test_compound_set_basic_info() -> smb::Result<()> {
     use smb::binrw_util::file_time::FileTime;
@@ -783,10 +756,7 @@ async fn test_compound_set_basic_info() -> smb::Result<()> {
 ///      worked end-to-end).
 ///   2. Hit the cache on the second call — same FileId — proving the
 ///      auto-injected lease keys are stable per path within a Client.
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "current_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 #[serial]
 async fn test_client_default_lease_state_auto_injects() -> smb::Result<()> {
     use smb::{Client, ClientConfig, FileAccessMask};

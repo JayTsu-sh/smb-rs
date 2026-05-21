@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use maybe_async::*;
 use smb_msg::{FileId, FsctlRequest, IoctlRequest, IoctlRequestFlags};
 
 use crate::FileCreateArgs;
@@ -40,9 +39,7 @@ pub struct Tree {
     conn_info: Arc<ConnectionInfo>,
 }
 
-#[maybe_async(AFIT)]
 impl Tree {
-    #[maybe_async]
     pub(crate) async fn connect(
         name: &str,
         upstream: &Upstream,
@@ -246,7 +243,6 @@ impl Tree {
     }
 
     // TODO: Make it common with ResourceHandle::fsctl_with_options
-    #[maybe_async]
     pub(crate) async fn fsctl_with_options<T: FsctlRequest>(
         &self,
         request: T,
@@ -298,7 +294,6 @@ impl TreeMessageHandler {
         })
     }
 
-    #[maybe_async]
     async fn _disconnect(upstream: Upstream, tree_id: u32, encrypt: bool) -> crate::Result<()> {
         // send and receive tree disconnect request & response.
         let request_content: RequestContent = TreeDisconnectRequest::default().into();
@@ -310,7 +305,6 @@ impl TreeMessageHandler {
         Ok(())
     }
 
-    #[maybe_async]
     async fn disconnect(&self) -> crate::Result<()> {
         let tree_id = self.tree_id.swap(Self::INVALID_TREE_ID, Ordering::Relaxed);
         if tree_id == Self::INVALID_TREE_ID {
@@ -331,7 +325,6 @@ impl TreeMessageHandler {
 }
 
 impl MessageHandler for TreeMessageHandler {
-    #[maybe_async]
     async fn sendo(
         &self,
         mut msg: crate::msg_handler::OutgoingMessage,
@@ -346,7 +339,6 @@ impl MessageHandler for TreeMessageHandler {
         self.upstream.sendo(msg).await
     }
 
-    #[maybe_async]
     async fn recvo(
         &self,
         options: crate::msg_handler::ReceiveOptions<'_>,

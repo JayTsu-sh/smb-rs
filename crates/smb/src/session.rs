@@ -59,7 +59,6 @@ pub struct Session {
     session_handler: HandlerReference<SessionMessageHandler>,
 }
 
-#[maybe_async]
 impl Session {
     /// Sets up a new session on the specified connection.
     /// This method is crate-internal; Use [`Connection::authenticate`] to create a new session.
@@ -109,9 +108,7 @@ impl Session {
         Self::_finish_create(setup_result).await
     }
 
-    async fn _finish_create<G>(
-        setup_result: SessionSetup<'_, G>,
-    ) -> crate::Result<Session>
+    async fn _finish_create<G>(setup_result: SessionSetup<'_, G>) -> crate::Result<Session>
     where
         G: crate::session::gss::GssState,
     {
@@ -194,9 +191,7 @@ impl Session {
         Ok(new_channel_id)
     }
 
-    async fn _common_setup<G>(
-        mut session_setup: SessionSetup<'_, G>,
-    ) -> crate::Result<Channel>
+    async fn _common_setup<G>(mut session_setup: SessionSetup<'_, G>) -> crate::Result<Channel>
     where
         G: crate::session::gss::GssState,
     {
@@ -282,7 +277,6 @@ pub(crate) struct SessionMessageHandler {
     dropping: AtomicBool,
 }
 
-#[maybe_async(AFIT)]
 impl SessionMessageHandler {
     pub fn new(primary_channel: HandlerReference<ChannelMessageHandler>) -> Self {
         let session_id = primary_channel.session_id();
@@ -366,7 +360,6 @@ impl SessionMessageHandler {
     }
 }
 
-#[maybe_async(AFIT)]
 impl MessageHandler for SessionMessageHandler {
     async fn sendo(&self, msg: OutgoingMessage) -> crate::Result<SendMessageResult> {
         self._with_channel(msg.channel_id, SendoWithChannel(msg))
@@ -379,7 +372,6 @@ impl MessageHandler for SessionMessageHandler {
     }
 }
 
-#[maybe_async(AFIT)]
 trait WithChannel {
     type Result;
     async fn work(
@@ -389,7 +381,6 @@ trait WithChannel {
 }
 
 struct SendoWithChannel(OutgoingMessage);
-#[maybe_async(AFIT)]
 impl WithChannel for SendoWithChannel {
     type Result = SendMessageResult;
     async fn work(
@@ -401,7 +392,6 @@ impl WithChannel for SendoWithChannel {
 }
 
 struct RecvoWithChannel<'a>(ReceiveOptions<'a>);
-#[maybe_async(AFIT)]
 impl WithChannel for RecvoWithChannel<'_> {
     type Result = IncomingMessage;
     async fn work(

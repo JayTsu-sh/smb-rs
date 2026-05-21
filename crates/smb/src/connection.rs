@@ -14,7 +14,6 @@ use crate::{Error, crypto, msg_handler::*, session::Session};
 use binrw::prelude::*;
 pub use config::*;
 use connection_info::{ConnectionInfo, NegotiatedProperties};
-use maybe_async::*;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use smb_dtyp::*;
@@ -52,7 +51,6 @@ pub struct Connection {
     server_address: SocketAddr,
 }
 
-#[maybe_async(AFIT)]
 impl Connection {
     /// Creates a new SMB connection, specifying a server configuration, without connecting to a server.
     /// Use the [`connect`](Connection::connect) method to establish a connection.
@@ -203,7 +201,6 @@ impl Connection {
 
     /// Switches the protocol to SMB2 against the server if required,
     /// and wraps the transport in a SMB2 worker.
-    #[maybe_async]
     async fn _negotiate_switch_to_smb2(
         &self,
         mut transport: Box<dyn SmbTransport>,
@@ -253,7 +250,6 @@ impl Connection {
     }
 
     /// This method perofrms the SMB2 negotiation.
-    #[maybe_async]
     async fn _negotiate_smb2(
         &self,
         server_address: std::net::SocketAddr,
@@ -479,7 +475,6 @@ impl Connection {
     }
 
     /// Performs SMB negotiation post-connect.
-    #[maybe_async]
     async fn _negotiate(
         &self,
         transport: Box<dyn SmbTransport>,
@@ -624,19 +619,16 @@ impl Connection {
 
     /// Install a [`crate::lease::LeaseSlot`] into this connection's
     /// lease cache. See [`ConnectionMessageHandler::insert_lease_slot`].
-    #[maybe_async]
     pub async fn insert_lease_slot(&self, slot: Arc<LeaseSlot>) -> crate::Result<()> {
         self.handler.insert_lease_slot(slot).await
     }
 
     /// Return the current number of cached lease slots.
-    #[maybe_async]
     pub async fn lease_slot_count(&self) -> crate::Result<usize> {
         self.handler.lease_slot_count().await
     }
 
     /// Look up a cached lease slot by path; `None` when absent.
-    #[maybe_async]
     pub async fn peek_lease_slot(&self, path: &str) -> crate::Result<Option<Arc<LeaseSlot>>> {
         self.handler.peek_lease_slot(path).await
     }
@@ -645,7 +637,6 @@ impl Connection {
     /// the `lease_table` lock. See
     /// [`ConnectionMessageHandler::try_acquire_lease`] for semantics and
     /// the rationale around lock ordering vs eviction.
-    #[maybe_async]
     pub async fn try_acquire_lease(
         &self,
         path: &str,
@@ -666,7 +657,6 @@ impl Connection {
     /// Phase C.5: tombstone a lease slot and remove it from the table.
     /// See [`ConnectionMessageHandler::take_lease_for_evict`] for the
     /// race-free contract.
-    #[maybe_async]
     pub async fn take_lease_for_evict(&self, path: &str) -> crate::Result<Option<LeaseEviction>> {
         self.handler.take_lease_for_evict(path).await
     }
@@ -677,7 +667,6 @@ impl Connection {
     /// returned for the caller to flush the wire Close. Live-ref slots
     /// stay in the table tombstoned; their last release_one will send
     /// the deferred Close through the regular path.
-    #[maybe_async]
     pub async fn sweep_idle_leases(
         &self,
         older_than: std::time::Duration,
@@ -726,7 +715,6 @@ impl Connection {
     /// depending on the server. There is no client-side enforcement
     /// today — adding one would require pre-serializing each member
     /// twice, which defeats the point of the single-write path.
-    #[maybe_async]
     pub async fn send_compound(
         &self,
         mut msgs: Vec<OutgoingMessage>,
@@ -870,7 +858,6 @@ impl ConnectionMessageHandler {
     /// carried an `RqLs` grant. Overwrites any prior entry for the same
     /// path — a stale slot (e.g., a previous open that was closed by the
     /// other side) is logically equivalent to no cache hit.
-    #[maybe_async]
     pub async fn insert_lease_slot(&self, slot: Arc<LeaseSlot>) -> crate::Result<()> {
         use std::sync::atomic::Ordering;
         let key = slot.path.clone();
@@ -928,7 +915,6 @@ impl ConnectionMessageHandler {
 
     /// Return the current number of cached lease slots. Primarily for
     /// observability and tests; not in any hot path.
-    #[maybe_async]
     pub async fn lease_slot_count(&self) -> crate::Result<usize> {
         Ok(self.lease_table.lock().await?.len())
     }
@@ -938,7 +924,6 @@ impl ConnectionMessageHandler {
     /// fast path in `Client::_create_file` goes through
     /// [`Self::try_acquire_lease`] instead so the bump is atomic with the
     /// lookup against concurrent evictions.
-    #[maybe_async]
     pub async fn peek_lease_slot(&self, path: &str) -> crate::Result<Option<Arc<LeaseSlot>>> {
         Ok(self.lease_table.lock().await?.get(path).cloned())
     }
@@ -952,7 +937,6 @@ impl ConnectionMessageHandler {
     /// slot between an acquirer's `peek` and `fetch_add`, leaving the
     /// acquirer with a stale FileId. Returns `Some(slot)` on a successful
     /// bump, `None` for any non-hit reason.
-    #[maybe_async]
     pub async fn try_acquire_lease(
         &self,
         path: &str,
@@ -981,7 +965,6 @@ impl ConnectionMessageHandler {
     /// from the table and falls back to the wire Create path.
     ///
     /// Returns `None` when `path` had no entry.
-    #[maybe_async]
     pub async fn take_lease_for_evict(&self, path: &str) -> crate::Result<Option<LeaseEviction>> {
         use std::sync::atomic::Ordering;
         let mut table = self.lease_table.lock().await?;
@@ -1009,7 +992,6 @@ impl ConnectionMessageHandler {
     /// are returned in the result so the caller can flush the wire
     /// Close; slots with live handles stay tombstoned and rely on the
     /// regular `release_one` -> `CloseAndEvict` path.
-    #[maybe_async]
     pub async fn sweep_idle_leases(
         &self,
         older_than: std::time::Duration,
@@ -1204,11 +1186,7 @@ impl ConnectionMessageHandler {
     /// Used by the session-setup driver, which needs the message's
     /// final on-wire `header.message_id` *before* the wire bytes are
     /// hashed into the SMB 3.1.1 preauth integrity chain.
-    #[maybe_async]
-    pub(crate) async fn prepare_outgoing(
-        &self,
-        msg: &mut OutgoingMessage,
-    ) -> crate::Result<()> {
+    pub(crate) async fn prepare_outgoing(&self, msg: &mut OutgoingMessage) -> crate::Result<()> {
         let priority_value = match self.conn_info.get() {
             Some(neg_info) => match neg_info.negotiation.dialect_rev {
                 Dialect::Smb0311 => 1,
@@ -1235,7 +1213,6 @@ impl ConnectionMessageHandler {
     /// [`OutgoingMessage::pre_processed`] to `true` if they manually
     /// stamped the header). [`Self::sendo`] is the public, all-in-one
     /// entry point that combines both.
-    #[maybe_async]
     pub(crate) async fn dispatch_outgoing(
         &self,
         msg: OutgoingMessage,
@@ -1247,7 +1224,6 @@ impl ConnectionMessageHandler {
             .await
     }
 
-    #[maybe_async]
     async fn process_sequence_outgoing(&self, msg: &mut OutgoingMessage) -> crate::Result<()> {
         if let Some(neg) = self.conn_info.get() {
             if neg.negotiation.caps.large_mtu() {
@@ -1305,7 +1281,6 @@ impl ConnectionMessageHandler {
         Ok(())
     }
 
-    #[maybe_async]
     async fn process_sequence_incoming(&self, msg: &IncomingMessage) -> crate::Result<()> {
         if let Some(neg) = self.conn_info.get() {
             if neg.negotiation.caps.large_mtu() {
@@ -1429,7 +1404,6 @@ impl ConnectionMessageHandler {
 }
 
 impl MessageHandler for ConnectionMessageHandler {
-    #[maybe_async]
     async fn sendo(&self, mut msg: OutgoingMessage) -> crate::Result<SendMessageResult> {
         if !msg.pre_processed {
             self.prepare_outgoing(&mut msg).await?;
@@ -1437,7 +1411,6 @@ impl MessageHandler for ConnectionMessageHandler {
         self.dispatch_outgoing(msg).await
     }
 
-    #[maybe_async]
     async fn recvo(&self, options: ReceiveOptions<'_>) -> crate::Result<IncomingMessage> {
         let msg = self
             .worker
@@ -1480,7 +1453,6 @@ impl MessageHandler for ConnectionMessageHandler {
         Ok(msg)
     }
 
-    #[maybe_async]
     async fn notify(&self, msg: IncomingMessage) -> crate::Result<()> {
         // Intercept LeaseBreakNotify *before* the session-id sanity check
         // because the server sends lease breaks with `session_id = 0` per
@@ -1536,7 +1508,6 @@ impl ConnectionMessageHandler {
     /// connection-wide notify loop must keep draining notifications even
     /// if a single ack fails. Phase C will surface ack failures back to
     /// the affected handle through the broadcast event.
-    #[maybe_async]
     async fn handle_lease_break(&self, msg: IncomingMessage) -> crate::Result<()> {
         let notify = match msg.message.content {
             ResponseContent::LeaseBreakNotify(n) => n,
@@ -1603,7 +1574,6 @@ impl ConnectionMessageHandler {
     /// bare connection handler triggers STATUS_NETWORK_NAME_DELETED on
     /// Samba-based servers. Lease identity is in the lease_key, not the
     /// session, so the choice of session doesn't matter.
-    #[maybe_async]
     async fn send_lease_break_ack(&self, notify: &smb_msg::LeaseBreakNotify) {
         let session_handler = {
             let sessions = match self.sessions.lock().await {
