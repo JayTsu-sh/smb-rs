@@ -1,4 +1,3 @@
-#![cfg(not(feature = "single_threaded"))]
 use serial_test::serial;
 use smb::{
     ConnectionConfig, Directory, FileCreateArgs, connection::EncryptionMode, sync_helpers::*,
@@ -8,9 +7,6 @@ use smb_msg::NotifyFilter;
 use std::sync::Arc;
 mod common;
 
-#[cfg(feature = "multi_threaded")]
-use std::thread::sleep;
-#[cfg(feature = "async")]
 use tokio::time::sleep;
 
 use common::TestConstants;

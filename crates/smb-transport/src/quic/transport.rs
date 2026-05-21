@@ -1,14 +1,6 @@
 //! QUIC transport implementation for SMB.
 //!
 //! This module uses the [quinn](https://docs.rs/quinn/latest/quinn/) crate to implement the QUIC transport protocol for SMB.
-//! Therefore, it should only be used when async features are enabled.
-
-// quic => async
-#[cfg(all(not(feature = "async"), feature = "quic"))]
-compile_error!(
-    "QUIC transport requires the async feature to be enabled. \
-    Please enable the async feature in your Cargo.toml."
-);
 
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
@@ -215,26 +207,16 @@ impl SmbTransport for QuicTransport {
 }
 
 impl SmbTransportWrite for QuicTransport {
-    #[cfg(feature = "async")]
     fn send_raw<'a>(&'a mut self, buf: &'a [u8]) -> BoxFuture<'a, crate::error::Result<()>> {
         async { Ok(self.send_raw(buf).await?) }.boxed()
-    }
-    #[cfg(not(feature = "async"))]
-    fn send_raw(&mut self, buf: &[u8]) -> Result<()> {
-        unimplemented!("QUIC transport requires async feature to be enabled");
     }
 }
 
 impl SmbTransportRead for QuicTransport {
-    #[cfg(feature = "async")]
     fn receive_exact<'a>(
         &'a mut self,
         out_buf: &'a mut [u8],
     ) -> BoxFuture<'a, crate::error::Result<()>> {
         async { Ok(self.receive_exact(out_buf).await?) }.boxed()
-    }
-    #[cfg(not(feature = "async"))]
-    fn receive_exact(&mut self, out_buf: &mut [u8]) -> Result<Vec<u8>> {
-        unimplemented!("QUIC transport requires async feature to be enabled");
     }
 }

@@ -1242,23 +1242,6 @@ impl MessageHandler for ResourceMessageHandle {
     }
 }
 
-#[cfg(not(feature = "async"))]
-impl Drop for ResourceHandle {
-    fn drop(&mut self) {
-        let file_id = self.file_id();
-        if file_id.is_err() {
-            return;
-        }
-
-        tracing::warn!(
-            "ResourceHandle for '{}' ({}) is being dropped without closing it properly. This may lead to resource leaks.",
-            self.name,
-            self._file_id
-        );
-    }
-}
-
-#[cfg(feature = "async")]
 impl Drop for ResourceHandle {
     fn drop(&mut self) {
         if !self.open.swap(false, std::sync::atomic::Ordering::Relaxed) {

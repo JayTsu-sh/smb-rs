@@ -330,7 +330,6 @@ impl SessionMessageHandler {
     /// # Notes
     /// This method waits for the logoff response to be received from the server.
     /// It is used when dropping the session.
-    #[cfg(feature = "async")]
     async fn logoff_async(&self) {
         self.logoff().await.unwrap_or_else(|e| {
             tracing::error!("Failed to logoff: {e}");
@@ -402,16 +401,6 @@ impl WithChannel for RecvoWithChannel<'_> {
     }
 }
 
-#[cfg(not(feature = "async"))]
-impl Drop for SessionMessageHandler {
-    fn drop(&mut self) {
-        self.logoff().unwrap_or_else(|e| {
-            tracing::error!("Failed to logoff: {e}",);
-        });
-    }
-}
-
-#[cfg(feature = "async")]
 impl Drop for SessionMessageHandler {
     fn drop(&mut self) {
         if self

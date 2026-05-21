@@ -25,8 +25,6 @@ use smb_transport::*;
 use std::cmp::max;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-#[cfg(feature = "multi_threaded")]
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::time::Instant;
 pub use transformer::TransformError;
@@ -511,7 +509,6 @@ impl Connection {
         // LeaseBreak notifications are part of the base SMB 2.x protocol and
         // every server can send them — we must always be ready to receive,
         // ack, and dispatch them, otherwise lease handling silently breaks.
-        #[cfg(not(feature = "single_threaded"))]
         if !self.config.disable_notifications {
             tracing::debug!(
                 "Starting Notification job (server notifications cap={}).",
@@ -524,7 +521,6 @@ impl Connection {
             // lease_event_tx broadcast (fed by handle_lease_break) and
             // tombstones matching slots in lease_table so new opens
             // miss the cache after a server-side break.
-            #[cfg(feature = "async")]
             self.handler.handler.start_lease_break_listener();
         }
 
@@ -612,7 +608,6 @@ impl Connection {
 
     /// Subscribe to lease-break notifications received on this connection.
     /// See [`ConnectionMessageHandler::subscribe_lease_breaks`] for semantics.
-    #[cfg(feature = "async")]
     pub fn subscribe_lease_breaks(&self) -> tokio::sync::broadcast::Receiver<LeaseBreakEvent> {
         self.handler.subscribe_lease_breaks()
     }
@@ -795,12 +790,8 @@ pub(crate) struct ConnectionMessageHandler {
 
     worker: OnceCell<Arc<WorkerImpl>>,
 
-    #[cfg(feature = "async")]
     /// Cancellation token for stopping notifications.
     stop_notifications: CancellationToken,
-    #[cfg(feature = "multi_threaded")]
-    /// Flag to stop notifications.
-    stop_notifications: Arc<AtomicBool>,
 
     /// Holds the sessions created by this connection.
     sessions: Mutex<HashMap<u64, Weak<ChannelMessageHandler>>>,
@@ -817,10 +808,7 @@ pub(crate) struct ConnectionMessageHandler {
     credit_pool: AtomicU16,
 
     /// Broadcasts [`LeaseBreakEvent`] to any [`crate::Client::subscribe_lease_breaks`]
-    /// consumers when the server sends a `LeaseBreakNotify`. Only present
-    /// under the `async` feature — sync builds receive notifications via
-    /// the existing notify path but do not fan them out.
-    #[cfg(feature = "async")]
+    /// consumers when the server sends a `LeaseBreakNotify`.
     lease_event_tx: tokio::sync::broadcast::Sender<LeaseBreakEvent>,
 
     /// Per-connection cache of server-granted leases (Phase C). Keyed by
@@ -833,7 +821,6 @@ pub(crate) struct ConnectionMessageHandler {
 
 impl ConnectionMessageHandler {
     fn new(client_guid: Guid, credits_backlog: Option<u16>) -> ConnectionMessageHandler {
-        #[cfg(feature = "async")]
         let (lease_event_tx, _) = tokio::sync::broadcast::channel(LEASE_BREAK_CHANNEL_CAPACITY);
 
         ConnectionMessageHandler {
@@ -844,10 +831,8 @@ impl ConnectionMessageHandler {
             curr_credits: Semaphore::new(1),
             curr_msg_id: AtomicU64::new(0),
             credit_pool: AtomicU16::new(1),
-            #[cfg(not(feature = "single_threaded"))]
             stop_notifications: Default::default(),
             sessions: Mutex::new(HashMap::with_capacity(1)),
-            #[cfg(feature = "async")]
             lease_event_tx,
             lease_table: Mutex::new(HashMap::new()),
         }
@@ -880,7 +865,6 @@ impl ConnectionMessageHandler {
                 live_refs = live,
                 "Replaced existing lease slot in cache; old slot tombstoned",
             );
-            #[cfg(feature = "async")]
             if live == 0 && prev.file_id != smb_msg::FileId::EMPTY {
                 let file_id = prev.file_id;
                 let handler = prev.proto.handler.clone();
@@ -1041,7 +1025,6 @@ impl ConnectionMessageHandler {
     /// and tombstones matching slots in `lease_table`. Idempotent — only
     /// the first call subscribes; subsequent calls are no-ops. Async-only:
     /// the broadcast channel doesn't exist in sync builds.
-    #[cfg(feature = "async")]
     fn start_lease_break_listener(self: &Arc<Self>) {
         let mut rx = self.lease_event_tx.subscribe();
         let self_clone = self.clone();
@@ -1097,7 +1080,6 @@ impl ConnectionMessageHandler {
     /// wire Create). Without this fence the in-flight acquirer could
     /// observe `tombstoned == false`, bump refcount, and hand out a
     /// FileId the server has already revoked.
-    #[cfg(feature = "async")]
     async fn apply_lease_break(&self, event: &LeaseBreakEvent) {
         use std::sync::atomic::Ordering;
         let event_key = event.lease_key.as_u128();
@@ -1158,7 +1140,6 @@ impl ConnectionMessageHandler {
     /// already sent the ack by that point, so missing the event only means
     /// the subscriber's cache invalidation is delayed, never that the
     /// protocol is left in a bad state.
-    #[cfg(feature = "async")]
     pub fn subscribe_lease_breaks(&self) -> tokio::sync::broadcast::Receiver<LeaseBreakEvent> {
         self.lease_event_tx.subscribe()
     }
@@ -1314,7 +1295,6 @@ impl ConnectionMessageHandler {
         Ok(())
     }
 
-    #[cfg(feature = "async")]
     async fn start_notify(self: &Arc<Self>) -> crate::Result<()> {
         let worker = self
             .worker
@@ -1364,41 +1344,8 @@ impl ConnectionMessageHandler {
         Ok(())
     }
 
-    #[cfg(feature = "multi_threaded")]
-    fn start_notify(self: &Arc<Self>) -> crate::Result<()> {
-        let (tx, rx) = mpsc::channel();
-        let worker = self
-            .worker
-            .get()
-            .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?;
-        worker.start_notify_channel(tx)?;
-
-        const POLLING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-        let stopped_ref = self.stop_notifications.clone();
-        let self_clone = self.clone();
-        std::thread::spawn(move || {
-            while !stopped_ref.load(Ordering::Relaxed) {
-                match rx.recv_timeout(POLLING_INTERVAL) {
-                    Ok(notification) => {
-                        self_clone.notify(notification).unwrap_or_else(|e| {
-                            tracing::error!("Error handling notification: {e:?}");
-                        });
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                }
-            }
-            tracing::info!("Notification handler thread stopped.");
-        });
-        Ok(())
-    }
-
-    #[cfg(not(feature = "single_threaded"))]
     pub fn stop_notify(&self) {
-        #[cfg(feature = "async")]
         self.stop_notifications.cancel();
-        #[cfg(not(feature = "async"))]
-        self.stop_notifications.store(true, Ordering::Relaxed);
         tracing::info!("Notification handler stopped.");
     }
 }
@@ -1544,7 +1491,6 @@ impl ConnectionMessageHandler {
         // see this event regardless of whether the ack reached the server
         // — they invalidate their cached state because the lease is
         // logically broken from this moment on.
-        #[cfg(feature = "async")]
         {
             let event = LeaseBreakEvent {
                 lease_key: notify.lease_key,
@@ -1619,22 +1565,8 @@ impl ConnectionMessageHandler {
     }
 }
 
-#[cfg(not(feature = "async"))]
 impl Drop for ConnectionMessageHandler {
     fn drop(&mut self) {
-        #[cfg(not(feature = "single_threaded"))]
-        self.stop_notify();
-
-        if let Some(worker) = self.worker.take() {
-            worker.stop().ok();
-        }
-    }
-}
-
-#[cfg(feature = "async")]
-impl Drop for ConnectionMessageHandler {
-    fn drop(&mut self) {
-        #[cfg(not(feature = "single_threaded"))]
         self.stop_notify();
 
         let worker = match self.worker.take() {

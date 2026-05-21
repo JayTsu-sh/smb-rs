@@ -1,5 +1,4 @@
 use common::{TestConstants, make_server_connection};
-#[cfg(feature = "async")]
 use futures_util::StreamExt;
 use serial_test::serial;
 use smb::{

@@ -79,9 +79,6 @@ pub async fn make_server_connection_ex(
     Ok((smb, unc_path))
 }
 
-// Re-Export correct version for async or sync
-
-#[cfg(feature = "async")]
 #[macro_export]
 macro_rules! with_temp_env {
     (
@@ -98,24 +95,5 @@ macro_rules! with_temp_env {
             ],
             $body
         ).await
-    };
-}
-#[cfg(not(feature = "async"))]
-#[macro_export]
-macro_rules! with_temp_env {
-    (
-        [
-            $(
-                ($name:expr, $value:expr),
-            )*
-        ],
-        $body:expr
-    ) => {
-        temp_env::with_vars(
-            [
-                $(($name, $value)),*
-            ],
-            move || { $body }
-        )
     };
 }

@@ -1,10 +1,7 @@
 use bytes::Bytes;
 use smb_msg::{Command, PlainRequest, PlainResponse, RequestContent, Status};
 use smb_transport::IoVec;
-#[cfg(not(feature = "async"))]
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, atomic::AtomicU64};
-#[cfg(feature = "async")]
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
@@ -257,15 +254,9 @@ pub struct ReceiveOptions<'a> {
     /// When using crate feature `async`, see [`async_cancel`][Self::async_cancel].
     pub allow_async: bool,
 
-    #[cfg(feature = "async")]
     /// An optional cancellation token to cancel the receive operation,
     /// if it's an async operation.
     pub async_cancel: Option<CancellationToken>,
-
-    #[cfg(not(feature = "async"))]
-    /// An atomic boolean flag to cancel the receive operation,
-    /// if it's an async operation.
-    pub async_cancel: Option<Arc<AtomicBool>>,
 
     /// An optional atomic u64 to update with a message ID + async ID that is being
     /// waited for. This is useful for tracking the async message ID
@@ -302,15 +293,8 @@ impl<'a> ReceiveOptions<'a> {
         self
     }
 
-    #[cfg(feature = "async")]
     pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
         self.async_cancel = Some(token);
-        self
-    }
-
-    #[cfg(not(feature = "async"))]
-    pub fn with_cancellation_flag(mut self, flag: Arc<AtomicBool>) -> Self {
-        self.async_cancel = Some(flag);
         self
     }
 

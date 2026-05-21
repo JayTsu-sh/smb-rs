@@ -664,7 +664,6 @@ impl Client {
     ///
     /// Errors: returns the same set as [`Client::get_connection`]; the
     /// caller must have already established the connection.
-    #[cfg(feature = "async")]
     pub async fn subscribe_lease_breaks(
         &self,
         server: &str,

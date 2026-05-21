@@ -55,7 +55,6 @@ pub async fn watch(cmd: &WatchCmd, cli: &Cli) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[cfg(feature = "async")]
 async fn watch_dir(
     dir: &Arc<Directory>,
     notify_filter: NotifyFilter,
@@ -87,63 +86,6 @@ async fn watch_dir(
             futures::future::ready(())
         })
         .await;
-
-    Ok(())
-}
-
-#[cfg(feature = "multi_threaded")]
-fn watch_dir(
-    dir: &Arc<Directory>,
-    notify_filter: NotifyFilter,
-    recursive: bool,
-    number: usize,
-) -> Result<(), Box<dyn Error>> {
-    let iterator = Directory::watch_stream(dir, notify_filter, recursive)?;
-    let canceller = iterator.get_canceller();
-
-    ctrlc::set_handler({
-        let canceller = canceller.clone();
-        move || {
-            tracing::info!("Cancellation requested, stopping watch...");
-            canceller.cancel();
-        }
-    })?;
-
-    for res in iterator.take(number) {
-        match res {
-            Ok(info) => {
-                tracing::info!("Change detected: {:?}", info);
-            }
-            Err(e) => {
-                tracing::error!("Error watching directory: {}", e);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(feature = "single_threaded")]
-fn watch_dir(
-    dir: &Arc<Directory>,
-    notify_filter: NotifyFilter,
-    recursive: bool,
-    number: usize,
-) -> Result<(), Box<dyn Error>> {
-    tracing::warn!(
-        "Single-threaded mode does not support clean cancellation. Press Ctrl+C to exit."
-    );
-
-    for res in Directory::watch_stream(dir, notify_filter, recursive)?.take(number) {
-        match res {
-            Ok(info) => {
-                tracing::info!("Change detected: {:?}", info);
-            }
-            Err(e) => {
-                tracing::error!("Error watching directory: {}", e);
-            }
-        }
-    }
 
     Ok(())
 }

@@ -1,6 +1,5 @@
 use crate::Cli;
 use clap::{Parser, ValueEnum};
-#[cfg(feature = "async")]
 use futures_util::StreamExt;
 use smb::{Client, FileAccessMask, FileBasicInformation, QueryQuotaInfo, UncPath, resource::*};
 use std::collections::VecDeque;

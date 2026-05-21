@@ -4,7 +4,6 @@ use smb_fscc::*;
 use smb_msg::CreateOptions;
 use std::sync::Arc;
 
-#[cfg(feature = "async")]
 use futures_util::StreamExt;
 mod common;
 use common::TestConstants;

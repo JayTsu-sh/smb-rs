@@ -365,19 +365,6 @@ impl MessageHandler for TreeMessageHandler {
     }
 }
 
-#[cfg(not(feature = "async"))]
-impl Drop for TreeMessageHandler {
-    fn drop(&mut self) {
-        self.disconnect()
-            .map_err(|e| {
-                tracing::warn!("Failed to disconnect from tree {}: {e}", self.tree_name);
-                e
-            })
-            .ok();
-    }
-}
-
-#[cfg(feature = "async")]
 impl Drop for TreeMessageHandler {
     fn drop(&mut self) {
         let tree_id = self.tree_id.load(Ordering::Relaxed);
