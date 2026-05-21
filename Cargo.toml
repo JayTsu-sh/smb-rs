@@ -49,7 +49,6 @@ const_format = "0.2"
 
 # Async
 tokio = { version = "1.43" }
-maybe-async = "0.2"
 futures-util = { version = "0.3" }
 futures-core = { version = "0.3" }
 tokio-util = { version = "0.7" }

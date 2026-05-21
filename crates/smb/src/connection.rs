@@ -453,7 +453,6 @@ impl Connection {
 
             // Enable notifications by client config + build config.
             if !self.config.disable_notifications
-                && cfg!(not(feature = "single_threaded"))
                 && supported_dialects.contains(&Dialect::Smb0311)
             {
                 capabilities.set_notifications(true);

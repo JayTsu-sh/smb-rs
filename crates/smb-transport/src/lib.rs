@@ -58,14 +58,3 @@ pub fn make_transport(
     }
 }
 
-// Force async if QUIC/RDMA are enabled
-#[cfg(all(feature = "is_sync", feature = "quic"))]
-compile_error!(
-    "QUIC transport requires the async feature to be enabled. \
-    Please enable the async feature in your Cargo.toml."
-);
-#[cfg(all(feature = "is_sync", feature = "rdma"))]
-compile_error!(
-    "RDMA transport requires the async feature to be enabled. \
-    Please enable the async feature in your Cargo.toml."
-);

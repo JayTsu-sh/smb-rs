@@ -1,23 +1,6 @@
 #![doc = include_str!("../docs/index.md")]
 #![forbid(unsafe_code)]
 
-#[cfg(not(any(
-    feature = "async",
-    feature = "single_threaded",
-    feature = "multi_threaded"
-)))]
-compile_error!(
-    "You must enable exactly one of the following features: async, single_threaded, multi_threaded"
-);
-#[cfg(any(
-    all(feature = "async", feature = "single_threaded"),
-    all(feature = "async", feature = "multi_threaded"),
-    all(feature = "single_threaded", feature = "multi_threaded")
-))]
-compile_error!(
-    "You must enable exactly one of the following features: async, single_threaded, multi_threaded"
-);
-
 pub mod client;
 pub mod compression;
 pub mod connection;
