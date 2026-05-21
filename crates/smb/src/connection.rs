@@ -1,3 +1,4 @@
+pub(crate) mod actor;
 pub mod config;
 pub mod connection_info;
 pub mod preauth_hash;
@@ -11,6 +12,7 @@ use crate::lease::{LeaseBreakEvent, LeaseSlot};
 use crate::session::ChannelMessageHandler;
 use crate::sync_helpers::*;
 use crate::{Error, crypto, msg_handler::*, session::Session};
+use actor::{ConnectionActor, ConnectionActorHandle};
 use binrw::prelude::*;
 pub use config::*;
 use connection_info::{ConnectionInfo, NegotiatedProperties};
@@ -450,8 +452,7 @@ impl Connection {
             }
 
             // Enable notifications by client config + build config.
-            if !self.config.disable_notifications
-                && supported_dialects.contains(&Dialect::Smb0311)
+            if !self.config.disable_notifications && supported_dialects.contains(&Dialect::Smb0311)
             {
                 capabilities.set_notifications(true);
             }
@@ -814,6 +815,17 @@ pub(crate) struct ConnectionMessageHandler {
     /// holder drops *and* the slot is tombstoned. The actual `Close`
     /// packet is deferred until destruction.
     lease_table: Mutex<HashMap<String, Arc<LeaseSlot>>>,
+
+    /// Handle to the per-connection state actor (S7).
+    ///
+    /// T1 scaffolding: the actor task is spawned and the handle is
+    /// stored here, but no caller routes through it yet — `sessions`
+    /// / `lease_table` above remain authoritative. T2 will migrate
+    /// each caller from the mutex fields to this handle, dropping the
+    /// mutex field in the same commit. See `actor.rs` module doc for
+    /// the full migration plan.
+    #[allow(dead_code)] // T1
+    actor: ConnectionActorHandle,
 }
 
 impl ConnectionMessageHandler {
@@ -832,6 +844,7 @@ impl ConnectionMessageHandler {
             sessions: Mutex::new(HashMap::with_capacity(1)),
             lease_event_tx,
             lease_table: Mutex::new(HashMap::new()),
+            actor: ConnectionActor::spawn(),
         }
     }
 
