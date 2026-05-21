@@ -231,21 +231,6 @@ async fn iterate_dir_items(
     Ok(())
 }
 
-#[sync_impl]
-fn iterate_dir_items(
-    item: &IteratedItem,
-    pattern: &str,
-    subdirs: &mut VecDeque<IteratedItem>,
-    params: &IterateParams<'_>,
-) -> smb::Result<()> {
-    for info in Directory::query::<DirectoryInfoQueryType>(&item.dir, pattern)? {
-        if let Some(to_push) = handle_iteration_item(&info?, &item.path, params) {
-            subdirs.push_back(to_push);
-        }
-    }
-    Ok(())
-}
-
 #[maybe_async]
 async fn handle_iteration_item(
     info: &DirectoryInfoQueryType,

@@ -145,45 +145,6 @@ async fn delete_many_files(share_path: &'static str, rng_numbers: &[u32]) -> smb
     Ok(())
 }
 
-// The same as above, but with threads:
-#[maybe_async::sync_impl]
-fn delete_many_files(share_path: &'static str, rng_numbers: &[u32]) -> smb::Result<()> {
-    // for each number, iterate and call delete_from_another_connection. Wait for all at the end.
-    use std::sync::mpsc;
-    use std::thread;
-    let (tx, rx) = mpsc::channel();
-    // Connect the client:
-    let (client, share_path) = make_server_connection(
-        share_path,
-        ConnectionConfig {
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        }
-        .into(),
-    )
-    .unwrap();
-    let client = Arc::new(client);
-    for &i in rng_numbers {
-        let share_path = share_path.clone();
-        let client = client.clone();
-        let tx = tx.clone();
-        thread::spawn(move || {
-            delete_file_from_another_connection(
-                client,
-                share_path,
-                &format!("{}_{i}.txt", NEW_FILE_NAME_UNDER_WORKDIR_PREFIX),
-            )
-            .unwrap();
-            tx.send(()).unwrap();
-        });
-    }
-    // Wait for all threads to finish:
-    for _ in rng_numbers {
-        rx.recv().unwrap();
-    }
-    Ok(())
-}
-
 #[maybe_async::async_impl]
 fn legacy_watch(sem: Arc<Semaphore>, r: Directory) {
     tokio::spawn(async move {
@@ -194,17 +155,6 @@ fn legacy_watch(sem: Arc<Semaphore>, r: Directory) {
         }
     });
 }
-#[maybe_async::sync_impl]
-fn legacy_watch(sem: Arc<Semaphore>, r: Directory) {
-    std::thread::spawn(move || {
-        loop {
-            for notification in r.watch(NotifyFilter::all(), true).unwrap() {
-                on_notification(sem.clone(), notification);
-            }
-        }
-    });
-}
-
 #[maybe_async::async_impl]
 fn stream_iter_watch(sem: Arc<Semaphore>, r: Directory) {
     use futures_util::TryStreamExt;
@@ -225,17 +175,6 @@ fn stream_iter_watch(sem: Arc<Semaphore>, r: Directory) {
         r.close().await.unwrap();
     });
 }
-#[maybe_async::sync_impl]
-fn stream_iter_watch(sem: Arc<Semaphore>, r: Directory) {
-    std::thread::spawn(move || {
-        let r = Arc::new(r);
-        for notification in Directory::watch_stream(&r, NotifyFilter::all(), true).unwrap() {
-            on_notification(sem.clone(), notification.unwrap());
-        }
-        r.close().unwrap();
-    });
-}
-
 fn on_notification(sem: Arc<Semaphore>, notification: FileNotifyInformation) {
     if notification.action == NotifyAction::Removed {
         sem.add_permits(1);
