@@ -12,10 +12,7 @@ use serial_test::serial;
 /// For example, you cannot run this test from outside of a docker container against a samba container,
 /// since the transport is routed through a virtual interface (that we usually bind to localhost:445 on the host).
 /// meanwhile, the server detects interfaces with IP addresses in the docker network range.
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "multi_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[serial]
 async fn test_multichannel_connection() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = default_connection_config();

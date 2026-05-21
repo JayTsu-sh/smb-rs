@@ -4,7 +4,6 @@ use crate::Error;
 use crate::connection::AuthMethodsConfig;
 use crate::connection::connection_info::ConnectionInfo;
 use crate::session::gss::GssState;
-use maybe_async::*;
 use sspi::{
     AcquireCredentialsHandleResult, AuthIdentity, BufferType, ClientRequestFlags, CredentialUse,
     DataRepresentation, InitializeSecurityContextResult, Negotiate, SecurityBuffer, Sspi,
@@ -73,7 +72,7 @@ impl Authenticator {
     /// adds the `Send` bound to the network client, which is required for our async code.
     ///
     /// See [<https://github.com/Devolutions/sspi-rs/issues/526>] for more details.
-    #[cfg(all(feature = "kerberos", feature = "async"))]
+    #[cfg(feature = "kerberos")]
     async fn _resolve_with_async_client(
         generator: &mut sspi::generator::GeneratorInitSecurityContext<'_>, // Generator returned from `sspi-rs`.
         network_client: &mut super::sspi_network_client::ReqwestNetworkClient, // Your custom network client.
@@ -104,7 +103,6 @@ impl Authenticator {
     }
 }
 
-#[maybe_async(AFIT)]
 impl GssState for Authenticator {
     fn user_name(&self) -> &Username {
         &self.user_name
@@ -166,18 +164,8 @@ impl GssState for Authenticator {
             #[cfg(feature = "kerberos")]
             {
                 use super::sspi_network_client::ReqwestNetworkClient;
-                #[cfg(feature = "async")]
-                {
-                    Self::_resolve_with_async_client(
-                        &mut generator,
-                        &mut ReqwestNetworkClient::new(),
-                    )
+                Self::_resolve_with_async_client(&mut generator, &mut ReqwestNetworkClient::new())
                     .await?
-                }
-                #[cfg(not(feature = "async"))]
-                {
-                    generator.resolve_with_client(&ReqwestNetworkClient {})?
-                }
             }
             #[cfg(not(feature = "kerberos"))]
             {

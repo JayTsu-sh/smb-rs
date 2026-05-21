@@ -1,19 +1,12 @@
 use crate::{Cli, path::*};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use maybe_async::*;
 use smb::sync_helpers::*;
 use smb::{Client, CreateOptions, FileAccessMask, FileAttributes, resource::*};
 use std::collections::HashMap;
 use std::error::Error;
-#[cfg(not(feature = "async"))]
-use std::fs;
-#[cfg(not(feature = "single_threaded"))]
 use std::sync::Arc;
-#[cfg(feature = "multi_threaded")]
-use std::thread::sleep;
 
-#[cfg(feature = "async")]
 use tokio::{fs, time::sleep};
 
 #[derive(Parser, Debug)]
@@ -39,7 +32,6 @@ struct CopyFile {
 }
 
 impl CopyFile {
-    #[maybe_async]
     async fn open(
         path: &Path,
         client: &Client,
@@ -91,8 +83,6 @@ impl CopyFile {
         })
     }
 
-    #[cfg(not(feature = "single_threaded"))]
-    #[maybe_async]
     async fn _get_channel_to_jobs_map(
         &self,
         to: &CopyFile,
@@ -136,17 +126,6 @@ impl CopyFile {
         Ok(channels)
     }
 
-    #[cfg(feature = "single_threaded")]
-    fn _get_channel_to_jobs_map(
-        &self,
-        _to: &CopyFile,
-        _client: &Client,
-    ) -> smb::Result<HashMap<Option<u32>, usize>> {
-        // Well, it's ignored anyway. We keep it just to be consistent.
-        Ok(HashMap::from([(None, 1)]))
-    }
-
-    #[maybe_async]
     async fn copy_to(self, to: CopyFile, client: &Client) -> Result<(), smb::Error> {
         use CopyFileValue::*;
 
@@ -176,8 +155,6 @@ impl CopyFile {
         Ok(())
     }
 
-    #[maybe_async]
-    #[cfg(not(feature = "single_threaded"))]
     pub async fn do_copy<
         F: ReadAtChannel + GetLen + Send + Sync + 'static,
         T: WriteAtChannel + SetLen + Send + Sync + 'static,
@@ -191,47 +168,16 @@ impl CopyFile {
         let progress_handle = Self::progress(state.clone());
         start_parallel_copy(from, to, state).await?;
 
-        #[cfg(feature = "async")]
         progress_handle.await.unwrap();
-        #[cfg(not(feature = "async"))]
-        progress_handle.join().unwrap();
         Ok(())
     }
 
-    /// Single-threaded copy implementation.
-    #[cfg(feature = "single_threaded")]
-    pub fn do_copy<F: ReadAtChannel + GetLen, T: WriteAtChannel + SetLen>(
-        from: F,
-        to: T,
-        _channels: HashMap<Option<u32>, usize>,
-    ) -> smb::Result<()> {
-        let progress = Self::make_progress_bar(from.get_len()?);
-        block_copy_progress(
-            from,
-            to,
-            Some(&move |current| {
-                progress.set_position(current);
-            }),
-        )
-    }
-
     /// Async progress bar task starter.
-    #[cfg(feature = "async")]
     fn progress(state: Arc<CopyState>) -> tokio::task::JoinHandle<()> {
         tokio::task::spawn(async move { Self::progress_loop(state).await })
     }
 
-    /// Thread progress bar task starter.
-    #[cfg(feature = "multi_threaded")]
-    fn progress(state: Arc<CopyState>) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
-            Self::progress_loop(state);
-        })
-    }
-
     /// Thread/task entrypoint for measuring and displaying copy progress.
-    #[cfg(not(feature = "single_threaded"))]
-    #[maybe_async]
     async fn progress_loop(state: Arc<CopyState>) {
         let progress_bar = Self::make_progress_bar(state.total_size());
         loop {
@@ -254,7 +200,6 @@ impl CopyFile {
     }
 }
 
-#[maybe_async]
 pub async fn copy(cmd: &CopyCmd, cli: &Cli) -> Result<(), Box<dyn Error>> {
     if matches!(cmd.from, Path::Local(_)) && matches!(cmd.to, Path::Local(_)) {
         return Err("Copying between two local files is not supported. Use `cp` or `copy` shell commands instead :)".into());

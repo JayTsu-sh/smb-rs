@@ -26,13 +26,12 @@ binrw = { workspace = true }
 modular-bitfield = { workspace = true }
 
 # Async
-tokio = { workspace = true, features = ["time", "rt"], optional = true }
-futures = { workspace = true, optional = true }
-futures-core = { workspace = true, optional = true }
-futures-util = { workspace = true, optional = true }
-tokio-util = { workspace = true, optional = true }
-tokio-stream = { workspace = true, optional = true }
-maybe-async = { workspace = true }
+tokio = { workspace = true, features = ["time", "rt"] }
+futures = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
 
 # General utils
 rand = { workspace = true }
@@ -77,26 +76,7 @@ temp-env = { version = "0.3.6", features = ["async_closure"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 
 [features]
-default = ["sign", "encrypt", "compress", "async", "std-fs-impls", "netbios-transport"]
-
-# Threading models
-async = [
-    "dep:tokio",
-    "dep:futures-core",
-    "dep:futures",
-    "dep:tokio-util",
-    "dep:tokio-stream",
-    "dep:futures-util",
-    "smb-transport/async",
-]
-multi_threaded = ["__is_sync"]
-single_threaded = ["__is_sync"]
-__is_sync = [
-    "maybe-async/is_sync",
-    "smb-rpc/is_sync",
-    "reqwest?/blocking",
-    "smb-transport/is_sync",
-]
+default = ["sign", "encrypt", "compress", "std-fs-impls", "netbios-transport"]
 
 # Compression
 compress_pattern_v1 = []
@@ -128,7 +108,7 @@ netbios-transport = ["smb-transport/netbios-transport"]
 kerberos = ["reqwest", "dep:byteorder"]
 
 # Implement traits for std::fs::File/tokio::fs::File
-std-fs-impls = ["tokio?/fs"]
+std-fs-impls = ["tokio/fs"]
 
 # Estooric use cases
 ksmbd-multichannel-compat = []
@@ -150,5 +130,5 @@ test-quic = []
 test-rdma = []
 
 [package.metadata.docs.rs]
-features = ["async", "sign", "encrypt", "compress", "kerberos", "quic"]
+features = ["sign", "encrypt", "compress", "kerberos", "quic"]
 no-default-features = true

@@ -2,20 +2,10 @@ use std::error::Error;
 use std::io::IsTerminal;
 
 use clap::Parser;
-use maybe_async::*;
 use smb_cli::*;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
-#[cfg(not(feature = "async"))]
-fn main() -> Result<(), Box<dyn Error>> {
-    _main().map_err(|e| {
-        tracing::error!("Error: {e}");
-        e
-    })
-}
-
-#[cfg(feature = "async")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     _main().await.map_err(|e| {
@@ -24,7 +14,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     })
 }
 
-#[maybe_async]
 async fn _main() -> Result<(), Box<dyn Error>> {
     // Default to info; honor RUST_LOG. tracing-log feature captures records from log-based crates.
     let filter = EnvFilter::builder()

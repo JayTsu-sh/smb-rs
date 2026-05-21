@@ -1,4 +1,3 @@
-use maybe_async::*;
 use smb_transport::{IoVec, SmbTransport};
 use std::{sync::Arc, time::Duration};
 
@@ -6,8 +5,7 @@ use crate::msg_handler::IncomingMessage;
 
 use super::base::ParallelWorker;
 
-#[maybe_async(AFIT)]
-#[allow(async_fn_in_trait)] // for maybe_async.
+#[allow(async_fn_in_trait)]
 pub trait MultiWorkerBackend {
     type SendMessage;
     type AwaitingNotifier;

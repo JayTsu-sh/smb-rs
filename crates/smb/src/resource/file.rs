@@ -1,8 +1,6 @@
 use super::file_util::*;
 use super::*;
 use bytes::Bytes;
-#[cfg(not(feature = "async"))]
-use std::io::prelude::*;
 use std::ops::{Deref, DerefMut};
 
 /// An opened file on the server.
@@ -24,24 +22,14 @@ pub struct File {
     // still go through [`File::handle()`].
     pub(crate) handle: ResourceHandle,
 
-    #[cfg(not(feature = "async"))]
-    pos: u64,
-    #[cfg(not(feature = "async"))]
-    dirty: bool,
-
     end_of_file: u64,
 }
 
-#[maybe_async(AFIT)]
 impl File {
     pub fn new(handle: ResourceHandle, end_of_file: u64) -> Self {
         File {
             handle,
             end_of_file,
-            #[cfg(not(feature = "async"))]
-            pos: 0,
-            #[cfg(not(feature = "async"))]
-            dirty: false,
         }
     }
 
@@ -223,7 +211,6 @@ impl File {
     /// # Note
     /// This method copies the data from `buf`. To avoid this copy,
     /// use [`File::write_block_zc`] with a pre-existing `Bytes` buffer.
-    #[maybe_async]
     #[inline]
     pub async fn write_block(
         &self,
@@ -378,77 +365,7 @@ impl File {
     }
 }
 
-// Despite being available, seeking means nothing here,
-// since it may only be used when calling read/write from the std::io traits.
-#[cfg(not(feature = "async"))]
-impl Seek for File {
-    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        let next_pos = match pos {
-            std::io::SeekFrom::Start(pos) => pos,
-            std::io::SeekFrom::End(pos) => {
-                let pos = self.end_of_file as i64 + pos;
-                if pos < 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "Invalid seek position",
-                    ));
-                }
-                pos.try_into().map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid seek position")
-                })?
-            }
-            std::io::SeekFrom::Current(pos) => {
-                let pos = self.pos as i64 + pos;
-                if pos < 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "Invalid seek position",
-                    ));
-                }
-                pos.try_into().map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid seek position")
-                })?
-            }
-        };
-        if next_pos > self.end_of_file {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Invalid seek position",
-            ));
-        }
-        Ok(self.pos)
-    }
-}
-
-#[cfg(not(feature = "async"))]
-impl Read for File {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let read_length = File::read_block(self, buf, self.pos, None, false)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        self.pos += read_length as u64;
-        Ok(read_length)
-    }
-}
-
-#[cfg(not(feature = "async"))]
-impl Write for File {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let written_length = File::write_block(self, buf, self.pos, None)?;
-        self.pos += written_length as u64;
-        self.dirty = true;
-        Ok(written_length)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        if !self.dirty {
-            return Ok(());
-        }
-        File::flush(self)
-    }
-}
-
 impl ReadAtChannel for File {
-    #[maybe_async]
     async fn read_at_channel(
         &self,
         buf: &mut [u8],
@@ -462,7 +379,6 @@ impl ReadAtChannel for File {
 }
 
 impl WriteAtChannel for File {
-    #[maybe_async]
     async fn write_at_channel(
         &self,
         buf: &[u8],
@@ -476,14 +392,12 @@ impl WriteAtChannel for File {
 }
 
 impl GetLen for File {
-    #[maybe_async]
     async fn get_len(&self) -> crate::Result<u64> {
         Ok(self.end_of_file)
     }
 }
 
 impl SetLen for File {
-    #[maybe_async]
     async fn set_len(&self, len: u64) -> crate::Result<()> {
         self.set_info(FileEndOfFileInformation { end_of_file: len })
             .await

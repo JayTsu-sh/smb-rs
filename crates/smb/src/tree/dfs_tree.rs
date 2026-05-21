@@ -1,7 +1,6 @@
 use std::ops::Deref;
 
 use crate::msg_handler::{MessageHandler, ReceiveOptions};
-use maybe_async::*;
 use smb_msg::{FileId, FsctlCodes, IoctlReqData, IoctlRequest, IoctlRequestFlags, dfsc::*};
 
 use super::Tree;
@@ -24,7 +23,6 @@ impl<'a> DfsRootTreeRef<'a> {
     /// This is used to get the referral information for a given path.
     ///
     /// See [MS-DFSC](<https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dfsc/04657125-a7d5-4c62-9bec-85af601fa14c>) for more information.
-    #[maybe_async]
     pub async fn dfs_get_referrals(&self, path: &str) -> crate::Result<RespGetDfsReferral> {
         let res = self
             .handler

@@ -4,11 +4,9 @@ use super::msg::*;
 use crate::{TcpTransport, TransportError, traits::*};
 
 use binrw::{BinRead, BinWrite};
-#[cfg(feature = "async")]
 use futures_core::future::BoxFuture;
-#[cfg(feature = "async")]
 use futures_util::FutureExt;
-use maybe_async::*;
+
 pub struct NetBiosTransport {
     tcp: Box<dyn SmbTransport>,
 }
@@ -22,7 +20,6 @@ impl NetBiosTransport {
     }
 
     /// Starts the underlying TCP connection, and sends NetBIOS session request and expects a session response.
-    #[maybe_async]
     #[tracing::instrument(level = "debug", skip_all, fields(server = %server_name, addr = %address))]
     async fn do_connect(&mut self, server_name: &str, address: SocketAddr) -> Result<()> {
         tracing::debug!("Connecting to NetBIOS Session services TCP...");
@@ -35,7 +32,6 @@ impl NetBiosTransport {
         Ok(())
     }
 
-    #[maybe_async]
     async fn netbios_session_setup(&mut self) -> Result<()> {
         let session_request = NBSessionRequest {
             called_name: NetBiosName::new("*SMBSERVER".to_string(), 0x20),
@@ -78,7 +74,6 @@ impl NetBiosTransport {
         Ok(())
     }
 
-    #[maybe_async]
     async fn netbios_receive_header(&mut self) -> Result<NBSSPacketHeader> {
         let mut header = [0u8; NBSSPacketHeader::SIZE];
         self.tcp.receive_exact(&mut header).await?;
@@ -89,18 +84,12 @@ impl NetBiosTransport {
 }
 
 impl SmbTransport for NetBiosTransport {
-    #[cfg(feature = "async")]
     fn connect<'a>(
         &'a mut self,
         server_name: &'a str,
         address: SocketAddr,
-    ) -> futures_core::future::BoxFuture<'a, Result<()>> {
+    ) -> BoxFuture<'a, Result<()>> {
         self.do_connect(server_name, address).boxed()
-    }
-
-    #[cfg(not(feature = "async"))]
-    fn connect(&mut self, server_name: &str, address: SocketAddr) -> Result<()> {
-        self.do_connect(server_name, address)
     }
 
     fn default_port(&self) -> u16 {
@@ -121,27 +110,12 @@ impl SmbTransport for NetBiosTransport {
 }
 
 impl SmbTransportRead for NetBiosTransport {
-    #[cfg(feature = "async")]
     fn receive_exact<'a>(&'a mut self, out_buf: &'a mut [u8]) -> BoxFuture<'a, Result<()>> {
         self.tcp.receive_exact(out_buf)
     }
-    #[cfg(not(feature = "async"))]
-    fn receive_exact(&mut self, out_buf: &mut [u8]) -> Result<()> {
-        self.tcp.receive_exact(out_buf)
-    }
-
-    #[cfg(not(feature = "async"))]
-    fn set_read_timeout(&self, timeout: std::time::Duration) -> Result<()> {
-        self.tcp.set_read_timeout(timeout)
-    }
 }
 impl SmbTransportWrite for NetBiosTransport {
-    #[cfg(feature = "async")]
     fn send_raw<'a>(&'a mut self, buf: &'a [u8]) -> BoxFuture<'a, Result<()>> {
-        self.tcp.send_raw(buf)
-    }
-    #[cfg(not(feature = "async"))]
-    fn send_raw(&mut self, buf: &[u8]) -> Result<()> {
         self.tcp.send_raw(buf)
     }
 }

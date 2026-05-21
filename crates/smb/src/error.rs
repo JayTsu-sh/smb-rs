@@ -128,17 +128,10 @@ pub enum Error {
     OperationTimeout(TimedOutTask, std::time::Duration),
     #[error("Lock error.")]
     LockError,
-    #[cfg(feature = "async")]
     #[error("Task join error.")]
     JoinError(#[from] tokio::task::JoinError),
     #[error("Acquire Error: {0}")]
     AcquireError(#[from] AcquireError),
-    #[cfg(not(feature = "async"))]
-    #[error("Thread join error: {0}")]
-    JoinError(String),
-    #[cfg(not(feature = "async"))]
-    #[error("Channel recv error.")]
-    ChannelRecvError(#[from] std::sync::mpsc::RecvError),
     #[error("Unexpected message with ID {0} (exp {1}).")]
     UnexpectedMessageId(u64, u64),
     #[error("Invalid configuration: {0}")]

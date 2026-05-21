@@ -17,15 +17,10 @@ smb-msg = { workspace = true, optional = true }
 
 bytes = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true, features = [
-    "net",
-    "macros",
-    "io-util",
-    "time",
-], optional = true }
-tokio-util = { workspace = true, optional = true }
-futures-core = { workspace = true, optional = true }
-futures-util = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["net", "macros", "io-util", "time"] }
+tokio-util = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
 
 # QUIC
 quinn = { workspace = true, optional = true }
@@ -42,16 +37,13 @@ binrw = { workspace = true }
 modular-bitfield = { workspace = true }
 time = { workspace = true }
 pastey = { workspace = true }
-maybe-async = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 smb-tests = { workspace = true }
 
 [features]
-default = ["async", "netbios-transport"]
-async = ["tokio", "tokio-util", "futures-core", "futures-util"]
-is_sync = ["maybe-async/is_sync"]
+default = ["netbios-transport"]
 
 netbios-transport = []
 quic = ["dep:quinn", "dep:rustls", "dep:rustls-platform-verifier"]

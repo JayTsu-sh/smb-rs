@@ -56,7 +56,6 @@ where
     kind: SetupKind,
 }
 
-#[maybe_async]
 impl<'a> SessionSetup<'a, Authenticator> {
     /// sspi-backed convenience over [`Self::with_gss`].
     pub async fn new(
@@ -80,7 +79,6 @@ impl<'a> SessionSetup<'a, Authenticator> {
     }
 }
 
-#[maybe_async]
 impl<'a, G> SessionSetup<'a, G>
 where
     G: GssState,
@@ -114,7 +112,7 @@ where
         };
 
         if let Some(primary_session) = primary_session {
-            let primary_session = primary_session.read().await?;
+            let primary_session = primary_session.read().await;
 
             let session = primary_session.session.clone();
 
@@ -132,7 +130,7 @@ where
                 .as_ref()
                 .expect("Should have been set up by set_session()")
                 .write()
-                .await?
+                .await
                 .channel = Some(channel);
         }
 
@@ -265,10 +263,7 @@ where
     /// session_id. Only called on the first response and only for new
     /// sessions; bind flows must have been constructed with a
     /// `primary_session` (asserted in the constructor).
-    async fn init_session(
-        &self,
-        session_id: u64,
-    ) -> crate::Result<Arc<RwLock<SessionInfo>>> {
+    async fn init_session(&self, session_id: u64) -> crate::Result<Arc<RwLock<SessionInfo>>> {
         match self.kind {
             SetupKind::New => {
                 let session_info = SessionInfo::new(session_id);
@@ -298,10 +293,10 @@ where
                     Error::InvalidState("Session state must be set before keys exchange".into())
                 })?
                 .read()
-                .await?
+                .await
                 .session
                 .write()
-                .await?
+                .await
                 .setup(&session_key, &preauth_hash, conn_info)?;
         }
         Ok(())
@@ -323,8 +318,8 @@ where
                     Error::InvalidState("Session state must be set on success path".into())
                 })?
                 .read()
-                .await?;
-            let mut session = result.session.write().await?;
+                .await;
+            let mut session = result.session.write().await;
             session.ready(flags, self.conn_info)?;
         }
         Ok(())
@@ -348,8 +343,8 @@ where
 
         if self.kind == SetupKind::New {
             tracing::trace!("Invalidating session before cleanup.");
-            let session_lock = session.read().await?;
-            session_lock.session.write().await?.invalidate();
+            let session_lock = session.read().await;
+            session_lock.session.write().await.invalidate();
         }
 
         self.upstream
@@ -365,7 +360,7 @@ where
     // -------------------------------------------------------------------
 
     async fn set_session(&mut self, session: Arc<RwLock<SessionInfo>>) -> crate::Result<()> {
-        let session_id = session.read().await?.id();
+        let session_id = session.read().await.id();
         let result = SessionAndChannel::new(session_id, session);
         let session = Arc::new(RwLock::new(result));
 
@@ -397,7 +392,7 @@ where
             .with_msg_id_filter(for_msg_id);
 
         let channel_set_up = match self.result.as_ref() {
-            Some(result) => result.read().await?.channel.is_some(),
+            Some(result) => result.read().await.channel.is_some(),
             None => false,
         };
         let skip_security_validation = !is_auth_done && !channel_set_up;
@@ -484,10 +479,7 @@ where
         &mut self,
         mut request: OutgoingMessage,
     ) -> crate::Result<SendMessageResult> {
-        self.upstream
-            .handler
-            .prepare_outgoing(&mut request)
-            .await?;
+        self.upstream.handler.prepare_outgoing(&mut request).await?;
 
         let session_id = self
             .result
@@ -496,7 +488,7 @@ where
                 Error::InvalidState("Session state must be set before the final request".into())
             })?
             .read()
-            .await?
+            .await
             .session_id;
         request.message.header.session_id = session_id;
 
@@ -554,7 +546,7 @@ where
             .as_ref()
             .ok_or_else(|| Error::InvalidState("Session setup result is missing.".to_string()))?
             .write()
-            .await?;
+            .await;
         session_lock.set_channel(
             self.channel
                 .take()

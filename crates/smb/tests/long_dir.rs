@@ -4,7 +4,6 @@ use smb_fscc::*;
 use smb_msg::CreateOptions;
 use std::sync::Arc;
 
-#[cfg(feature = "async")]
 use futures_util::StreamExt;
 mod common;
 use common::TestConstants;
@@ -17,10 +16,7 @@ const NUM_FILES: usize = 100;
 
 /// This test is to check if we can iterate over a long directory
 /// To make sure it works properly, since dealing with streams can be tricky.
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "multi_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[serial] // Run only in a full-feature test, because it takes a while
 async fn test_smb_iterating_long_directory() -> Result<(), Box<dyn std::error::Error>> {
     let (client, share_path) = make_server_connection(
@@ -39,7 +35,6 @@ async fn test_smb_iterating_long_directory() -> Result<(), Box<dyn std::error::E
     client
         .lock()
         .await
-        .unwrap()
         .create_file(
             &long_dir_path,
             &FileCreateArgs::make_create_new(
@@ -55,7 +50,6 @@ async fn test_smb_iterating_long_directory() -> Result<(), Box<dyn std::error::E
         let file = client
             .lock()
             .await
-            .unwrap()
             .create_file(
                 &share_path.clone().with_path(&file_name),
                 &FileCreateArgs::make_create_new(Default::default(), Default::default()),
@@ -69,7 +63,6 @@ async fn test_smb_iterating_long_directory() -> Result<(), Box<dyn std::error::E
     let directory = client
         .lock()
         .await
-        .unwrap()
         .create_file(
             &long_dir_path,
             &FileCreateArgs::make_open_existing(
@@ -104,7 +97,6 @@ async fn test_smb_iterating_long_directory() -> Result<(), Box<dyn std::error::E
             let file = client
                 .lock()
                 .await
-                .unwrap()
                 .create_file(
                     &full_file_path,
                     &FileCreateArgs::make_open_existing(
@@ -134,7 +126,6 @@ async fn test_smb_iterating_long_directory() -> Result<(), Box<dyn std::error::E
     let directory = client
         .lock()
         .await
-        .unwrap()
         .create_file(
             &long_dir_path,
             &FileCreateArgs::make_open_existing(FileAccessMask::new().with_delete(true)),
@@ -152,7 +143,6 @@ async fn test_smb_iterating_long_directory() -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-#[maybe_async::maybe_async]
 pub async fn remove_file_by_name(tree: &Tree, file_name: &str) -> smb::Result<()> {
     let file = tree
         .open_existing(

@@ -2,7 +2,6 @@ use super::ResourceHandle;
 use crate::Error;
 use crate::msg_handler::{MessageHandler, ReceiveOptions};
 use crate::sync_helpers::*;
-use maybe_async::*;
 use smb_fscc::*;
 use smb_msg::*;
 use std::ops::{Deref, DerefMut};
@@ -21,7 +20,6 @@ pub struct Directory {
     query_lock: Mutex<()>,
 }
 
-#[maybe_async(AFIT)]
 impl Directory {
     pub fn new(handle: ResourceHandle) -> Self {
         let access: DirAccessMask = handle.access.into();
@@ -124,7 +122,6 @@ impl Directory {
     ///   create a new instance of this structure to query the directory again.
     /// * You must use [`futures_util::StreamExt`] to consume the stream.
     ///   See (<https://tokio.rs/tokio/tutorial/streams>) for more information on how to use streams.
-    #[cfg(feature = "async")]
     pub fn query<'a, T>(
         this: &'a Arc<Self>,
         pattern: &str,
@@ -153,7 +150,6 @@ impl Directory {
     ///   See [<https://tokio.rs/tokio/tutorial/streams>] for more information on how to use streams.
     /// * The actual buffer size that may be used depends on the negotiated transact size given by the server.
     ///   In case of `buffer_size` > `max_transact_size`, the function would use the minimum, and log a warning.
-    #[cfg(feature = "async")]
     pub async fn query_with_options<'a, T>(
         this: &'a Arc<Self>,
         pattern: &str,
@@ -173,47 +169,6 @@ impl Directory {
         let buffer_size = buffer_size.min(max_allowed_buffer_size);
 
         iter_stream::QueryDirectoryStream::new(this, pattern.to_string(), buffer_size).await
-    }
-
-    /// Synchronously iterates over the directory contents, using the provided pattern and information type.
-    /// # Arguments
-    /// * `pattern` - The pattern to match against the file names in the directory. Use wildcards like `*` and `?` to match multiple files.
-    /// # Returns
-    /// * An iterator over the directory contents, yielding [`QueryDirectoryInfoValue`] objects.
-    /// # Notes
-    /// * **IMPORTANT**: Calling this method BLOCKS ANY ADDITIONAL CALLS to this method on THIS structure instance.
-    ///   Hence, you should not call this method on the same instance from multiple threads. This is for safety,
-    ///   since SMB2 does not allow multiple queries on the same handle at the same time.
-    #[cfg(not(feature = "async"))]
-    pub fn query<'a, T>(
-        &'a self,
-        pattern: &str,
-    ) -> crate::Result<iter_sync::QueryDirectoryIterator<'a, T>>
-    where
-        T: QueryDirectoryInfoValue,
-    {
-        Self::query_with_options(self, pattern, Self::QUERY_DIRECTORY_DEFAULT_BUFFER_SIZE)
-    }
-
-    /// Synchronously iterates over the directory contents, using the provided pattern and information type.
-    /// # Arguments
-    /// * `pattern` - The pattern to match against the file names in the directory. Use wildcards like `*` and `?` to match multiple files.
-    /// # Returns
-    /// * An iterator over the directory contents, yielding [`QueryDirectoryInfoValue`] objects.
-    /// # Notes
-    /// * **IMPORTANT**: Calling this method BLOCKS ANY ADDITIONAL CALLS to this method on THIS structure instance.
-    ///   Hence, you should not call this method on the same instance from multiple threads. This is for safety,
-    ///   since SMB2 does not allow multiple queries on the same handle at the same time.
-    #[cfg(not(feature = "async"))]
-    pub fn query_with_options<'a, T>(
-        &'a self,
-        pattern: &str,
-        buffer_size: u32,
-    ) -> crate::Result<iter_sync::QueryDirectoryIterator<'a, T>>
-    where
-        T: QueryDirectoryInfoValue,
-    {
-        iter_sync::QueryDirectoryIterator::new(self, pattern, buffer_size)
     }
 
     /// Watches the directory for changes.
@@ -259,7 +214,6 @@ impl Directory {
         .into()
     }
 
-    #[cfg(feature = "async")]
     /// Watches the directory for changes, returning a [`Stream`][`futures_core::Stream`] of notifications.
     ///
     /// * See [`watch_stream_cancellable`][Self::watch_stream_cancellable] for a version that supports cancellation,
@@ -281,7 +235,6 @@ impl Directory {
         Self::watch_stream_cancellable(this, filter, recursive, Default::default())
     }
 
-    #[cfg(feature = "async")]
     pub fn watch_stream_cancellable(
         this: &Arc<Self>,
         filter: NotifyFilter,
@@ -408,52 +361,13 @@ impl Directory {
         Ok(ReceiverStream::new(receiver))
     }
 
-    // TODO: Doc
-
-    #[cfg(feature = "multi_threaded")]
-    pub fn watch_stream(
-        this: &Arc<Self>,
-        filter: NotifyFilter,
-        recursive: bool,
-    ) -> crate::Result<
-        impl Iterator<Item = crate::Result<FileNotifyInformation>> + NotifyDirectoryIteratorCancellable,
-    > {
-        let cancel_handle = NotifyDirectoryIteratorCanceller::new(this);
-        iter_mtd::NotifyDirectoryIterator::new(cancel_handle, filter, recursive)
-    }
-
-    /// Returns an iterator that watches the directory for changes.
-    #[cfg(feature = "single_threaded")]
-    pub fn watch_stream(
-        this: &Arc<Self>,
-        filter: NotifyFilter,
-        recursive: bool,
-    ) -> crate::Result<impl Iterator<Item = crate::Result<FileNotifyInformation>> + '_> {
-        // Simply watch in loop and chain the results.
-        let veci = std::iter::from_fn(move || {
-            match this
-                ._watch_options(filter, recursive, ReceiveOptions::default())
-                .into()
-            {
-                Ok(result) => Some(Ok(result)),
-                Err(e) => Some(Err(e)),
-            }
-        })
-        // Flatten the results into a single item iterator
-        .flat_map(|result| match result {
-            Ok(vec) => vec.into_iter().map(Ok).collect::<Vec<_>>().into_iter(),
-            Err(e) => vec![Err(e)].into_iter(),
-        });
-        Ok(veci)
-    }
-
     /// (Internal) Watches the directory for changes, with an optional timeout.
     ///
     /// This method accepts the `ReceiveOptions` struct, allowing more fine-tuned control over the receive operation.
     /// It uses:
     /// * `timeout` - to set the timeout for the receive operation.
     /// * `async_msg_ids` - to allow async notifications.
-    /// * `async_cancel` - to allow cancellation of the receive operation, when crate feature `async` is enabled.
+    /// * `async_cancel` - to allow cancellation of the receive operation.
     async fn _watch_options(
         &self,
         filter: NotifyFilter,
@@ -485,7 +399,6 @@ impl Directory {
                 .into(),
                 ReceiveOptions {
                     allow_async: true,
-                    #[cfg(feature = "async")]
                     async_cancel: options.async_cancel,
                     async_msg_ids: options.async_msg_ids,
                     timeout: options.timeout,
@@ -579,20 +492,6 @@ impl Directory {
             .as_quota()?
             .into())
     }
-
-    /// Sets the quota information for the current file.
-    /// # Arguments
-    /// * `info` - The information to set - a vector of [`FileQuotaInformation`].
-    pub async fn set_quota_info(&self, info: Vec<FileQuotaInformation>) -> crate::Result<()> {
-        let info = ChainedItemList::from(info);
-        self.handle
-            .set_info_common(
-                info,
-                SetInfoClass::Quota(Default::default()),
-                Default::default(),
-            )
-            .await
-    }
 }
 
 /// Single result from a directory watch operation.
@@ -648,7 +547,6 @@ impl DerefMut for Directory {
     }
 }
 
-#[cfg(feature = "async")]
 pub mod iter_stream {
     use super::*;
     use futures_core::Stream;
@@ -695,7 +593,7 @@ pub mod iter_stream {
                     .await;
                 });
             }
-            let guard = directory.query_lock.lock().await?;
+            let guard = directory.query_lock.lock().await;
             Ok(Self {
                 receiver,
                 notify_fetch_next,
@@ -764,284 +662,3 @@ pub mod iter_stream {
         }
     }
 }
-
-#[cfg(not(feature = "async"))]
-pub mod iter_sync {
-
-    use super::*;
-    pub struct QueryDirectoryIterator<'a, T>
-    where
-        T: QueryDirectoryInfoValue,
-    {
-        /// Results from last call to [`Directory::send_query`], that were not yet consumed.
-        /// Uses VecDeque for O(1) pop_front instead of Vec::remove(0) which is O(n).
-        backlog: std::collections::VecDeque<T>,
-        /// The directory to query.
-        directory: &'a Directory,
-        /// The pattern to match against the file names in the directory.
-        pattern: &'a str,
-        /// Whether this is the first query or not.
-        is_first: bool,
-        /// The buffer size to use for each query.
-        buffer_size: u32,
-
-        /// The lock being held while iterating the directory.
-        _iter_lock_guard: MutexGuard<'a, ()>,
-    }
-
-    impl<'a, T> QueryDirectoryIterator<'a, T>
-    where
-        T: QueryDirectoryInfoValue,
-    {
-        pub fn new(
-            directory: &'a Directory,
-            pattern: &'a str,
-            buffer_size: u32,
-        ) -> crate::Result<Self> {
-            Ok(Self {
-                backlog: std::collections::VecDeque::new(),
-                directory,
-                pattern,
-                is_first: true,
-                buffer_size,
-                _iter_lock_guard: directory.query_lock.lock()?,
-            })
-        }
-    }
-
-    impl<'a, T> Iterator for QueryDirectoryIterator<'a, T>
-    where
-        T: QueryDirectoryInfoValue + for<'b> binrw::prelude::BinWrite<Args<'b> = ()>,
-    {
-        type Item = crate::Result<T>;
-
-        fn next(&mut self) -> Option<Self::Item> {
-            // Pop from backlog if we have any results left (O(1) with VecDeque).
-            if let Some(item) = self.backlog.pop_front() {
-                return Some(Ok(item));
-            }
-
-            // If we have no backlog, we need to query the directory again.
-            let query_result =
-                self.directory
-                    .send_query::<T>(&self.pattern, self.is_first, self.buffer_size);
-            self.is_first = false;
-            match query_result {
-                Ok(next_backlog) => {
-                    if next_backlog.is_empty() {
-                        // No more items
-                        None
-                    } else {
-                        // Store the items in the backlog and return the first one.
-                        self.backlog = next_backlog.into();
-                        self.next()
-                    }
-                }
-                Err(e) => {
-                    // Another error occurred, return it.
-                    Some(Err(e))
-                }
-            }
-        }
-    }
-}
-
-#[cfg(feature = "multi_threaded")]
-mod iter_mtd {
-    use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use crate::msg_handler::AsyncMessageIds;
-    /// A helper structure that allows cancelling a [`NotifyDirectoryIterator`].
-    #[derive(Clone)]
-    pub struct NotifyDirectoryIteratorCanceller {
-        /// Dual-purpose flag:
-        /// 1. Indicates to the worker thread that it should stop (by setting to `true`).
-        /// 2. Used by the worker thread to indicate that a cancellation was requested
-        ///    (by setting to `true` when it sends a cancel request) - in the async processing itself (via `ReceiveOptions`).
-        pub(crate) cancel_flag: Arc<AtomicBool>,
-        pub(crate) directory: Arc<Directory>,
-        pub(crate) async_msg_ids: Arc<AsyncMessageIds>,
-
-        cancel_event: Arc<std::sync::Condvar>,
-        cancel_done: Arc<Mutex<bool>>,
-    }
-
-    impl NotifyDirectoryIteratorCanceller {
-        pub(crate) fn new(directory: &Arc<Directory>) -> Self {
-            Self {
-                cancel_flag: Default::default(),
-                directory: directory.clone(),
-                async_msg_ids: Default::default(),
-                cancel_event: Default::default(),
-                cancel_done: Default::default(),
-            }
-        }
-
-        /// Cancels the ongoing watch operation.
-        ///
-        /// This method is non-blocking: it launches a thread to send the cancel request,
-        /// and returns immediately. The actual cancellation may take some time to complete,
-        /// depending on network conditions and server responsiveness.
-        /// Use [`wait_cancelled`] to block until the cancellation is confirmed.
-        pub fn cancel(&self) {
-            self.cancel_flag.store(true, Ordering::Relaxed);
-
-            // Dropping the iterator requests cancellation of the async operation.
-            // the cancel response should arrive to the worker as well.
-            // * if during the wait, we already have the common async_msg_ids set - use it to send cancel request.
-            // * if before sending next request, the flag is checked.
-            let directory = self.directory.clone();
-            let async_msg_ids = self.async_msg_ids.clone();
-            std::thread::spawn(move || {
-                directory
-                    .send_cancel(&async_msg_ids)
-                    .map_err(|e| {
-                        tracing::error!("Error sending cancel request: {e}");
-                        e
-                    })
-                    .ok()
-            });
-        }
-
-        /// Blocks the current thread until the cancellation is confirmed.
-        pub fn wait_cancelled(
-            &self,
-        ) -> std::result::Result<(), std::sync::PoisonError<std::sync::MutexGuard<'_, bool>>>
-        {
-            let _lockguard = self
-                .cancel_event
-                .wait_while(self.cancel_done.lock()?, |done| !*done)?;
-            Ok(())
-        }
-
-        pub(crate) fn notify_cancelled(
-            &self,
-        ) -> std::result::Result<(), std::sync::PoisonError<std::sync::MutexGuard<'_, bool>>>
-        {
-            {
-                let mut done = self.cancel_done.lock()?;
-                if *done {
-                    return Ok(()); // Already notified
-                }
-                *done = true;
-            }
-            self.cancel_event.notify_all();
-            Ok(())
-        }
-    }
-
-    pub trait NotifyDirectoryIteratorCancellable {
-        fn get_canceller(&self) -> &NotifyDirectoryIteratorCanceller;
-    }
-
-    /// Iterator over directory change notifications.
-    ///
-    /// This is needed since cancellation of the async operation is complex on multi-threaded
-    /// environments, and requires a dedicated worker thread to handle the async operation.
-    pub(crate) struct NotifyDirectoryIterator {
-        iterator: <std::sync::mpsc::Receiver<crate::Result<FileNotifyInformation>> as IntoIterator>::IntoIter,
-
-        canceller: NotifyDirectoryIteratorCanceller,
-    }
-
-    impl NotifyDirectoryIterator {
-        pub fn new(
-            canceller: NotifyDirectoryIteratorCanceller,
-            notify_filter: NotifyFilter,
-            recursive: bool,
-        ) -> crate::Result<Self> {
-            let async_msg_ids = canceller.async_msg_ids.clone();
-            let cancel_flag = canceller.cancel_flag.clone();
-
-            let (tx, rx) = std::sync::mpsc::channel();
-
-            // Launch the worker thread that will handle the async notifications.
-            std::thread::spawn({
-                let canceller = canceller.clone();
-                let cancel_flag = cancel_flag.clone();
-                let receive_options = ReceiveOptions::new()
-                    .with_async_msg_ids(async_msg_ids.clone())
-                    .with_cancellation_flag(cancel_flag.clone())
-                    .with_timeout(Duration::MAX);
-                move || {
-                    while !cancel_flag.load(Ordering::Relaxed) {
-                        let watch_result = canceller.directory._watch_options(
-                            notify_filter,
-                            recursive,
-                            receive_options.clone(),
-                        );
-                        receive_options.async_msg_ids.as_ref().unwrap().reset();
-
-                        use DirectoryWatchResult::*;
-                        match watch_result {
-                            Notifications(notifications) => {
-                                for notification in notifications {
-                                    if tx.send(Ok(notification)).is_err() {
-                                        break; // Receiver dropped
-                                    }
-                                }
-                            }
-                            Cancelled => {
-                                // Cancelled by user, exit the loop.
-                                canceller
-                                    .notify_cancelled()
-                                    .map_err(|e| {
-                                        tracing::error!("Error notifying cancellation: {e}");
-                                        e
-                                    })
-                                    .ok();
-                                tracing::debug!("Watch cancelled by user");
-                                break;
-                            }
-                            Cleanup => {
-                                // Server cleaned up the watch, exit the loop.
-                                tracing::debug!("Watch cleaned up by server");
-                                tx.send(Err(crate::Error::Cancelled("watch cleaned up by server")))
-                                    .ok();
-                                break;
-                            }
-                            x => {
-                                let x: crate::Result<_> = x.into();
-                                let x = x.unwrap_err();
-                                tracing::debug!("Error watching directory: {x}");
-                                tx.send(Err(x)).ok();
-                                break; // Exit on error
-                            }
-                        }
-                    }
-                }
-            });
-
-            let iterator = rx.into_iter();
-
-            Ok(Self {
-                iterator,
-                canceller,
-            })
-        }
-    }
-
-    impl Iterator for NotifyDirectoryIterator {
-        type Item = crate::Result<FileNotifyInformation>;
-
-        fn next(&mut self) -> Option<Self::Item> {
-            self.iterator.next()
-        }
-    }
-
-    impl NotifyDirectoryIteratorCancellable for NotifyDirectoryIterator {
-        fn get_canceller(&self) -> &NotifyDirectoryIteratorCanceller {
-            &self.canceller
-        }
-    }
-
-    impl Drop for NotifyDirectoryIterator {
-        fn drop(&mut self) {
-            self.canceller.cancel();
-        }
-    }
-}
-
-#[cfg(feature = "multi_threaded")]
-pub use iter_mtd::{NotifyDirectoryIteratorCancellable, NotifyDirectoryIteratorCanceller};

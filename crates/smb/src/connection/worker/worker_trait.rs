@@ -6,7 +6,6 @@ use crate::{
 };
 use smb_transport::SmbTransport;
 
-use maybe_async::*;
 use smb_msg::Status;
 
 use crate::{
@@ -19,7 +18,6 @@ use crate::{
 /// Each Implementation of this trait is responsible for handling the connection to the server,
 /// sending messages, and redirecting correct messages when received,
 /// if using async, to the correct pending task.
-#[maybe_async(AFIT)]
 #[allow(async_fn_in_trait)]
 pub trait Worker: Sized + std::fmt::Debug {
     /// Instantiates a new connection worker.
@@ -42,7 +40,6 @@ pub trait Worker: Sized + std::fmt::Debug {
     /// * The message received from the server, matching the filters.
     async fn receive_next(&self, options: &ReceiveOptions<'_>) -> crate::Result<IncomingMessage>;
 
-    #[cfg(feature = "async")]
     async fn receive_next_cancellable(
         &self,
         options: &ReceiveOptions<'_>,
@@ -60,25 +57,6 @@ pub trait Worker: Sized + std::fmt::Debug {
                 res
             }
         }
-    }
-
-    #[cfg(not(feature = "async"))]
-    async fn receive_next_cancellable(
-        &self,
-        options: &ReceiveOptions<'_>,
-    ) -> crate::Result<IncomingMessage> {
-        // There's no actual async cancellation, so we do our best effort.
-        // If the request is already running, cancellation must be performed by sending a
-        // cancel message to the server.
-        if options
-            .async_cancel
-            .as_ref()
-            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-        {
-            return Err(Error::Cancelled("receive_next"));
-        }
-
-        self.receive_next(options).await
     }
 
     /// Receive a message from the server.
@@ -162,17 +140,14 @@ pub trait Worker: Sized + std::fmt::Debug {
     /// Get the transformer for this worker.
     fn transformer(&self) -> &Transformer;
 
-    #[maybe_async]
     async fn negotaite_complete(&self, neg: &Arc<ConnectionInfo>) {
         self.transformer().negotiated(neg).await.unwrap();
     }
 
-    #[maybe_async]
     async fn session_started(&self, info: &Arc<RwLock<SessionAndChannel>>) -> crate::Result<()> {
         self.transformer().session_started(info).await
     }
 
-    #[maybe_async]
     async fn session_ended(&self, info: &Arc<RwLock<SessionAndChannel>>) -> crate::Result<()> {
         self.transformer().session_ended(info).await
     }

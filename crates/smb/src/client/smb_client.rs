@@ -1,7 +1,6 @@
 use crate::ConnectionConfig;
 use crate::msg_handler::OutgoingMessage;
 use crate::{Connection, Error, FileCreateArgs, Pipe, Resource, Session, Tree, sync_helpers::*};
-use maybe_async::maybe_async;
 use smb_fscc::{ChainedItemList, FileBasicInformation, SetFileInfo, SetFileInfoClass};
 use smb_msg::{
     AdditionalInfo, CloseRequest, CreateRequest, FileId, ImpersonationLevel, NetworkInterfaceInfo,
@@ -47,8 +46,6 @@ use super::{config::ClientConfig, unc_path::UncPath};
 /// ```no_run
 /// use smb::{Client, ClientConfig, UncPath, FileCreateArgs, FileAccessMask};
 /// use std::str::FromStr;
-/// # #[cfg(not(feature = "async"))] fn main() {}
-/// #[cfg(feature = "async")]
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///     // instantiate the client
@@ -102,7 +99,6 @@ pub struct AltChannelInfo {
     connection: Arc<Connection>,
 }
 
-#[maybe_async(AFIT)]
 impl Client {
     /// Creates a new `Client` instance with the given configuration.
     pub fn new(config: ClientConfig) -> Self {
@@ -126,13 +122,13 @@ impl Client {
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn close(&self) -> crate::Result<()> {
         // Close all opened shares
-        let mut trees = self.share_connects.lock().await?;
+        let mut trees = self.share_connects.lock().await;
         for (_unc, connected_tree) in trees.iter() {
             connected_tree.tree.disconnect().await?;
         }
         trees.clear();
 
-        let mut connections = self.connections.write().await?;
+        let mut connections = self.connections.write().await;
         // Close sessions
         for (_unc, conn) in connections.iter_mut() {
             for (_session_id, session) in conn.sessions.iter_mut() {
@@ -184,7 +180,6 @@ impl Client {
     ///
     /// ## Prerequisites
     /// The client must have an active IPC$ connection (see [`Client::ipc_connect`]).
-    #[maybe_async]
     #[tracing::instrument(level = "debug", skip_all, fields(server = %server, sid_count = sids.len()))]
     pub async fn lookup_sids(
         &self,
@@ -230,8 +225,6 @@ impl Client {
     /// ```no_run
     /// # use smb::{Client, ClientConfig, UncPath, FileCreateArgs, FileAccessMask};
     /// # use std::str::FromStr;
-    /// # #[cfg(not(feature = "async"))] fn main() {}
-    /// # #[cfg(feature = "async")]
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// // instantiate the client
@@ -350,7 +343,7 @@ impl Client {
 
         self.share_connects
             .lock()
-            .await?
+            .await
             .insert(target.clone(), connect_share_info);
 
         tracing::debug!(
@@ -606,7 +599,7 @@ impl Client {
         let connect_ok = conn.connect().await;
 
         if connect_ok.is_err() {
-            let mut connections = self.connections.write().await?;
+            let mut connections = self.connections.write().await;
             connections.remove(&server_address.ip());
             connect_ok?;
         }
@@ -616,9 +609,8 @@ impl Client {
         Ok(conn)
     }
 
-    #[maybe_async]
     async fn _add_connection(&self, to_add: Arc<Connection>, ip: &IpAddr) -> crate::Result<()> {
-        let mut connections = self.connections.write().await?;
+        let mut connections = self.connections.write().await;
         if connections.contains_key(ip) {
             return Err(Error::InvalidArgument(format!(
                 "Connection to {ip:?} already exists",
@@ -647,7 +639,6 @@ impl Client {
         self.get_connection_ip_channel(ip).await
     }
 
-    #[maybe_async]
     async fn get_connection_ip_channel(&self, ip: IpAddr) -> crate::Result<Arc<Connection>> {
         self._with_connection(ip, |c| Ok(c.connection.clone()))
             .await
@@ -669,7 +660,6 @@ impl Client {
     ///
     /// Errors: returns the same set as [`Client::get_connection`]; the
     /// caller must have already established the connection.
-    #[cfg(feature = "async")]
     pub async fn subscribe_lease_breaks(
         &self,
         server: &str,
@@ -983,12 +973,11 @@ impl Client {
         self._with_tree(path, |tree| Ok(tree.tree.clone())).await
     }
 
-    #[maybe_async]
     async fn _with_connection<F, R>(&self, ip: IpAddr, f: F) -> crate::Result<R>
     where
         F: FnOnce(&mut ClientConnectionInfo) -> crate::Result<R>,
     {
-        let mut connections = self.connections.write().await?;
+        let mut connections = self.connections.write().await;
         let conn = connections
             .get_mut(&ip)
             .ok_or_else(|| Error::NotFound(format!("No connection found for server: {ip:?}")))?;
@@ -997,13 +986,12 @@ impl Client {
 
     /// Locks `share_connects`, locates the tree for the specified path,
     /// and calls the specified closure with the tree.
-    #[maybe_async]
     async fn _with_tree<F, R>(&self, path: &UncPath, f: F) -> crate::Result<R>
     where
         F: FnOnce(&mut ClientConectedTree) -> crate::Result<R>,
     {
         let tree_path = path.clone().with_no_path();
-        let mut sc = self.share_connects.lock().await?;
+        let mut sc = self.share_connects.lock().await;
         let sc = sc.get_mut(&tree_path).ok_or_else(|| {
             Error::NotFound(format!("No connected share found for path: {path}",))
         })?;
@@ -1105,7 +1093,6 @@ impl Client {
     /// using a different network interface, if available.
     ///
     /// This method returns a map of channel IDs to their corresponding connections.
-    #[maybe_async]
     async fn _setup_multi_channel(
         &self,
         unc: &UncPath,
@@ -1223,7 +1210,6 @@ impl<'a> DfsResolver<'a> {
     }
 
     /// Resolves the DFS referral for the given UNC path and re-creates a file on the resolved path.
-    #[maybe_async]
     async fn resolve_to_dfs_file(
         &self,
         dfs_path: &UncPath,
@@ -1257,7 +1243,6 @@ impl<'a> DfsResolver<'a> {
     }
 
     /// Returns a list of DFS referral paths for the given input UNC path.
-    #[maybe_async]
     async fn get_dfs_refs(&self, unc: &UncPath) -> crate::Result<Vec<UncPath>> {
         tracing::debug!("Resolving DFS referral for {unc}");
         let dfs_path_string = unc.to_string();

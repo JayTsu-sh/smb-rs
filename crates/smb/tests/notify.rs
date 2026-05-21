@@ -1,4 +1,3 @@
-#![cfg(not(feature = "single_threaded"))]
 use serial_test::serial;
 use smb::{
     ConnectionConfig, Directory, FileCreateArgs, connection::EncryptionMode, sync_helpers::*,
@@ -8,9 +7,6 @@ use smb_msg::NotifyFilter;
 use std::sync::Arc;
 mod common;
 
-#[cfg(feature = "multi_threaded")]
-use std::thread::sleep;
-#[cfg(feature = "async")]
 use tokio::time::sleep;
 
 use common::TestConstants;
@@ -25,10 +21,7 @@ macro_rules! make_smb_notify_test {
     ) => {
         pastey::paste!{
             $(
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "multi_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[serial]
 async fn [<test_smb_notify $watch_callback>]() -> Result<(), Box<dyn std::error::Error>> {
     do_test_smb_notify($watch_callback).await
@@ -40,7 +33,6 @@ async fn [<test_smb_notify $watch_callback>]() -> Result<(), Box<dyn std::error:
 
 make_smb_notify_test!(legacy_watch, stream_iter_watch,);
 
-#[maybe_async::maybe_async]
 async fn do_test_smb_notify(
     f_start_notify_task: fn(Arc<Semaphore>, Directory),
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -105,7 +97,6 @@ async fn do_test_smb_notify(
     Ok(())
 }
 
-#[maybe_async::async_impl]
 async fn delete_many_files(share_path: &'static str, rng_numbers: &[u32]) -> smb::Result<()> {
     // for each number, iterate and call delete_from_another_connection. Wait for all at the end.
     use futures_util::future::join_all;
@@ -145,46 +136,6 @@ async fn delete_many_files(share_path: &'static str, rng_numbers: &[u32]) -> smb
     Ok(())
 }
 
-// The same as above, but with threads:
-#[maybe_async::sync_impl]
-fn delete_many_files(share_path: &'static str, rng_numbers: &[u32]) -> smb::Result<()> {
-    // for each number, iterate and call delete_from_another_connection. Wait for all at the end.
-    use std::sync::mpsc;
-    use std::thread;
-    let (tx, rx) = mpsc::channel();
-    // Connect the client:
-    let (client, share_path) = make_server_connection(
-        share_path,
-        ConnectionConfig {
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        }
-        .into(),
-    )
-    .unwrap();
-    let client = Arc::new(client);
-    for &i in rng_numbers {
-        let share_path = share_path.clone();
-        let client = client.clone();
-        let tx = tx.clone();
-        thread::spawn(move || {
-            delete_file_from_another_connection(
-                client,
-                share_path,
-                &format!("{}_{i}.txt", NEW_FILE_NAME_UNDER_WORKDIR_PREFIX),
-            )
-            .unwrap();
-            tx.send(()).unwrap();
-        });
-    }
-    // Wait for all threads to finish:
-    for _ in rng_numbers {
-        rx.recv().unwrap();
-    }
-    Ok(())
-}
-
-#[maybe_async::async_impl]
 fn legacy_watch(sem: Arc<Semaphore>, r: Directory) {
     tokio::spawn(async move {
         loop {
@@ -194,18 +145,6 @@ fn legacy_watch(sem: Arc<Semaphore>, r: Directory) {
         }
     });
 }
-#[maybe_async::sync_impl]
-fn legacy_watch(sem: Arc<Semaphore>, r: Directory) {
-    std::thread::spawn(move || {
-        loop {
-            for notification in r.watch(NotifyFilter::all(), true).unwrap() {
-                on_notification(sem.clone(), notification);
-            }
-        }
-    });
-}
-
-#[maybe_async::async_impl]
 fn stream_iter_watch(sem: Arc<Semaphore>, r: Directory) {
     use futures_util::TryStreamExt;
     tokio::spawn(async move {
@@ -225,24 +164,12 @@ fn stream_iter_watch(sem: Arc<Semaphore>, r: Directory) {
         r.close().await.unwrap();
     });
 }
-#[maybe_async::sync_impl]
-fn stream_iter_watch(sem: Arc<Semaphore>, r: Directory) {
-    std::thread::spawn(move || {
-        let r = Arc::new(r);
-        for notification in Directory::watch_stream(&r, NotifyFilter::all(), true).unwrap() {
-            on_notification(sem.clone(), notification.unwrap());
-        }
-        r.close().unwrap();
-    });
-}
-
 fn on_notification(sem: Arc<Semaphore>, notification: FileNotifyInformation) {
     if notification.action == NotifyAction::Removed {
         sem.add_permits(1);
     }
 }
 
-#[maybe_async::maybe_async]
 async fn delete_file_from_another_connection(
     client: Arc<smb::Client>,
     share_path: smb::UncPath,

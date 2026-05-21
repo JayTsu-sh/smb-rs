@@ -14,7 +14,6 @@ use crate::{interface::*, pdu::DceRpcSyntaxId};
 
 use crate::ndr64::*;
 use binrw::prelude::*;
-use maybe_async::maybe_async;
 use smb_dtyp::{SID, make_guid};
 
 // ─── Context handle (20 bytes) ──────────────────────────────────────────────
@@ -518,7 +517,6 @@ where
     ///
     /// # Arguments
     /// * `server_name` - The target server name (e.g., `r"\\server"`).
-    #[maybe_async]
     pub async fn open_policy2(&mut self, server_name: &str) -> crate::Result<LsaHandle> {
         let input = LsarOpenPolicy2In {
             system_name: NdrPtr::from(server_name.parse::<NdrString<u16>>().unwrap()).into(),
@@ -548,7 +546,6 @@ where
     /// # Arguments
     /// * `policy_handle` - Handle from [`LsaRpc::open_policy2`].
     /// * `sids` - The SIDs to resolve.
-    #[maybe_async]
     pub async fn lookup_sids(
         &mut self,
         policy_handle: &LsaHandle,
@@ -611,7 +608,6 @@ where
     }
 
     /// Closes a policy handle previously opened with [`LsaRpc::open_policy2`].
-    #[maybe_async]
     pub async fn close(&mut self, policy_handle: LsaHandle) -> crate::Result<()> {
         let input = LsarCloseIn {
             object_handle: policy_handle,

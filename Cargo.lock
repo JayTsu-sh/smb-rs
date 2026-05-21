@@ -1302,17 +1302,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "maybe-async"
-version = "0.2.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5cf92c10c7e361d6b99666ec1c6f9805b0bea2c3bd8c78dc6fe98ac5bd78db11"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.111",
-]
-
-[[package]]
 name = "md-5"
 version = "0.11.0-rc.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2412,7 +2401,6 @@ dependencies = [
  "hmac",
  "kbkdf",
  "lz4_flex",
- "maybe-async",
  "modular-bitfield",
  "pastey",
  "rand 0.8.5",
@@ -2446,7 +2434,6 @@ dependencies = [
  "futures",
  "futures-util",
  "indicatif",
- "maybe-async",
  "smb",
  "tokio",
  "tracing",
@@ -2519,7 +2506,6 @@ name = "smb-rpc"
 version = "0.12.0"
 dependencies = [
  "binrw",
- "maybe-async",
  "modular-bitfield",
  "pastey",
  "smb-dtyp",
@@ -2544,7 +2530,6 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
- "maybe-async",
  "modular-bitfield",
  "pastey",
  "quinn",

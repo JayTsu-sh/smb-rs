@@ -1,7 +1,6 @@
 use crate::Error;
 
 use super::Tree;
-use maybe_async::maybe_async;
 use smb_msg::{NetworkInterfaceInfo, QueryNetworkInterfaceInfoRequest};
 
 pub struct IpcTreeRef<'a> {
@@ -15,7 +14,6 @@ impl<'a> IpcTreeRef<'a> {
         Ok(Self { tree })
     }
 
-    #[maybe_async]
     pub async fn query_network_interfaces(&self) -> crate::Result<Vec<NetworkInterfaceInfo>> {
         if !self.tree.conn_info.config.multichannel.is_enabled() {
             // Server might decline + this is irrelevant!

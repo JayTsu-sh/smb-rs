@@ -3,7 +3,6 @@ use crate::connection::worker::Worker;
 use crate::msg_handler::ReceiveOptions;
 use crate::sync_helpers::*;
 use bytes::Bytes;
-use maybe_async::*;
 use smb_msg::ResponseContent;
 use smb_transport::{IoVec, SmbTransport, SmbTransportWrite, TransportError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -80,7 +79,6 @@ where
     }
 }
 
-#[maybe_async(AFIT)]
 impl<T> ParallelWorker<T>
 where
     T: MultiWorkerBackend + std::fmt::Debug,
@@ -220,7 +218,7 @@ where
         }
 
         // Update the state: If awaited, wake up the task. Else, store it.
-        let mut state = self.state.lock().await?;
+        let mut state = self.state.lock().await;
         let message_waiter = state.awaiting.remove(&msg_id);
         match message_waiter {
             Some(tx) => {
@@ -271,7 +269,6 @@ where
     }
 }
 
-#[maybe_async(AFIT)]
 impl<T> Worker for ParallelWorker<T>
 where
     T: MultiWorkerBackend + std::fmt::Debug,
@@ -296,7 +293,7 @@ where
         worker
             .backend_impl
             .lock()
-            .await?
+            .await
             .replace(T::start(transport, worker.clone(), rx).await?);
 
         Ok(worker)
@@ -307,7 +304,7 @@ where
         {
             self.backend_impl
                 .lock()
-                .await?
+                .await
                 .take()
                 .ok_or(Error::InvalidState(
                     "No backend present for worker.".to_string(),
@@ -350,7 +347,7 @@ where
 
     async fn receive_next(&self, options: &ReceiveOptions<'_>) -> crate::Result<IncomingMessage> {
         let wait_for_receive = {
-            let mut state = self.state.lock().await?;
+            let mut state = self.state.lock().await;
             if self.stopped() {
                 tracing::trace!("Connection is closed, avoid receiving.");
                 return Err(Error::ConnectionStopped);

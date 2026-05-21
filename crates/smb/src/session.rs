@@ -59,7 +59,6 @@ pub struct Session {
     session_handler: HandlerReference<SessionMessageHandler>,
 }
 
-#[maybe_async]
 impl Session {
     /// Sets up a new session on the specified connection.
     /// This method is crate-internal; Use [`Connection::authenticate`] to create a new session.
@@ -109,9 +108,7 @@ impl Session {
         Self::_finish_create(setup_result).await
     }
 
-    async fn _finish_create<G>(
-        setup_result: SessionSetup<'_, G>,
-    ) -> crate::Result<Session>
+    async fn _finish_create<G>(setup_result: SessionSetup<'_, G>) -> crate::Result<Session>
     where
         G: crate::session::gss::GssState,
     {
@@ -149,8 +146,8 @@ impl Session {
         }
 
         {
-            let primary_session_state = self.handler.session_state().read().await?;
-            let session = primary_session_state.session.read().await?;
+            let primary_session_state = self.handler.session_state().read().await;
+            let session = primary_session_state.session.read().await;
             if !session.is_ready() {
                 return Err(Error::InvalidState(
                     "Cannot bind session that is not ready.".to_string(),
@@ -182,29 +179,27 @@ impl Session {
 
         self.alt_channels
             .write()
-            .await?
+            .await
             .insert(new_channel_id, channel);
 
         self.session_handler
             .channel_handlers
             .write()
-            .await?
+            .await
             .insert(new_channel_id, channel_handler);
 
         Ok(new_channel_id)
     }
 
-    async fn _common_setup<G>(
-        mut session_setup: SessionSetup<'_, G>,
-    ) -> crate::Result<Channel>
+    async fn _common_setup<G>(mut session_setup: SessionSetup<'_, G>) -> crate::Result<Channel>
     where
         G: crate::session::gss::GssState,
     {
         let setup_result = session_setup.setup().await?;
 
         {
-            let session = setup_result.read().await?;
-            let session = session.session.read().await?;
+            let session = setup_result.read().await;
+            let session = session.session.read().await;
             tracing::debug!("Session setup complete.");
             if session.allow_unsigned()? {
                 tracing::debug!("Session is guest/anonymous.");
@@ -282,7 +277,6 @@ pub(crate) struct SessionMessageHandler {
     dropping: AtomicBool,
 }
 
-#[maybe_async(AFIT)]
 impl SessionMessageHandler {
     pub fn new(primary_channel: HandlerReference<ChannelMessageHandler>) -> Self {
         let session_id = primary_channel.session_id();
@@ -305,8 +299,8 @@ impl SessionMessageHandler {
         }
 
         {
-            let state = self.primary_channel.session_state().read().await?;
-            let state = state.session.read().await?;
+            let state = self.primary_channel.session_state().read().await;
+            let state = state.session.read().await;
             if !state.is_ready() {
                 tracing::trace!("Session not ready, or logged-off already, skipping logoff.");
                 return Ok(());
@@ -322,10 +316,10 @@ impl SessionMessageHandler {
         self.primary_channel
             .session_state()
             .read()
-            .await?
+            .await
             .session
             .write()
-            .await?
+            .await
             .invalidate();
 
         Ok(())
@@ -336,7 +330,6 @@ impl SessionMessageHandler {
     /// # Notes
     /// This method waits for the logoff response to be received from the server.
     /// It is used when dropping the session.
-    #[cfg(feature = "async")]
     async fn logoff_async(&self) {
         self.logoff().await.unwrap_or_else(|e| {
             tracing::error!("Failed to logoff: {e}");
@@ -357,7 +350,7 @@ impl SessionMessageHandler {
             Some(id) => id,
         };
 
-        let handlers = self.channel_handlers.read().await?;
+        let handlers = self.channel_handlers.read().await;
         if let Some(handler) = handlers.get(&channel_id) {
             t.work(handler).await
         } else {
@@ -366,7 +359,6 @@ impl SessionMessageHandler {
     }
 }
 
-#[maybe_async(AFIT)]
 impl MessageHandler for SessionMessageHandler {
     async fn sendo(&self, msg: OutgoingMessage) -> crate::Result<SendMessageResult> {
         self._with_channel(msg.channel_id, SendoWithChannel(msg))
@@ -379,7 +371,6 @@ impl MessageHandler for SessionMessageHandler {
     }
 }
 
-#[maybe_async(AFIT)]
 trait WithChannel {
     type Result;
     async fn work(
@@ -389,7 +380,6 @@ trait WithChannel {
 }
 
 struct SendoWithChannel(OutgoingMessage);
-#[maybe_async(AFIT)]
 impl WithChannel for SendoWithChannel {
     type Result = SendMessageResult;
     async fn work(
@@ -401,7 +391,6 @@ impl WithChannel for SendoWithChannel {
 }
 
 struct RecvoWithChannel<'a>(ReceiveOptions<'a>);
-#[maybe_async(AFIT)]
 impl WithChannel for RecvoWithChannel<'_> {
     type Result = IncomingMessage;
     async fn work(
@@ -412,16 +401,6 @@ impl WithChannel for RecvoWithChannel<'_> {
     }
 }
 
-#[cfg(not(feature = "async"))]
-impl Drop for SessionMessageHandler {
-    fn drop(&mut self) {
-        self.logoff().unwrap_or_else(|e| {
-            tracing::error!("Failed to logoff: {e}",);
-        });
-    }
-}
-
-#[cfg(feature = "async")]
 impl Drop for SessionMessageHandler {
     fn drop(&mut self) {
         if self

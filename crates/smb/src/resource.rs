@@ -3,7 +3,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use maybe_async::*;
 use smb_dtyp::SecurityDescriptor;
 use smb_fscc::*;
 use smb_msg::*;
@@ -112,7 +111,6 @@ pub enum Resource {
 }
 
 impl Resource {
-    #[maybe_async]
     pub(crate) async fn create(
         name: &str,
         upstream: &Upstream,
@@ -546,7 +544,6 @@ pub struct ResourceHandle {
     conn_info: Arc<ConnectionInfo>,
 }
 
-#[maybe_async(AFIT)]
 impl ResourceHandle {
     /// Returns the name of the resource.
     pub fn name(&self) -> &str {
@@ -632,7 +629,6 @@ impl ResourceHandle {
     /// (Internal)
     ///
     /// Sends a Query Information Request and parses the response.
-    #[maybe_async]
     async fn query_common(
         &self,
         mut req: QueryInfoRequest,
@@ -703,7 +699,6 @@ impl ResourceHandle {
     /// (Internal)
     ///
     /// Sends a Set Information Request and parses the response.
-    #[maybe_async]
     async fn set_info_common<T>(
         &self,
         data: T,
@@ -942,7 +937,6 @@ impl ResourceHandle {
     }
 
     /// (Internal)
-    #[maybe_async]
     async fn _ioctl(
         &self,
         ctl_code: u32,
@@ -1080,7 +1074,6 @@ impl ResourceHandle {
     /// Sends a close request to the server for the given file ID.
     /// This should be called properly after taking out the file id (handle) from the resource instance,
     /// to avoid Use-after-free errors.
-    #[maybe_async]
     async fn send_close(
         file_id: FileId,
         handler: &HandlerReference<ResourceMessageHandle>,
@@ -1097,7 +1090,6 @@ impl ResourceHandle {
     /// gone (refcount was zero at evict time). The handler is pulled
     /// from `LeaseSlot::proto`, so the close goes through the same
     /// tree+session as the original Create.
-    #[maybe_async]
     pub(crate) async fn send_close_external(
         file_id: FileId,
         handler: &HandlerReference<ResourceMessageHandle>,
@@ -1163,7 +1155,6 @@ impl ResourceHandle {
         Ok(())
     }
 
-    #[maybe_async]
     #[inline]
     async fn send_receive(
         &self,
@@ -1172,7 +1163,6 @@ impl ResourceHandle {
         self.handler.send_recv(msg).await
     }
 
-    #[maybe_async]
     #[inline]
     async fn send_recvo(
         &self,
@@ -1184,7 +1174,6 @@ impl ResourceHandle {
             .await
     }
 
-    #[maybe_async]
     #[inline]
     async fn sendo_recvo(
         &self,
@@ -1194,7 +1183,6 @@ impl ResourceHandle {
         self.handler.sendo_recvo(msg, options).await
     }
 
-    #[maybe_async]
     #[inline]
     pub async fn send_cancel(&self, msg_ids: &AsyncMessageIds) -> crate::Result<SendMessageResult> {
         let mut outgoing_message = OutgoingMessage::new(CancelRequest {}.into());
@@ -1237,7 +1225,6 @@ impl ResourceMessageHandle {
 }
 
 impl MessageHandler for ResourceMessageHandle {
-    #[maybe_async]
     #[inline]
     async fn sendo(
         &self,
@@ -1246,7 +1233,6 @@ impl MessageHandler for ResourceMessageHandle {
         self.upstream.sendo(msg).await
     }
 
-    #[maybe_async]
     #[inline]
     async fn recvo(
         &self,
@@ -1256,23 +1242,6 @@ impl MessageHandler for ResourceMessageHandle {
     }
 }
 
-#[cfg(not(feature = "async"))]
-impl Drop for ResourceHandle {
-    fn drop(&mut self) {
-        let file_id = self.file_id();
-        if file_id.is_err() {
-            return;
-        }
-
-        tracing::warn!(
-            "ResourceHandle for '{}' ({}) is being dropped without closing it properly. This may lead to resource leaks.",
-            self.name,
-            self._file_id
-        );
-    }
-}
-
-#[cfg(feature = "async")]
 impl Drop for ResourceHandle {
     fn drop(&mut self) {
         if !self.open.swap(false, std::sync::atomic::Ordering::Relaxed) {
@@ -1321,12 +1290,6 @@ impl Drop for ResourceHandle {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    // `use maybe_async::*;` at the file top brings a `test` macro into our parent
-    // scope, which conflicts with the standard `#[test]` attribute. Pull the
-    // standard one in explicitly so attribute resolution is unambiguous.
-    #[allow(unused_imports)]
-    use core::prelude::v1::test;
-
     use super::{FileCreateArgs, LeaseGrant};
     use smb_fscc::FileAccessMask;
     use smb_msg::{LeaseFlags, LeaseState, RequestLease, RequestLeaseV1, RequestLeaseV2};

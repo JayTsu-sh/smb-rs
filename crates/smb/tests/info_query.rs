@@ -4,10 +4,7 @@ use serial_test::serial;
 use smb::*;
 use std::result::Result;
 
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "multi_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[serial] // Run only in a full-feature test, because it takes a while
 async fn test_file_query_information() -> Result<(), Box<dyn std::error::Error>> {
     use smb::connection::EncryptionMode;
@@ -42,7 +39,6 @@ async fn test_file_query_information() -> Result<(), Box<dyn std::error::Error>>
     Ok(test_result?)
 }
 
-#[maybe_async::maybe_async]
 async fn do_test_query_information(file: &File) -> smb::Result<()> {
     const TEST_DATA: &[u8] = b"Hello, world!";
     file.write_at(TEST_DATA, 0).await?;
@@ -118,8 +114,7 @@ async fn do_test_query_information(file: &File) -> smb::Result<()> {
 //     Ok(test_result?)
 // }
 
-// #[maybe_async::maybe_async]
-// async fn do_test_pipe_query_information(pipe: &smb::Pipe) -> smb::Result<()> {
+// // async fn do_test_pipe_query_information(pipe: &smb::Pipe) -> smb::Result<()> {
 //     pipe.query_info::<FilePipeInformation>().await?;
 //     pipe.query_info::<FilePipeLocalInformation>().await?;
 //     pipe.query_info::<FilePipeRemoteInformation>().await?;

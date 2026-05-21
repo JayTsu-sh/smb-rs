@@ -1,8 +1,6 @@
 use binrw::{BinRead, BinWrite};
 use bytes::{Bytes, BytesMut};
-#[cfg(feature = "async")]
 use futures_core::future::BoxFuture;
-#[cfg(feature = "async")]
 use futures_util::FutureExt;
 use std::{io::Cursor, net::SocketAddr};
 
@@ -10,14 +8,11 @@ use crate::{IoVec, SmbTcpMessageHeader, error::Result};
 
 #[allow(async_fn_in_trait)]
 pub trait SmbTransport: Send + SmbTransportRead + SmbTransportWrite {
-    #[cfg(feature = "async")]
     fn connect<'a>(
         &'a mut self,
         server_name: &'a str,
         address: SocketAddr,
     ) -> BoxFuture<'a, Result<()>>;
-    #[cfg(not(feature = "async"))]
-    fn connect(&mut self, server_name: &str, address: SocketAddr) -> Result<()>;
 
     fn default_port(&self) -> u16;
 
@@ -31,12 +26,8 @@ pub trait SmbTransport: Send + SmbTransportRead + SmbTransportWrite {
 }
 
 pub trait SmbTransportWrite: Send {
-    #[cfg(feature = "async")]
     fn send_raw<'a>(&'a mut self, buf: &'a [u8]) -> BoxFuture<'a, Result<()>>;
-    #[cfg(not(feature = "async"))]
-    fn send_raw(&mut self, buf: &[u8]) -> Result<()>;
 
-    #[cfg(feature = "async")]
     fn send<'a>(&'a mut self, data: &'a IoVec) -> BoxFuture<'a, Result<()>> {
         async {
             // Transport Header (stack-allocated, no heap allocation for 4 bytes)
@@ -55,58 +46,20 @@ pub trait SmbTransportWrite: Send {
         }
         .boxed()
     }
-
-    #[cfg(not(feature = "async"))]
-    fn send(&mut self, data: &IoVec) -> Result<()> {
-        // Transport Header (stack-allocated, no heap allocation for 4 bytes)
-        let header = SmbTcpMessageHeader {
-            stream_protocol_length: data.total_size() as u32,
-        };
-        let mut header_buf = [0u8; SmbTcpMessageHeader::SIZE];
-        header.write(&mut Cursor::new(header_buf.as_mut_slice()))?;
-
-        // Use vectored I/O to send header + all buffers in a single syscall.
-        let mut slices: Vec<std::io::IoSlice<'_>> = Vec::with_capacity(1 + data.len());
-        slices.push(std::io::IoSlice::new(&header_buf));
-        for buf in data.iter() {
-            slices.push(std::io::IoSlice::new(buf));
-        }
-        self.send_all_vectored(&mut slices)
-    }
-
-    /// Write all data from the provided IoSlice array.
-    /// Default implementation falls back to sequential send_raw calls.
-    #[cfg(not(feature = "async"))]
-    fn send_all_vectored(&mut self, slices: &mut [std::io::IoSlice<'_>]) -> Result<()> {
-        // Default: fall back to sequential sends
-        for slice in slices.iter() {
-            self.send_raw(slice)?;
-        }
-        Ok(())
-    }
 }
 
 pub trait SmbTransportWriteExt: SmbTransportWrite {
-    #[cfg(feature = "async")]
     /// Use this method to send a SMB message to the server.
     /// This sends the message itself, adding the transport header.
     fn send<'a>(&'a mut self, message: &'a [u8]) -> BoxFuture<'a, Result<()>>;
-    #[cfg(not(feature = "async"))]
-    /// Use this method to send a SMB message to the server.
-    /// This sends the message itself, adding the transport header.
-    fn send(&mut self, message: &[u8]) -> Result<()>;
 }
 
 pub trait SmbTransportRead: Send {
-    #[cfg(feature = "async")]
     fn receive_exact<'a>(&'a mut self, out_buf: &'a mut [u8]) -> BoxFuture<'a, Result<()>>;
-    #[cfg(not(feature = "async"))]
-    fn receive_exact(&mut self, out_buf: &mut [u8]) -> Result<()>;
 
     /// Receive an SMB message from the transport, returning the raw bytes as `Bytes`.
     ///
     /// Uses `BytesMut` internally for zero-copy `freeze()` into `Bytes`.
-    #[cfg(feature = "async")]
     fn receive<'a>(&'a mut self) -> BoxFuture<'a, Result<Bytes>> {
         async {
             // Transport Header
@@ -129,70 +82,24 @@ pub trait SmbTransportRead: Send {
         }
         .boxed()
     }
-
-    /// Receive an SMB message from the transport, returning the raw bytes as `Bytes`.
-    ///
-    /// Uses `BytesMut` internally for zero-copy `freeze()` into `Bytes`.
-    #[cfg(not(feature = "async"))]
-    fn receive(&mut self) -> Result<Bytes> {
-        // Transport Header
-        let mut header_data = [0; SmbTcpMessageHeader::SIZE];
-        self.receive_exact(&mut header_data)?;
-        let header = SmbTcpMessageHeader::read(&mut Cursor::new(header_data))?;
-
-        // Content - use BytesMut for zero-copy freeze into Bytes.
-        let len = header.stream_protocol_length as usize;
-        let mut data = BytesMut::zeroed(len);
-        self.receive_exact(&mut data)?;
-
-        tracing::trace!(
-            "Received SMB message of {} bytes from server: {:?}",
-            data.len(),
-            &data[..]
-        );
-
-        Ok(data.freeze())
-    }
-
-    /// For synchronous implementations, sets the read timeout for the connection.
-    /// This is useful when polling for messages.
-    #[cfg(not(feature = "async"))]
-    fn set_read_timeout(&self, timeout: std::time::Duration) -> Result<()>;
 }
 
 pub trait SmbTransportReadExt: SmbTransportRead {
-    #[cfg(feature = "async")]
     /// Use this method to receive a SMB message from the server.
     /// This returns the message itself, dropping the transport header.
     fn receive<'a>(&'a mut self) -> BoxFuture<'a, Result<Bytes>>;
-    #[cfg(not(feature = "async"))]
-    /// Use this method to receive a SMB message from the server.
-    /// This returns the message itself, dropping the transport header.
-    fn receive(&mut self) -> Result<Bytes>;
 }
 
 impl SmbTransportReadExt for dyn SmbTransportRead + '_ {
-    #[cfg(feature = "async")]
     #[inline]
     fn receive<'a>(&'a mut self) -> BoxFuture<'a, Result<Bytes>> {
-        self.receive()
-    }
-    #[cfg(not(feature = "async"))]
-    #[inline]
-    fn receive(&mut self) -> Result<Bytes> {
         self.receive()
     }
 }
 
 impl SmbTransportReadExt for dyn SmbTransport + '_ {
-    #[cfg(feature = "async")]
     #[inline]
     fn receive<'a>(&'a mut self) -> BoxFuture<'a, Result<Bytes>> {
-        self.receive()
-    }
-    #[cfg(not(feature = "async"))]
-    #[inline]
-    fn receive(&mut self) -> Result<Bytes> {
         self.receive()
     }
 }

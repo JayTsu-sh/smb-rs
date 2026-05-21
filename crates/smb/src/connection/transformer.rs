@@ -4,7 +4,6 @@ use crate::sync_helpers::*;
 use crate::{compression::*, msg_handler::*};
 use binrw::prelude::*;
 use bytes::Bytes;
-use maybe_async::*;
 use smb_msg::*;
 use smb_transport::IoVec;
 use std::{collections::HashMap, io::Cursor, sync::Arc};
@@ -51,13 +50,12 @@ struct TransformerConfig {
     conn_info: Option<Arc<ConnectionInfo>>,
 }
 
-#[maybe_async(AFIT)]
 impl Transformer {
     /// Notifies that the connection negotiation has been completed,
     /// with the given [`ConnectionInfo`].
     pub async fn negotiated(&self, neg_info: &Arc<ConnectionInfo>) -> crate::Result<()> {
         {
-            let config = self.config.read().await?;
+            let config = self.config.read().await;
             if config.negotiated {
                 return Err(crate::Error::InvalidState(
                     "Connection is already negotiated!".into(),
@@ -65,7 +63,7 @@ impl Transformer {
             }
         }
 
-        let mut config = self.config.write().await?;
+        let mut config = self.config.write().await;
         if neg_info.dialect.supports_compression() && neg_info.config.compression_enabled {
             let compress = neg_info.negotiation.compression.as_ref().map(|c| {
                 let caps = Arc::new(c.clone());
@@ -79,7 +77,7 @@ impl Transformer {
         // From now on the transformer is the sole owner: all subsequent
         // SessionSetup Req/Resp ingestion happens inside
         // `transform_outgoing` / `transform_incoming`.
-        *self.preauth_hash.lock().await? = neg_info.preauth_hash.clone();
+        *self.preauth_hash.lock().await = neg_info.preauth_hash.clone();
 
         config.conn_info = Some(neg_info.clone());
         config.negotiated = true;
@@ -98,7 +96,7 @@ impl Transformer {
     /// `transform_outgoing`), and uses the value to derive the channel
     /// SigningKey.
     pub async fn snapshot_preauth_finalized(&self) -> crate::Result<Option<PreauthHashValue>> {
-        let snapshot = self.preauth_hash.lock().await?.clone();
+        let snapshot = self.preauth_hash.lock().await.clone();
         match snapshot.finish()? {
             PreauthHashState::Finished(v) => Ok(Some(v)),
             PreauthHashState::Unsupported => Ok(None),
@@ -114,7 +112,7 @@ impl Transformer {
     /// re-borrowing from the worker on every send.
     #[allow(dead_code)] // wired up in S4-T3
     async fn conn_info(&self) -> crate::Result<Option<Arc<ConnectionInfo>>> {
-        Ok(self.config.read().await?.conn_info.clone())
+        Ok(self.config.read().await.conn_info.clone())
     }
 
     /// Derive a one-shot [`MessageSigner`] for the final SessionSetup
@@ -170,17 +168,17 @@ impl Transformer {
         &self,
         session: &Arc<RwLock<SessionAndChannel>>,
     ) -> crate::Result<()> {
-        let rconfig = self.config.read().await?;
+        let rconfig = self.config.read().await;
         if !rconfig.negotiated {
             return Err(crate::Error::InvalidState(
                 "Connection is not negotiated yet!".to_string(),
             ));
         }
 
-        let session_id = { session.read().await?.session_id };
+        let session_id = { session.read().await.session_id };
         self.sessions
             .write()
-            .await?
+            .await
             .insert(session_id, session.clone());
 
         tracing::trace!(
@@ -197,10 +195,10 @@ impl Transformer {
         &self,
         session: &Arc<RwLock<SessionAndChannel>>,
     ) -> crate::Result<()> {
-        let session_id = { session.read().await?.session_id };
+        let session_id = { session.read().await.session_id };
         self.sessions
             .write()
-            .await?
+            .await
             .remove(&session_id)
             .ok_or(crate::Error::InvalidState(format!(
                 "Session {session_id} not found!",
@@ -221,19 +219,18 @@ impl Transformer {
     /// and invokes the provided closure with the channel information.
     ///
     /// Note: this function WILL deadlock if any lock attempt is performed within the closure on `self.sessions`.
-    #[maybe_async]
     #[inline]
     async fn _with_channel<F, R>(&self, session_id: u64, f: F) -> crate::Result<R>
     where
         F: FnOnce(&SessionAndChannel) -> crate::Result<R>,
     {
-        let sessions = self.sessions.read().await?;
+        let sessions = self.sessions.read().await;
         let session = sessions
             .get(&session_id)
             .ok_or(crate::Error::InvalidState(format!(
                 "Session {session_id} not found!",
             )))?;
-        let session = session.read().await?;
+        let session = session.read().await;
         f(&session)
     }
 
@@ -243,20 +240,19 @@ impl Transformer {
     /// and invokes the provided closure with the session information.
     ///
     /// Note: this function WILL deadlock if any lock attempt is performed within the closure on `self.sessions`.
-    #[maybe_async]
     #[inline]
     async fn _with_session<F, R>(&self, session_id: u64, f: F) -> crate::Result<R>
     where
         F: FnOnce(&SessionInfo) -> crate::Result<R>,
     {
-        let sessions = self.sessions.read().await?;
+        let sessions = self.sessions.read().await;
         let session = sessions
             .get(&session_id)
             .ok_or(crate::Error::InvalidState(format!(
                 "Session {session_id} not found!",
             )))?;
-        let session = session.read().await?;
-        let session_info = session.session.read().await?;
+        let session = session.read().await;
+        let session_info = session.session.read().await;
         f(&session_info)
     }
 
@@ -482,7 +478,7 @@ impl Transformer {
         // need to know which messages count.
         if Self::participates_in_preauth_outgoing(&msg.message.header) {
             if let Some(plain) = outgoing_data.first() {
-                let mut hash = self.preauth_hash.lock().await?;
+                let mut hash = self.preauth_hash.lock().await;
                 // Clone-then-replace: if `next` errors we want to keep
                 // the previous hash state intact, not corrupt it to a
                 // default `Unsupported`.
@@ -504,35 +500,32 @@ impl Transformer {
                 "Should not sign and encrypt at the same time!"
             );
 
-            let mut signer = if let Some(Protection::SnapshotKdfSign { session_key }) =
-                msg.security.take()
-            {
-                // Setup-phase path: the final SessionSetup Request signs
-                // itself with a one-shot key derived from
-                // KDF(SessionKey, finalized preauth hash AFTER this
-                // request's plain bytes), per MS-SMB2 §3.2.4.1.7. No
-                // channel exists in `session_state` yet (it'll be
-                // installed by the driver immediately after dispatch
-                // for the response-verify path).
-                self.derive_setup_phase_signer(&session_key).await?
-            } else {
-                self._with_channel(session_id, |session| {
-                    let channel_info =
-                        session
-                            .channel
-                            .as_ref()
-                            .ok_or(crate::Error::TranformFailed(TransformError {
+            let mut signer =
+                if let Some(Protection::SnapshotKdfSign { session_key }) = msg.security.take() {
+                    // Setup-phase path: the final SessionSetup Request signs
+                    // itself with a one-shot key derived from
+                    // KDF(SessionKey, finalized preauth hash AFTER this
+                    // request's plain bytes), per MS-SMB2 §3.2.4.1.7. No
+                    // channel exists in `session_state` yet (it'll be
+                    // installed by the driver immediately after dispatch
+                    // for the response-verify path).
+                    self.derive_setup_phase_signer(&session_key).await?
+                } else {
+                    self._with_channel(session_id, |session| {
+                        let channel_info = session.channel.as_ref().ok_or(
+                            crate::Error::TranformFailed(TransformError {
                                 outgoing: true,
                                 phase: TransformPhase::SignVerify,
                                 session_id: Some(session_id),
                                 why: "Message is required to be signed, but no channel is set up!",
                                 msg_id: Some(msg.message.header.message_id),
-                            }))?;
+                            }),
+                        )?;
 
-                    Ok(channel_info.signer()?.clone())
-                })
-                .await?
-            };
+                        Ok(channel_info.signer()?.clone())
+                    })
+                    .await?
+                };
 
             signer.sign_message(&mut msg.message.header, &mut outgoing_data)?;
 
@@ -547,7 +540,7 @@ impl Transformer {
         const COMPRESSION_THRESHOLD: usize = 1024;
         outgoing_data = {
             if msg.compress && outgoing_data.total_size() > COMPRESSION_THRESHOLD {
-                let rconfig = self.config.read().await?;
+                let rconfig = self.config.read().await;
                 if let Some(compress) = &rconfig.compress {
                     // Build a vector of the entire data. In the future, this may be optimized to avoid copying.
                     // currently, there's not chained compression, and copy will occur anyway.
@@ -650,7 +643,7 @@ impl Transformer {
         // 2. Decompress (whole chain)
         debug_assert!(!matches!(message, Response::Encrypted(_)));
         let (message, raw) = if let Response::Compressed(compressed_message) = message {
-            let rconfig = self.config.read().await?;
+            let rconfig = self.config.read().await;
             form.compressed = true;
             match &rconfig.compress {
                 Some(compress) => {
@@ -775,7 +768,7 @@ impl Transformer {
         // 2. Decompress
         debug_assert!(!matches!(message, Response::Encrypted(_)));
         let (message, raw) = if let Response::Compressed(compressed_message) = message {
-            let rconfig = self.config.read().await?;
+            let rconfig = self.config.read().await;
             form.compressed = true;
             match &rconfig.compress {
                 Some(compress) => {
@@ -814,7 +807,7 @@ impl Transformer {
         // snapshot see Negotiate Resp / intermediate SessionSetup Resp
         // bytes included.
         if Self::participates_in_preauth_incoming(&message.header) {
-            let mut hash = self.preauth_hash.lock().await?;
+            let mut hash = self.preauth_hash.lock().await;
             // Clone-then-replace; see `transform_outgoing` for rationale.
             *hash = hash.clone().next(&raw)?;
         }
@@ -842,7 +835,6 @@ impl Transformer {
     /// A helper method to verify the incoming message.
     /// This method is used to verify the signature of the incoming message,
     /// if such verification is required.
-    #[maybe_async]
     async fn verify_plain_incoming(
         &self,
         message: &mut PlainResponse,
@@ -897,7 +889,6 @@ impl Transformer {
     // must also be enabled, or else this code will not be compiled.
     // This behavior is actually against the spec - MS-SMB2 3.2.4.1.1:
     // > "If the client signs the request, it MUST set the SMB2_FLAGS_SIGNED bit in the Flags field of the SMB2 header."
-    #[maybe_async]
     async fn is_message_signed_ksmbd(&self, _message: &PlainResponse) -> bool {
         #[cfg(feature = "ksmbd-multichannel-compat")]
         {

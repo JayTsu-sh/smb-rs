@@ -12,7 +12,6 @@ use smb_fscc::FileDispositionInformation;
 use smb_msg::Status;
 use smb_transport::{TransportConfig, TransportError};
 
-#[maybe_async::maybe_async]
 async fn _do_minimal_connection_test(
     conn_config: Option<ConnectionConfig>,
     share: Option<&str>,
@@ -35,7 +34,6 @@ async fn _do_minimal_connection_test(
     Ok(())
 }
 
-#[maybe_async::maybe_async]
 async fn _test_basic_integration(
     transport: TransportConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -46,10 +44,7 @@ async fn _test_basic_integration(
     Ok(_do_minimal_connection_test(Some(conn_config), None).await?)
 }
 
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "multi_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[serial]
 async fn test_basic_guest() -> smb::Result<()> {
     with_temp_env!(
@@ -68,10 +63,7 @@ async fn test_basic_guest() -> smb::Result<()> {
     )
 }
 
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "multi_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[serial]
 async fn test_basic_auth_fail() -> smb::Result<()> {
     with_temp_env!(
@@ -83,7 +75,6 @@ async fn test_basic_auth_fail() -> smb::Result<()> {
     )
 }
 
-#[maybe_async::maybe_async]
 async fn do_test_basic_auth_fail() -> smb::Result<()> {
     let res = _do_minimal_connection_test(None, None).await.unwrap_err();
     match res {
@@ -95,7 +86,6 @@ async fn do_test_basic_auth_fail() -> smb::Result<()> {
     smb::Result::Ok(())
 }
 
-#[maybe_async::maybe_async]
 async fn _test_connection_timeout_fail(
     transport_config: TransportConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -159,19 +149,13 @@ macro_rules! test_transport {
     ) => {
             $(
                 pastey::paste!{
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "multi_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[serial]
 async fn [<test_basic_integration_ $transport_config:lower>]() -> Result<(), Box<dyn std::error::Error>> {
     _test_basic_integration(TransportConfig::$config_value).await
 }
 
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "multi_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[serial]
 async fn [<test_connection_timeout_fail_ $transport_config:lower>]() -> Result<(), Box<dyn std::error::Error>> {
     _test_connection_timeout_fail(TransportConfig::$config_value).await

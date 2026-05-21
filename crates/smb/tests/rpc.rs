@@ -3,10 +3,7 @@
 mod common;
 use serial_test::serial;
 
-#[test_log::test(maybe_async::test(
-    not(feature = "async"),
-    async(feature = "async", tokio::test(flavor = "multi_thread"))
-))]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[serial]
 async fn test_shares_enum() -> smb::Result<()> {
     let (client, path) = make_server_connection("IPC$", None).await?;
