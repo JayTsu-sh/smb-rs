@@ -12,9 +12,7 @@ The [`Client`] struct provides a simple interface for interacting with an SMB se
 ```rust,no_run
 use smb::{Client, ClientConfig, UncPath, FileCreateArgs, FileAccessMask};
 use std::str::FromStr;
-# #[cfg(not(feature = "async"))] fn main() {}
 
-# #[cfg(feature = "async")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // instantiate the client
@@ -39,9 +37,7 @@ But wait... How do we know it's actually a file? Well, we don't. The [`Client::c
 
 ```rust,no_run
 # use smb::*;
-# #[cfg(not(feature = "async"))] fn main() {}
 # #[tokio::main]
-# #[cfg(feature = "async")]
 # async fn main() -> Result<()> {
 # let client = Client::default();
 # let mut file = client.create_file(&UncPath::new("")?, &FileCreateArgs::default()).await?;
@@ -65,8 +61,6 @@ Cool! Let's assume we got ourselves a file. Then, we can do the obvious operatio
 
 ```rust,no_run
 # use smb::*;
-# #[cfg(not(feature = "async"))] fn main() {}
-# #[cfg(feature = "async")]
 # #[tokio::main]
 # async fn main() -> Result<()> {
 # let client = Client::default();
@@ -83,8 +77,6 @@ At the end, close the file.
 
 ```rust,no_run
 # use smb::*;
-# #[cfg(not(feature = "async"))] fn main() {}
-# #[cfg(feature = "async")]
 # #[tokio::main]
 # async fn main() -> Result<()> {
 # let client = Client::default();
@@ -96,29 +88,27 @@ file.close().await?;
 
 ## Feature flags
 
-| Type            | Algorithm           |  Async  | Multi-threaded | Single-threaded | Feature Name           |
-| --------------- | ------------------- | ---| ---| --- | ---------------------- |
-| Authentication  | Kerberos            | ✅  | ✅  | ✅   | `kerberos`             |
-| Transport       | QUIC                | ✅  | ❌   | ❌    | `quic`                 |
-| **Signing**     | *                   |    |    |     | `sign`                 |
-| Signing         | HMAC_SHA256         | ✅  | ✅  | ✅   | `sign_hmac`            |
-| Signing         | AES-128-GCM         | ✅  | ✅  | ✅   | `sign_gmac`            |
-| Signing         | AES-128-CCM         | ✅  | ✅  | ✅   | `sign_cmac`            |
-| **Encryption**  | *                   |    |    |     | `encrypt`              |
-| Encryption      | AES-128-CCM         | ✅  | ✅  | ✅   | `encrypt_aes128ccm`    |
-| Encryption      | AES-128-GCM         | ✅  | ✅  | ✅   | `encrypt_aes128gcm`    |
-| Encryption      | AES-256-CCM         | ✅  | ✅  | ✅   | `encrypt_aes256ccm`    |
-| Encryption      | AES-256-GCM         | ✅  | ✅  | ✅   | `encrypt_aes256gcm`    |
-| **Compression** | *                   |    |    |     | `compress`             |
-| Compression     | LZ4                 | ✅  | ✅  | ✅   | `compress_lz4`         |
-| Compression     | Pattern_V1          | 🟡  | 🟡  | 🟡   | `compress_pattern_v1`* |
-| Compression     | LZNT1/LZ77/+Huffman | ❌  | ❌  | ❌   | -                      |
+| Type            | Algorithm           | Feature Name           |
+| --------------- | ------------------- | ---------------------- |
+| Authentication  | Kerberos            | `kerberos`             |
+| Transport       | QUIC                | `quic`                 |
+| **Signing**     | *                   | `sign`                 |
+| Signing         | HMAC_SHA256         | `sign_hmac`            |
+| Signing         | AES-128-GCM         | `sign_gmac`            |
+| Signing         | AES-128-CCM         | `sign_cmac`            |
+| **Encryption**  | *                   | `encrypt`              |
+| Encryption      | AES-128-CCM         | `encrypt_aes128ccm`    |
+| Encryption      | AES-128-GCM         | `encrypt_aes128gcm`    |
+| Encryption      | AES-256-CCM         | `encrypt_aes256ccm`    |
+| Encryption      | AES-256-GCM         | `encrypt_aes256gcm`    |
+| **Compression** | *                   | `compress`             |
+| Compression     | LZ4                 | `compress_lz4`         |
+| Compression     | Pattern_V1          | `compress_pattern_v1`* |
+| Compression     | LZNT1/LZ77/+Huffman | -                      |
 
 * The Pattern_V1 compression algorithm currently supports in-bound decompression only.
 
 ## Advanced documentation
 <!-- markdownlint-disable reference-links-images -->
-* [Switching between threading models][docs::threading_models]
-
 * [Performing parallel file operations][docs::parallelize]
 <!-- markdownlint-enable reference-links-images -->

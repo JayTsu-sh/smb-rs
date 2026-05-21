@@ -161,8 +161,6 @@ impl Connection {
     /// # use smb::*;
     /// # use std::time::Duration;
     /// use smb_transport::TcpTransport;
-    /// # #[cfg(not(feature = "async"))] fn main() {}
-    /// #[cfg(feature = "async")]
     /// # #[tokio::main]
     /// # async fn main() -> Result<()> {
     /// let custom_tcp_transport = Box::new(TcpTransport::new(Duration::from_millis(10))); // you may also implement you own transport!

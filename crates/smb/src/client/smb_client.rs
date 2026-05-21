@@ -46,8 +46,6 @@ use super::{config::ClientConfig, unc_path::UncPath};
 /// ```no_run
 /// use smb::{Client, ClientConfig, UncPath, FileCreateArgs, FileAccessMask};
 /// use std::str::FromStr;
-/// # #[cfg(not(feature = "async"))] fn main() {}
-/// #[cfg(feature = "async")]
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///     // instantiate the client
@@ -227,8 +225,6 @@ impl Client {
     /// ```no_run
     /// # use smb::{Client, ClientConfig, UncPath, FileCreateArgs, FileAccessMask};
     /// # use std::str::FromStr;
-    /// # #[cfg(not(feature = "async"))] fn main() {}
-    /// # #[cfg(feature = "async")]
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// // instantiate the client
