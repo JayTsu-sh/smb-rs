@@ -593,7 +593,7 @@ pub mod iter_stream {
                     .await;
                 });
             }
-            let guard = directory.query_lock.lock().await?;
+            let guard = directory.query_lock.lock().await;
             Ok(Self {
                 receiver,
                 notify_fetch_next,

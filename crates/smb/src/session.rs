@@ -146,8 +146,8 @@ impl Session {
         }
 
         {
-            let primary_session_state = self.handler.session_state().read().await?;
-            let session = primary_session_state.session.read().await?;
+            let primary_session_state = self.handler.session_state().read().await;
+            let session = primary_session_state.session.read().await;
             if !session.is_ready() {
                 return Err(Error::InvalidState(
                     "Cannot bind session that is not ready.".to_string(),
@@ -179,13 +179,13 @@ impl Session {
 
         self.alt_channels
             .write()
-            .await?
+            .await
             .insert(new_channel_id, channel);
 
         self.session_handler
             .channel_handlers
             .write()
-            .await?
+            .await
             .insert(new_channel_id, channel_handler);
 
         Ok(new_channel_id)
@@ -198,8 +198,8 @@ impl Session {
         let setup_result = session_setup.setup().await?;
 
         {
-            let session = setup_result.read().await?;
-            let session = session.session.read().await?;
+            let session = setup_result.read().await;
+            let session = session.session.read().await;
             tracing::debug!("Session setup complete.");
             if session.allow_unsigned()? {
                 tracing::debug!("Session is guest/anonymous.");
@@ -299,8 +299,8 @@ impl SessionMessageHandler {
         }
 
         {
-            let state = self.primary_channel.session_state().read().await?;
-            let state = state.session.read().await?;
+            let state = self.primary_channel.session_state().read().await;
+            let state = state.session.read().await;
             if !state.is_ready() {
                 tracing::trace!("Session not ready, or logged-off already, skipping logoff.");
                 return Ok(());
@@ -316,10 +316,10 @@ impl SessionMessageHandler {
         self.primary_channel
             .session_state()
             .read()
-            .await?
+            .await
             .session
             .write()
-            .await?
+            .await
             .invalidate();
 
         Ok(())
@@ -350,7 +350,7 @@ impl SessionMessageHandler {
             Some(id) => id,
         };
 
-        let handlers = self.channel_handlers.read().await?;
+        let handlers = self.channel_handlers.read().await;
         if let Some(handler) = handlers.get(&channel_id) {
             t.work(handler).await
         } else {

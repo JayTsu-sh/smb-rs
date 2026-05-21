@@ -47,10 +47,9 @@ impl AsyncBackend {
 
         // Cleanup
         tracing::debug!("Cleaning up worker loop.");
-        if let Ok(mut state) = worker.state.lock().await {
-            for (_, tx) in state.awaiting.drain() {
-                let _notify_result = tx.send(Err(Error::ConnectionStopped));
-            }
+        let mut state = worker.state.lock().await;
+        for (_, tx) in state.awaiting.drain() {
+            let _notify_result = tx.send(Err(Error::ConnectionStopped));
         }
     }
 
@@ -159,7 +158,7 @@ impl MultiWorkerBackend for AsyncBackend {
         backend
             .loop_handles
             .lock()
-            .await?
+            .await
             .replace((recv_task, send_task));
 
         Ok(backend)
@@ -171,7 +170,7 @@ impl MultiWorkerBackend for AsyncBackend {
         let loop_handles = self
             .loop_handles
             .lock()
-            .await?
+            .await
             .take()
             .ok_or(Error::ConnectionStopped)?;
         loop_handles.0.await?;

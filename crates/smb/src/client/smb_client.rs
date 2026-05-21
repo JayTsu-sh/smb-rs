@@ -124,13 +124,13 @@ impl Client {
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn close(&self) -> crate::Result<()> {
         // Close all opened shares
-        let mut trees = self.share_connects.lock().await?;
+        let mut trees = self.share_connects.lock().await;
         for (_unc, connected_tree) in trees.iter() {
             connected_tree.tree.disconnect().await?;
         }
         trees.clear();
 
-        let mut connections = self.connections.write().await?;
+        let mut connections = self.connections.write().await;
         // Close sessions
         for (_unc, conn) in connections.iter_mut() {
             for (_session_id, session) in conn.sessions.iter_mut() {
@@ -347,7 +347,7 @@ impl Client {
 
         self.share_connects
             .lock()
-            .await?
+            .await
             .insert(target.clone(), connect_share_info);
 
         tracing::debug!(
@@ -603,7 +603,7 @@ impl Client {
         let connect_ok = conn.connect().await;
 
         if connect_ok.is_err() {
-            let mut connections = self.connections.write().await?;
+            let mut connections = self.connections.write().await;
             connections.remove(&server_address.ip());
             connect_ok?;
         }
@@ -614,7 +614,7 @@ impl Client {
     }
 
     async fn _add_connection(&self, to_add: Arc<Connection>, ip: &IpAddr) -> crate::Result<()> {
-        let mut connections = self.connections.write().await?;
+        let mut connections = self.connections.write().await;
         if connections.contains_key(ip) {
             return Err(Error::InvalidArgument(format!(
                 "Connection to {ip:?} already exists",
@@ -981,7 +981,7 @@ impl Client {
     where
         F: FnOnce(&mut ClientConnectionInfo) -> crate::Result<R>,
     {
-        let mut connections = self.connections.write().await?;
+        let mut connections = self.connections.write().await;
         let conn = connections
             .get_mut(&ip)
             .ok_or_else(|| Error::NotFound(format!("No connection found for server: {ip:?}")))?;
@@ -995,7 +995,7 @@ impl Client {
         F: FnOnce(&mut ClientConectedTree) -> crate::Result<R>,
     {
         let tree_path = path.clone().with_no_path();
-        let mut sc = self.share_connects.lock().await?;
+        let mut sc = self.share_connects.lock().await;
         let sc = sc.get_mut(&tree_path).ok_or_else(|| {
             Error::NotFound(format!("No connected share found for path: {path}",))
         })?;

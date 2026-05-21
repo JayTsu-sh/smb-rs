@@ -560,7 +560,7 @@ impl Connection {
         self.handler
             .sessions
             .lock()
-            .await?
+            .await
             .insert(session.session_id(), session_handler);
         Ok(session)
     }
@@ -595,7 +595,7 @@ impl Connection {
         self.handler
             .sessions
             .lock()
-            .await?
+            .await
             .insert(session.session_id(), session_handler);
         Ok(session)
     }
@@ -846,7 +846,7 @@ impl ConnectionMessageHandler {
     pub async fn insert_lease_slot(&self, slot: Arc<LeaseSlot>) -> crate::Result<()> {
         use std::sync::atomic::Ordering;
         let key = slot.path.clone();
-        let mut table = self.lease_table.lock().await?;
+        let mut table = self.lease_table.lock().await;
         let displaced = table.insert(key, slot);
         drop(table);
         if let Some(prev) = displaced {
@@ -900,7 +900,7 @@ impl ConnectionMessageHandler {
     /// Return the current number of cached lease slots. Primarily for
     /// observability and tests; not in any hot path.
     pub async fn lease_slot_count(&self) -> crate::Result<usize> {
-        Ok(self.lease_table.lock().await?.len())
+        Ok(self.lease_table.lock().await.len())
     }
 
     /// Look up a cached lease slot by path. Returns `None` when there is
@@ -909,7 +909,7 @@ impl ConnectionMessageHandler {
     /// [`Self::try_acquire_lease`] instead so the bump is atomic with the
     /// lookup against concurrent evictions.
     pub async fn peek_lease_slot(&self, path: &str) -> crate::Result<Option<Arc<LeaseSlot>>> {
-        Ok(self.lease_table.lock().await?.get(path).cloned())
+        Ok(self.lease_table.lock().await.get(path).cloned())
     }
 
     /// Phase C.5 race-free acquire: look up `path` and call
@@ -928,7 +928,7 @@ impl ConnectionMessageHandler {
         requested_disposition: smb_msg::CreateDisposition,
         wants_directory: bool,
     ) -> crate::Result<Option<Arc<LeaseSlot>>> {
-        let table = self.lease_table.lock().await?;
+        let table = self.lease_table.lock().await;
         let Some(slot) = table.get(path).cloned() else {
             return Ok(None);
         };
@@ -951,7 +951,7 @@ impl ConnectionMessageHandler {
     /// Returns `None` when `path` had no entry.
     pub async fn take_lease_for_evict(&self, path: &str) -> crate::Result<Option<LeaseEviction>> {
         use std::sync::atomic::Ordering;
-        let mut table = self.lease_table.lock().await?;
+        let mut table = self.lease_table.lock().await;
         let Some(slot) = table.remove(path) else {
             return Ok(None);
         };
@@ -989,7 +989,7 @@ impl ConnectionMessageHandler {
         let Some(cutoff) = std::time::Instant::now().checked_sub(older_than) else {
             return Ok(Vec::new());
         };
-        let mut table = self.lease_table.lock().await?;
+        let mut table = self.lease_table.lock().await;
 
         // Two-phase: collect victims first to avoid mutating while iterating.
         let victims: Vec<String> = table
@@ -1085,13 +1085,7 @@ impl ConnectionMessageHandler {
         let event_key = event.lease_key.as_u128();
 
         let matching: Vec<Arc<LeaseSlot>> = {
-            let mut table = match self.lease_table.lock().await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(error = ?e, "lease_table lock poisoned during break apply");
-                    return;
-                }
-            };
+            let mut table = self.lease_table.lock().await;
 
             // Two-phase under the same lock: find victim paths first to
             // sidestep "mutate while iterating", then remove + apply
@@ -1417,7 +1411,7 @@ impl MessageHandler for ConnectionMessageHandler {
 
         // Avoid holding the lock while notifying the session further.
         let session = {
-            let sessions = self.sessions.lock().await?;
+            let sessions = self.sessions.lock().await;
             match sessions.get(&msg.message.header.session_id) {
                 None => {
                     tracing::warn!(
@@ -1522,17 +1516,7 @@ impl ConnectionMessageHandler {
     /// session, so the choice of session doesn't matter.
     async fn send_lease_break_ack(&self, notify: &smb_msg::LeaseBreakNotify) {
         let session_handler = {
-            let sessions = match self.sessions.lock().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(
-                        lease_key = ?notify.lease_key,
-                        error = ?e,
-                        "Cannot send LeaseBreakAck: sessions lock poisoned",
-                    );
-                    return;
-                }
-            };
+            let sessions = self.sessions.lock().await;
             sessions.values().find_map(|w| w.upgrade())
         };
 

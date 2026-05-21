@@ -108,10 +108,7 @@ mod impls {
             offset: u64,
             _channel: Option<u32>,
         ) -> crate::Result<usize> {
-            let mut reader = self
-                .lock()
-                .await
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let mut reader = self.lock().await;
             reader.seek(std::io::SeekFrom::Start(offset)).await?;
             Ok(reader.read(buf).await?)
         }
@@ -126,10 +123,7 @@ mod impls {
             offset: u64,
             _channel: Option<u32>,
         ) -> crate::Result<usize> {
-            let mut writer = self
-                .lock()
-                .await
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let mut writer = self.lock().await;
             writer.seek(std::io::SeekFrom::Start(offset)).await?;
             Ok(writer.write(buf).await?)
         }
@@ -137,20 +131,14 @@ mod impls {
 
     impl GetLen for Mutex<File> {
         async fn get_len(&self) -> crate::Result<u64> {
-            let file = self
-                .lock()
-                .await
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let file = self.lock().await;
             Ok(file.metadata().await?.len())
         }
     }
 
     impl SetLen for Mutex<File> {
         async fn set_len(&self, len: u64) -> crate::Result<()> {
-            let file = self
-                .lock()
-                .await
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let file = self.lock().await;
             Ok(File::set_len(&file, len).await?)
         }
     }

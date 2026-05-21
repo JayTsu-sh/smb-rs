@@ -35,7 +35,6 @@ async fn test_smb_iterating_long_directory() -> Result<(), Box<dyn std::error::E
     client
         .lock()
         .await
-        .unwrap()
         .create_file(
             &long_dir_path,
             &FileCreateArgs::make_create_new(
@@ -51,7 +50,6 @@ async fn test_smb_iterating_long_directory() -> Result<(), Box<dyn std::error::E
         let file = client
             .lock()
             .await
-            .unwrap()
             .create_file(
                 &share_path.clone().with_path(&file_name),
                 &FileCreateArgs::make_create_new(Default::default(), Default::default()),
@@ -65,7 +63,6 @@ async fn test_smb_iterating_long_directory() -> Result<(), Box<dyn std::error::E
     let directory = client
         .lock()
         .await
-        .unwrap()
         .create_file(
             &long_dir_path,
             &FileCreateArgs::make_open_existing(
@@ -100,7 +97,6 @@ async fn test_smb_iterating_long_directory() -> Result<(), Box<dyn std::error::E
             let file = client
                 .lock()
                 .await
-                .unwrap()
                 .create_file(
                     &full_file_path,
                     &FileCreateArgs::make_open_existing(
@@ -130,7 +126,6 @@ async fn test_smb_iterating_long_directory() -> Result<(), Box<dyn std::error::E
     let directory = client
         .lock()
         .await
-        .unwrap()
         .create_file(
             &long_dir_path,
             &FileCreateArgs::make_open_existing(FileAccessMask::new().with_delete(true)),
