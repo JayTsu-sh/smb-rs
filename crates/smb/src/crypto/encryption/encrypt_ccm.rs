@@ -8,6 +8,7 @@ use ccm::{
     aead::AeadInOut,
     consts::{U11, U16},
 };
+use std::sync::Arc;
 
 use crate::crypto::CryptoError;
 
@@ -37,8 +38,8 @@ where
         + Sync
         + 'static,
 {
-    pub fn build(encrypting_key: &[u8]) -> Result<Box<dyn EncryptingAlgo>, CryptoError> {
-        Ok(Box::new(Self {
+    pub fn build(encrypting_key: &[u8]) -> Result<Arc<dyn EncryptingAlgo>, CryptoError> {
+        Ok(Arc::new(Self {
             cipher: Ccm::<C, U16, U11>::new_from_slice(encrypting_key)?,
         }))
     }

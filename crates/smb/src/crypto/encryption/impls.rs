@@ -1,5 +1,6 @@
 use crypto_common::array::{Array, ArraySize};
 use smb_msg::*;
+use std::sync::Arc;
 
 use crate::crypto::{CryptoError, EncryptingAlgo};
 
@@ -32,7 +33,7 @@ pub const ENCRYPTING_ALGOS: &[EncryptionCipher] = &[
 pub fn make_encrypting_algo(
     encrypting_algorithm: EncryptionCipher,
     encrypting_key: &[u8],
-) -> Result<Box<dyn EncryptingAlgo>, CryptoError> {
+) -> Result<Arc<dyn EncryptingAlgo>, CryptoError> {
     if !ENCRYPTING_ALGOS.contains(&encrypting_algorithm) {
         return Err(CryptoError::UnsupportedEncryptionAlgorithm(
             encrypting_algorithm,

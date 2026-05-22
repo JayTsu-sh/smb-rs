@@ -4,18 +4,26 @@ use binrw::prelude::*;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use std::io::Cursor;
+use std::sync::Arc;
 
 use crate::crypto;
 use smb_msg::{Response, encrypted::*};
 use smb_transport::IoVec;
 
-#[derive(Debug)]
+/// Encrypts SMB2 messages with a session-derived AEAD key.
+///
+/// `Clone` is cheap (`Arc`-clone of the algo handle). The trait doc on
+/// [`crypto::EncryptingAlgo`] guarantees `&self` thread-safety after
+/// key setup, and the per-message nonce is drawn from `OsRng` inside
+/// [`Self::encrypt_message`] — so clones can encrypt concurrently
+/// without risk of nonce reuse.
+#[derive(Clone, Debug)]
 pub struct MessageEncryptor {
-    algo: Box<dyn crypto::EncryptingAlgo>,
+    algo: Arc<dyn crypto::EncryptingAlgo>,
 }
 
 impl MessageEncryptor {
-    pub fn new(algo: Box<dyn crypto::EncryptingAlgo>) -> MessageEncryptor {
+    pub fn new(algo: Arc<dyn crypto::EncryptingAlgo>) -> MessageEncryptor {
         MessageEncryptor { algo }
     }
 
@@ -58,13 +66,15 @@ impl MessageEncryptor {
     }
 }
 
-#[derive(Debug)]
+/// Decrypts SMB2 messages with a session-derived AEAD key. See
+/// [`MessageEncryptor`] for the rationale behind `Clone`.
+#[derive(Clone, Debug)]
 pub struct MessageDecryptor {
-    algo: Box<dyn crypto::EncryptingAlgo>,
+    algo: Arc<dyn crypto::EncryptingAlgo>,
 }
 
 impl MessageDecryptor {
-    pub fn new(algo: Box<dyn crypto::EncryptingAlgo>) -> MessageDecryptor {
+    pub fn new(algo: Arc<dyn crypto::EncryptingAlgo>) -> MessageDecryptor {
         MessageDecryptor { algo }
     }
 
