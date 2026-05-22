@@ -1,6 +1,6 @@
 use crate::connection::preauth_hash::{PreauthHashState, PreauthHashValue};
 use crate::session::{
-    MessageDecryptor, MessageEncryptor, MessageSigner, SessionAndChannel, SessionInfo,
+    MessageDecryptor, MessageEncryptor, MessageSigner, SessionAndChannel,
 };
 use crate::sync_helpers::*;
 use crate::{compression::*, msg_handler::*};
@@ -214,26 +214,27 @@ impl Transformer {
         Ok(())
     }
 
-    /// (Internal)
+    /// Looks up the [`SessionAndChannel`] entry for `session_id`.
+    /// Errs with `InvalidState` when the transformer has no record of
+    /// that session.
     ///
-    /// Locates the [`SessionAndChannel`] entry for `session_id` and
-    /// invokes the closure with it. The closure runs while the outer
-    /// `sessions` `RwLock` read guard is held; callers must not
-    /// re-acquire `self.sessions` from inside or they will deadlock.
-    /// The inner channel slot is now `ArcSwapOption<ChannelInfo>`, so
-    /// no nested `RwLock` is traversed here — only the outer guard.
+    /// Internal helper for the public `get_signer` / `get_encryptor` /
+    /// etc. accessors below. Each accessor extracts exactly what it
+    /// needs (signer clone, encryptor clone, channel binding bit) and
+    /// releases the read guard before returning — no closure-over-lock
+    /// pattern remains.
     #[inline]
-    async fn _with_channel<F, R>(&self, session_id: u64, f: F) -> crate::Result<R>
-    where
-        F: FnOnce(&SessionAndChannel) -> crate::Result<R>,
-    {
+    async fn session_entry(
+        &self,
+        session_id: u64,
+    ) -> crate::Result<Arc<SessionAndChannel>> {
         let sessions = self.sessions.read().await;
-        let session = sessions
+        sessions
             .get(&session_id)
+            .cloned()
             .ok_or(crate::Error::InvalidState(format!(
                 "Session {session_id} not found!",
-            )))?;
-        f(session)
+            )))
     }
 
     /// Returns a fresh clone of the channel signer for `session_id`,
@@ -244,19 +245,15 @@ impl Transformer {
     /// Errs with `InvalidState` when no entry for `session_id` is
     /// in the transformer's sessions table. Callsites map `Ok(None)`
     /// to the per-site `TransformError` they need.
-    ///
-    /// Replaces the previous `_with_channel(session_id, |s| ...)`
-    /// closure pattern at the four signing callsites
-    /// (compound sign, outgoing sign, incoming verify, ksmbd binding).
     pub(crate) async fn get_signer(
         &self,
         session_id: u64,
     ) -> crate::Result<Option<MessageSigner>> {
-        self._with_channel(session_id, |session| match session.channel() {
+        let entry = self.session_entry(session_id).await?;
+        match entry.channel() {
             Some(channel) => Ok(Some(channel.signer()?.clone())),
             None => Ok(None),
-        })
-        .await
+        }
     }
 
     /// `true` iff the channel for `session_id` is installed *and*
@@ -271,13 +268,11 @@ impl Transformer {
     /// transformer.
     #[cfg(feature = "ksmbd-multichannel-compat")]
     pub(crate) async fn is_binding(&self, session_id: u64) -> crate::Result<bool> {
-        self._with_channel(session_id, |session| {
-            Ok(session
-                .channel()
-                .map(|channel| channel.is_binding())
-                .unwrap_or(false))
-        })
-        .await
+        let entry = self.session_entry(session_id).await?;
+        Ok(entry
+            .channel()
+            .map(|channel| channel.is_binding())
+            .unwrap_or(false))
     }
 
     /// Returns a fresh clone of the session encryptor for `session_id`,
@@ -294,8 +289,8 @@ impl Transformer {
         &self,
         session_id: u64,
     ) -> crate::Result<Option<MessageEncryptor>> {
-        self._with_session(session_id, |info| info.encryptor_clone())
-            .await
+        let entry = self.session_entry(session_id).await?;
+        entry.session.read().await.encryptor_clone()
     }
 
     /// Mirror of [`Self::get_encryptor`] for the incoming decrypt path.
@@ -303,30 +298,8 @@ impl Transformer {
         &self,
         session_id: u64,
     ) -> crate::Result<Option<MessageDecryptor>> {
-        self._with_session(session_id, |info| info.decryptor_clone())
-            .await
-    }
-
-    /// (Internal)
-    ///
-    /// Locates the current [`SessionInfo`] for `session_id` and invokes
-    /// the closure with a `&SessionInfo` borrow. Two locks acquired in
-    /// sequence (outer `sessions` read + inner `SessionInfo` read);
-    /// callers must not re-enter either from the closure or they will
-    /// deadlock.
-    #[inline]
-    async fn _with_session<F, R>(&self, session_id: u64, f: F) -> crate::Result<R>
-    where
-        F: FnOnce(&SessionInfo) -> crate::Result<R>,
-    {
-        let sessions = self.sessions.read().await;
-        let session = sessions
-            .get(&session_id)
-            .ok_or(crate::Error::InvalidState(format!(
-                "Session {session_id} not found!",
-            )))?;
-        let session_info = session.session.read().await;
-        f(&session_info)
+        let entry = self.session_entry(session_id).await?;
+        entry.session.read().await.decryptor_clone()
     }
 
     /// Build the wire bytes for an SMB2 compound chain (MS-SMB2 3.2.4.1.4):
