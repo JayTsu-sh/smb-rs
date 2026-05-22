@@ -49,8 +49,6 @@
 //!   would add latency to every send/recv without buying any
 //!   serialisation we don't already have.
 
-#![allow(dead_code)] // T1: command surface defined ahead of T2 caller migration.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Weak;

@@ -803,11 +803,9 @@ pub(crate) struct ConnectionMessageHandler {
     lease_event_tx: tokio::sync::broadcast::Sender<LeaseBreakEvent>,
 
     /// Handle to the per-connection state actor (S7). Owns the
-    /// Phase C lease cache (keyed by share-relative path) and — once
-    /// C3 lands — the sessions table. All mutation of those maps
-    /// happens inside the actor task; callers send commands and await
-    /// typed replies.
-    #[allow(dead_code)] // T2 C2: lease group migrated; sessions still on Mutex.
+    /// Phase C lease cache (keyed by share-relative path) and the
+    /// sessions table. All mutation of those maps happens inside the
+    /// actor task; callers send commands and await typed replies.
     actor: ConnectionActorHandle,
 }
 
