@@ -809,22 +809,12 @@ pub(crate) struct ConnectionMessageHandler {
     /// consumers when the server sends a `LeaseBreakNotify`.
     lease_event_tx: tokio::sync::broadcast::Sender<LeaseBreakEvent>,
 
-    /// Per-connection cache of server-granted leases (Phase C). Keyed by
-    /// the file path relative to the share. Entries are inserted when a
-    /// `CreateResponse` carries an `RqLs` grant and removed when the last
-    /// holder drops *and* the slot is tombstoned. The actual `Close`
-    /// packet is deferred until destruction.
-    lease_table: Mutex<HashMap<String, Arc<LeaseSlot>>>,
-
-    /// Handle to the per-connection state actor (S7).
-    ///
-    /// T1 scaffolding: the actor task is spawned and the handle is
-    /// stored here, but no caller routes through it yet — `sessions`
-    /// / `lease_table` above remain authoritative. T2 will migrate
-    /// each caller from the mutex fields to this handle, dropping the
-    /// mutex field in the same commit. See `actor.rs` module doc for
-    /// the full migration plan.
-    #[allow(dead_code)] // T1
+    /// Handle to the per-connection state actor (S7). Owns the
+    /// Phase C lease cache (keyed by share-relative path) and — once
+    /// C3 lands — the sessions table. All mutation of those maps
+    /// happens inside the actor task; callers send commands and await
+    /// typed replies.
+    #[allow(dead_code)] // T2 C2: lease group migrated; sessions still on Mutex.
     actor: ConnectionActorHandle,
 }
 
@@ -843,7 +833,6 @@ impl ConnectionMessageHandler {
             stop_notifications: Default::default(),
             sessions: Mutex::new(HashMap::with_capacity(1)),
             lease_event_tx,
-            lease_table: Mutex::new(HashMap::new()),
             actor: ConnectionActor::spawn(),
         }
     }
@@ -855,10 +844,7 @@ impl ConnectionMessageHandler {
     /// other side) is logically equivalent to no cache hit.
     pub async fn insert_lease_slot(&self, slot: Arc<LeaseSlot>) -> crate::Result<()> {
         use std::sync::atomic::Ordering;
-        let key = slot.path.clone();
-        let mut table = self.lease_table.lock().await;
-        let displaced = table.insert(key, slot);
-        drop(table);
+        let displaced = self.actor.insert_lease(slot).await?;
         if let Some(prev) = displaced {
             // Tombstone the displaced slot. If a live ResourceHandle is
             // still holding it (refcount > 0), its eventual close/Drop
@@ -910,7 +896,7 @@ impl ConnectionMessageHandler {
     /// Return the current number of cached lease slots. Primarily for
     /// observability and tests; not in any hot path.
     pub async fn lease_slot_count(&self) -> crate::Result<usize> {
-        Ok(self.lease_table.lock().await.len())
+        self.actor.lease_slot_count().await
     }
 
     /// Look up a cached lease slot by path. Returns `None` when there is
@@ -919,7 +905,7 @@ impl ConnectionMessageHandler {
     /// [`Self::try_acquire_lease`] instead so the bump is atomic with the
     /// lookup against concurrent evictions.
     pub async fn peek_lease_slot(&self, path: &str) -> crate::Result<Option<Arc<LeaseSlot>>> {
-        Ok(self.lease_table.lock().await.get(path).cloned())
+        self.actor.peek_lease(path.to_string()).await
     }
 
     /// Phase C.5 race-free acquire: look up `path` and call
@@ -938,15 +924,14 @@ impl ConnectionMessageHandler {
         requested_disposition: smb_msg::CreateDisposition,
         wants_directory: bool,
     ) -> crate::Result<Option<Arc<LeaseSlot>>> {
-        let table = self.lease_table.lock().await;
-        let Some(slot) = table.get(path).cloned() else {
-            return Ok(None);
-        };
-        if slot.try_acquire_for_reuse(requested_access, requested_disposition, wants_directory) {
-            Ok(Some(slot))
-        } else {
-            Ok(None)
-        }
+        self.actor
+            .try_acquire_lease(
+                path.to_string(),
+                requested_access,
+                requested_disposition,
+                wants_directory,
+            )
+            .await
     }
 
     /// Phase C.5: atomically tombstone a slot keyed by `path`, remove it
@@ -960,24 +945,7 @@ impl ConnectionMessageHandler {
     ///
     /// Returns `None` when `path` had no entry.
     pub async fn take_lease_for_evict(&self, path: &str) -> crate::Result<Option<LeaseEviction>> {
-        use std::sync::atomic::Ordering;
-        let mut table = self.lease_table.lock().await;
-        let Some(slot) = table.remove(path) else {
-            return Ok(None);
-        };
-        slot.tombstoned.store(true, Ordering::Release);
-        let live = slot.refcount.load(Ordering::Acquire);
-        let needs_wire_close = live == 0;
-        tracing::debug!(
-            path = %slot.path,
-            live_handles = live,
-            needs_wire_close,
-            "Lease slot tombstoned and removed from table",
-        );
-        Ok(Some(LeaseEviction {
-            slot,
-            needs_wire_close,
-        }))
+        self.actor.take_lease_for_evict(path.to_string()).await
     }
 
     /// Phase C.5 idle sweep: walk the lease table, tombstone every slot
@@ -990,45 +958,7 @@ impl ConnectionMessageHandler {
         &self,
         older_than: std::time::Duration,
     ) -> crate::Result<Vec<LeaseEviction>> {
-        use std::sync::atomic::Ordering;
-        // If `older_than` exceeds the elapsed time since this `Instant`
-        // monotonic clock began (e.g. caller passed `Duration::MAX`),
-        // there is nothing older than the cutoff — return immediately
-        // instead of the previous bug where the fallback `now` made
-        // every slot eligible for eviction.
-        let Some(cutoff) = std::time::Instant::now().checked_sub(older_than) else {
-            return Ok(Vec::new());
-        };
-        let mut table = self.lease_table.lock().await;
-
-        // Two-phase: collect victims first to avoid mutating while iterating.
-        let victims: Vec<String> = table
-            .iter()
-            .filter_map(|(k, slot)| match slot.last_used.read() {
-                Ok(ts) if *ts <= cutoff => Some(k.clone()),
-                _ => None,
-            })
-            .collect();
-
-        let mut out = Vec::with_capacity(victims.len());
-        for path in victims {
-            if let Some(slot) = table.remove(&path) {
-                slot.tombstoned.store(true, Ordering::Release);
-                let live = slot.refcount.load(Ordering::Acquire);
-                let needs_wire_close = live == 0;
-                tracing::debug!(
-                    path = %slot.path,
-                    live_handles = live,
-                    needs_wire_close,
-                    "Idle lease slot tombstoned and removed",
-                );
-                out.push(LeaseEviction {
-                    slot,
-                    needs_wire_close,
-                });
-            }
-        }
-        Ok(out)
+        self.actor.sweep_idle_leases(older_than).await
     }
 
     /// Spawn a long-running task that consumes the lease-break broadcast
@@ -1083,40 +1013,24 @@ impl ConnectionMessageHandler {
     /// updated to the server's new state.
     ///
     /// The tombstone-store, granted_state update, and table removal all
-    /// happen inside the `lease_table` lock so a concurrent
-    /// `try_acquire_lease` either runs first (and gets a still-valid
-    /// slot for which the wire I/O may racily fail — recoverable) or
-    /// runs after (and finds the slot gone, falling back to a fresh
-    /// wire Create). Without this fence the in-flight acquirer could
-    /// observe `tombstoned == false`, bump refcount, and hand out a
-    /// FileId the server has already revoked.
+    /// happen inside the actor task so a concurrent `try_acquire_lease`
+    /// either runs strictly before (and gets a still-valid slot for
+    /// which the wire I/O may racily fail — recoverable) or strictly
+    /// after (and finds the slot gone, falling back to a fresh wire
+    /// Create). Without this fence the in-flight acquirer could observe
+    /// `tombstoned == false`, bump refcount, and hand out a FileId the
+    /// server has already revoked.
     async fn apply_lease_break(&self, event: &LeaseBreakEvent) {
-        use std::sync::atomic::Ordering;
         let event_key = event.lease_key.as_u128();
-
-        let matching: Vec<Arc<LeaseSlot>> = {
-            let mut table = self.lease_table.lock().await;
-
-            // Two-phase under the same lock: find victim paths first to
-            // sidestep "mutate while iterating", then remove + apply
-            // state transitions. Keeping both phases inside the lock
-            // closes the race against `try_acquire_lease`.
-            let victim_paths: Vec<String> = table
-                .iter()
-                .filter(|(_, slot)| slot.lease_key == event_key)
-                .map(|(k, _)| k.clone())
-                .collect();
-            victim_paths
-                .into_iter()
-                .filter_map(|p| {
-                    let slot = table.remove(&p)?;
-                    slot.tombstoned.store(true, Ordering::Release);
-                    if let Ok(mut state) = slot.granted_state.write() {
-                        *state = event.new_state;
-                    }
-                    Some(slot)
-                })
-                .collect()
+        let matching = match self.actor.apply_lease_break(event_key, event.new_state).await {
+            Ok(m) => m,
+            Err(_) => {
+                // Connection actor has shut down — break fan-out is a
+                // best-effort cleanup, so swallow the error rather than
+                // panicking the listener task. The connection is on its
+                // way down; the slots will be reclaimed by Drop.
+                return;
+            }
         };
 
         if matching.is_empty() {
