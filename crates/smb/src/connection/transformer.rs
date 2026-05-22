@@ -1,5 +1,7 @@
 use crate::connection::preauth_hash::{PreauthHashState, PreauthHashValue};
-use crate::session::{MessageSigner, SessionAndChannel, SessionInfo};
+use crate::session::{
+    MessageDecryptor, MessageEncryptor, MessageSigner, SessionAndChannel, SessionInfo,
+};
 use crate::sync_helpers::*;
 use crate::{compression::*, msg_handler::*};
 use binrw::prelude::*;
@@ -276,6 +278,33 @@ impl Transformer {
                 .unwrap_or(false))
         })
         .await
+    }
+
+    /// Returns a fresh clone of the session encryptor for `session_id`,
+    /// or `Ok(None)` when the session hasn't reached `Ready` yet (no
+    /// encryptor derived). The clone is an `Arc`-clone of the underlying
+    /// AEAD algo — see [`MessageEncryptor`] for the safety argument
+    /// covering concurrent reuse.
+    ///
+    /// The point of returning an owned [`MessageEncryptor`] is to let
+    /// callers drop the sessions read lock *before* running the AEAD
+    /// encrypt, which is the most expensive single step on the outgoing
+    /// hot path.
+    pub(crate) async fn get_encryptor(
+        &self,
+        session_id: u64,
+    ) -> crate::Result<Option<MessageEncryptor>> {
+        self._with_session(session_id, |info| info.encryptor_clone())
+            .await
+    }
+
+    /// Mirror of [`Self::get_encryptor`] for the incoming decrypt path.
+    pub(crate) async fn get_decryptor(
+        &self,
+        session_id: u64,
+    ) -> crate::Result<Option<MessageDecryptor>> {
+        self._with_session(session_id, |info| info.decryptor_clone())
+            .await
     }
 
     /// (Internal)
@@ -601,20 +630,20 @@ impl Transformer {
         if should_encrypt {
             debug_assert!(should_encrypt && !should_sign);
 
-            let encrypted_header = self
-                ._with_session(session_id, |session| {
-                    let encryptor = session.encryptor()?.ok_or(crate::Error::TranformFailed(
-                        TransformError {
-                            outgoing: true,
-                            phase: TransformPhase::EncryptDecrypt,
-                            session_id: Some(session_id),
-                            why: "Message is required to be encrypted, but no encryptor is set up!",
-                            msg_id: Some(msg.message.header.message_id),
-                        },
-                    ))?;
-                    encryptor.encrypt_message(&mut outgoing_data, session_id)
-                })
-                .await?;
+            // AEAD encrypt runs *outside* the sessions read lock:
+            // get_encryptor returns an owned clone, then we release
+            // the inner borrow before the (CPU-bound) encrypt step.
+            let encryptor = self.get_encryptor(session_id).await?.ok_or(
+                crate::Error::TranformFailed(TransformError {
+                    outgoing: true,
+                    phase: TransformPhase::EncryptDecrypt,
+                    session_id: Some(session_id),
+                    why: "Message is required to be encrypted, but no encryptor is set up!",
+                    msg_id: Some(msg.message.header.message_id),
+                }),
+            )?;
+            let encrypted_header =
+                encryptor.encrypt_message(&mut outgoing_data, session_id)?;
 
             let write_encryption_header =
                 outgoing_data.insert_owned(0, Vec::with_capacity(EncryptedHeader::STRUCTURE_SIZE));
@@ -653,20 +682,16 @@ impl Transformer {
         let (message, raw) = if let Response::Encrypted(encrypted_message) = message {
             let session_id = encrypted_message.header.session_id;
             form.encrypted = true;
-            let (msg, vec) = self
-                ._with_session(session_id, |session| {
-                    let decryptor = session.decryptor()?.ok_or(crate::Error::TranformFailed(
-                        TransformError {
-                            outgoing: false,
-                            phase: TransformPhase::EncryptDecrypt,
-                            session_id: Some(session_id),
-                            why: "Message is required to be encrypted, but no decryptor is set up!",
-                            msg_id: None,
-                        },
-                    ))?;
-                    decryptor.decrypt_message(encrypted_message)
-                })
-                .await?;
+            let decryptor = self.get_decryptor(session_id).await?.ok_or(
+                crate::Error::TranformFailed(TransformError {
+                    outgoing: false,
+                    phase: TransformPhase::EncryptDecrypt,
+                    session_id: Some(session_id),
+                    why: "Message is required to be encrypted, but no decryptor is set up!",
+                    msg_id: None,
+                }),
+            )?;
+            let (msg, vec) = decryptor.decrypt_message(encrypted_message)?;
             (msg, Bytes::from(vec))
         } else {
             (message, data)
@@ -777,20 +802,16 @@ impl Transformer {
             let session_id = encrypted_message.header.session_id;
 
             form.encrypted = true;
-            let (msg, vec) = self
-                ._with_session(session_id, |session| {
-                    let decryptor = session.decryptor()?.ok_or(crate::Error::TranformFailed(
-                        TransformError {
-                            outgoing: false,
-                            phase: TransformPhase::EncryptDecrypt,
-                            session_id: Some(session_id),
-                            why: "Message is required to be encrypted, but no decryptor is set up!",
-                            msg_id: None,
-                        },
-                    ))?;
-                    decryptor.decrypt_message(encrypted_message)
-                })
-                .await?;
+            let decryptor = self.get_decryptor(session_id).await?.ok_or(
+                crate::Error::TranformFailed(TransformError {
+                    outgoing: false,
+                    phase: TransformPhase::EncryptDecrypt,
+                    session_id: Some(session_id),
+                    why: "Message is required to be encrypted, but no decryptor is set up!",
+                    msg_id: None,
+                }),
+            )?;
+            let (msg, vec) = decryptor.decrypt_message(encrypted_message)?;
             // Decryption returns a new Vec<u8>, convert to Bytes
             (msg, Bytes::from(vec))
         } else {
