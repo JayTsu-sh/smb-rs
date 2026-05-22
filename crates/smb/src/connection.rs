@@ -9,7 +9,6 @@ use crate::compression;
 use crate::connection::preauth_hash::PreauthHashState;
 use crate::dialects::DialectImpl;
 use crate::lease::{LeaseBreakEvent, LeaseSlot};
-use crate::session::ChannelMessageHandler;
 use crate::sync_helpers::*;
 use crate::{Error, crypto, msg_handler::*, session::Session};
 use actor::{ConnectionActor, ConnectionActorHandle};
@@ -25,7 +24,6 @@ use smb_msg::{
 };
 use smb_transport::*;
 use std::cmp::max;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::time::Instant;
@@ -556,10 +554,9 @@ impl Connection {
         .await?;
         let session_handler = session.handler.weak();
         self.handler
-            .sessions
-            .lock()
-            .await
-            .insert(session.session_id(), session_handler);
+            .actor
+            .insert_session(session.session_id(), session_handler)
+            .await?;
         Ok(session)
     }
 
@@ -591,10 +588,9 @@ impl Connection {
         .await?;
         let session_handler = session.handler.weak();
         self.handler
-            .sessions
-            .lock()
-            .await
-            .insert(session.session_id(), session_handler);
+            .actor
+            .insert_session(session.session_id(), session_handler)
+            .await?;
         Ok(session)
     }
 
@@ -791,9 +787,6 @@ pub(crate) struct ConnectionMessageHandler {
     /// Cancellation token for stopping notifications.
     stop_notifications: CancellationToken,
 
-    /// Holds the sessions created by this connection.
-    sessions: Mutex<HashMap<u64, Weak<ChannelMessageHandler>>>,
-
     // Negotiation-related state.
     conn_info: OnceCell<Arc<ConnectionInfo>>,
 
@@ -831,7 +824,6 @@ impl ConnectionMessageHandler {
             curr_msg_id: AtomicU64::new(0),
             credit_pool: AtomicU16::new(1),
             stop_notifications: Default::default(),
-            sessions: Mutex::new(HashMap::with_capacity(1)),
             lease_event_tx,
             actor: ConnectionActor::spawn(),
         }
@@ -1333,23 +1325,24 @@ impl MessageHandler for ConnectionMessageHandler {
             return Ok(());
         }
 
-        // Avoid holding the lock while notifying the session further.
-        let session = {
-            let sessions = self.sessions.lock().await;
-            match sessions.get(&msg.message.header.session_id) {
-                None => {
-                    tracing::warn!(
-                        "Received notification for unknown session ID {}: {msg:?}",
-                        msg.message.header.session_id
-                    );
-                    return Ok(());
-                }
-                Some(weak_session) => weak_session.upgrade().ok_or_else(|| {
-                    Error::InvalidState(format!(
-                        "Session {} is no longer available",
-                        msg.message.header.session_id
-                    ))
-                })?,
+        // Lookup runs inside the actor task; we receive a typed result
+        // that distinguishes unknown session_id (warn and drop) from a
+        // known-but-dropped session (raise InvalidState to surface the
+        // ordering bug to callers).
+        let session = match self.actor.get_session(msg.message.header.session_id).await? {
+            Ok(Some(handler)) => handler,
+            Ok(None) => {
+                tracing::warn!(
+                    "Received notification for unknown session ID {}: {msg:?}",
+                    msg.message.header.session_id
+                );
+                return Ok(());
+            }
+            Err(actor::SessionGone) => {
+                return Err(Error::InvalidState(format!(
+                    "Session {} is no longer available",
+                    msg.message.header.session_id
+                )));
             }
         };
 
@@ -1439,9 +1432,16 @@ impl ConnectionMessageHandler {
     /// Samba-based servers. Lease identity is in the lease_key, not the
     /// session, so the choice of session doesn't matter.
     async fn send_lease_break_ack(&self, notify: &smb_msg::LeaseBreakNotify) {
-        let session_handler = {
-            let sessions = self.sessions.lock().await;
-            sessions.values().find_map(|w| w.upgrade())
+        let session_handler = match self.actor.any_live_session().await {
+            Ok(h) => h,
+            Err(_) => {
+                // Connection actor has shut down — best-effort path.
+                tracing::warn!(
+                    lease_key = ?notify.lease_key,
+                    "Cannot send LeaseBreakAck: connection actor stopped",
+                );
+                return;
+            }
         };
 
         let Some(h) = session_handler else {
