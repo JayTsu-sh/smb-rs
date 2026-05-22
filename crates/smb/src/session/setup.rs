@@ -43,7 +43,7 @@ where
 
     handler: Option<ChannelMessageHandler>,
 
-    result: Option<Arc<RwLock<SessionAndChannel>>>,
+    result: Option<Arc<SessionAndChannel>>,
 
     authenticator: G,
     upstream: &'a ChannelUpstream,
@@ -63,7 +63,7 @@ impl<'a> SessionSetup<'a, Authenticator> {
         upstream: &'a ChannelUpstream,
         conn_info: &'a Arc<ConnectionInfo>,
         new_channel_id: u32,
-        primary_session: Option<&Arc<RwLock<SessionAndChannel>>>,
+        primary_session: Option<&Arc<SessionAndChannel>>,
         kind: SetupKind,
     ) -> crate::Result<Self> {
         let authenticator = Authenticator::build(identity, conn_info)?;
@@ -90,7 +90,7 @@ where
         upstream: &'a ChannelUpstream,
         conn_info: &'a Arc<ConnectionInfo>,
         new_channel_id: u32,
-        primary_session: Option<&Arc<RwLock<SessionAndChannel>>>,
+        primary_session: Option<&Arc<SessionAndChannel>>,
         kind: SetupKind,
     ) -> crate::Result<Self> {
         debug_assert!(
@@ -112,15 +112,12 @@ where
         };
 
         if let Some(primary_session) = primary_session {
-            let primary_session = primary_session.read().await;
-
             let session = primary_session.session.clone();
 
-            let channel = primary_session
-                .channel
-                .as_ref()
-                .expect("A properly initialized session is expected in session setup.")
-                .clone();
+            let channel = (*primary_session
+                .channel()
+                .expect("A properly initialized session is expected in session setup."))
+            .clone();
             #[cfg(feature = "ksmbd-multichannel-compat")]
             let channel = channel.with_binding(true);
 
@@ -129,9 +126,7 @@ where
                 .result
                 .as_ref()
                 .expect("Should have been set up by set_session()")
-                .write()
-                .await
-                .channel = Some(channel);
+                .set_channel(channel);
         }
 
         Ok(result)
@@ -144,7 +139,7 @@ where
     /// GSS layer reports authentication complete. On any error the
     /// matching [`SetupKind`]-specific cleanup runs before propagating
     /// the error out.
-    pub(crate) async fn setup(&mut self) -> crate::Result<Arc<RwLock<SessionAndChannel>>> {
+    pub(crate) async fn setup(&mut self) -> crate::Result<Arc<SessionAndChannel>> {
         tracing::debug!(
             "Setting up session for user {} (@{}).",
             self.authenticator.user_name().account_name(),
@@ -292,8 +287,6 @@ where
                 .ok_or_else(|| {
                     Error::InvalidState("Session state must be set before keys exchange".into())
                 })?
-                .read()
-                .await
                 .session
                 .write()
                 .await
@@ -311,14 +304,9 @@ where
             let flags = self.flags.ok_or_else(|| {
                 Error::InvalidState("flags must be set before on_setup_success".into())
             })?;
-            let result = self
-                .result
-                .as_ref()
-                .ok_or_else(|| {
-                    Error::InvalidState("Session state must be set on success path".into())
-                })?
-                .read()
-                .await;
+            let result = self.result.as_ref().ok_or_else(|| {
+                Error::InvalidState("Session state must be set on success path".into())
+            })?;
             let mut session = result.session.write().await;
             session.ready(flags, self.conn_info)?;
         }
@@ -343,8 +331,7 @@ where
 
         if self.kind == SetupKind::New {
             tracing::trace!("Invalidating session before cleanup.");
-            let session_lock = session.read().await;
-            session_lock.session.write().await.invalidate();
+            session.session.write().await.invalidate();
         }
 
         self.upstream
@@ -361,8 +348,7 @@ where
 
     async fn set_session(&mut self, session: Arc<RwLock<SessionInfo>>) -> crate::Result<()> {
         let session_id = session.read().await.id();
-        let result = SessionAndChannel::new(session_id, session);
-        let session = Arc::new(RwLock::new(result));
+        let session = Arc::new(SessionAndChannel::new(session_id, session));
 
         let setup_handler = ChannelMessageHandler::make_for_setup(&session, self.upstream).await?;
         self.handler = Some(setup_handler);
@@ -392,7 +378,7 @@ where
             .with_msg_id_filter(for_msg_id);
 
         let channel_set_up = match self.result.as_ref() {
-            Some(result) => result.read().await.channel.is_some(),
+            Some(result) => result.channel().is_some(),
             None => false,
         };
         let skip_security_validation = !is_auth_done && !channel_set_up;
@@ -487,8 +473,6 @@ where
             .ok_or_else(|| {
                 Error::InvalidState("Session state must be set before the final request".into())
             })?
-            .read()
-            .await
             .session_id;
         request.message.header.session_id = session_id;
 
@@ -541,12 +525,10 @@ where
 
         self.channel = Some(channel_info);
 
-        let mut session_lock = self
+        let session_lock = self
             .result
             .as_ref()
-            .ok_or_else(|| Error::InvalidState("Session setup result is missing.".to_string()))?
-            .write()
-            .await;
+            .ok_or_else(|| Error::InvalidState("Session setup result is missing.".to_string()))?;
         session_lock.set_channel(
             self.channel
                 .take()

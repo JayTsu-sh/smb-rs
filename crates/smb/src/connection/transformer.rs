@@ -19,7 +19,12 @@ pub struct Transformer {
     /// Sessions opened from this connection.
     // This structure is performance-critical, so it uses RwLock to allow concurrent reads.
     // Writes are only done when a session is started or ended - which is *very* rare in high-performance scenarios.
-    sessions: RwLock<HashMap<u64, Arc<RwLock<SessionAndChannel>>>>,
+    //
+    // The value is `Arc<SessionAndChannel>` (no inner `RwLock`): T3
+    // collapsed the previously-nested per-session RwLock into the
+    // entry's set-once `ArcSwapOption<ChannelInfo>` slot plus an
+    // `Arc<RwLock<SessionInfo>>` that is still kept (state machine).
+    sessions: RwLock<HashMap<u64, Arc<SessionAndChannel>>>,
 
     config: RwLock<TransformerConfig>,
 
@@ -164,10 +169,7 @@ impl Transformer {
     }
 
     /// Notifies that a session has started.
-    pub async fn session_started(
-        &self,
-        session: &Arc<RwLock<SessionAndChannel>>,
-    ) -> crate::Result<()> {
+    pub async fn session_started(&self, session: &Arc<SessionAndChannel>) -> crate::Result<()> {
         let rconfig = self.config.read().await;
         if !rconfig.negotiated {
             return Err(crate::Error::InvalidState(
@@ -175,7 +177,7 @@ impl Transformer {
             ));
         }
 
-        let session_id = { session.read().await.session_id };
+        let session_id = session.session_id;
         self.sessions
             .write()
             .await
@@ -191,11 +193,8 @@ impl Transformer {
     }
 
     /// Notifies that a session has ended.
-    pub async fn session_ended(
-        &self,
-        session: &Arc<RwLock<SessionAndChannel>>,
-    ) -> crate::Result<()> {
-        let session_id = { session.read().await.session_id };
+    pub async fn session_ended(&self, session: &Arc<SessionAndChannel>) -> crate::Result<()> {
+        let session_id = session.session_id;
         self.sessions
             .write()
             .await
@@ -215,10 +214,12 @@ impl Transformer {
 
     /// (Internal)
     ///
-    /// Locates the current channel per the provded session ID,
-    /// and invokes the provided closure with the channel information.
-    ///
-    /// Note: this function WILL deadlock if any lock attempt is performed within the closure on `self.sessions`.
+    /// Locates the [`SessionAndChannel`] entry for `session_id` and
+    /// invokes the closure with it. The closure runs while the outer
+    /// `sessions` `RwLock` read guard is held; callers must not
+    /// re-acquire `self.sessions` from inside or they will deadlock.
+    /// The inner channel slot is now `ArcSwapOption<ChannelInfo>`, so
+    /// no nested `RwLock` is traversed here — only the outer guard.
     #[inline]
     async fn _with_channel<F, R>(&self, session_id: u64, f: F) -> crate::Result<R>
     where
@@ -230,16 +231,16 @@ impl Transformer {
             .ok_or(crate::Error::InvalidState(format!(
                 "Session {session_id} not found!",
             )))?;
-        let session = session.read().await;
-        f(&session)
+        f(session)
     }
 
     /// (Internal)
     ///
-    /// Locates the current session per the provided session ID,
-    /// and invokes the provided closure with the session information.
-    ///
-    /// Note: this function WILL deadlock if any lock attempt is performed within the closure on `self.sessions`.
+    /// Locates the current [`SessionInfo`] for `session_id` and invokes
+    /// the closure with a `&SessionInfo` borrow. Two locks acquired in
+    /// sequence (outer `sessions` read + inner `SessionInfo` read);
+    /// callers must not re-enter either from the closure or they will
+    /// deadlock.
     #[inline]
     async fn _with_session<F, R>(&self, session_id: u64, f: F) -> crate::Result<R>
     where
@@ -251,7 +252,6 @@ impl Transformer {
             .ok_or(crate::Error::InvalidState(format!(
                 "Session {session_id} not found!",
             )))?;
-        let session = session.read().await;
         let session_info = session.session.read().await;
         f(&session_info)
     }
@@ -380,8 +380,7 @@ impl Transformer {
                 ._with_channel(session_id, |session| {
                     let channel_info =
                         session
-                            .channel
-                            .as_ref()
+                            .channel()
                             .ok_or(crate::Error::TranformFailed(TransformError {
                                 outgoing: true,
                                 phase: TransformPhase::SignVerify,
@@ -512,7 +511,7 @@ impl Transformer {
                     self.derive_setup_phase_signer(&session_key).await?
                 } else {
                     self._with_channel(session_id, |session| {
-                        let channel_info = session.channel.as_ref().ok_or(
+                        let channel_info = session.channel().ok_or(
                             crate::Error::TranformFailed(TransformError {
                                 outgoing: true,
                                 phase: TransformPhase::SignVerify,
@@ -854,16 +853,16 @@ impl Transformer {
         let session_id = message.header.session_id;
         let mut signer = self
             ._with_channel(session_id, |session| {
-                let channel_info = session
-                    .channel
-                    .as_ref()
-                    .ok_or(crate::Error::TranformFailed(TransformError {
-                        outgoing: false,
-                        phase: TransformPhase::SignVerify,
-                        session_id: Some(session_id),
-                        why: "Message is required to be signed, but no channel is set up!",
-                        msg_id: Some(message.header.message_id),
-                    }))?;
+                let channel_info =
+                    session
+                        .channel()
+                        .ok_or(crate::Error::TranformFailed(TransformError {
+                            outgoing: false,
+                            phase: TransformPhase::SignVerify,
+                            session_id: Some(session_id),
+                            why: "Message is required to be signed, but no channel is set up!",
+                            msg_id: Some(message.header.message_id),
+                        }))?;
 
                 Ok(channel_info.signer()?.clone())
             })
@@ -899,7 +898,7 @@ impl Transformer {
             let session_id = _message.header.session_id;
             let is_binding = self
                 ._with_channel(session_id, |session| {
-                    let channel_info = session.channel.as_ref().ok_or(crate::Error::Other(
+                    let channel_info = session.channel().ok_or(crate::Error::Other(
                         "Get channel info for ksmbd sign test failed",
                     ))?;
 

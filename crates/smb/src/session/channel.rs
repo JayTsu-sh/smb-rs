@@ -15,14 +15,12 @@ impl Channel {
     pub(crate) async fn new(
         upstream: &ChannelUpstream,
         conn_info: &Arc<ConnectionInfo>,
-        setup_result: &Arc<RwLock<SessionAndChannel>>,
+        setup_result: &Arc<SessionAndChannel>,
     ) -> crate::Result<Self> {
         let (session_id, channel_id) = {
-            let setup_result = setup_result.read().await;
             let session = setup_result.session.read().await;
             let channel = setup_result
-                .channel
-                .as_ref()
+                .channel()
                 .ok_or_else(|| Error::InvalidState("Channel not set in setup result".into()))?;
             (session.id(), channel.id())
         };
@@ -56,8 +54,7 @@ impl Channel {
     /// SMB2 compound chains (P2.b) and need to set the `signed` flag on
     /// each chained header before going through the worker directly.
     pub async fn allow_unsigned(&self) -> crate::Result<bool> {
-        let state = self.handler.session_state.read().await;
-        let session = state.session.read().await;
+        let session = self.handler.session_state.session.read().await;
         session.allow_unsigned()
     }
 
@@ -77,8 +74,7 @@ impl Channel {
     /// Errors with `InvalidState` when the underlying session has not
     /// reached the Ready state, matching `SessionInfo::should_encrypt`.
     pub async fn should_encrypt(&self) -> crate::Result<bool> {
-        let state = self.handler.session_state.read().await;
-        let session = state.session.read().await;
+        let session = self.handler.session_state.session.read().await;
         session.should_encrypt()
     }
 }
@@ -92,7 +88,7 @@ pub struct ChannelMessageHandler {
     channel_id: u32,
     upstream: ChannelUpstream,
 
-    session_state: Arc<RwLock<SessionAndChannel>>,
+    session_state: Arc<SessionAndChannel>,
 }
 
 impl ChannelMessageHandler {
@@ -100,7 +96,7 @@ impl ChannelMessageHandler {
         session_id: u64,
         channel_id: u32,
         upstream: &ChannelUpstream,
-        setup_result: &Arc<RwLock<SessionAndChannel>>,
+        setup_result: &Arc<SessionAndChannel>,
     ) -> HandlerReference<ChannelMessageHandler> {
         HandlerReference::new(ChannelMessageHandler {
             session_id,
@@ -111,10 +107,10 @@ impl ChannelMessageHandler {
     }
 
     pub(crate) async fn make_for_setup(
-        setup_result: &Arc<RwLock<SessionAndChannel>>,
+        setup_result: &Arc<SessionAndChannel>,
         upstream: &ChannelUpstream,
     ) -> crate::Result<Self> {
-        let session_id = setup_result.read().await.session.read().await.id();
+        let session_id = setup_result.session.read().await.id();
         Ok(Self {
             session_id,
             channel_id: u32::MAX,
@@ -137,8 +133,7 @@ impl ChannelMessageHandler {
         // allow unsigned messages only if the session is anonymous or guest.
         // this is enforced against configuration when setting up the session.
         let (unsigned_allowed, encryption_required) = {
-            let session = self.session_state.read().await;
-            let session = session.session.read().await;
+            let session = self.session_state.session.read().await;
             let encryption_required = session.is_ready() && session.should_encrypt()?;
             (session.allow_unsigned()?, encryption_required)
         };
@@ -193,8 +188,7 @@ impl ChannelMessageHandler {
             // Note: this is performed here for extra security,
             // while we could have just checked the session state, let's require
             // the caller to explicitly state that it is okay to skip security validation.
-            let session = self.session_state.read().await;
-            let session = session.session.read().await;
+            let session = self.session_state.session.read().await;
             assert!(
                 session.is_initial(),
                 "Incorrect internal state: security checks are never skipped, unless the session is still being set up!"
@@ -223,7 +217,7 @@ impl ChannelMessageHandler {
         self.channel_id
     }
 
-    pub fn session_state(&self) -> &Arc<RwLock<SessionAndChannel>> {
+    pub fn session_state(&self) -> &Arc<SessionAndChannel> {
         &self.session_state
     }
 }
@@ -237,8 +231,7 @@ impl MessageHandler for ChannelMessageHandler {
         // doesn't have to re-derive it from `msg.encrypt` /
         // `header.flags.signed` later.
         if msg.security.is_none() {
-            let session = self.session_state.read().await;
-            let session = session.session.read().await;
+            let session = self.session_state.session.read().await;
             if session.is_invalid() {
                 return Err(Error::InvalidState("Session is invalid".to_string()));
             }

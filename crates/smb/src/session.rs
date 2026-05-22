@@ -18,6 +18,7 @@ use crate::{
     sync_helpers::*,
     tree::Tree,
 };
+use arc_swap::ArcSwapOption;
 use smb_msg::{Notification, ResponseContent, Status, session_setup::*};
 use std::collections::HashMap;
 use std::ops::Deref;
@@ -146,8 +147,7 @@ impl Session {
         }
 
         {
-            let primary_session_state = self.handler.session_state().read().await;
-            let session = primary_session_state.session.read().await;
+            let session = self.handler.session_state().session.read().await;
             if !session.is_ready() {
                 return Err(Error::InvalidState(
                     "Cannot bind session that is not ready.".to_string(),
@@ -198,8 +198,7 @@ impl Session {
         let setup_result = session_setup.setup().await?;
 
         {
-            let session = setup_result.read().await;
-            let session = session.session.read().await;
+            let session = setup_result.session.read().await;
             tracing::debug!("Session setup complete.");
             if session.allow_unsigned()? {
                 tracing::debug!("Session is guest/anonymous.");
@@ -244,12 +243,34 @@ impl Deref for Session {
     }
 }
 
-#[derive(Clone)]
+/// Per-session state shared by the transformer (one entry per
+/// `session_id` in [`crate::connection::transformer::Transformer::sessions`]).
+///
+/// # Lock layout (post-S7-T3 C2)
+///
+/// The outer `Arc<RwLock<SessionAndChannel>>` that the pre-T3 codebase
+/// wrapped this struct in is gone — every mutator now operates through
+/// `&self`:
+///
+/// - `session: Arc<RwLock<SessionInfo>>` still uses an inner `RwLock`
+///   because the session state machine (`Initial` → `SettingUp` →
+///   `Ready` / `Invalid`) is mutated during setup and teardown.
+///   Mutations are bounded (≤2 sites) and reads are hot, so `RwLock` is
+///   the right primitive there.
+/// - `channel: ArcSwapOption<ChannelInfo>` uses [`arc_swap`] for the
+///   set-once channel slot: `ChannelInfo` is installed exactly once at
+///   session-setup completion (`setup.rs::make_channel`) and is then
+///   read on every wire message that participates in signing.
+///   `ArcSwapOption` gives us atomic store + lock-free load — no
+///   write-lock acquired per signed message.
+///
+/// `Clone` is *not* derived. Instances always live behind `Arc`; clone
+/// the `Arc` instead.
 pub struct SessionAndChannel {
     pub session_id: u64,
 
     pub session: Arc<RwLock<SessionInfo>>,
-    pub channel: Option<ChannelInfo>,
+    pub channel: ArcSwapOption<ChannelInfo>,
 }
 
 impl SessionAndChannel {
@@ -257,12 +278,24 @@ impl SessionAndChannel {
         Self {
             session_id,
             session,
-            channel: None,
+            channel: ArcSwapOption::const_empty(),
         }
     }
 
-    pub fn set_channel(&mut self, channel: ChannelInfo) {
-        self.channel = Some(channel);
+    /// Install the channel slot. Takes `&self` because the underlying
+    /// `ArcSwapOption` supports atomic store without an outer lock.
+    /// Called exactly once per session setup (see
+    /// `session/setup.rs::make_channel`).
+    pub fn set_channel(&self, channel: ChannelInfo) {
+        self.channel.store(Some(Arc::new(channel)));
+    }
+
+    /// Snapshot the currently installed channel (if any). Returns a
+    /// fresh `Arc<ChannelInfo>` so callers can drop the
+    /// `Arc<SessionAndChannel>` while holding a stable reference to
+    /// the channel state they observed.
+    pub fn channel(&self) -> Option<Arc<ChannelInfo>> {
+        self.channel.load_full()
     }
 }
 
@@ -299,8 +332,7 @@ impl SessionMessageHandler {
         }
 
         {
-            let state = self.primary_channel.session_state().read().await;
-            let state = state.session.read().await;
+            let state = self.primary_channel.session_state().session.read().await;
             if !state.is_ready() {
                 tracing::trace!("Session not ready, or logged-off already, skipping logoff.");
                 return Ok(());
@@ -315,8 +347,6 @@ impl SessionMessageHandler {
         tracing::info!("Session logged off.");
         self.primary_channel
             .session_state()
-            .read()
-            .await
             .session
             .write()
             .await
