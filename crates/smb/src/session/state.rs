@@ -455,6 +455,22 @@ impl SessionInfo {
             )),
         }
     }
+
+    /// Cheap-clone variant of [`Self::encryptor`]. Returns an owned
+    /// [`MessageEncryptor`] (an `Arc` clone of the underlying
+    /// `EncryptingAlgo`) so the caller can drop the `SessionInfo` lock
+    /// before doing the encrypt work. Used by the S7-T3 hot-path
+    /// migration to avoid holding the inner `RwLock<SessionInfo>`
+    /// across [`MessageEncryptor::encrypt_message`].
+    pub fn encryptor_clone(&self) -> crate::Result<Option<MessageEncryptor>> {
+        Ok(self.encryptor()?.cloned())
+    }
+
+    /// Cheap-clone variant of [`Self::decryptor`]. See
+    /// [`Self::encryptor_clone`] for the rationale.
+    pub fn decryptor_clone(&self) -> crate::Result<Option<MessageDecryptor>> {
+        Ok(self.decryptor()?.cloned())
+    }
 }
 
 /// A helper struct for deriving SMB2 keys from a session key and preauth hash.

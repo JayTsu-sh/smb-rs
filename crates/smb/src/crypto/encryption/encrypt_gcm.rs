@@ -1,6 +1,7 @@
 use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt};
 use aes_gcm::{AesGcm, KeyInit, KeySizeUser, aead::AeadInOut};
 use crypto_common::typenum;
+use std::sync::Arc;
 
 use crate::crypto::CryptoError;
 
@@ -25,8 +26,8 @@ where
         + Sync
         + 'static,
 {
-    pub fn build(encrypting_key: &[u8]) -> Result<Box<dyn EncryptingAlgo>, CryptoError> {
-        Ok(Box::new(Self {
+    pub fn build(encrypting_key: &[u8]) -> Result<Arc<dyn EncryptingAlgo>, CryptoError> {
+        Ok(Arc::new(Self {
             cipher: AesGcm::<T, typenum::U12>::new_from_slice(encrypting_key)?,
         }))
     }

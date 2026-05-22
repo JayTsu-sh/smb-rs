@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use crate::{
     Error, connection::connection_info::ConnectionInfo, msg_handler::ReceiveOptions,
-    session::SessionAndChannel, sync_helpers::*,
+    session::SessionAndChannel,
 };
 use smb_transport::SmbTransport;
 
@@ -144,11 +144,11 @@ pub trait Worker: Sized + std::fmt::Debug {
         self.transformer().negotiated(neg).await.unwrap();
     }
 
-    async fn session_started(&self, info: &Arc<RwLock<SessionAndChannel>>) -> crate::Result<()> {
+    async fn session_started(&self, info: &Arc<SessionAndChannel>) -> crate::Result<()> {
         self.transformer().session_started(info).await
     }
 
-    async fn session_ended(&self, info: &Arc<RwLock<SessionAndChannel>>) -> crate::Result<()> {
+    async fn session_ended(&self, info: &Arc<SessionAndChannel>) -> crate::Result<()> {
         self.transformer().session_ended(info).await
     }
 }

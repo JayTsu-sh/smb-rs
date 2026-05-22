@@ -1,5 +1,7 @@
 use crate::connection::preauth_hash::{PreauthHashState, PreauthHashValue};
-use crate::session::{SessionAndChannel, SessionInfo};
+use crate::session::{
+    MessageDecryptor, MessageEncryptor, MessageSigner, SessionAndChannel,
+};
 use crate::sync_helpers::*;
 use crate::{compression::*, msg_handler::*};
 use binrw::prelude::*;
@@ -19,7 +21,12 @@ pub struct Transformer {
     /// Sessions opened from this connection.
     // This structure is performance-critical, so it uses RwLock to allow concurrent reads.
     // Writes are only done when a session is started or ended - which is *very* rare in high-performance scenarios.
-    sessions: RwLock<HashMap<u64, Arc<RwLock<SessionAndChannel>>>>,
+    //
+    // The value is `Arc<SessionAndChannel>` (no inner `RwLock`): T3
+    // collapsed the previously-nested per-session RwLock into the
+    // entry's set-once `ArcSwapOption<ChannelInfo>` slot plus an
+    // `Arc<RwLock<SessionInfo>>` that is still kept (state machine).
+    sessions: RwLock<HashMap<u64, Arc<SessionAndChannel>>>,
 
     config: RwLock<TransformerConfig>,
 
@@ -164,10 +171,7 @@ impl Transformer {
     }
 
     /// Notifies that a session has started.
-    pub async fn session_started(
-        &self,
-        session: &Arc<RwLock<SessionAndChannel>>,
-    ) -> crate::Result<()> {
+    pub async fn session_started(&self, session: &Arc<SessionAndChannel>) -> crate::Result<()> {
         let rconfig = self.config.read().await;
         if !rconfig.negotiated {
             return Err(crate::Error::InvalidState(
@@ -175,7 +179,7 @@ impl Transformer {
             ));
         }
 
-        let session_id = { session.read().await.session_id };
+        let session_id = session.session_id;
         self.sessions
             .write()
             .await
@@ -191,11 +195,8 @@ impl Transformer {
     }
 
     /// Notifies that a session has ended.
-    pub async fn session_ended(
-        &self,
-        session: &Arc<RwLock<SessionAndChannel>>,
-    ) -> crate::Result<()> {
-        let session_id = { session.read().await.session_id };
+    pub async fn session_ended(&self, session: &Arc<SessionAndChannel>) -> crate::Result<()> {
+        let session_id = session.session_id;
         self.sessions
             .write()
             .await
@@ -213,47 +214,92 @@ impl Transformer {
         Ok(())
     }
 
-    /// (Internal)
+    /// Looks up the [`SessionAndChannel`] entry for `session_id`.
+    /// Errs with `InvalidState` when the transformer has no record of
+    /// that session.
     ///
-    /// Locates the current channel per the provded session ID,
-    /// and invokes the provided closure with the channel information.
-    ///
-    /// Note: this function WILL deadlock if any lock attempt is performed within the closure on `self.sessions`.
+    /// Internal helper for the public `get_signer` / `get_encryptor` /
+    /// etc. accessors below. Each accessor extracts exactly what it
+    /// needs (signer clone, encryptor clone, channel binding bit) and
+    /// releases the read guard before returning — no closure-over-lock
+    /// pattern remains.
     #[inline]
-    async fn _with_channel<F, R>(&self, session_id: u64, f: F) -> crate::Result<R>
-    where
-        F: FnOnce(&SessionAndChannel) -> crate::Result<R>,
-    {
+    async fn session_entry(
+        &self,
+        session_id: u64,
+    ) -> crate::Result<Arc<SessionAndChannel>> {
         let sessions = self.sessions.read().await;
-        let session = sessions
+        sessions
             .get(&session_id)
+            .cloned()
             .ok_or(crate::Error::InvalidState(format!(
                 "Session {session_id} not found!",
-            )))?;
-        let session = session.read().await;
-        f(&session)
+            )))
     }
 
-    /// (Internal)
+    /// Returns a fresh clone of the channel signer for `session_id`,
+    /// or `Ok(None)` when the session entry exists but its channel
+    /// slot hasn't been installed yet (e.g., a Negotiate Response
+    /// arriving before `make_channel` finishes).
     ///
-    /// Locates the current session per the provided session ID,
-    /// and invokes the provided closure with the session information.
+    /// Errs with `InvalidState` when no entry for `session_id` is
+    /// in the transformer's sessions table. Callsites map `Ok(None)`
+    /// to the per-site `TransformError` they need.
+    pub(crate) async fn get_signer(
+        &self,
+        session_id: u64,
+    ) -> crate::Result<Option<MessageSigner>> {
+        let entry = self.session_entry(session_id).await?;
+        match entry.channel() {
+            Some(channel) => Ok(Some(channel.signer()?.clone())),
+            None => Ok(None),
+        }
+    }
+
+    /// `true` iff the channel for `session_id` is installed *and*
+    /// flagged as a binding-only channel (ksmbd multichannel compat).
+    /// Used by [`Self::is_message_signed_ksmbd`] to special-case the
+    /// ksmbd "missing signed flag during multi-channel setup" quirk
+    /// (see MS-SMB2 3.2.4.1.1 for the spec the bug violates).
     ///
-    /// Note: this function WILL deadlock if any lock attempt is performed within the closure on `self.sessions`.
-    #[inline]
-    async fn _with_session<F, R>(&self, session_id: u64, f: F) -> crate::Result<R>
-    where
-        F: FnOnce(&SessionInfo) -> crate::Result<R>,
-    {
-        let sessions = self.sessions.read().await;
-        let session = sessions
-            .get(&session_id)
-            .ok_or(crate::Error::InvalidState(format!(
-                "Session {session_id} not found!",
-            )))?;
-        let session = session.read().await;
-        let session_info = session.session.read().await;
-        f(&session_info)
+    /// Returns `Ok(false)` when the channel hasn't been installed —
+    /// matches the swallow-error behaviour of the pre-refactor
+    /// closure path. Errs only when `session_id` is unknown to the
+    /// transformer.
+    #[cfg(feature = "ksmbd-multichannel-compat")]
+    pub(crate) async fn is_binding(&self, session_id: u64) -> crate::Result<bool> {
+        let entry = self.session_entry(session_id).await?;
+        Ok(entry
+            .channel()
+            .map(|channel| channel.is_binding())
+            .unwrap_or(false))
+    }
+
+    /// Returns a fresh clone of the session encryptor for `session_id`,
+    /// or `Ok(None)` when the session hasn't reached `Ready` yet (no
+    /// encryptor derived). The clone is an `Arc`-clone of the underlying
+    /// AEAD algo — see [`MessageEncryptor`] for the safety argument
+    /// covering concurrent reuse.
+    ///
+    /// The point of returning an owned [`MessageEncryptor`] is to let
+    /// callers drop the sessions read lock *before* running the AEAD
+    /// encrypt, which is the most expensive single step on the outgoing
+    /// hot path.
+    pub(crate) async fn get_encryptor(
+        &self,
+        session_id: u64,
+    ) -> crate::Result<Option<MessageEncryptor>> {
+        let entry = self.session_entry(session_id).await?;
+        entry.session.read().await.encryptor_clone()
+    }
+
+    /// Mirror of [`Self::get_encryptor`] for the incoming decrypt path.
+    pub(crate) async fn get_decryptor(
+        &self,
+        session_id: u64,
+    ) -> crate::Result<Option<MessageDecryptor>> {
+        let entry = self.session_entry(session_id).await?;
+        entry.session.read().await.decryptor_clone()
     }
 
     /// Build the wire bytes for an SMB2 compound chain (MS-SMB2 3.2.4.1.4):
@@ -376,22 +422,15 @@ impl Transformer {
         }
         if should_sign {
             let session_id = msgs[0].message.header.session_id;
-            let signer = self
-                ._with_channel(session_id, |session| {
-                    let channel_info =
-                        session
-                            .channel
-                            .as_ref()
-                            .ok_or(crate::Error::TranformFailed(TransformError {
-                                outgoing: true,
-                                phase: TransformPhase::SignVerify,
-                                session_id: Some(session_id),
-                                why: "Compound message is signed, but no channel signer is set up",
-                                msg_id: None,
-                            }))?;
-                    Ok(channel_info.signer()?.clone())
-                })
-                .await?;
+            let signer = self.get_signer(session_id).await?.ok_or(
+                crate::Error::TranformFailed(TransformError {
+                    outgoing: true,
+                    phase: TransformPhase::SignVerify,
+                    session_id: Some(session_id),
+                    why: "Compound message is signed, but no channel signer is set up",
+                    msg_id: None,
+                }),
+            )?;
 
             for i in 0..msgs.len() {
                 let mut iov: IoVec = IoVec::from(std::mem::take(&mut member_bufs[i]));
@@ -511,20 +550,15 @@ impl Transformer {
                     // for the response-verify path).
                     self.derive_setup_phase_signer(&session_key).await?
                 } else {
-                    self._with_channel(session_id, |session| {
-                        let channel_info = session.channel.as_ref().ok_or(
-                            crate::Error::TranformFailed(TransformError {
-                                outgoing: true,
-                                phase: TransformPhase::SignVerify,
-                                session_id: Some(session_id),
-                                why: "Message is required to be signed, but no channel is set up!",
-                                msg_id: Some(msg.message.header.message_id),
-                            }),
-                        )?;
-
-                        Ok(channel_info.signer()?.clone())
-                    })
-                    .await?
+                    self.get_signer(session_id).await?.ok_or(
+                        crate::Error::TranformFailed(TransformError {
+                            outgoing: true,
+                            phase: TransformPhase::SignVerify,
+                            session_id: Some(session_id),
+                            why: "Message is required to be signed, but no channel is set up!",
+                            msg_id: Some(msg.message.header.message_id),
+                        }),
+                    )?
                 };
 
             signer.sign_message(&mut msg.message.header, &mut outgoing_data)?;
@@ -569,20 +603,20 @@ impl Transformer {
         if should_encrypt {
             debug_assert!(should_encrypt && !should_sign);
 
-            let encrypted_header = self
-                ._with_session(session_id, |session| {
-                    let encryptor = session.encryptor()?.ok_or(crate::Error::TranformFailed(
-                        TransformError {
-                            outgoing: true,
-                            phase: TransformPhase::EncryptDecrypt,
-                            session_id: Some(session_id),
-                            why: "Message is required to be encrypted, but no encryptor is set up!",
-                            msg_id: Some(msg.message.header.message_id),
-                        },
-                    ))?;
-                    encryptor.encrypt_message(&mut outgoing_data, session_id)
-                })
-                .await?;
+            // AEAD encrypt runs *outside* the sessions read lock:
+            // get_encryptor returns an owned clone, then we release
+            // the inner borrow before the (CPU-bound) encrypt step.
+            let encryptor = self.get_encryptor(session_id).await?.ok_or(
+                crate::Error::TranformFailed(TransformError {
+                    outgoing: true,
+                    phase: TransformPhase::EncryptDecrypt,
+                    session_id: Some(session_id),
+                    why: "Message is required to be encrypted, but no encryptor is set up!",
+                    msg_id: Some(msg.message.header.message_id),
+                }),
+            )?;
+            let encrypted_header =
+                encryptor.encrypt_message(&mut outgoing_data, session_id)?;
 
             let write_encryption_header =
                 outgoing_data.insert_owned(0, Vec::with_capacity(EncryptedHeader::STRUCTURE_SIZE));
@@ -621,20 +655,16 @@ impl Transformer {
         let (message, raw) = if let Response::Encrypted(encrypted_message) = message {
             let session_id = encrypted_message.header.session_id;
             form.encrypted = true;
-            let (msg, vec) = self
-                ._with_session(session_id, |session| {
-                    let decryptor = session.decryptor()?.ok_or(crate::Error::TranformFailed(
-                        TransformError {
-                            outgoing: false,
-                            phase: TransformPhase::EncryptDecrypt,
-                            session_id: Some(session_id),
-                            why: "Message is required to be encrypted, but no decryptor is set up!",
-                            msg_id: None,
-                        },
-                    ))?;
-                    decryptor.decrypt_message(encrypted_message)
-                })
-                .await?;
+            let decryptor = self.get_decryptor(session_id).await?.ok_or(
+                crate::Error::TranformFailed(TransformError {
+                    outgoing: false,
+                    phase: TransformPhase::EncryptDecrypt,
+                    session_id: Some(session_id),
+                    why: "Message is required to be encrypted, but no decryptor is set up!",
+                    msg_id: None,
+                }),
+            )?;
+            let (msg, vec) = decryptor.decrypt_message(encrypted_message)?;
             (msg, Bytes::from(vec))
         } else {
             (message, data)
@@ -745,20 +775,16 @@ impl Transformer {
             let session_id = encrypted_message.header.session_id;
 
             form.encrypted = true;
-            let (msg, vec) = self
-                ._with_session(session_id, |session| {
-                    let decryptor = session.decryptor()?.ok_or(crate::Error::TranformFailed(
-                        TransformError {
-                            outgoing: false,
-                            phase: TransformPhase::EncryptDecrypt,
-                            session_id: Some(session_id),
-                            why: "Message is required to be encrypted, but no decryptor is set up!",
-                            msg_id: None,
-                        },
-                    ))?;
-                    decryptor.decrypt_message(encrypted_message)
-                })
-                .await?;
+            let decryptor = self.get_decryptor(session_id).await?.ok_or(
+                crate::Error::TranformFailed(TransformError {
+                    outgoing: false,
+                    phase: TransformPhase::EncryptDecrypt,
+                    session_id: Some(session_id),
+                    why: "Message is required to be encrypted, but no decryptor is set up!",
+                    msg_id: None,
+                }),
+            )?;
+            let (msg, vec) = decryptor.decrypt_message(encrypted_message)?;
             // Decryption returns a new Vec<u8>, convert to Bytes
             (msg, Bytes::from(vec))
         } else {
@@ -852,22 +878,15 @@ impl Transformer {
 
         // Verify signature (if required, according to the spec)
         let session_id = message.header.session_id;
-        let mut signer = self
-            ._with_channel(session_id, |session| {
-                let channel_info = session
-                    .channel
-                    .as_ref()
-                    .ok_or(crate::Error::TranformFailed(TransformError {
-                        outgoing: false,
-                        phase: TransformPhase::SignVerify,
-                        session_id: Some(session_id),
-                        why: "Message is required to be signed, but no channel is set up!",
-                        msg_id: Some(message.header.message_id),
-                    }))?;
-
-                Ok(channel_info.signer()?.clone())
-            })
-            .await?;
+        let mut signer = self.get_signer(session_id).await?.ok_or(
+            crate::Error::TranformFailed(TransformError {
+                outgoing: false,
+                phase: TransformPhase::SignVerify,
+                session_id: Some(session_id),
+                why: "Message is required to be signed, but no channel is set up!",
+                msg_id: Some(message.header.message_id),
+            }),
+        )?;
 
         signer.verify_signature(&mut message.header, raw)?;
         tracing::debug!(
@@ -897,17 +916,7 @@ impl Transformer {
             }
 
             let session_id = _message.header.session_id;
-            let is_binding = self
-                ._with_channel(session_id, |session| {
-                    let channel_info = session.channel.as_ref().ok_or(crate::Error::Other(
-                        "Get channel info for ksmbd sign test failed",
-                    ))?;
-
-                    Ok(channel_info.is_binding())
-                })
-                .await;
-
-            return matches!(is_binding, Ok(true));
+            return self.is_binding(session_id).await.unwrap_or(false);
         }
 
         #[cfg(not(feature = "ksmbd-multichannel-compat"))]

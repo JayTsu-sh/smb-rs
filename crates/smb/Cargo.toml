@@ -47,6 +47,10 @@ siphasher = "1"
 
 url = "2.5.0"
 byteorder = { version = "1.5.0", optional = true }
+# Lock-free atomic Arc swap used for the set-once channel slot inside
+# SessionAndChannel: avoids an outer RwLock that every encrypt / sign
+# path would otherwise traverse.
+arc-swap = "1"
 
 # APIs
 sspi = { version = "0.18.0", features = ["ring"], default-features = false }
