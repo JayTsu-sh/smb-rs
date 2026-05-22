@@ -49,8 +49,6 @@
 //!   would add latency to every send/recv without buying any
 //!   serialisation we don't already have.
 
-#![allow(dead_code)] // T1: command surface defined ahead of T2 caller migration.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Weak;
@@ -58,7 +56,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use smb_fscc::FileAccessMask;
-use smb_msg::CreateDisposition;
+use smb_msg::{CreateDisposition, LeaseState};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -123,6 +121,17 @@ pub(crate) enum ConnectionCommand {
         older_than: Duration,
         reply: oneshot::Sender<Vec<LeaseEviction>>,
     },
+    /// Apply a server-initiated lease break: remove every slot whose
+    /// `lease_key` matches, tombstone it, and overwrite its cached
+    /// `granted_state` with the server's new state. Returns the removed
+    /// slots so the caller can emit per-slot tracing without iterating
+    /// the table again. Unlike `TakeLeaseForEvict`, the caller does not
+    /// owe a wire Close — the server has already revoked the FileId.
+    ApplyLeaseBreak {
+        lease_key: u128,
+        new_state: LeaseState,
+        reply: oneshot::Sender<Vec<Arc<LeaseSlot>>>,
+    },
 
     // ─── sessions table ─────────────────────────────────────────────
     /// Insert a session's channel-handler weak reference. The actor
@@ -138,7 +147,27 @@ pub(crate) enum ConnectionCommand {
     AnyLiveSession {
         reply: oneshot::Sender<Option<Arc<ChannelMessageHandler>>>,
     },
+    /// Look up the channel handler for a specific `session_id` and try
+    /// to upgrade its weak reference. Used by `notify()` to route a
+    /// server response back to the session it belongs to. Returns:
+    ///   - `Ok(Some(handler))` — session is known and still alive
+    ///   - `Ok(None)` — session_id not in the table (unknown session)
+    ///   - `Err(SessionGone)` — session was registered but its `Arc` has
+    ///     since been dropped (caller surfaces this as `InvalidState`)
+    GetSession {
+        session_id: u64,
+        reply: oneshot::Sender<Result<Option<Arc<ChannelMessageHandler>>, SessionGone>>,
+    },
 }
+
+/// Sentinel returned by [`ConnectionCommand::GetSession`] when the
+/// requested session was registered but every strong reference has been
+/// dropped — i.e. the session ended without being explicitly removed
+/// from the table. Distinguished from "unknown session_id" so the caller
+/// can map it to [`crate::Error::InvalidState`] while a genuine cache
+/// miss yields a warn-and-skip.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SessionGone;
 
 /// Background task that serially owns the per-connection mutable
 /// state. Constructed and spawned by [`Self::spawn`]; the returned
@@ -268,6 +297,36 @@ impl ConnectionActor {
                 };
                 let _ = reply.send(result);
             }
+            ConnectionCommand::ApplyLeaseBreak {
+                lease_key,
+                new_state,
+                reply,
+            } => {
+                use std::sync::atomic::Ordering;
+                // Two-phase under the actor's single-owner lock so a
+                // concurrent TryAcquireLease either runs strictly before
+                // (and gets a still-valid slot whose wire I/O may racily
+                // fail — recoverable) or strictly after (and finds the
+                // slot gone, falling back to a fresh wire Create).
+                let victim_paths: Vec<String> = self
+                    .lease_table
+                    .iter()
+                    .filter(|(_, slot)| slot.lease_key == lease_key)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                let removed: Vec<Arc<LeaseSlot>> = victim_paths
+                    .into_iter()
+                    .filter_map(|p| {
+                        let slot = self.lease_table.remove(&p)?;
+                        slot.tombstoned.store(true, Ordering::Release);
+                        if let Ok(mut state) = slot.granted_state.write() {
+                            *state = new_state;
+                        }
+                        Some(slot)
+                    })
+                    .collect();
+                let _ = reply.send(removed);
+            }
             ConnectionCommand::InsertSession {
                 session_id,
                 handler,
@@ -278,6 +337,16 @@ impl ConnectionActor {
             }
             ConnectionCommand::AnyLiveSession { reply } => {
                 let result = self.sessions.values().find_map(|w| w.upgrade());
+                let _ = reply.send(result);
+            }
+            ConnectionCommand::GetSession { session_id, reply } => {
+                let result = match self.sessions.get(&session_id) {
+                    None => Ok(None),
+                    Some(weak) => match weak.upgrade() {
+                        Some(handler) => Ok(Some(handler)),
+                        None => Err(SessionGone),
+                    },
+                };
                 let _ = reply.send(result);
             }
         }
@@ -352,6 +421,19 @@ impl ConnectionActorHandle {
             .await
     }
 
+    pub(crate) async fn apply_lease_break(
+        &self,
+        lease_key: u128,
+        new_state: LeaseState,
+    ) -> crate::Result<Vec<Arc<LeaseSlot>>> {
+        self.dispatch(|reply| ConnectionCommand::ApplyLeaseBreak {
+            lease_key,
+            new_state,
+            reply,
+        })
+        .await
+    }
+
     pub(crate) async fn insert_session(
         &self,
         session_id: u64,
@@ -369,6 +451,19 @@ impl ConnectionActorHandle {
         &self,
     ) -> crate::Result<Option<Arc<ChannelMessageHandler>>> {
         self.dispatch(|reply| ConnectionCommand::AnyLiveSession { reply })
+            .await
+    }
+
+    /// Look up `session_id` and upgrade its weak handler reference.
+    /// The outer `Result` reports actor-channel health (Err = actor
+    /// has shut down); the inner `Result` distinguishes unknown
+    /// session (`Ok(None)`) from a known-but-dropped session
+    /// (`Err(SessionGone)`).
+    pub(crate) async fn get_session(
+        &self,
+        session_id: u64,
+    ) -> crate::Result<Result<Option<Arc<ChannelMessageHandler>>, SessionGone>> {
+        self.dispatch(|reply| ConnectionCommand::GetSession { session_id, reply })
             .await
     }
 }
