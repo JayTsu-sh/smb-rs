@@ -138,7 +138,27 @@ pub(crate) enum ConnectionCommand {
     AnyLiveSession {
         reply: oneshot::Sender<Option<Arc<ChannelMessageHandler>>>,
     },
+    /// Look up the channel handler for a specific `session_id` and try
+    /// to upgrade its weak reference. Used by `notify()` to route a
+    /// server response back to the session it belongs to. Returns:
+    ///   - `Ok(Some(handler))` — session is known and still alive
+    ///   - `Ok(None)` — session_id not in the table (unknown session)
+    ///   - `Err(SessionGone)` — session was registered but its `Arc` has
+    ///     since been dropped (caller surfaces this as `InvalidState`)
+    GetSession {
+        session_id: u64,
+        reply: oneshot::Sender<Result<Option<Arc<ChannelMessageHandler>>, SessionGone>>,
+    },
 }
+
+/// Sentinel returned by [`ConnectionCommand::GetSession`] when the
+/// requested session was registered but every strong reference has been
+/// dropped — i.e. the session ended without being explicitly removed
+/// from the table. Distinguished from "unknown session_id" so the caller
+/// can map it to [`crate::Error::InvalidState`] while a genuine cache
+/// miss yields a warn-and-skip.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SessionGone;
 
 /// Background task that serially owns the per-connection mutable
 /// state. Constructed and spawned by [`Self::spawn`]; the returned
@@ -280,6 +300,16 @@ impl ConnectionActor {
                 let result = self.sessions.values().find_map(|w| w.upgrade());
                 let _ = reply.send(result);
             }
+            ConnectionCommand::GetSession { session_id, reply } => {
+                let result = match self.sessions.get(&session_id) {
+                    None => Ok(None),
+                    Some(weak) => match weak.upgrade() {
+                        Some(handler) => Ok(Some(handler)),
+                        None => Err(SessionGone),
+                    },
+                };
+                let _ = reply.send(result);
+            }
         }
     }
 }
@@ -369,6 +399,19 @@ impl ConnectionActorHandle {
         &self,
     ) -> crate::Result<Option<Arc<ChannelMessageHandler>>> {
         self.dispatch(|reply| ConnectionCommand::AnyLiveSession { reply })
+            .await
+    }
+
+    /// Look up `session_id` and upgrade its weak handler reference.
+    /// The outer `Result` reports actor-channel health (Err = actor
+    /// has shut down); the inner `Result` distinguishes unknown
+    /// session (`Ok(None)`) from a known-but-dropped session
+    /// (`Err(SessionGone)`).
+    pub(crate) async fn get_session(
+        &self,
+        session_id: u64,
+    ) -> crate::Result<Result<Option<Arc<ChannelMessageHandler>>, SessionGone>> {
+        self.dispatch(|reply| ConnectionCommand::GetSession { session_id, reply })
             .await
     }
 }
