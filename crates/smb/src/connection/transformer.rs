@@ -1,5 +1,5 @@
 use crate::connection::preauth_hash::{PreauthHashState, PreauthHashValue};
-use crate::session::{SessionAndChannel, SessionInfo};
+use crate::session::{MessageSigner, SessionAndChannel, SessionInfo};
 use crate::sync_helpers::*;
 use crate::{compression::*, msg_handler::*};
 use binrw::prelude::*;
@@ -234,6 +234,50 @@ impl Transformer {
         f(session)
     }
 
+    /// Returns a fresh clone of the channel signer for `session_id`,
+    /// or `Ok(None)` when the session entry exists but its channel
+    /// slot hasn't been installed yet (e.g., a Negotiate Response
+    /// arriving before `make_channel` finishes).
+    ///
+    /// Errs with `InvalidState` when no entry for `session_id` is
+    /// in the transformer's sessions table. Callsites map `Ok(None)`
+    /// to the per-site `TransformError` they need.
+    ///
+    /// Replaces the previous `_with_channel(session_id, |s| ...)`
+    /// closure pattern at the four signing callsites
+    /// (compound sign, outgoing sign, incoming verify, ksmbd binding).
+    pub(crate) async fn get_signer(
+        &self,
+        session_id: u64,
+    ) -> crate::Result<Option<MessageSigner>> {
+        self._with_channel(session_id, |session| match session.channel() {
+            Some(channel) => Ok(Some(channel.signer()?.clone())),
+            None => Ok(None),
+        })
+        .await
+    }
+
+    /// `true` iff the channel for `session_id` is installed *and*
+    /// flagged as a binding-only channel (ksmbd multichannel compat).
+    /// Used by [`Self::is_message_signed_ksmbd`] to special-case the
+    /// ksmbd "missing signed flag during multi-channel setup" quirk
+    /// (see MS-SMB2 3.2.4.1.1 for the spec the bug violates).
+    ///
+    /// Returns `Ok(false)` when the channel hasn't been installed —
+    /// matches the swallow-error behaviour of the pre-refactor
+    /// closure path. Errs only when `session_id` is unknown to the
+    /// transformer.
+    #[cfg(feature = "ksmbd-multichannel-compat")]
+    pub(crate) async fn is_binding(&self, session_id: u64) -> crate::Result<bool> {
+        self._with_channel(session_id, |session| {
+            Ok(session
+                .channel()
+                .map(|channel| channel.is_binding())
+                .unwrap_or(false))
+        })
+        .await
+    }
+
     /// (Internal)
     ///
     /// Locates the current [`SessionInfo`] for `session_id` and invokes
@@ -376,21 +420,15 @@ impl Transformer {
         }
         if should_sign {
             let session_id = msgs[0].message.header.session_id;
-            let signer = self
-                ._with_channel(session_id, |session| {
-                    let channel_info =
-                        session
-                            .channel()
-                            .ok_or(crate::Error::TranformFailed(TransformError {
-                                outgoing: true,
-                                phase: TransformPhase::SignVerify,
-                                session_id: Some(session_id),
-                                why: "Compound message is signed, but no channel signer is set up",
-                                msg_id: None,
-                            }))?;
-                    Ok(channel_info.signer()?.clone())
-                })
-                .await?;
+            let signer = self.get_signer(session_id).await?.ok_or(
+                crate::Error::TranformFailed(TransformError {
+                    outgoing: true,
+                    phase: TransformPhase::SignVerify,
+                    session_id: Some(session_id),
+                    why: "Compound message is signed, but no channel signer is set up",
+                    msg_id: None,
+                }),
+            )?;
 
             for i in 0..msgs.len() {
                 let mut iov: IoVec = IoVec::from(std::mem::take(&mut member_bufs[i]));
@@ -510,20 +548,15 @@ impl Transformer {
                     // for the response-verify path).
                     self.derive_setup_phase_signer(&session_key).await?
                 } else {
-                    self._with_channel(session_id, |session| {
-                        let channel_info = session.channel().ok_or(
-                            crate::Error::TranformFailed(TransformError {
-                                outgoing: true,
-                                phase: TransformPhase::SignVerify,
-                                session_id: Some(session_id),
-                                why: "Message is required to be signed, but no channel is set up!",
-                                msg_id: Some(msg.message.header.message_id),
-                            }),
-                        )?;
-
-                        Ok(channel_info.signer()?.clone())
-                    })
-                    .await?
+                    self.get_signer(session_id).await?.ok_or(
+                        crate::Error::TranformFailed(TransformError {
+                            outgoing: true,
+                            phase: TransformPhase::SignVerify,
+                            session_id: Some(session_id),
+                            why: "Message is required to be signed, but no channel is set up!",
+                            msg_id: Some(msg.message.header.message_id),
+                        }),
+                    )?
                 };
 
             signer.sign_message(&mut msg.message.header, &mut outgoing_data)?;
@@ -851,22 +884,15 @@ impl Transformer {
 
         // Verify signature (if required, according to the spec)
         let session_id = message.header.session_id;
-        let mut signer = self
-            ._with_channel(session_id, |session| {
-                let channel_info =
-                    session
-                        .channel()
-                        .ok_or(crate::Error::TranformFailed(TransformError {
-                            outgoing: false,
-                            phase: TransformPhase::SignVerify,
-                            session_id: Some(session_id),
-                            why: "Message is required to be signed, but no channel is set up!",
-                            msg_id: Some(message.header.message_id),
-                        }))?;
-
-                Ok(channel_info.signer()?.clone())
-            })
-            .await?;
+        let mut signer = self.get_signer(session_id).await?.ok_or(
+            crate::Error::TranformFailed(TransformError {
+                outgoing: false,
+                phase: TransformPhase::SignVerify,
+                session_id: Some(session_id),
+                why: "Message is required to be signed, but no channel is set up!",
+                msg_id: Some(message.header.message_id),
+            }),
+        )?;
 
         signer.verify_signature(&mut message.header, raw)?;
         tracing::debug!(
@@ -896,17 +922,7 @@ impl Transformer {
             }
 
             let session_id = _message.header.session_id;
-            let is_binding = self
-                ._with_channel(session_id, |session| {
-                    let channel_info = session.channel().ok_or(crate::Error::Other(
-                        "Get channel info for ksmbd sign test failed",
-                    ))?;
-
-                    Ok(channel_info.is_binding())
-                })
-                .await;
-
-            return matches!(is_binding, Ok(true));
+            return self.is_binding(session_id).await.unwrap_or(false);
         }
 
         #[cfg(not(feature = "ksmbd-multichannel-compat"))]
