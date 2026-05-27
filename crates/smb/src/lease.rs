@@ -15,7 +15,6 @@
 //! runs (e.g. before `delete` or `rename`).
 
 use crate::connection::connection_info::ConnectionInfo;
-use crate::msg_handler::HandlerReference;
 use crate::tree::TreeMessageHandler;
 use smb_dtyp::Guid;
 use smb_fscc::FileAccessMask;
@@ -76,7 +75,7 @@ pub struct LeaseBreakEvent {
 pub(crate) struct ResourceProto {
     /// Shared handler chain — `Arc`-backed under the hood, so cloning into
     /// a new ResourceHandle on hit is just a refcount bump.
-    pub handler: HandlerReference<TreeMessageHandler>,
+    pub handler: Arc<TreeMessageHandler>,
     /// Snapshot of the connection's negotiated info at create time; the
     /// same instance every resulting ResourceHandle reads from. Cheap to
     /// clone (Arc).

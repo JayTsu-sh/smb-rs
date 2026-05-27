@@ -2,12 +2,12 @@ use crate::msg_handler::Protection;
 
 use super::*;
 
-pub(crate) type ChannelUpstream = HandlerReference<ConnectionMessageHandler>;
+pub(crate) type ChannelUpstream = Arc<ConnectionMessageHandler>;
 
 pub struct Channel {
     channel_id: u32,
 
-    pub(crate) handler: HandlerReference<ChannelMessageHandler>,
+    pub(crate) handler: Arc<ChannelMessageHandler>,
     pub(crate) conn_info: Arc<ConnectionInfo>,
 }
 
@@ -97,8 +97,8 @@ impl ChannelMessageHandler {
         channel_id: u32,
         upstream: &ChannelUpstream,
         setup_result: &Arc<SessionAndChannel>,
-    ) -> HandlerReference<ChannelMessageHandler> {
-        HandlerReference::new(ChannelMessageHandler {
+    ) -> Arc<ChannelMessageHandler> {
+        Arc::new(ChannelMessageHandler {
             session_id,
             channel_id,
             upstream: upstream.clone(),

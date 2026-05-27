@@ -12,7 +12,7 @@ use crate::{
     connection::ConnectionMessageHandler,
     crypto::KeyToDerive,
     msg_handler::{
-        HandlerReference, IncomingMessage, MessageHandler, OutgoingMessage, ReceiveOptions,
+        IncomingMessage, MessageHandler, OutgoingMessage, ReceiveOptions,
         SendMessageResult,
     },
     tree::Tree,
@@ -58,7 +58,7 @@ pub struct Session {
     channel_counter: AtomicU32,
 
     // Message handler for this session.
-    session_handler: HandlerReference<SessionMessageHandler>,
+    session_handler: Arc<SessionMessageHandler>,
 }
 
 impl Session {
@@ -117,7 +117,7 @@ impl Session {
         let primary_channel = Self::_common_setup(setup_result).await?;
 
         let handler =
-            HandlerReference::new(SessionMessageHandler::new(primary_channel.handler.clone()));
+            Arc::new(SessionMessageHandler::new(primary_channel.handler.clone()));
 
         Ok(Session {
             session_handler: handler,
@@ -133,7 +133,7 @@ impl Session {
     pub(crate) async fn bind(
         &self,
         identity: sspi::AuthIdentity,
-        handler: &HandlerReference<ConnectionMessageHandler>,
+        handler: &Arc<ConnectionMessageHandler>,
         conn_info: &Arc<ConnectionInfo>,
     ) -> crate::Result<u32> {
         if self.conn_info.negotiation.dialect_rev != conn_info.negotiation.dialect_rev {
@@ -304,15 +304,15 @@ pub(crate) struct SessionMessageHandler {
     session_id: u64,
     // this is used to speed up access to the primary channel handler.
     primary_channel_id: u32,
-    primary_channel: HandlerReference<ChannelMessageHandler>,
+    primary_channel: Arc<ChannelMessageHandler>,
 
-    channel_handlers: RwLock<HashMap<u32, HandlerReference<ChannelMessageHandler>>>,
+    channel_handlers: RwLock<HashMap<u32, Arc<ChannelMessageHandler>>>,
 
     dropping: AtomicBool,
 }
 
 impl SessionMessageHandler {
-    pub fn new(primary_channel: HandlerReference<ChannelMessageHandler>) -> Self {
+    pub fn new(primary_channel: Arc<ChannelMessageHandler>) -> Self {
         let session_id = primary_channel.session_id();
         let primary_channel_id = primary_channel.channel_id();
         Self {
@@ -406,7 +406,7 @@ trait WithChannel {
     type Result;
     async fn work(
         self,
-        href: &HandlerReference<ChannelMessageHandler>,
+        href: &Arc<ChannelMessageHandler>,
     ) -> crate::Result<Self::Result>;
 }
 
@@ -415,7 +415,7 @@ impl WithChannel for SendoWithChannel {
     type Result = SendMessageResult;
     async fn work(
         self,
-        href: &HandlerReference<ChannelMessageHandler>,
+        href: &Arc<ChannelMessageHandler>,
     ) -> crate::Result<Self::Result> {
         href.sendo(self.0).await
     }
@@ -426,7 +426,7 @@ impl WithChannel for RecvoWithChannel<'_> {
     type Result = IncomingMessage;
     async fn work(
         self,
-        href: &HandlerReference<ChannelMessageHandler>,
+        href: &Arc<ChannelMessageHandler>,
     ) -> crate::Result<Self::Result> {
         href.recvo(self.0).await
     }

@@ -13,7 +13,7 @@ use crate::{
     connection::connection_info::ConnectionInfo,
     lease::{LeaseSlot, ResourceProto, SlotReleaseAction},
     msg_handler::{
-        AsyncMessageIds, HandlerReference, IncomingMessage, MessageHandler, OutgoingMessage,
+        AsyncMessageIds, IncomingMessage, MessageHandler, OutgoingMessage,
         ReceiveOptions, SendMessageResult,
     },
     tree::TreeMessageHandler,
@@ -29,7 +29,7 @@ pub use file::*;
 pub use file_util::*;
 pub use pipe::*;
 
-type Upstream = HandlerReference<TreeMessageHandler>;
+type Upstream = Arc<TreeMessageHandler>;
 
 #[derive(Default)]
 pub struct FileCreateArgs {
@@ -514,7 +514,7 @@ impl LeaseGrant {
 /// Holds the common information for an opened SMB resource.
 pub struct ResourceHandle {
     name: String,
-    handler: HandlerReference<TreeMessageHandler>,
+    handler: Arc<TreeMessageHandler>,
 
     // Whether the resource is open or not.
     // TODO: Consider using RwLock here on FileId instead of AtomicBool+FileId.
@@ -1076,7 +1076,7 @@ impl ResourceHandle {
     /// to avoid Use-after-free errors.
     async fn send_close(
         file_id: FileId,
-        handler: &HandlerReference<TreeMessageHandler>,
+        handler: &Arc<TreeMessageHandler>,
     ) -> crate::Result<()> {
         tracing::trace!("Send close to file with ID: {file_id:?}");
         let response = handler.send_recv(CloseRequest { file_id }.into()).await?;
@@ -1092,7 +1092,7 @@ impl ResourceHandle {
     /// tree+session as the original Create.
     pub(crate) async fn send_close_external(
         file_id: FileId,
-        handler: &HandlerReference<TreeMessageHandler>,
+        handler: &Arc<TreeMessageHandler>,
     ) -> crate::Result<()> {
         Self::send_close(file_id, handler).await
     }
@@ -1202,7 +1202,7 @@ impl ResourceHandle {
     /// * Even if a resource is positioned in the same tree, if the tree was accessed using different
     ///   share connections, this will return false!
     pub fn same_tree(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.handler.handler, &other.handler.handler)
+        Arc::ptr_eq(&self.handler, &other.handler)
     }
 }
 
