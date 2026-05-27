@@ -13,7 +13,7 @@ use crate::{
     connection::connection_info::ConnectionInfo,
     lease::{LeaseSlot, ResourceProto, SlotReleaseAction},
     msg_handler::{
-        AsyncMessageIds, IncomingMessage, MessageHandler, OutgoingMessage,
+        AsyncMessageIds, IncomingMessage, MessageHandler, MessageHandlerExt, OutgoingMessage,
         ReceiveOptions, SendMessageResult,
     },
     tree::TreeMessageHandler,

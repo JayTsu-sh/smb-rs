@@ -10,12 +10,6 @@ pub struct OutgoingMessage {
 
     pub return_raw_data: bool,
 
-    /// Ask the sender to compress the message before sending, if possible.
-    pub compress: bool,
-    /// Whether this request also expects a response.
-    /// This value defaults to true.
-    pub has_response: bool,
-
     /// Zero-copy write data. Stored as `Bytes` for cheap clone without copying.
     pub additional_data: Option<Bytes>,
 
@@ -83,8 +77,6 @@ impl OutgoingMessage {
         OutgoingMessage {
             message: PlainRequest::new(content),
             return_raw_data: false,
-            compress: true,
-            has_response: true,
             additional_data: None,
             channel_id: None,
             pre_processed: false,
@@ -315,6 +307,12 @@ impl<'a> Default for ReceiveOptions<'a> {
 
 /// Chain-of-responsibility pattern trait for handling SMB messages
 /// outgoing from the client or incoming from the server.
+///
+/// Implementers provide the three core operations (`sendo`, `recvo`,
+/// `notify`). The eight `send*` / `recv*` / `*_recv*` composition
+/// helpers that wrap them live on [`MessageHandlerExt`], a sibling
+/// trait with a blanket impl — callers get the same `arc.send_recv(msg)`
+/// syntax as before, as long as `MessageHandlerExt` is in scope.
 #[allow(async_fn_in_trait)]
 pub trait MessageHandler {
     /// Send a message to the server, returning the result.
@@ -344,8 +342,24 @@ pub trait MessageHandler {
         tracing::debug!("Received notification message: {msg:?}");
         Ok(())
     }
+}
 
-    // -- Utility functions, accessible from references via Deref.
+/// Composition helpers built on top of [`MessageHandler::sendo`] /
+/// [`MessageHandler::recvo`]. Split off from the core trait so
+/// implementers' surface stays at three methods; callers automatically
+/// pick up the eight helpers via the blanket impl below.
+///
+/// Common shapes:
+/// - `send*`: send a request content.
+/// - `recv*`: receive a response.
+/// - `send*_recv*` / `sendo*_recv*` / `sendor_*`: combined send + recv.
+/// - the `o` suffix means "with low-level options"
+///   (`OutgoingMessage` / `ReceiveOptions` instead of `RequestContent` /
+///   default options).
+/// - the `or` infix means "also return the send result", not just the
+///   incoming response.
+#[allow(async_fn_in_trait)]
+pub trait MessageHandlerExt: MessageHandler {
     #[inline]
     async fn send(&self, msg: RequestContent) -> crate::Result<SendMessageResult> {
         self.sendo(OutgoingMessage::new(msg)).await
@@ -411,6 +425,9 @@ pub trait MessageHandler {
         self.sendor_recvo(msg, ReceiveOptions::new()).await
     }
 }
+
+// Blanket impl: every MessageHandler automatically gets the helpers.
+impl<T: MessageHandler + ?Sized> MessageHandlerExt for T {}
 
 // Note: prior versions of this module defined a `HandlerReference<T>`
 // wrapper that was structurally `Arc<T>` + a `weak()` method. Since

@@ -14,7 +14,7 @@ use smb_msg::{
 
 use crate::{
     Error, Resource,
-    msg_handler::{MessageHandler, Protection},
+    msg_handler::{MessageHandler, MessageHandlerExt, Protection},
     session::SessionMessageHandler,
 };
 mod dfs_tree;

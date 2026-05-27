@@ -576,7 +576,7 @@ impl Transformer {
         // 2. Compress
         const COMPRESSION_THRESHOLD: usize = 1024;
         outgoing_data = {
-            if msg.compress && outgoing_data.total_size() > COMPRESSION_THRESHOLD {
+            if outgoing_data.total_size() > COMPRESSION_THRESHOLD {
                 let rconfig = self.config.read().await;
                 if let Some(compress) = &rconfig.compress {
                     // Build a vector of the entire data. In the future, this may be optimized to avoid copying.

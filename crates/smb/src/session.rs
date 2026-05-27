@@ -12,7 +12,7 @@ use crate::{
     connection::ConnectionMessageHandler,
     crypto::KeyToDerive,
     msg_handler::{
-        IncomingMessage, MessageHandler, OutgoingMessage, ReceiveOptions,
+        IncomingMessage, MessageHandler, MessageHandlerExt, OutgoingMessage, ReceiveOptions,
         SendMessageResult,
     },
     tree::Tree,
