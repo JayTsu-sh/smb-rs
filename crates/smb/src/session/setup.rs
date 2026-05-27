@@ -478,11 +478,11 @@ where
         request.security = Some(crate::msg_handler::Protection::SnapshotKdfSign {
             session_key: self.session_key()?,
         });
-        let request = request.into_signed_pre_prepared();
-        // Sign and Encrypt are mutually exclusive per the transformer's
-        // own debug_assert; the SnapshotKdfSign Protection set above
-        // takes precedence and channel.sendo / transformer never look
-        // at the legacy `encrypt: bool` field once security is sealed.
+        let request = request.into_signed();
+        // The SnapshotKdfSign Protection set above is what the
+        // transformer dispatches on; `into_signed` just flips the
+        // wire-protocol signed flag so worker bookkeeping that still
+        // inspects `flags.signed` sees a consistent state.
 
         tracing::trace!(
             "setup loop: dispatching final signed SessionSetup msg_id={} session_id={:#x}",
