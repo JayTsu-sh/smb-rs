@@ -114,9 +114,6 @@ kerberos = ["reqwest", "dep:byteorder"]
 # Implement traits for std::fs::File/tokio::fs::File
 std-fs-impls = ["tokio/fs"]
 
-# Estooric use cases
-ksmbd-multichannel-compat = []
-
 # Debugging
 __debug-dump-keys = []
 

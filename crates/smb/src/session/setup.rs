@@ -117,9 +117,8 @@ where
             let channel = (*primary_session
                 .channel()
                 .expect("A properly initialized session is expected in session setup."))
-            .clone();
-            #[cfg(feature = "ksmbd-multichannel-compat")]
-            let channel = channel.with_binding(true);
+            .clone()
+            .with_binding(true);
 
             result.set_session(session).await?;
             result
