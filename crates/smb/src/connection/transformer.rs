@@ -258,16 +258,18 @@ impl Transformer {
     }
 
     /// `true` iff the channel for `session_id` is installed *and*
-    /// flagged as a binding-only channel (ksmbd multichannel compat).
-    /// Used by [`Self::is_message_signed_ksmbd`] to special-case the
-    /// ksmbd "missing signed flag during multi-channel setup" quirk
-    /// (see MS-SMB2 3.2.4.1.1 for the spec the bug violates).
+    /// flagged as a binding-only channel. Used by
+    /// [`Self::is_binding_session_setup_signed`] to enable an extra
+    /// defense-in-depth signature verification on SessionSetup
+    /// responses that violate MS-SMB2 3.2.4.1.1 by carrying a
+    /// non-zero signature without the `signed` flag (a quirk of some
+    /// server implementations, notably ksmbd, during multichannel
+    /// binding).
     ///
     /// Returns `Ok(false)` when the channel hasn't been installed —
     /// matches the swallow-error behaviour of the pre-refactor
     /// closure path. Errs only when `session_id` is unknown to the
     /// transformer.
-    #[cfg(feature = "ksmbd-multichannel-compat")]
     pub(crate) async fn is_binding(&self, session_id: u64) -> crate::Result<bool> {
         let entry = self.session_entry(session_id).await?;
         Ok(entry
@@ -872,7 +874,7 @@ impl Transformer {
         if form.encrypted
             || message.header.message_id == u64::MAX
             || message.header.status == Status::Pending as u32
-            || !(message.header.flags.signed() || self.is_message_signed_ksmbd(message).await)
+            || !(message.header.flags.signed() || self.is_binding_session_setup_signed(message).await)
         {
             return Ok(());
         }
@@ -901,27 +903,35 @@ impl Transformer {
 
     /// (Internal)
     ///
-    /// ksmbd multichannel setup compatibility check.
+    /// Defense-in-depth signature check for multichannel binding.
     ///
-    // ksmbd has a subtle, but irritating bug, where it does not set the "signed" flag
-    // for responses during multi channel session setups. To resolve this, we check if the
-    // current channel is defined as "binding-only" channel. The feature `ksmbd-multichannel-compat`
-    // must also be enabled, or else this code will not be compiled.
-    // This behavior is actually against the spec - MS-SMB2 3.2.4.1.1:
-    // > "If the client signs the request, it MUST set the SMB2_FLAGS_SIGNED bit in the Flags field of the SMB2 header."
-    async fn is_message_signed_ksmbd(&self, _message: &PlainResponse) -> bool {
-        #[cfg(feature = "ksmbd-multichannel-compat")]
-        {
-            if _message.header.command != Command::SessionSetup || _message.header.signature == 0 {
-                return false;
-            }
-
-            let session_id = _message.header.session_id;
-            return self.is_binding(session_id).await.unwrap_or(false);
+    /// MS-SMB2 3.2.4.1.1 mandates:
+    /// > "If the client signs the request, it MUST set the SMB2_FLAGS_SIGNED
+    /// > bit in the Flags field of the SMB2 header."
+    ///
+    /// Some server implementations (notably ksmbd) emit SessionSetup
+    /// responses *during multichannel binding* that violate this:
+    /// the `signed` flag is cleared but the signature field is
+    /// non-zero. The wire-spec default would silently skip
+    /// verification (because the flag is what marks a message as
+    /// "claims to be signed"), letting a corrupted signature go
+    /// undetected.
+    ///
+    /// When this returns `true`, [`Self::verify_plain_incoming`]
+    /// promotes the response to a verified-signature path anyway,
+    /// running full crypto verification against the bytes. If the
+    /// signature is genuine the response is accepted; if not it is
+    /// rejected.
+    ///
+    /// Narrow precondition: command is SessionSetup AND signature is
+    /// non-zero AND the channel is in binding state (set only in
+    /// `SetupKind::Bind`). Non-binding paths follow the spec verbatim.
+    async fn is_binding_session_setup_signed(&self, message: &PlainResponse) -> bool {
+        if message.header.command != Command::SessionSetup || message.header.signature == 0 {
+            return false;
         }
-
-        #[cfg(not(feature = "ksmbd-multichannel-compat"))]
-        return false;
+        let session_id = message.header.session_id;
+        self.is_binding(session_id).await.unwrap_or(false)
     }
 }
 

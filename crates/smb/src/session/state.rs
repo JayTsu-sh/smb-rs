@@ -235,9 +235,16 @@ pub struct ChannelInfo {
     algos: ChannelAlgos,
     valid: bool,
 
-    #[cfg(feature = "ksmbd-multichannel-compat")]
-    /// Indicates whether this channel was created temporarily for multichannel setup.
-    /// This is relevant for compatibility with ksmbd. See [`crate::connection::Transformer::verify_plain_incoming`]
+    /// `true` iff this channel was created for SMB multichannel
+    /// session-binding (i.e. it is a secondary channel attached to an
+    /// already-Ready primary session). Used by
+    /// [`crate::connection::Transformer::verify_plain_incoming`] to
+    /// enable an extra defense-in-depth signature verification on
+    /// SessionSetup responses that arrive with the wire-protocol
+    /// `signed` flag cleared but a non-zero signature field — a
+    /// spec-violating pattern emitted by some server implementations
+    /// (notably ksmbd) during binding. The check runs only when this
+    /// flag is set, so non-binding sessions follow the spec verbatim.
     binding: bool,
 }
 
@@ -253,18 +260,15 @@ impl ChannelInfo {
             id: internal_id,
             algos,
             valid: true,
-            #[cfg(feature = "ksmbd-multichannel-compat")]
             binding: false,
         })
     }
 
-    #[cfg(feature = "ksmbd-multichannel-compat")]
     pub(crate) fn with_binding(mut self, binding: bool) -> Self {
         self.binding = binding;
         self
     }
 
-    #[cfg(feature = "ksmbd-multichannel-compat")]
     pub fn is_binding(&self) -> bool {
         self.binding
     }
