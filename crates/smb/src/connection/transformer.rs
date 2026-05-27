@@ -344,7 +344,7 @@ impl Transformer {
             ));
         }
         for (i, m) in msgs.iter().enumerate() {
-            if m.encrypt {
+            if matches!(m.security, Some(Protection::Encrypt)) {
                 return Err(crate::Error::InvalidArgument(format!(
                     "compound member {i}: encryption is not supported in the current minimal compound path",
                 )));
@@ -496,7 +496,7 @@ impl Transformer {
                 (true, false)
             }
             Some(Protection::Encrypt) => (false, true),
-            None => (msg.message.header.flags.signed(), msg.encrypt),
+            None => (msg.message.header.flags.signed(), false),
         };
         let session_id = msg.message.header.session_id;
 

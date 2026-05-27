@@ -12,9 +12,6 @@ pub struct OutgoingMessage {
 
     /// Ask the sender to compress the message before sending, if possible.
     pub compress: bool,
-    /// Ask the sender to encrypt the message before sending, if possible.
-    pub encrypt: bool,
-    // Signing is set through message/header/flags/signed.
     /// Whether this request also expects a response.
     /// This value defaults to true.
     pub has_response: bool,
@@ -36,17 +33,15 @@ pub struct OutgoingMessage {
     /// through [`OutgoingMessage::into_signed_pre_prepared`].
     pub(crate) pre_processed: bool,
 
-    /// Internal: explicit, sealed-at-construction safety policy. When
-    /// `Some`, the transformer dispatches on this *instead of*
-    /// inferring sign/encrypt from session state — eliminating the
-    /// class of bug where `ChannelMessageHandler::sendo` looks at
-    /// `session.state` to decide and gets it wrong (e.g. the
-    /// Windows-DC unsigned-final-request regression).
-    ///
-    /// Today only the SessionSetup driver populates this, for the
-    /// final SessionSetup Request. S5-T2 will extend the same
-    /// mechanism to the rest of the send paths and retire the
-    /// state-inference branch in `ChannelMessageHandler::sendo`.
+    /// Internal: explicit, sealed-at-construction safety policy.
+    /// Producers stamp this directly (`tree.sendo` for share-level
+    /// encrypt_data; session-setup driver for `SnapshotKdfSign`); the
+    /// channel layer fills in the default for any message that
+    /// arrives with `None` based on session state. Once set, the
+    /// transformer dispatches purely on this enum without inspecting
+    /// other mutable state — eliminating the class of bug where the
+    /// state inference looked at `session.state` to decide and got it
+    /// wrong (e.g. the Windows-DC unsigned-final-request regression).
     pub(crate) security: Option<Protection>,
 }
 
@@ -89,7 +84,6 @@ impl OutgoingMessage {
             message: PlainRequest::new(content),
             return_raw_data: false,
             compress: true,
-            encrypt: false,
             has_response: true,
             additional_data: None,
             channel_id: None,
@@ -105,11 +99,6 @@ impl OutgoingMessage {
 
     pub fn with_return_raw_data(mut self, return_raw_data: bool) -> Self {
         self.return_raw_data = return_raw_data;
-        self
-    }
-
-    pub fn with_encrypt(mut self, encrypt: bool) -> Self {
-        self.encrypt = encrypt;
         self
     }
 

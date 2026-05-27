@@ -224,30 +224,18 @@ impl ChannelMessageHandler {
 
 impl MessageHandler for ChannelMessageHandler {
     async fn sendo(&self, mut msg: OutgoingMessage) -> crate::Result<SendMessageResult> {
-        // If the caller already sealed a [`Protection`] decision (e.g.
-        // the session-setup driver attaching `SnapshotKdfSign`), honor
-        // it as-is. Otherwise translate the session state into a
-        // matching `Protection` variant here, once, so the transformer
-        // doesn't have to re-derive it from `msg.encrypt` /
-        // `header.flags.signed` later.
+        // If the caller already sealed a [`Protection`] decision
+        // (e.g. tree.sendo stamping Protection::Encrypt for an
+        // encrypt-data share, or the session-setup driver attaching
+        // SnapshotKdfSign), honor it as-is. Otherwise translate
+        // session state into a matching variant once, here.
         if msg.security.is_none() {
             let session = self.session_state.session.read().await;
             if session.is_invalid() {
                 return Err(Error::InvalidState("Session is invalid".to_string()));
             }
 
-            // It is possible for a lower-level / builder caller to
-            // pre-request encryption via `with_encrypt(true)`; convert
-            // it to the matching Protection variant. The session must
-            // be ready to actually serve an encryptor.
-            if msg.encrypt {
-                if !session.is_ready() {
-                    return Err(Error::InvalidState(
-                        "Session is not ready, cannot encrypt message".to_string(),
-                    ));
-                }
-                msg.security = Some(Protection::Encrypt);
-            } else if session.is_ready() || session.is_setting_up() {
+            if session.is_ready() || session.is_setting_up() {
                 if session.is_ready() && session.should_encrypt()? {
                     msg.security = Some(Protection::Encrypt);
                 } else if !session.allow_unsigned()? {
@@ -260,19 +248,15 @@ impl MessageHandler for ChannelMessageHandler {
             }
         }
 
-        // Mirror the chosen Protection onto the legacy hint fields so
-        // compound paths and worker logging that still read those
-        // fields see consistent state. Removing these reads is
-        // deferred to S7's transformer rework.
-        match &msg.security {
-            Some(Protection::SignWithChannel) | Some(Protection::SnapshotKdfSign { .. }) => {
-                msg.message.header.flags.set_signed(true);
-                msg.encrypt = false;
-            }
-            Some(Protection::Encrypt) => {
-                msg.encrypt = true;
-            }
-            Some(Protection::None) | None => {}
+        // Mirror the chosen signing Protection onto `header.flags.signed`
+        // so the worker (which still inspects the wire-protocol flag on
+        // its own bookkeeping path) sees consistent state. Encryption
+        // has no equivalent flag to mirror.
+        if matches!(
+            msg.security,
+            Some(Protection::SignWithChannel) | Some(Protection::SnapshotKdfSign { .. })
+        ) {
+            msg.message.header.flags.set_signed(true);
         }
 
         msg.message.header.session_id = self.session_id;
