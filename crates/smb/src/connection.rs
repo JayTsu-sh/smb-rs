@@ -1457,8 +1457,12 @@ impl ConnectionMessageHandler {
             lease_key: notify.lease_key,
             lease_state: notify.new_lease_state,
         };
-        let mut out = OutgoingMessage::new(RequestContent::LeaseBreakAck(ack));
-        out.has_response = false;
+        // Fire-and-forget: caller intentionally never invokes recvo on
+        // this message. The wire-protocol response (if any) is ignored
+        // by the worker's response router as an unmatched msg_id; there
+        // is no per-message field telling the worker not to allocate a
+        // response slot.
+        let out = OutgoingMessage::new(RequestContent::LeaseBreakAck(ack));
         match h.sendo(out).await {
             Ok(r) => tracing::debug!(
                 lease_key = ?notify.lease_key,

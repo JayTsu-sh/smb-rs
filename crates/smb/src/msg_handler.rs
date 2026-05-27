@@ -10,12 +10,6 @@ pub struct OutgoingMessage {
 
     pub return_raw_data: bool,
 
-    /// Ask the sender to compress the message before sending, if possible.
-    pub compress: bool,
-    /// Whether this request also expects a response.
-    /// This value defaults to true.
-    pub has_response: bool,
-
     /// Zero-copy write data. Stored as `Bytes` for cheap clone without copying.
     pub additional_data: Option<Bytes>,
 
@@ -83,8 +77,6 @@ impl OutgoingMessage {
         OutgoingMessage {
             message: PlainRequest::new(content),
             return_raw_data: false,
-            compress: true,
-            has_response: true,
             additional_data: None,
             channel_id: None,
             pre_processed: false,
