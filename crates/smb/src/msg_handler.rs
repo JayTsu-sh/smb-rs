@@ -412,47 +412,10 @@ pub trait MessageHandler {
     }
 }
 
-/// A templated shared reference to an SMB message handler.
-///
-/// Provides a more ergonomic way to interact with the handler.
-/// Provided methods are:
-/// - `send*`: Send a message content to the server.
-/// - `receive*`: Receive a message from the server.
-/// - `send*_receive*`: Send a message and receive a response.
-/// - `*o`: Send a message and receive a response with custom options:
-///     - `sendo`: Send a message with custom, low-level handler options.
-///     - `recvo`: Receive a message with custom, low-level handler options.
-pub(crate) struct HandlerReference<T: MessageHandler + ?Sized> {
-    pub handler: Arc<T>,
-}
-
-impl<T: MessageHandler> HandlerReference<T> {
-    pub(crate) fn new(handler: T) -> HandlerReference<T> {
-        HandlerReference {
-            handler: Arc::new(handler),
-        }
-    }
-
-    /// Returns a weak reference to the handler.
-    pub(crate) fn weak(&self) -> std::sync::Weak<T> {
-        Arc::downgrade(&self.handler)
-    }
-}
-
-// Implement deref that returns the content of Arc<T> above (T)
-impl<T: MessageHandler> std::ops::Deref for HandlerReference<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.handler
-    }
-}
-
-// Clone:
-impl<T: MessageHandler> Clone for HandlerReference<T> {
-    fn clone(&self) -> Self {
-        HandlerReference {
-            handler: self.handler.clone(),
-        }
-    }
-}
+// Note: prior versions of this module defined a `HandlerReference<T>`
+// wrapper that was structurally `Arc<T>` + a `weak()` method. Since
+// the crate has no `dyn MessageHandler` callsites (every Upstream is
+// a concrete `MessageHandler` impl), the wrapper added no
+// polymorphism — it only saved one method call (`.weak()` vs
+// `Arc::downgrade(&_)`). Callers now use `Arc<T>` directly and rely
+// on `Arc::deref` to reach trait methods. See refactor-notes §17.

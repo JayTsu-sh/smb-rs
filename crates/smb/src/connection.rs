@@ -45,7 +45,7 @@ const LEASE_BREAK_CHANNEL_CAPACITY: usize = 64;
 /// Each SMB connection has a single matching transport (e.g. TCP connection).
 /// Usually, most use cases require a single connection per server-client communication.
 pub struct Connection {
-    handler: HandlerReference<ConnectionMessageHandler>,
+    handler: Arc<ConnectionMessageHandler>,
     config: ConnectionConfig,
 
     server_name: String,
@@ -63,7 +63,7 @@ impl Connection {
     ) -> crate::Result<Self> {
         config.validate()?;
         Ok(Connection {
-            handler: HandlerReference::new(ConnectionMessageHandler::new(
+            handler: Arc::new(ConnectionMessageHandler::new(
                 client_guid,
                 config.credits_backlog,
             )),
@@ -513,14 +513,14 @@ impl Connection {
                 "Starting Notification job (server notifications cap={}).",
                 info.negotiation.caps.notifications()
             );
-            self.handler.handler.start_notify().await?;
+            self.handler.start_notify().await?;
             tracing::debug!("Notification job started.");
 
             // Phase C.2: the break-listener consumes the per-connection
             // lease_event_tx broadcast (fed by handle_lease_break) and
             // tombstones matching slots in lease_table so new opens
             // miss the cache after a server-side break.
-            self.handler.handler.start_lease_break_listener();
+            self.handler.start_lease_break_listener();
         }
 
         self.handler
@@ -555,7 +555,7 @@ impl Connection {
                 .ok_or_else(|| Error::InvalidState("Connection not negotiated.".to_string()))?,
         )
         .await?;
-        let session_handler = session.handler.weak();
+        let session_handler = Arc::downgrade(&session.handler);
         self.handler
             .actor
             .insert_session(session.session_id(), session_handler)
@@ -589,7 +589,7 @@ impl Connection {
                 .ok_or_else(|| Error::InvalidState("Connection not negotiated.".to_string()))?,
         )
         .await?;
-        let session_handler = session.handler.weak();
+        let session_handler = Arc::downgrade(&session.handler);
         self.handler
             .actor
             .insert_session(session.session_id(), session_handler)
@@ -858,8 +858,8 @@ impl ConnectionMessageHandler {
                 let file_id = prev.file_id;
                 let handler = prev.proto.handler.clone();
                 // The spawned task captures the `handler` chain
-                // (ResourceMessageHandle -> TreeMessageHandle ->
-                // SessionMessageHandler) by Arc clone, but NOT this
+                // (TreeMessageHandler -> SessionMessageHandler)
+                // by Arc clone, but NOT this
                 // ConnectionMessageHandler itself. If the Connection
                 // races into Drop before the spawn runs, its
                 // `worker.stop()` (in Connection::Drop) will complete

@@ -13,7 +13,7 @@ use crate::{
     connection::connection_info::ConnectionInfo,
     lease::{LeaseSlot, ResourceProto, SlotReleaseAction},
     msg_handler::{
-        AsyncMessageIds, HandlerReference, IncomingMessage, MessageHandler, OutgoingMessage,
+        AsyncMessageIds, IncomingMessage, MessageHandler, OutgoingMessage,
         ReceiveOptions, SendMessageResult,
     },
     tree::TreeMessageHandler,
@@ -29,7 +29,7 @@ pub use file::*;
 pub use file_util::*;
 pub use pipe::*;
 
-type Upstream = HandlerReference<TreeMessageHandler>;
+type Upstream = Arc<TreeMessageHandler>;
 
 #[derive(Default)]
 pub struct FileCreateArgs {
@@ -225,7 +225,7 @@ impl Resource {
         // [`Resource::attach_lease_slot`] after this function returns.
         let handle = ResourceHandle {
             name: name.to_string(),
-            handler: ResourceMessageHandle::new(upstream),
+            handler: upstream.clone(),
             open: AtomicBool::new(true),
             _file_id: response.file_id,
             created: response.creation_time.date_time(),
@@ -387,7 +387,7 @@ impl Resource {
         let is_dir = matches!(self, Resource::Directory(_));
         let epoch_at_grant = h.lease_granted.map(|g| g.epoch).unwrap_or(0);
         Some(Arc::new(ResourceProto {
-            handler: ResourceMessageHandle::new(upstream),
+            handler: upstream.clone(),
             conn_info: h.conn_info.clone(),
             created: h.created,
             modified: h.modified,
@@ -514,7 +514,7 @@ impl LeaseGrant {
 /// Holds the common information for an opened SMB resource.
 pub struct ResourceHandle {
     name: String,
-    handler: HandlerReference<ResourceMessageHandle>,
+    handler: Arc<TreeMessageHandler>,
 
     // Whether the resource is open or not.
     // TODO: Consider using RwLock here on FileId instead of AtomicBool+FileId.
@@ -1076,7 +1076,7 @@ impl ResourceHandle {
     /// to avoid Use-after-free errors.
     async fn send_close(
         file_id: FileId,
-        handler: &HandlerReference<ResourceMessageHandle>,
+        handler: &Arc<TreeMessageHandler>,
     ) -> crate::Result<()> {
         tracing::trace!("Send close to file with ID: {file_id:?}");
         let response = handler.send_recv(CloseRequest { file_id }.into()).await?;
@@ -1092,7 +1092,7 @@ impl ResourceHandle {
     /// tree+session as the original Create.
     pub(crate) async fn send_close_external(
         file_id: FileId,
-        handler: &HandlerReference<ResourceMessageHandle>,
+        handler: &Arc<TreeMessageHandler>,
     ) -> crate::Result<()> {
         Self::send_close(file_id, handler).await
     }
@@ -1202,43 +1202,7 @@ impl ResourceHandle {
     /// * Even if a resource is positioned in the same tree, if the tree was accessed using different
     ///   share connections, this will return false!
     pub fn same_tree(&self, other: &Self) -> bool {
-        Arc::ptr_eq(
-            &self.handler.upstream.handler,
-            &other.handler.upstream.handler,
-        )
-    }
-}
-
-// `pub(crate)` so [`crate::lease::ResourceProto`] can hold a `HandlerReference`
-// to it across the cache-hit reconstruction path. The type itself remains
-// invisible to external callers — they only interact through `Resource`.
-pub(crate) struct ResourceMessageHandle {
-    upstream: Upstream,
-}
-
-impl ResourceMessageHandle {
-    pub(crate) fn new(upstream: &Upstream) -> HandlerReference<ResourceMessageHandle> {
-        HandlerReference::new(ResourceMessageHandle {
-            upstream: upstream.clone(),
-        })
-    }
-}
-
-impl MessageHandler for ResourceMessageHandle {
-    #[inline]
-    async fn sendo(
-        &self,
-        msg: crate::msg_handler::OutgoingMessage,
-    ) -> crate::Result<crate::msg_handler::SendMessageResult> {
-        self.upstream.sendo(msg).await
-    }
-
-    #[inline]
-    async fn recvo(
-        &self,
-        options: crate::msg_handler::ReceiveOptions<'_>,
-    ) -> crate::Result<crate::msg_handler::IncomingMessage> {
-        self.upstream.recvo(options).await
+        Arc::ptr_eq(&self.handler, &other.handler)
     }
 }
 

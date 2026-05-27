@@ -14,7 +14,7 @@ use smb_msg::{
 
 use crate::{
     Error, Resource,
-    msg_handler::{HandlerReference, MessageHandler, Protection},
+    msg_handler::{MessageHandler, Protection},
     session::SessionMessageHandler,
 };
 mod dfs_tree;
@@ -23,7 +23,7 @@ use crate::msg_handler::OutgoingMessage;
 pub use dfs_tree::*;
 pub use ipc_tree::*;
 
-type Upstream = HandlerReference<SessionMessageHandler>;
+type Upstream = Arc<SessionMessageHandler>;
 
 #[derive(Debug, Clone)]
 pub struct TreeConnectInfo {
@@ -35,7 +35,7 @@ pub struct TreeConnectInfo {
 ///
 /// A Tree is the SMB protocol's representation of a connected share on the server.
 pub struct Tree {
-    handler: HandlerReference<TreeMessageHandler>,
+    handler: Arc<TreeMessageHandler>,
     conn_info: Arc<ConnectionInfo>,
 }
 
@@ -209,8 +209,8 @@ impl Tree {
     /// Phase C uses this from [`crate::resource::Resource::build_lease_proto`]
     /// so the lease cache can construct a `ResourceMessageHandle` against
     /// the same tree the Create was issued on. `pub(crate)` because the
-    /// `HandlerReference` type is internal.
-    pub(crate) fn handler_ref(&self) -> &HandlerReference<TreeMessageHandler> {
+    /// Crate-private because the per-connection handler type is internal.
+    pub(crate) fn handler_ref(&self) -> &Arc<TreeMessageHandler> {
         &self.handler
     }
 
@@ -285,8 +285,8 @@ impl TreeMessageHandler {
         tree_id: u32,
         tree_name: String,
         info: TreeConnectInfo,
-    ) -> HandlerReference<TreeMessageHandler> {
-        HandlerReference::new(TreeMessageHandler {
+    ) -> Arc<TreeMessageHandler> {
+        Arc::new(TreeMessageHandler {
             tree_id: AtomicU32::new(tree_id),
             upstream: upstream.clone(),
             info,

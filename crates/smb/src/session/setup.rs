@@ -391,7 +391,7 @@ where
         } else {
             assert!(skip_security_validation);
             tracing::trace!("setup loop: receiving with upstream handler");
-            self.upstream.handler.recvo(roptions).await
+            self.upstream.recvo(roptions).await
         };
 
         // Upgrade generic transport / channel-layer errors to
@@ -464,7 +464,7 @@ where
         &mut self,
         mut request: OutgoingMessage,
     ) -> crate::Result<SendMessageResult> {
-        self.upstream.handler.prepare_outgoing(&mut request).await?;
+        self.upstream.prepare_outgoing(&mut request).await?;
 
         let session_id = self
             .result
@@ -489,7 +489,7 @@ where
             request.message.header.message_id,
             session_id
         );
-        let result = self.upstream.handler.dispatch_outgoing(request).await?;
+        let result = self.upstream.dispatch_outgoing(request).await?;
 
         // Install the channel into session_state *after* dispatch so
         // the receive path can verify the matching signed Response —
