@@ -1,7 +1,9 @@
 use crate::Cli;
 use clap::Parser;
-use smb::{Client, DirAccessMask, NotifyFilter, UncPath, resource::*, sync_helpers::*};
+use smb::{Client, DirAccessMask, NotifyFilter, UncPath, resource::*};
 use std::error::Error;
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Parser, Debug)]
 pub struct WatchCmd {

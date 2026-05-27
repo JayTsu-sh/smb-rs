@@ -1,8 +1,9 @@
 use serial_test::serial;
-use smb::{ConnectionConfig, Directory, connection::EncryptionMode, sync_helpers::*, tree::Tree};
+use smb::{ConnectionConfig, Directory, connection::EncryptionMode, tree::Tree};
 use smb_fscc::*;
 use smb_msg::CreateOptions;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use futures_util::StreamExt;
 mod common;

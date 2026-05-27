@@ -2446,6 +2446,7 @@ dependencies = [
  "indicatif",
  "smb",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]

@@ -1,13 +1,13 @@
 use crate::connection::transformer::Transformer;
 use crate::connection::worker::Worker;
 use crate::msg_handler::ReceiveOptions;
-use crate::sync_helpers::*;
 use bytes::Bytes;
 use smb_msg::ResponseContent;
 use smb_transport::{IoVec, SmbTransport, SmbTransportWrite, TransportError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
+use tokio::sync::{Mutex, OnceCell, mpsc};
 
 use crate::{
     Error,

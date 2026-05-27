@@ -1,6 +1,8 @@
 use crate::ConnectionConfig;
 use crate::msg_handler::OutgoingMessage;
-use crate::{Connection, Error, FileCreateArgs, Pipe, Resource, Session, Tree, sync_helpers::*};
+use crate::{Connection, Error, FileCreateArgs, Pipe, Resource, Session, Tree};
+use std::sync::Arc;
+use tokio::sync::{Mutex, RwLock};
 use smb_fscc::{ChainedItemList, FileBasicInformation, SetFileInfo, SetFileInfoClass};
 use smb_msg::{
     AdditionalInfo, CloseRequest, CreateRequest, FileId, ImpersonationLevel, NetworkInterfaceInfo,
@@ -12,7 +14,6 @@ use smb_transport::TransportConfig;
 use smb_transport::utils::TransportUtils;
 use sspi::{AuthIdentity, Secret};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::{collections::HashMap, str::FromStr};
 
 use super::{config::ClientConfig, unc_path::UncPath};

@@ -2,13 +2,14 @@ use crate::connection::preauth_hash::{PreauthHashState, PreauthHashValue};
 use crate::session::{
     MessageDecryptor, MessageEncryptor, MessageSigner, SessionAndChannel,
 };
-use crate::sync_helpers::*;
+use std::sync::Arc;
+use tokio::sync::{Mutex, RwLock};
 use crate::{compression::*, msg_handler::*};
 use binrw::prelude::*;
 use bytes::Bytes;
 use smb_msg::*;
 use smb_transport::IoVec;
-use std::{collections::HashMap, io::Cursor, sync::Arc};
+use std::{collections::HashMap, io::Cursor};
 
 use super::connection_info::ConnectionInfo;
 

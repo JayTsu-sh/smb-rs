@@ -1,8 +1,10 @@
-use crate::{error::*, sync_helpers::*};
+use crate::error::*;
 use smb_transport::{IoVec, SmbTransport, SmbTransportRead, SmbTransportWrite, TransportError};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
+use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinHandle;
 
 use crate::{Error, msg_handler::IncomingMessage};
 

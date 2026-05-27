@@ -45,5 +45,3 @@ pub use smb_transport as transport;
 /// SMB Result type
 pub type Result<T> = std::result::Result<T, crate::Error>;
 
-// Re-exports of some dependencies for convenience
-pub mod sync_helpers;

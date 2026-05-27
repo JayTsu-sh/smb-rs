@@ -11,6 +11,7 @@ rust-version.workspace = true
 smb = { workspace = true, features = ["std-fs-impls"] }
 
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio-util = { workspace = true }
 futures-util = { workspace = true }
 futures = { workspace = true }
 

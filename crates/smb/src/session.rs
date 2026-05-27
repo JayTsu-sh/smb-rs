@@ -15,14 +15,15 @@ use crate::{
         HandlerReference, IncomingMessage, MessageHandler, OutgoingMessage, ReceiveOptions,
         SendMessageResult,
     },
-    sync_helpers::*,
     tree::Tree,
 };
 use arc_swap::ArcSwapOption;
 use smb_msg::{Notification, ResponseContent, Status, session_setup::*};
 use std::collections::HashMap;
 use std::ops::Deref;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
+use tokio::sync::RwLock;
 
 mod authenticator;
 mod channel;
