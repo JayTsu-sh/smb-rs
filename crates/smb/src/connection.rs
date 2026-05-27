@@ -858,8 +858,8 @@ impl ConnectionMessageHandler {
                 let file_id = prev.file_id;
                 let handler = prev.proto.handler.clone();
                 // The spawned task captures the `handler` chain
-                // (ResourceMessageHandle -> TreeMessageHandle ->
-                // SessionMessageHandler) by Arc clone, but NOT this
+                // (TreeMessageHandler -> SessionMessageHandler)
+                // by Arc clone, but NOT this
                 // ConnectionMessageHandler itself. If the Connection
                 // races into Drop before the spawn runs, its
                 // `worker.stop()` (in Connection::Drop) will complete
