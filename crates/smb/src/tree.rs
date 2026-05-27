@@ -14,7 +14,7 @@ use smb_msg::{
 
 use crate::{
     Error, Resource,
-    msg_handler::{HandlerReference, MessageHandler},
+    msg_handler::{HandlerReference, MessageHandler, Protection},
     session::SessionMessageHandler,
 };
 mod dfs_tree;
@@ -297,7 +297,10 @@ impl TreeMessageHandler {
     async fn _disconnect(upstream: Upstream, tree_id: u32, encrypt: bool) -> crate::Result<()> {
         // send and receive tree disconnect request & response.
         let request_content: RequestContent = TreeDisconnectRequest::default().into();
-        let mut message = OutgoingMessage::new(request_content).with_encrypt(encrypt);
+        let mut message = OutgoingMessage::new(request_content);
+        if encrypt {
+            message.security = Some(Protection::Encrypt);
+        }
         message.message.header.tree_id = Some(tree_id);
 
         let _response = upstream.sendo_recv(message).await?;
@@ -331,8 +334,11 @@ impl MessageHandler for TreeMessageHandler {
     ) -> crate::Result<crate::msg_handler::SendMessageResult> {
         if !msg.message.header.flags.async_command() {
             msg.message.header.tree_id = self.tree_id.load(Ordering::Relaxed).into();
-            if self.info.share_flags.encrypt_data() {
-                msg.encrypt = true;
+            // Share-level encrypt_data forces Encrypt; only set when the
+            // caller hasn't already sealed a Protection decision (e.g.
+            // the session-setup driver's SnapshotKdfSign).
+            if self.info.share_flags.encrypt_data() && msg.security.is_none() {
+                msg.security = Some(Protection::Encrypt);
             }
         }
 
