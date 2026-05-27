@@ -1,6 +1,6 @@
 use super::ResourceHandle;
 use crate::Error;
-use crate::msg_handler::{MessageHandler, ReceiveOptions};
+use crate::msg_handler::{MessageHandlerExt, ReceiveOptions};
 use std::sync::Arc;
 use tokio::sync::{Mutex, MutexGuard, mpsc};
 use smb_fscc::*;

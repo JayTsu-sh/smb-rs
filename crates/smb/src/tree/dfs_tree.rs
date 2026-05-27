@@ -1,6 +1,6 @@
 use std::ops::Deref;
 
-use crate::msg_handler::{MessageHandler, ReceiveOptions};
+use crate::msg_handler::{MessageHandlerExt, ReceiveOptions};
 use smb_msg::{FileId, FsctlCodes, IoctlReqData, IoctlRequest, IoctlRequestFlags, dfsc::*};
 
 use super::Tree;
