@@ -12,7 +12,7 @@ use common::make_server_connection;
 use smb::FileCreateArgs;
 
 const LONG_DIR: &str = "longdir";
-const FILE_PREFIX: &'static str = "test_file_with_a_long_name_to_take_up_some_space_when_dir_query_performed_and_consume_buffer_size_";
+const FILE_PREFIX: &str = "test_file_with_a_long_name_to_take_up_some_space_when_dir_query_performed_and_consume_buffer_size_";
 const NUM_FILES: usize = 100;
 
 /// This test is to check if we can iterate over a long directory
@@ -56,7 +56,7 @@ async fn test_smb_iterating_long_directory() -> Result<(), Box<dyn std::error::E
                 &FileCreateArgs::make_create_new(Default::default(), Default::default()),
             )
             .await?
-            .unwrap_file();
+            .into_file()?;
         file.close().await?;
     }
 
@@ -74,7 +74,7 @@ async fn test_smb_iterating_long_directory() -> Result<(), Box<dyn std::error::E
             ),
         )
         .await?
-        .unwrap_dir();
+        .into_dir()?;
     let directory = Arc::new(directory);
     const SMALL_BUFFER_SIZE_FOR_MANY_ITERATIONS: u32 = 0x300;
     let found = Directory::query_with_options::<FileFullDirectoryInformation>(
@@ -108,7 +108,8 @@ async fn test_smb_iterating_long_directory() -> Result<(), Box<dyn std::error::E
                 )
                 .await
                 .unwrap()
-                .unwrap_file();
+                .into_file()
+                .unwrap();
             file.set_info(FileDispositionInformation {
                 delete_pending: true.into(),
             })
@@ -132,7 +133,7 @@ async fn test_smb_iterating_long_directory() -> Result<(), Box<dyn std::error::E
             &FileCreateArgs::make_open_existing(FileAccessMask::new().with_delete(true)),
         )
         .await?
-        .unwrap_dir();
+        .into_dir()?;
     directory
         .set_info(FileDispositionInformation {
             delete_pending: true.into(),
@@ -153,7 +154,7 @@ pub async fn remove_file_by_name(tree: &Tree, file_name: &str) -> smb::Result<()
                 .with_delete(true),
         )
         .await?
-        .unwrap_file();
+        .into_file()?;
     file.set_info(FileDispositionInformation {
         delete_pending: true.into(),
     })

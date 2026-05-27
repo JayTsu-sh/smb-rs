@@ -70,7 +70,7 @@ async fn test_smb_integration_dialect_encrpytion_mode(
                 ),
             )
             .await?
-            .unwrap_file();
+            .into_file()?;
 
         file.write_at(TEST_DATA, 0).await?;
 
@@ -98,13 +98,13 @@ async fn test_smb_integration_dialect_encrpytion_mode(
                 ),
             )
             .await?
-            .unwrap_dir();
+            .into_dir()?;
         let directory = Arc::new(directory);
         let ds = Directory::query::<FileDirectoryInformation>(&directory, TEST_FILE).await?;
         let mut found = false;
 
         ds.for_each(|entry| {
-            if entry.unwrap().file_name.to_string() == TEST_FILE {
+            if entry.unwrap().file_name == TEST_FILE {
                 found = true;
             }
             async {}
@@ -129,7 +129,7 @@ async fn test_smb_integration_dialect_encrpytion_mode(
             ),
         )
         .await?
-        .unwrap_file();
+        .into_file()?;
 
     // So anyway it will be deleted at the end.
     file.set_info(FileDispositionInformation {

@@ -274,7 +274,7 @@ pub mod tests {
         let valid_servers = vec!["server", "server-name", "server.name", "server_name"];
         for server in valid_servers {
             let unc_path = UncPath::new(server);
-            assert!(matches!(unc_path, Ok(_)));
+            assert!(unc_path.is_ok());
         }
         let invalid_servers = vec!["server/name", "server\\name", "server/share"];
         for server in invalid_servers {

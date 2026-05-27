@@ -32,12 +32,14 @@ async fn anonymous_session_accepts_unsigned_final_response() {
     control.push_server_frame(session_setup_response_intermediate(SESSION_ID));
     control.push_server_frame(session_setup_response_final_anonymous(SESSION_ID));
 
-    let mut config = ConnectionConfig::default();
-    config.smb2_only_negotiate = true;
-    config.timeout = Some(std::time::Duration::from_secs(5));
     // Anonymous sessions must be permitted by config or the driver
     // rejects the success reply outright (state.rs::ready check).
-    config.allow_unsigned_guest_access = true;
+    let config = ConnectionConfig {
+        smb2_only_negotiate: true,
+        timeout: Some(std::time::Duration::from_secs(5)),
+        allow_unsigned_guest_access: true,
+        ..Default::default()
+    };
     let conn = Connection::from_transport(transport, "samba-anon.test", Guid::generate(), config)
         .await
         .expect("Negotiate must succeed");

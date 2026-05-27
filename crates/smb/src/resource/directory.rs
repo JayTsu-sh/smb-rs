@@ -218,7 +218,7 @@ impl Directory {
     /// Watches the directory for changes, returning a [`Stream`][`futures_core::Stream`] of notifications.
     ///
     /// * See [`watch_stream_cancellable`][Self::watch_stream_cancellable] for a version that supports cancellation,
-    ///  via a [`CancellationToken`].
+    ///   via a [`CancellationToken`].
     ///
     /// # Arguments
     /// * `filter` - The filter to use for the changes. This is a bitmask of the changes to watch for.

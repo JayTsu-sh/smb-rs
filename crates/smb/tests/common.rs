@@ -33,8 +33,10 @@ pub fn smb_tests_share() -> String {
 }
 
 pub fn default_connection_config() -> ConnectionConfig {
-    let mut conn_config = ConnectionConfig::default();
-    conn_config.timeout = Some(std::time::Duration::from_secs(10));
+    let mut conn_config = ConnectionConfig {
+        timeout: Some(std::time::Duration::from_secs(10)),
+        ..Default::default()
+    };
     conn_config.auth_methods.kerberos = false;
     conn_config.auth_methods.ntlm = true;
     conn_config

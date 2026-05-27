@@ -38,9 +38,11 @@ async fn smb302_signing_required_signs_final_session_setup() {
     control.push_server_frame(session_setup_response_intermediate(SESSION_ID));
     control.push_server_frame(session_setup_response_final(SESSION_ID));
 
-    let mut config = ConnectionConfig::default();
-    config.smb2_only_negotiate = true;
-    config.timeout = Some(std::time::Duration::from_secs(5));
+    let config = ConnectionConfig {
+        smb2_only_negotiate: true,
+        timeout: Some(std::time::Duration::from_secs(5)),
+        ..Default::default()
+    };
     let conn = Connection::from_transport(transport, "smb302.test", Guid::generate(), config)
         .await
         .expect("Negotiate must succeed against SMB 3.0.2 mock server");

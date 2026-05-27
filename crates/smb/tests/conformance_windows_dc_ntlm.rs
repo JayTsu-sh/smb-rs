@@ -49,12 +49,14 @@ async fn windows_dc_signing_required_signs_final_session_setup() {
     control.push_server_frame(session_setup_response_final(SESSION_ID));
 
     // -- 2. Drive Negotiate via the production Connection path. --
-    let mut config = ConnectionConfig::default();
     // smb2_only_negotiate skips the optional SMB1 multi-protocol probe
     // (one fewer scripted frame to write) — same as the production
     // configuration that triggered the user's bug report.
-    config.smb2_only_negotiate = true;
-    config.timeout = Some(std::time::Duration::from_secs(5));
+    let config = ConnectionConfig {
+        smb2_only_negotiate: true,
+        timeout: Some(std::time::Duration::from_secs(5)),
+        ..Default::default()
+    };
     let conn = Connection::from_transport(transport, "windows-dc.test", Guid::generate(), config)
         .await
         .expect("Connection::from_transport (Negotiate) must succeed against scripted server");
