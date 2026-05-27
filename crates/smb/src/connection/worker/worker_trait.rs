@@ -35,7 +35,7 @@ pub trait Worker: Sized + std::fmt::Debug {
     /// Use [`Worker::receive`] instead, if you're a user of this trait, and not an implementor.
     /// # Arguments
     /// * `msg_id` - The message ID to receive. This function will not return until the message id specified
-    /// is received.
+    ///   is received.
     /// # Returns
     /// * The message received from the server, matching the filters.
     async fn receive_next(&self, options: &ReceiveOptions<'_>) -> crate::Result<IncomingMessage>;

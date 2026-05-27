@@ -761,12 +761,16 @@ async fn test_compound_set_basic_info() -> smb::Result<()> {
 async fn test_client_default_lease_state_auto_injects() -> smb::Result<()> {
     use smb::{Client, ClientConfig, FileAccessMask};
     let share = smb_tests_share();
-    let mut config = ClientConfig::default();
-    let mut conn_config = smb::ConnectionConfig::default();
-    conn_config.timeout = Some(Duration::from_secs(10));
+    let mut conn_config = smb::ConnectionConfig {
+        timeout: Some(Duration::from_secs(10)),
+        ..Default::default()
+    };
     conn_config.auth_methods.kerberos = false;
     conn_config.auth_methods.ntlm = true;
-    config.connection = conn_config;
+    let mut config = ClientConfig {
+        connection: conn_config,
+        ..Default::default()
+    };
     config.default_lease_state = Some(
         LeaseState::new()
             .with_read_caching(true)

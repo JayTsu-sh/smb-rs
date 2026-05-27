@@ -54,7 +54,7 @@ async fn do_test_smb_notify(
                 &FileCreateArgs::make_create_new(Default::default(), Default::default()),
             )
             .await?
-            .unwrap_file()
+            .into_file()?
             .close()
             .await?;
     }
@@ -66,7 +66,7 @@ async fn do_test_smb_notify(
             ),
         )
         .await?
-        .unwrap_dir();
+        .into_dir()?;
 
     let notified_sem = Arc::new(Semaphore::new(0));
     f_start_notify_task(notified_sem.clone(), dir);
@@ -184,7 +184,7 @@ async fn delete_file_from_another_connection(
             ),
         )
         .await?
-        .unwrap_file();
+        .into_file()?;
 
     file.set_info(FileDispositionInformation {
         delete_pending: true.into(),

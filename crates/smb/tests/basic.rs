@@ -26,7 +26,7 @@ async fn _do_minimal_connection_test(
             &FileCreateArgs::make_create_new(Default::default(), Default::default()),
         )
         .await?
-        .unwrap_file();
+        .into_file()?;
 
     file.set_info(FileDispositionInformation::default()).await?;
 

@@ -31,7 +31,7 @@ async fn test_file_query_information() -> Result<(), Box<dyn std::error::Error>>
     })
     .await?;
 
-    let test_result = do_test_query_information(&file).await;
+    let test_result = do_test_query_information(file).await;
 
     file.close().await?;
     client.close().await?;
@@ -69,7 +69,7 @@ async fn do_test_query_information(file: &File) -> smb::Result<()> {
 
     let std_info = file.query_info::<FileStandardInformation>().await?;
     assert_eq!(std_info.end_of_file, TEST_DATA.len() as u64);
-    assert_eq!(std_info.allocation_size >= TEST_DATA.len() as u64, true);
+    assert!(std_info.allocation_size >= TEST_DATA.len() as u64);
     assert_eq!(std_info.delete_pending, true.into());
 
     file.query_info::<FileStreamInformation>().await?;

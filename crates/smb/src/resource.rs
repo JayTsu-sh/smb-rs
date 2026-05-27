@@ -793,8 +793,8 @@ impl ResourceHandle {
     /// # Arguments
     /// * `flags` - The [QueryInfoFlags] for the query request.
     /// * `output_buffer_length` - An optional maximum output buffer to use. This should be less
-    /// than or equal to the negotiated max transaction size. If `None`, the default transaction size
-    /// will be used (see [`ConnectionConfig::default_transaction_size`][crate::ConnectionConfig::default_transaction_size]).
+    ///   than or equal to the negotiated max transaction size. If `None`, the default transaction size
+    ///   will be used (see [`ConnectionConfig::default_transaction_size`][crate::ConnectionConfig::default_transaction_size]).
     /// # Returns
     /// A `Result` containing the requested information.
     /// # Notes
@@ -842,8 +842,8 @@ impl ResourceHandle {
     /// # Arguments
     /// * `additional_info` - The information to request on the security descriptor.
     /// * `output_buffer_length` - An optional maximum output buffer to use. This should be less
-    /// than or equal to the negotiated max transaction size. If `None`, the default transaction size
-    /// will be used (see [`ConnectionConfig::default_transaction_size`][crate::ConnectionConfig::default_transaction_size]).
+    ///   than or equal to the negotiated max transaction size. If `None`, the default transaction size
+    ///   will be used (see [`ConnectionConfig::default_transaction_size`][crate::ConnectionConfig::default_transaction_size]).
     /// # Returns
     /// A `Result` containing the requested information, of type [`SecurityDescriptor`].
     pub async fn query_security_info_with_options(

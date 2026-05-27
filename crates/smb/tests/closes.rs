@@ -19,7 +19,7 @@ async fn _close_tests_helper()
             &FileCreateArgs::make_create_new(Default::default(), Default::default()),
         )
         .await?;
-    let file = file.unwrap_file();
+    let file = file.into_file()?;
     file.set_info(FileDispositionInformation::default()).await?;
     let connection = client.get_connection(file_path.server()).await?;
     let session = client.get_session(&file_path).await?;

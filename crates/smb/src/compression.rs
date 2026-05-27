@@ -455,7 +455,7 @@ mod tests {
     #[cfg(feature = "compress_pattern_v1")]
     #[test]
     pub fn test_pattern_v1_algorithm_decompression() {
-        let pattern_v1_payload_buffer = vec!['h' as u8, 0x0, 0x0, 0x0, 0xee, 0x1, 0x0, 0x0];
+        let pattern_v1_payload_buffer = vec![b'h', 0x0, 0x0, 0x0, 0xee, 0x1, 0x0, 0x0];
         let mut out = vec![];
         super::PatternV1Compression
             .decompress(&pattern_v1_payload_buffer, None, &mut out)
