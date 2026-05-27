@@ -167,7 +167,7 @@ mod cmac_signer {
 
 #[cfg(feature = "sign_gmac")]
 mod gmac_signer {
-    use crate::sync_helpers::OnceCell;
+    use tokio::sync::OnceCell;
 
     use aes::Aes128;
     use aes_gcm::{

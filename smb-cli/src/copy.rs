@@ -1,12 +1,11 @@
 use crate::{Cli, path::*};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use smb::sync_helpers::*;
 use smb::{Client, CreateOptions, FileAccessMask, FileAttributes, resource::*};
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
-
+use tokio::sync::Mutex;
 use tokio::{fs, time::sleep};
 
 #[derive(Parser, Debug)]

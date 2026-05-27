@@ -1,4 +1,4 @@
-use crate::sync_helpers::*;
+use tokio::sync::Mutex;
 
 /// This trait describes an object that can perform read operations at a specific offset,
 /// optionally using a specific channel ID.

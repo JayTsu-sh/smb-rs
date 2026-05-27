@@ -479,11 +479,11 @@ where
         request.security = Some(crate::msg_handler::Protection::SnapshotKdfSign {
             session_key: self.session_key()?,
         });
-        let mut request = request.into_signed_pre_prepared();
-        // Inhibit any future encryption attempt on this message (Sign
-        // and Encrypt are mutually exclusive per the transformer's
-        // own debug_assert).
-        request.encrypt = false;
+        let request = request.into_signed_pre_prepared();
+        // Sign and Encrypt are mutually exclusive per the transformer's
+        // own debug_assert; the SnapshotKdfSign Protection set above
+        // takes precedence and channel.sendo / transformer never look
+        // at the legacy `encrypt: bool` field once security is sealed.
 
         tracing::trace!(
             "setup loop: dispatching final signed SessionSetup msg_id={} session_id={:#x}",

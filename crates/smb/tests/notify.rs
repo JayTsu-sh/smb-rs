@@ -1,10 +1,9 @@
 use serial_test::serial;
-use smb::{
-    ConnectionConfig, Directory, FileCreateArgs, connection::EncryptionMode, sync_helpers::*,
-};
+use smb::{ConnectionConfig, Directory, FileCreateArgs, connection::EncryptionMode};
 use smb_fscc::*;
 use smb_msg::NotifyFilter;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 mod common;
 
 use tokio::time::sleep;
