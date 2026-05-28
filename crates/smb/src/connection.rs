@@ -1070,14 +1070,13 @@ impl ConnectionMessageHandler {
     const CREDITS_PER_MSG_NO_LARGE_MTU: u32 = 1;
 
     /// Stamp an [`OutgoingMessage`] with priority, credit charge, and a
-    /// fresh message_id. Idempotent guard: callers should set
-    /// [`OutgoingMessage::pre_processed`] to `true` after invoking, so
-    /// downstream [`Self::sendo`] doesn't re-run the sequencing logic
-    /// (which would consume an extra msg_id and an extra credit slot).
-    ///
-    /// Used by the session-setup driver, which needs the message's
-    /// final on-wire `header.message_id` *before* the wire bytes are
-    /// hashed into the SMB 3.1.1 preauth integrity chain.
+    /// fresh message_id. Callers that need the wire-bytes of a
+    /// request *before* it goes through [`Self::sendo`] (e.g. the
+    /// session-setup driver hashing the final SessionSetup Request
+    /// into the SMB 3.1.1 preauth integrity chain) invoke this
+    /// directly, then call [`Self::dispatch_outgoing`] to hand the
+    /// message off — bypassing `sendo` so the sequencing logic does
+    /// not run twice.
     pub(crate) async fn prepare_outgoing(&self, msg: &mut OutgoingMessage) -> crate::Result<()> {
         let priority_value = match self.conn_info.get() {
             Some(neg_info) => match neg_info.negotiation.dialect_rev {
@@ -1099,12 +1098,11 @@ impl ConnectionMessageHandler {
         Ok(())
     }
 
-    /// Hand a pre-prepared [`OutgoingMessage`] to the worker for
-    /// transformation (sign/compress/encrypt) and transmission. Callers
-    /// must have invoked [`Self::prepare_outgoing`] first (or set
-    /// [`OutgoingMessage::pre_processed`] to `true` if they manually
-    /// stamped the header). [`Self::sendo`] is the public, all-in-one
-    /// entry point that combines both.
+    /// Hand a fully-prepared [`OutgoingMessage`] to the worker for
+    /// transformation (sign/compress/encrypt) and transmission.
+    /// Callers must have invoked [`Self::prepare_outgoing`] first.
+    /// [`Self::sendo`] is the public, all-in-one entry point that
+    /// combines both.
     pub(crate) async fn dispatch_outgoing(
         &self,
         msg: OutgoingMessage,
@@ -1263,9 +1261,7 @@ impl ConnectionMessageHandler {
 
 impl MessageHandler for ConnectionMessageHandler {
     async fn sendo(&self, mut msg: OutgoingMessage) -> crate::Result<SendMessageResult> {
-        if !msg.pre_processed {
-            self.prepare_outgoing(&mut msg).await?;
-        }
+        self.prepare_outgoing(&mut msg).await?;
         self.dispatch_outgoing(msg).await
     }
 
