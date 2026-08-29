@@ -1,7 +1,7 @@
 use std::fmt;
 
 /// Identity of one physical connection generation.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct GenerationId(u64);
 
 impl GenerationId {
@@ -11,7 +11,7 @@ impl GenerationId {
 }
 
 /// Request identity is never meaningful without its generation.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct RequestKey {
     pub(crate) generation: GenerationId,
     pub(crate) message_id: u64,
@@ -110,6 +110,10 @@ impl RequestRecord {
 
     pub(crate) const fn caller(&self) -> CallerOutcome {
         self.caller
+    }
+
+    pub(crate) const fn caller_is_open(&self) -> bool {
+        matches!(self.caller, CallerOutcome::Open)
     }
 
     pub(crate) const fn send(&self) -> SendProgress {
