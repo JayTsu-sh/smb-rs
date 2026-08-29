@@ -233,7 +233,7 @@ impl Share {
                 let inner = self.inner.open_file(path.as_str(), options.mode).await?;
                 Ok(File {
                     inner,
-                    close_state: Mutex::new(FileCloseState::Open),
+                    close_authority: FileCloseAuthority::new(),
                 })
             })
         })
@@ -254,7 +254,7 @@ pub enum Resource {
 /// Non-cloneable positioned file handle.
 pub struct File {
     inner: RuntimeFile,
-    close_state: Mutex<FileCloseState>,
+    close_authority: FileCloseAuthority,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -269,6 +269,42 @@ enum FileCloseState {
     Open,
     Confirmed,
     OutcomeUnknown,
+}
+
+struct FileCloseAuthority {
+    state: Mutex<FileCloseState>,
+}
+
+impl FileCloseAuthority {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(FileCloseState::Open),
+        }
+    }
+
+    async fn close_with<F, Fut>(&self, close: F) -> crate::Result<CloseOutcome>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = crate::Result<()>>,
+    {
+        let mut state = self.state.lock().await;
+        match *state {
+            FileCloseState::Confirmed => return Ok(CloseOutcome::AlreadyClosed),
+            FileCloseState::OutcomeUnknown => return Ok(CloseOutcome::OutcomeUnknown),
+            FileCloseState::Open => {}
+        }
+        match close().await {
+            Ok(()) => {
+                *state = FileCloseState::Confirmed;
+                Ok(CloseOutcome::Confirmed)
+            }
+            Err(Error::OutcomeUnknown) => {
+                *state = FileCloseState::OutcomeUnknown;
+                Ok(CloseOutcome::OutcomeUnknown)
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 impl File {
@@ -432,23 +468,7 @@ impl File {
                         "file close permits only ReplayPolicy::Never".into(),
                     ));
                 }
-                let mut state = self.close_state.lock().await;
-                match *state {
-                    FileCloseState::Confirmed => return Ok(CloseOutcome::AlreadyClosed),
-                    FileCloseState::OutcomeUnknown => return Ok(CloseOutcome::OutcomeUnknown),
-                    FileCloseState::Open => {}
-                }
-                match self.inner.close().await {
-                    Ok(()) => {
-                        *state = FileCloseState::Confirmed;
-                        Ok(CloseOutcome::Confirmed)
-                    }
-                    Err(Error::OutcomeUnknown) => {
-                        *state = FileCloseState::OutcomeUnknown;
-                        Ok(CloseOutcome::OutcomeUnknown)
-                    }
-                    Err(error) => Err(error),
-                }
+                self.close_authority.close_with(|| self.inner.close()).await
             })
         })
     }
@@ -459,6 +479,11 @@ pub struct Pipe;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
 
     fn assert_send_sync<T: Send + Sync>() {}
@@ -471,5 +496,45 @@ mod tests {
         assert!(SharePath::new("dir/file.bin").is_ok());
         assert!(SharePath::new("../escape").is_err());
         assert!(SharePath::new("\\absolute").is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_file_close_invokes_the_wire_closure_once() {
+        let authority = Arc::new(FileCloseAuthority::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let close = |authority: Arc<FileCloseAuthority>, calls: Arc<AtomicUsize>| async move {
+            authority
+                .close_with(|| async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    Ok(())
+                })
+                .await
+        };
+
+        let (first, second) = tokio::join!(
+            close(authority.clone(), calls.clone()),
+            close(authority, calls.clone())
+        );
+        let outcomes = [first.unwrap(), second.unwrap()];
+        assert!(outcomes.contains(&CloseOutcome::Confirmed));
+        assert!(outcomes.contains(&CloseOutcome::AlreadyClosed));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_close_outcome_is_sticky_and_not_retried() {
+        let authority = FileCloseAuthority::new();
+        assert_eq!(
+            authority
+                .close_with(|| async { Err(Error::OutcomeUnknown) })
+                .await
+                .unwrap(),
+            CloseOutcome::OutcomeUnknown
+        );
+        assert_eq!(
+            authority.close_with(|| async { Ok(()) }).await.unwrap(),
+            CloseOutcome::OutcomeUnknown
+        );
     }
 }
