@@ -7,7 +7,9 @@ use std::{
 use bytes::Bytes;
 use futures_core::future::BoxFuture;
 
-use super::{CancelToken, File, Operation, operation::OperationContext};
+#[cfg(test)]
+use super::CancelToken;
+use super::{File, Operation, operation::OperationContext};
 use crate::Error;
 
 type ErasedValue = Box<dyn Any + Send>;
