@@ -358,6 +358,14 @@ impl RuntimeFile {
         self.inner.end_of_file()
     }
 
+    pub(crate) fn maximum_read_size(&self) -> u32 {
+        self.inner.maximum_read_size()
+    }
+
+    pub(crate) fn maximum_write_size(&self) -> u32 {
+        self.inner.maximum_write_size()
+    }
+
     pub(crate) async fn len(&self) -> crate::Result<u64> {
         Ok(self
             .inner

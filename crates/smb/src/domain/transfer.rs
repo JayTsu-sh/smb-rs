@@ -1,10 +1,12 @@
 use std::{
+    collections::BTreeMap,
     future::Future,
     pin::Pin,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 
+use bytes::Bytes;
 use futures_core::{Stream, future::BoxFuture};
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use tokio::sync::broadcast;
@@ -171,13 +173,18 @@ impl File {
         let deadline = options.deadline;
         let cancellation = options.cancellation.clone();
         let operation = Operation::new(move |context| {
-            let copy = move |offset: u64, length: u32, cancellation: CancelToken| {
+            let read = move |offset: u64, length: u32, cancellation: CancelToken| {
                 async move {
-                    let bytes = self
-                        .read_exact_at(offset, length)
-                        .cancellation(cancellation.clone())
+                    self.read_exact_at(offset, length)
+                        .cancellation(cancellation)
                         .replay(ReplayPolicy::Idempotent)
-                        .await?;
+                        .await
+                }
+                .boxed()
+            };
+            let write = move |offset: u64, bytes: Bytes, cancellation: CancelToken| {
+                async move {
+                    let length = u32::try_from(bytes.len())?;
                     destination
                         .write_all_at(offset, bytes)
                         .cancellation(cancellation)
@@ -188,7 +195,12 @@ impl File {
             };
             Box::pin(async move {
                 let length = self.inner.len().await?;
-                run_transfer(length, options, context.cancellation, progress, copy).await
+                let mut options = options;
+                options.chunk_size = options
+                    .chunk_size
+                    .min(self.inner.maximum_read_size())
+                    .min(destination.inner.maximum_write_size());
+                run_transfer(length, options, context.cancellation, progress, read, write).await
             })
         });
         let operation = match (deadline, cancellation) {
@@ -206,15 +218,17 @@ impl File {
     }
 }
 
-async fn run_transfer<'a, CopyChunk>(
+async fn run_transfer<'a, ReadChunk, WriteChunk>(
     length: u64,
     options: TransferOptions,
     cancellation: CancelToken,
     progress: broadcast::Sender<TransferProgress>,
-    copy_chunk: CopyChunk,
+    read_chunk: ReadChunk,
+    write_chunk: WriteChunk,
 ) -> crate::Result<TransferReport>
 where
-    CopyChunk: Fn(u64, u32, CancelToken) -> BoxFuture<'a, crate::Result<u32>> + Clone + 'a,
+    ReadChunk: Fn(u64, u32, CancelToken) -> BoxFuture<'a, crate::Result<Bytes>> + Clone + 'a,
+    WriteChunk: Fn(u64, Bytes, CancelToken) -> BoxFuture<'a, crate::Result<u32>> + Clone + 'a,
 {
     if options.concurrency == 0 || options.chunk_size == 0 {
         return Err(Error::InvalidArgument(
@@ -228,40 +242,63 @@ where
     }
 
     let mut pending = FuturesUnordered::new();
-    let mut next_offset = 0_u64;
+    let mut ready: BTreeMap<u64, Bytes> = BTreeMap::new();
+    let mut next_read = 0_u64;
+    let mut next_write = 0_u64;
     let mut transferred = 0_u64;
     let mut chunks = 0_u64;
     loop {
-        while pending.len() < options.concurrency && next_offset < length {
-            let remaining = length - next_offset;
+        while pending.len() + ready.len() < options.concurrency && next_read < length {
+            let remaining = length - next_read;
             let chunk_length = remaining.min(u64::from(options.chunk_size)) as u32;
-            let offset = next_offset;
-            next_offset += u64::from(chunk_length);
-            let copy = copy_chunk.clone();
+            let offset = next_read;
+            next_read += u64::from(chunk_length);
+            let read = read_chunk.clone();
             let token = cancellation.clone();
             pending.push(async move {
-                let copied = copy(offset, chunk_length, token).await?;
-                if copied != chunk_length {
+                let bytes = read(offset, chunk_length, token).await?;
+                if bytes.len() != chunk_length as usize {
                     return Err(Error::InvalidMessage(
-                        "transfer chunk completed with a short byte count".into(),
+                        "transfer read completed with a short byte count".into(),
                     ));
                 }
-                Ok((offset, copied))
+                Ok((offset, bytes))
             });
         }
 
-        let Some(result) = pending.next().await else {
-            break;
-        };
-        let (offset, bytes) = result?;
-        transferred += u64::from(bytes);
-        chunks += 1;
-        let _ = progress.send(TransferProgress::ChunkCompleted {
-            offset,
-            bytes,
-            transferred,
-            total: length,
-        });
+        if let Some(bytes) = ready.remove(&next_write) {
+            let expected = u32::try_from(bytes.len())?;
+            let written = write_chunk(next_write, bytes, cancellation.clone()).await?;
+            if written != expected {
+                return Err(Error::InvalidMessage(
+                    "transfer write completed with a short byte count".into(),
+                ));
+            }
+            let offset = next_write;
+            next_write += u64::from(written);
+            transferred += u64::from(written);
+            chunks += 1;
+            let _ = progress.send(TransferProgress::ChunkCompleted {
+                offset,
+                bytes: written,
+                transferred,
+                total: length,
+            });
+            continue;
+        }
+
+        match pending.next().await {
+            Some(result) => {
+                let (offset, bytes) = result?;
+                ready.insert(offset, bytes);
+            }
+            None if ready.is_empty() => break,
+            None => {
+                return Err(Error::InvalidState(
+                    "transfer scheduler cannot reach the next ordered write".into(),
+                ));
+            }
+        }
     }
     Ok(TransferReport {
         bytes: transferred,
@@ -273,7 +310,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
@@ -283,12 +320,12 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn scheduler_bounds_concurrency_and_accepts_out_of_order_completion() {
+    async fn scheduler_bounds_concurrent_reads_and_orders_writes() {
         let active = Arc::new(AtomicUsize::new(0));
         let maximum = Arc::new(AtomicUsize::new(0));
         let release = Arc::new(Notify::new());
         let (progress, mut receiver) = broadcast::channel(8);
-        let copy = {
+        let read = {
             let active = Arc::clone(&active);
             let maximum = Arc::clone(&maximum);
             let release = Arc::clone(&release);
@@ -305,7 +342,19 @@ mod tests {
                         release.notify_waiters();
                     }
                     active.fetch_sub(1, Ordering::SeqCst);
-                    Ok(length)
+                    Ok(Bytes::from(vec![0_u8; length as usize]))
+                }
+                .boxed()
+            }
+        };
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let write = {
+            let writes = Arc::clone(&writes);
+            move |offset, bytes: Bytes, _| {
+                let writes = Arc::clone(&writes);
+                async move {
+                    writes.lock().unwrap().push(offset);
+                    Ok(bytes.len() as u32)
                 }
                 .boxed()
             }
@@ -315,24 +364,29 @@ mod tests {
             TransferOptions::default().concurrency(2).chunk_size(4),
             CancelToken::new(),
             progress,
-            copy,
+            read,
+            write,
         )
         .await
         .unwrap();
         assert_eq!(report.bytes(), 12);
         assert_eq!(report.chunks(), 3);
         assert_eq!(maximum.load(Ordering::SeqCst), 2);
+        assert_eq!(*writes.lock().unwrap(), [0, 4, 8]);
         let first = receiver.recv().await.unwrap();
         assert!(matches!(
             first,
-            TransferProgress::ChunkCompleted { offset: 4, .. }
+            TransferProgress::ChunkCompleted { offset: 0, .. }
         ));
     }
 
     #[tokio::test]
     async fn short_chunk_and_invalid_policy_are_typed_failures() {
         let (progress, _) = broadcast::channel(1);
-        let short = |_offset, length, _| async move { Ok(length - 1) }.boxed();
+        let short = |_offset, length: u32, _| {
+            async move { Ok(Bytes::from(vec![0_u8; length.saturating_sub(1) as usize])) }.boxed()
+        };
+        let write = |_, bytes: Bytes, _| async move { Ok(bytes.len() as u32) }.boxed();
         assert!(matches!(
             run_transfer(
                 4,
@@ -340,20 +394,23 @@ mod tests {
                 CancelToken::new(),
                 progress,
                 short,
+                write,
             )
             .await,
             Err(Error::InvalidMessage(_))
         ));
 
         let (progress, _) = broadcast::channel(1);
-        let never = |_, _, _| async { unreachable!() }.boxed();
+        let never_read = |_, _, _| async { unreachable!() }.boxed();
+        let never_write = |_, _, _| async { unreachable!() }.boxed();
         assert!(matches!(
             run_transfer(
                 4,
                 TransferOptions::default().concurrency(0),
                 CancelToken::new(),
                 progress,
-                never,
+                never_read,
+                never_write,
             )
             .await,
             Err(Error::InvalidArgument(_))
@@ -363,13 +420,16 @@ mod tests {
     #[tokio::test]
     async fn bounded_progress_reports_lag_with_a_resynchronizing_total() {
         let (progress, receiver) = broadcast::channel(1);
-        let copy = |_, length, _| async move { Ok(length) }.boxed();
+        let read =
+            |_, length, _| async move { Ok(Bytes::from(vec![0_u8; length as usize])) }.boxed();
+        let write = |_, bytes: Bytes, _| async move { Ok(bytes.len() as u32) }.boxed();
         let report = run_transfer(
             12,
             TransferOptions::default().concurrency(1).chunk_size(4),
             CancelToken::new(),
             progress,
-            copy,
+            read,
+            write,
         )
         .await
         .unwrap();
@@ -406,7 +466,7 @@ mod tests {
     async fn cancellation_stops_inflight_chunks_with_the_typed_terminal() {
         let cancellation = CancelToken::new();
         let started = Arc::new(Notify::new());
-        let copy = {
+        let read = {
             let started = Arc::clone(&started);
             move |_, _, cancellation: CancelToken| {
                 let started = Arc::clone(&started);
@@ -418,13 +478,15 @@ mod tests {
                 .boxed()
             }
         };
+        let write = |_, bytes: Bytes, _| async move { Ok(bytes.len() as u32) }.boxed();
         let (progress, _) = broadcast::channel(1);
         let running = tokio::spawn(run_transfer(
             8,
             TransferOptions::default().concurrency(2).chunk_size(4),
             cancellation.clone(),
             progress,
-            copy,
+            read,
+            write,
         ));
         started.notified().await;
         cancellation.cancel();
@@ -437,7 +499,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn transfer_deadline_cancels_every_inflight_chunk() {
         let started = Arc::new(AtomicUsize::new(0));
-        let copy = {
+        let read = {
             let started = Arc::clone(&started);
             move |_, _, cancellation: CancelToken| {
                 let started = Arc::clone(&started);
@@ -449,6 +511,7 @@ mod tests {
                 .boxed()
             }
         };
+        let write = |_, bytes: Bytes, _| async move { Ok(bytes.len() as u32) }.boxed();
         let (progress, _) = broadcast::channel(1);
         let operation = Operation::new(move |context| {
             Box::pin(run_transfer(
@@ -456,7 +519,8 @@ mod tests {
                 TransferOptions::default().concurrency(2).chunk_size(4),
                 context.cancellation,
                 progress,
-                copy,
+                read,
+                write,
             ))
         })
         .timeout(Duration::from_secs(1));

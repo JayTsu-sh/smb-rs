@@ -494,11 +494,12 @@ impl File {
                 if length == 0 {
                     return Ok(Bytes::new());
                 }
+                let first_length = length.min(self.inner.maximum_read_size());
                 let first = self
                     .inner
                     .read_at(
                         offset,
-                        length,
+                        first_length,
                         context.remaining()?,
                         context.cancellation.clone(),
                         context.runtime_replay(),
@@ -522,11 +523,12 @@ impl File {
                         Error::InvalidArgument("read range exceeds u64 offsets".into())
                     })?;
                     let remaining = length - result.len() as u32;
+                    let request_length = remaining.min(self.inner.maximum_read_size());
                     let bytes = self
                         .inner
                         .read_at(
                             position,
-                            remaining,
+                            request_length,
                             context.remaining()?,
                             context.cancellation.clone(),
                             context.runtime_replay(),
@@ -559,7 +561,11 @@ impl File {
                         .inner
                         .write_at(
                             position,
-                            bytes.slice(written..),
+                            bytes.slice(
+                                written
+                                    ..(written + self.inner.maximum_write_size() as usize)
+                                        .min(bytes.len()),
+                            ),
                             context.remaining()?,
                             context.cancellation.clone(),
                             context.runtime_replay(),

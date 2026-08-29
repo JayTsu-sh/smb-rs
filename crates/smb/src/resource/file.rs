@@ -42,6 +42,14 @@ pub struct File {
 }
 
 impl File {
+    pub(crate) fn maximum_read_size(&self) -> u32 {
+        self.handle.conn_info.negotiation.max_read_size
+    }
+
+    pub(crate) fn maximum_write_size(&self) -> u32 {
+        self.handle.conn_info.negotiation.max_write_size
+    }
+
     pub fn new(handle: ResourceHandle, end_of_file: u64) -> Self {
         File {
             handle,
@@ -88,11 +96,6 @@ impl File {
             ));
         }
 
-        // EOF
-        if pos >= self.end_of_file {
-            return Ok(0);
-        }
-
         tracing::debug!(
             "Reading up to {} bytes at offset {} from {}",
             buf.len(),
@@ -103,6 +106,9 @@ impl File {
         let response = self
             .send_read_request(buf.len() as u32, pos, channel, unbuffered)
             .await?;
+        if response.message.header.status().map_err(std::io::Error::other)? == Status::EndOfFile {
+            return Ok(0);
+        }
         let content = response
             .message
             .content
@@ -166,10 +172,6 @@ impl File {
             return Err(Error::MissingPermissions("file read data".into()));
         }
 
-        if pos >= self.end_of_file {
-            return Ok(bytes::Bytes::new());
-        }
-
         let response = self
             .send_read_request_with_options(
                 max_len,
@@ -179,6 +181,9 @@ impl File {
                 options,
             )
             .await?;
+        if response.message.header.status()? == Status::EndOfFile {
+            return Ok(bytes::Bytes::new());
+        }
         let content = response
             .message
             .content
@@ -245,7 +250,10 @@ impl File {
         )
         .with_channel_id(channel);
 
-        let mut options = ResponseOptions::new().with_allow_async(true);
+        let mut options = ResponseOptions::new()
+            .with_allow_async(true)
+            .with_cmd(Some(Command::Read))
+            .with_status(&[Status::Success, Status::EndOfFile]);
         if let Some(timeout) = operation.timeout {
             options = options.with_timeout(timeout);
         }

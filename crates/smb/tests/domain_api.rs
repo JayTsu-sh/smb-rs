@@ -371,10 +371,10 @@ async fn domain_batch_and_concurrent_transfer() -> smb::Result<()> {
         outcomes.outcome(write),
         Some(BatchOutcome::Success(count)) if *count == marker.len()
     ));
-    assert!(matches!(
-        outcomes.outcome(read),
-        Some(BatchOutcome::Success(bytes)) if *bytes == marker
-    ));
+    match outcomes.outcome(read) {
+        Some(BatchOutcome::Success(bytes)) => assert_eq!(*bytes, marker),
+        other => panic!("unexpected batch read outcome: {other:?}"),
+    }
 
     let mut transfer = source.transfer_to(
         &destination,
