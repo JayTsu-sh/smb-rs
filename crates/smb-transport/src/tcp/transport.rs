@@ -186,6 +186,46 @@ impl SmbTransportWrite for TcpTransport {
         }
         .boxed()
     }
+
+    fn send_with_progress<'a>(
+        &'a mut self,
+        data: &'a crate::SendFrame,
+        progress: &'a mut (dyn FnMut(usize) + Send),
+    ) -> BoxFuture<'a, Result<()>> {
+        use crate::iovec::SendCursor;
+        use bytes::Buf;
+        use tokio::io::AsyncWriteExt;
+
+        async move {
+            const MAX_VECTORED_SEGMENTS: usize = 63;
+            if data.segments().len() > MAX_VECTORED_SEGMENTS {
+                return Err(TransportError::SegmentLimitExceeded {
+                    actual: data.segments().len(),
+                    maximum: MAX_VECTORED_SEGMENTS,
+                });
+            }
+            let mut cursor = SendCursor::new(data)?;
+            let writer = self.writer.as_mut().ok_or(TransportError::NotConnected)?;
+            while cursor.has_remaining() {
+                let written = {
+                    let mut slices =
+                        std::array::from_fn::<_, 64, _>(|_| std::io::IoSlice::new(&[]));
+                    let count = cursor.chunks_vectored(&mut slices);
+                    writer
+                        .write_vectored(&slices[..count])
+                        .await
+                        .map_err(Self::map_tcp_error)?
+                };
+                if written == 0 {
+                    return Err(TransportError::WriteZero);
+                }
+                cursor.try_advance(written)?;
+                progress(written);
+            }
+            Ok(())
+        }
+        .boxed()
+    }
 }
 
 impl SmbTransportRead for TcpTransport {

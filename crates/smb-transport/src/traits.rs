@@ -49,6 +49,36 @@ pub trait SmbTransportWrite: Send {
         }
         .boxed()
     }
+
+    /// Sends one sealed frame and reports each positive transport advance.
+    ///
+    /// The callback is observational only: scheduling, credit accounting, and
+    /// caller completion remain the runtime owner's responsibility.
+    fn send_with_progress<'a>(
+        &'a mut self,
+        data: &'a SendFrame,
+        progress: &'a mut (dyn FnMut(usize) + Send),
+    ) -> BoxFuture<'a, Result<()>> {
+        async {
+            let header = SmbTcpMessageHeader {
+                stream_protocol_length: data.total_len() as u32,
+            };
+            let mut header_buf = [0u8; SmbTcpMessageHeader::SIZE];
+            header.write(&mut Cursor::new(header_buf.as_mut_slice()))?;
+            self.send_raw(&header_buf).await?;
+            progress(header_buf.len());
+
+            for buf in data.segments() {
+                if buf.is_empty() {
+                    continue;
+                }
+                self.send_raw(buf).await?;
+                progress(buf.len());
+            }
+            Ok(())
+        }
+        .boxed()
+    }
 }
 
 pub trait SmbTransportWriteExt: SmbTransportWrite {

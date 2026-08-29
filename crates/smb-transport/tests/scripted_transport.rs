@@ -162,3 +162,44 @@ fn production_cursor_survives_every_scripted_short_write_size() {
         Err(smb_transport::TransportError::WriteZero)
     ));
 }
+
+#[tokio::test]
+async fn progress_send_reports_every_positive_short_write() {
+    for maximum in 1..=15 {
+        let (transport, control) = ScriptedTransport::new();
+        control.set_maximum_write(maximum);
+        let (_, mut write) = transport.split().expect("scripted transport splits");
+        let frame = SendFrame::from_segments(
+            vec![Bytes::from_static(b"meta"), Bytes::from_static(b"payload")],
+            2,
+        )
+        .unwrap();
+        let mut advances = Vec::new();
+        write
+            .send_with_progress(&frame, &mut |bytes| advances.push(bytes))
+            .await
+            .expect("progress send succeeds");
+        assert!(advances.iter().all(|bytes| *bytes > 0 && *bytes <= maximum));
+        assert_eq!(advances.iter().sum::<usize>(), 4 + frame.total_len());
+        assert_eq!(
+            control.captured_client_frames(),
+            vec![Bytes::from_static(b"metapayload")]
+        );
+    }
+}
+
+#[tokio::test]
+async fn zero_progress_is_typed_before_any_frame_is_captured() {
+    let (transport, control) = ScriptedTransport::new();
+    control.set_maximum_write(0);
+    let (_, mut write) = transport.split().expect("scripted transport splits");
+    let frame = SendFrame::from_segments(vec![Bytes::from_static(b"x")], 1).unwrap();
+    let mut advances = Vec::new();
+    let error = write
+        .send_with_progress(&frame, &mut |bytes| advances.push(bytes))
+        .await
+        .expect_err("zero progress must fail");
+    assert!(matches!(error, smb_transport::TransportError::WriteZero));
+    assert!(advances.is_empty());
+    assert!(control.captured_client_frames().is_empty());
+}

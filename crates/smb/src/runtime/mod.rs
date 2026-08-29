@@ -7,6 +7,8 @@
 // The next W3 slice wires these types into the owner task. Keeping the
 // transition-local allowance here avoids weakening warnings crate-wide.
 #[allow(dead_code)]
+mod engine;
+#[allow(dead_code)]
 mod reducer;
 #[allow(dead_code)]
 mod state;

@@ -26,6 +26,7 @@ struct ScriptedTransportState {
     write_faults: Mutex<BTreeMap<usize, ErrorKind>>,
     read_operations: AtomicUsize,
     write_operations: AtomicUsize,
+    maximum_write: AtomicUsize,
     frame_pushed: Notify,
     frame_captured: Notify,
 }
@@ -66,6 +67,10 @@ impl ScriptedTransportControl {
             .lock()
             .expect("scripted transport write faults poisoned")
             .insert(operation, kind);
+    }
+
+    pub fn set_maximum_write(&self, maximum: usize) {
+        self.inner.maximum_write.store(maximum, Ordering::Relaxed);
     }
 
     pub fn captured_client_frames(&self) -> Vec<Bytes> {
@@ -154,6 +159,7 @@ pub struct ScriptedTransport {
 impl ScriptedTransport {
     pub fn new() -> (Box<Self>, ScriptedTransportControl) {
         let control = ScriptedTransportControl::default();
+        control.set_maximum_write(usize::MAX);
         let transport = Self {
             read: ScriptedRead::new(control.clone()),
             write: ScriptedWrite::new(control.clone()),
@@ -339,6 +345,38 @@ impl SmbTransportWrite for ScriptedWrite {
                 )));
             }
             self.feed(bytes)
+        }
+        .boxed()
+    }
+
+    fn send_with_progress<'a>(
+        &'a mut self,
+        frame: &'a SendFrame,
+        progress: &'a mut (dyn FnMut(usize) + Send),
+    ) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let maximum = self.control.inner.maximum_write.load(Ordering::Relaxed);
+            if maximum == 0 {
+                return Err(TransportError::WriteZero);
+            }
+            let mut cursor = SendCursor::new(frame)?;
+            while cursor.has_remaining() {
+                if let Some(kind) = self.control.take_write_fault() {
+                    return Err(TransportError::IoError(std::io::Error::new(
+                        kind,
+                        "scripted write fault",
+                    )));
+                }
+                let chunk = cursor.chunk();
+                let written = chunk.len().min(maximum);
+                if written == 0 {
+                    return Err(TransportError::WriteZero);
+                }
+                self.feed(&chunk[..written])?;
+                cursor.try_advance(written)?;
+                progress(written);
+            }
+            Ok(())
         }
         .boxed()
     }
