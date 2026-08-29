@@ -181,7 +181,7 @@ impl File {
                 flags,
                 length,
                 offset: pos,
-                file_id: self.handle.file_id().map_err(std::io::Error::other)?,
+                file_id: self.handle.file_id().await.map_err(std::io::Error::other)?,
                 minimum_count: 1,
             }
             .into(),
@@ -248,7 +248,7 @@ impl File {
         let outgoing = CommandRequest::new(
             WriteRequest::new(
                 pos,
-                self.handle.file_id().map_err(std::io::Error::other)?,
+                self.handle.file_id().await.map_err(std::io::Error::other)?,
                 WriteFlags::new(),
                 buf.len() as u32,
             )
@@ -284,7 +284,7 @@ impl File {
             .handle
             .execute_content(
                 FlushRequest {
-                    file_id: self.handle.file_id().map_err(std::io::Error::other)?,
+                    file_id: self.handle.file_id().await.map_err(std::io::Error::other)?,
                 }
                 .into(),
                 ResponseOptions::new().with_allow_async(true),

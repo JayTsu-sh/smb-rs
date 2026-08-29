@@ -68,7 +68,7 @@ impl Directory {
                     file_information_class: T::CLASS_ID,
                     flags: QueryDirectoryFlags::new().with_restart_scans(restart),
                     file_index: 0,
-                    file_id: self.handle.file_id()?,
+                    file_id: self.handle.file_id().await?,
                     output_buffer_length: buffer_size,
                     file_name: pattern.into(),
                 }
@@ -382,7 +382,7 @@ impl Directory {
         }
         let output_buffer_length = self.calc_transact_size(None);
 
-        let file_id = match self.file_id() {
+        let file_id = match self.file_id().await {
             Ok(id) => id,
             Err(e) => return DirectoryWatchResult::Error(e),
         };
@@ -483,7 +483,7 @@ impl Directory {
                     flags: QueryInfoFlags::new()
                         .with_restart_scan(info.restart_scan.into())
                         .with_return_single_entry(info.return_single.into()),
-                    file_id: self.handle.file_id()?,
+                    file_id: self.handle.file_id().await?,
                     data: GetInfoRequestData::Quota(info),
                 },
                 output_buffer_length,

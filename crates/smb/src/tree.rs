@@ -109,17 +109,15 @@ impl Tree {
         let session = upstream.session_object()?;
 
         let context = TreeContext::new(
-                upstream,
-                tree_id,
-                name.to_string(),
-                tree_connect_info,
-                session,
-                object,
-            );
+            upstream,
+            tree_id,
+            name.to_string(),
+            tree_connect_info,
+            session,
+            object,
+        );
         upstream.register_share(Arc::downgrade(&context)).await;
-        let t = Tree {
-            context,
-        };
+        let t = Tree { context };
 
         Ok(t)
     }
@@ -333,7 +331,11 @@ impl TreeContext {
             tree_name,
             recovery: tokio::sync::Mutex::new(()),
             recovery_slots: Arc::new(tokio::sync::Semaphore::new(
-                upstream.conn_info().config.auto_reconnect.max_waiting_operations,
+                upstream
+                    .conn_info()
+                    .config
+                    .auto_reconnect
+                    .max_waiting_operations,
             )),
             recovering: AtomicBool::new(false),
         })
@@ -398,9 +400,8 @@ impl TreeContext {
             }
         }
         let Some(candidate) = candidate else {
-            return Err(last_error.unwrap_or_else(|| {
-                Error::InvalidState("Share recovery is disabled".into())
-            }));
+            return Err(last_error
+                .unwrap_or_else(|| Error::InvalidState("Share recovery is disabled".into())));
         };
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::InvalidState("Tree closed during recovery".into()));
@@ -478,7 +479,9 @@ impl TreeContext {
         options: ResponseOptions<'_>,
     ) -> crate::Result<(CommandSubmission, CommandResponse)> {
         self.wait_for_reconnect(
-            options.timeout.or_else(|| Some(self.upstream.conn_info().config.timeout())),
+            options
+                .timeout
+                .or_else(|| Some(self.upstream.conn_info().config.timeout())),
             options.async_cancel.clone(),
         )
         .await?;
@@ -492,8 +495,19 @@ impl TreeContext {
         self.wait_for_reconnect(Some(self.upstream.conn_info().config.timeout()), None)
             .await?;
         self.upstream
-            .create_object(self.generation().object, crate::runtime::ObjectKind::Resource)
+            .create_object(
+                self.generation().object,
+                crate::runtime::ObjectKind::Resource,
+            )
             .await
+    }
+
+    pub(crate) async fn current_share_object(
+        self: &Arc<Self>,
+    ) -> crate::Result<crate::runtime::ObjectToken> {
+        self.wait_for_reconnect(Some(self.upstream.conn_info().config.timeout()), None)
+            .await?;
+        Ok(self.generation().object)
     }
 
     pub(crate) async fn execute_for(
@@ -509,8 +523,7 @@ impl TreeContext {
             .await?;
         let incoming = &result.1;
         if !incoming.message.header.flags.async_command()
-            && incoming.message.header.tree_id.unwrap_or_default()
-                != generation.tree_id
+            && incoming.message.header.tree_id.unwrap_or_default() != generation.tree_id
         {
             return Err(Error::InvalidMessage(
                 "Received message for different tree, or tree disconnecting.".to_string(),
@@ -540,9 +553,13 @@ impl TreeContext {
         content: RequestContent,
         dependency: crate::runtime::ObjectToken,
     ) -> crate::Result<CommandResponse> {
-        self.execute_for(CommandRequest::new(content), ResponseOptions::new(), dependency)
-            .await
-            .map(|(_, incoming)| incoming)
+        self.execute_for(
+            CommandRequest::new(content),
+            ResponseOptions::new(),
+            dependency,
+        )
+        .await
+        .map(|(_, incoming)| incoming)
     }
 
     pub(crate) async fn execute_content(

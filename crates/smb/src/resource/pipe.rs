@@ -156,7 +156,7 @@ impl PipeRpcConnection {
         to_send: DcRpcCoPktRequestContent,
     ) -> crate::Result<DceRpcCoResponsePkt> {
         const READ_WRITE_PIPE_OFFSET: u64 = 0;
-        let file_id = pipe.handle.file_id()?;
+        let file_id = pipe.handle.file_id().await?;
         let dcerpc_request_buffer: Vec<u8> = DceRpcCoRequestPkt::new(
             to_send,
             call_id,
