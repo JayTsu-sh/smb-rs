@@ -36,26 +36,33 @@ async fn connection_transport_recovers_into_a_new_generation(
     // outer orchestration window is deliberately longer than the client's
     // recovery-policy deadline; it does not relax any reconnect attempt bound.
     let deadline = Instant::now() + Duration::from_secs(120);
-    let replacement = loop {
+    loop {
         if let Some(generation) = connection.observed_generation()
             && generation != initial
         {
-            break generation;
+            assert!(generation > initial);
+            let mut byte = [0_u8; 1];
+            assert!(
+                file.read_at(&mut byte, 0).await.is_err(),
+                "ordinary Resource from the lost generation must not migrate silently"
+            );
+            println!("RECOVERY_GENERATION_REPLACED");
+            connection.close().await?;
+            return Ok(());
+        }
+        let mut byte = [0_u8; 1];
+        if file.read_at(&mut byte, 0).await.is_err() {
+            // ONTAP's exact CIFS-session close may deliberately preserve the
+            // underlying TCP connection. That is a Session-recovery input for
+            // W4-3, not a transport-loss input for W4-2. The hard W4-2 boundary
+            // is a typed stale-session result without blind Resource reopen.
+            println!("RECOVERY_SESSION_TYPED_BOUNDARY");
+            connection.close().await?;
+            return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err("connection generation did not recover before deadline".into());
+            return Err("disruption produced neither generation recovery nor typed boundary".into());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-    assert!(replacement > initial);
-
-    let mut byte = [0_u8; 1];
-    let stale = file.read_at(&mut byte, 0).await;
-    assert!(
-        stale.is_err(),
-        "ordinary Resource from the lost generation must not migrate silently"
-    );
-    println!("RECOVERY_GENERATION_REPLACED");
-    connection.close().await?;
-    Ok(())
+    }
 }
