@@ -8,7 +8,9 @@ use crate::compression;
 use crate::clock::TokioClock;
 use crate::connection::preauth_hash::PreauthHashState;
 use crate::dialects::DialectImpl;
-use crate::lease::{LeaseBreakAckOutcome, LeaseBreakEvent, LeaseSlot};
+use crate::lease::{
+    LeaseBreakAckOutcome, LeaseBreakEvent, LeaseSlot, OplockBreakEvent, OplockSlot,
+};
 use crate::runtime::{
     GenerationBootstrap, GenerationId, GenerationPublication, RandomRecoveryJitter,
     PreparedGeneration, RecoveryDriver, RecoveryError, RuntimeError,
@@ -26,7 +28,7 @@ use rand::rngs::OsRng;
 use registry::ConnectionRegistry;
 use smb_dtyp::*;
 use smb_msg::{
-    RequestContent, Response, ResponseContent, negotiate::*, oplock::LeaseBreakAck,
+    OplockLevel, RequestContent, Response, ResponseContent, negotiate::*, oplock::LeaseBreakAck,
     smb1::SMB1NegotiateMessage,
 };
 use smb_transport::*;
@@ -723,6 +725,10 @@ impl Connection {
         self.context.subscribe_lease_breaks()
     }
 
+    pub fn subscribe_oplock_breaks(&self) -> tokio::sync::broadcast::Receiver<OplockBreakEvent> {
+        self.context.subscribe_oplock_breaks()
+    }
+
     /// Install a [`crate::lease::LeaseSlot`] into this connection's
     /// lease cache. See [`ConnectionCore::insert_lease_slot`].
     pub async fn insert_lease_slot(&self, slot: Arc<LeaseSlot>) -> crate::Result<()> {
@@ -912,6 +918,7 @@ pub(crate) struct ConnectionCore {
     /// Broadcasts [`LeaseBreakEvent`] to any [`crate::Client::subscribe_lease_breaks`]
     /// consumers when the server sends a `LeaseBreakNotify`.
     lease_event_tx: tokio::sync::broadcast::Sender<LeaseBreakEvent>,
+    oplock_event_tx: tokio::sync::broadcast::Sender<OplockBreakEvent>,
 
     /// Domain-only lease/session registry. It owns no task and no request or
     /// transport authority; every lock is released before wire I/O.
@@ -1054,6 +1061,7 @@ impl ConnectionCore {
 
     fn new(client_guid: Guid) -> ConnectionCore {
         let (lease_event_tx, _) = tokio::sync::broadcast::channel(LEASE_BREAK_CHANNEL_CAPACITY);
+        let (oplock_event_tx, _) = tokio::sync::broadcast::channel(LEASE_BREAK_CHANNEL_CAPACITY);
 
         ConnectionCore {
             client_guid,
@@ -1061,6 +1069,7 @@ impl ConnectionCore {
             recovery: OnceLock::new(),
             stop_notifications: Default::default(),
             lease_event_tx,
+            oplock_event_tx,
             registry: ConnectionRegistry::new(),
         }
     }
@@ -1123,6 +1132,10 @@ impl ConnectionCore {
             }
         }
         Ok(())
+    }
+
+    pub(crate) async fn insert_oplock_slot(&self, slot: &Arc<OplockSlot>) {
+        self.registry.insert_oplock(slot).await;
     }
 
     /// Return the current number of cached lease slots. Primarily for
@@ -1242,6 +1255,10 @@ impl ConnectionCore {
     /// protocol is left in a bad state.
     pub fn subscribe_lease_breaks(&self) -> tokio::sync::broadcast::Receiver<LeaseBreakEvent> {
         self.lease_event_tx.subscribe()
+    }
+
+    pub fn subscribe_oplock_breaks(&self) -> tokio::sync::broadcast::Receiver<OplockBreakEvent> {
+        self.oplock_event_tx.subscribe()
     }
 
     pub fn worker(&self) -> Option<Arc<WorkerImpl>> {
@@ -1498,6 +1515,9 @@ impl ConnectionCore {
         if matches!(msg.message.content, ResponseContent::LeaseBreakNotify(_)) {
             return self.handle_lease_break(msg).await;
         }
+        if matches!(msg.message.content, ResponseContent::OplockBreakNotify(_)) {
+            return self.handle_oplock_break(msg).await;
+        }
 
         if msg.message.header.session_id == 0 {
             tracing::warn!("Received notification without session ID: {msg:?}");
@@ -1535,6 +1555,83 @@ impl ConnectionCore {
 }
 
 impl ConnectionCore {
+    async fn handle_oplock_break(&self, msg: CommandResponse) -> crate::Result<()> {
+        let notify = match msg.message.content {
+            ResponseContent::OplockBreakNotify(notify) => notify,
+            other => {
+                return Err(Error::InvalidState(format!(
+                    "handle_oplock_break called with non-oplock content: {other:?}"
+                )));
+            }
+        };
+        let new_level = notify
+            .oplock_level()
+            .map_err(|error| Error::InvalidMessage(error.to_string()))?;
+        let Some(slot) = self.registry.find_oplock(notify.file_id()).await else {
+            tracing::warn!(file_id = ?notify.file_id(), "Unknown oplock break owner");
+            return Ok(());
+        };
+        let Some(worker) = self.worker() else {
+            return Err(Error::InvalidState("Runtime is uninitialized".into()));
+        };
+        if slot.object().generation() != worker.connection_object().generation() {
+            tracing::debug!(file_id = ?notify.file_id(), "Ignoring stale-generation oplock break");
+            return Ok(());
+        }
+        let previous_level = {
+            let mut level = slot
+                .level
+                .write()
+                .map_err(|_| Error::InvalidState("Oplock state is unavailable".into()))?;
+            let previous = *level;
+            *level = new_level;
+            previous
+        };
+        let ack_required = previous_level != OplockLevel::II;
+        let ack_outcome = if ack_required {
+            const ACK_DEADLINE: Duration = Duration::from_secs(35);
+            match tokio::time::timeout(
+                ACK_DEADLINE,
+                self.send_oplock_break_ack(&slot, new_level),
+            )
+            .await
+            {
+                Ok(Ok(())) => LeaseBreakAckOutcome::Accepted,
+                Ok(Err(error)) => {
+                    tracing::warn!(?error, "OplockBreakAck failed");
+                    LeaseBreakAckOutcome::Failed
+                }
+                Err(_) => LeaseBreakAckOutcome::TimedOut,
+            }
+        } else {
+            LeaseBreakAckOutcome::NotRequired
+        };
+        let _ = self.oplock_event_tx.send(OplockBreakEvent {
+            file_id: notify.file_id(),
+            previous_level,
+            new_level,
+            ack_outcome,
+            received_at: Instant::now(),
+        });
+        Ok(())
+    }
+
+    async fn send_oplock_break_ack(
+        &self,
+        slot: &Arc<OplockSlot>,
+        level: OplockLevel,
+    ) -> crate::Result<()> {
+        let ack = smb_msg::OplockBreakAck::new(level, slot.file_id());
+        slot.context
+            .execute_for(
+                CommandRequest::new(RequestContent::OplockBreakAck(ack)),
+                ResponseOptions::new().with_cmd(Some(smb_msg::Command::OplockBreak)),
+                slot.object(),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Process an incoming `LeaseBreakNotify`. Called from [`Self::notify`]
     /// before any session forwarding so that:
     ///

@@ -14,7 +14,7 @@ use smb_msg::{CreateDisposition, LeaseState};
 use tokio::sync::Mutex;
 
 use super::LeaseEviction;
-use crate::lease::LeaseSlot;
+use crate::lease::{LeaseSlot, OplockSlot};
 use crate::session::{ChannelContext, SessionContext};
 
 #[derive(Debug, Clone, Copy)]
@@ -24,6 +24,7 @@ pub(crate) struct SessionGone;
 struct RegistryState {
     sessions: HashMap<u64, Weak<SessionContext>>,
     leases: HashMap<String, Arc<LeaseSlot>>,
+    oplocks: HashMap<(u64, u64), Weak<OplockSlot>>,
 }
 
 #[derive(Default)]
@@ -42,6 +43,23 @@ impl ConnectionRegistry {
             .await
             .leases
             .insert(slot.path.clone(), slot)
+    }
+
+    pub(crate) async fn insert_oplock(&self, slot: &Arc<OplockSlot>) {
+        self.state.lock().await.oplocks.insert(
+            (slot.file_id().persistent, slot.file_id().volatile),
+            Arc::downgrade(slot),
+        );
+    }
+
+    pub(crate) async fn find_oplock(&self, file_id: smb_msg::FileId) -> Option<Arc<OplockSlot>> {
+        let mut state = self.state.lock().await;
+        let key = (file_id.persistent, file_id.volatile);
+        let slot = state.oplocks.get(&key).and_then(Weak::upgrade);
+        if slot.is_none() {
+            state.oplocks.remove(&key);
+        }
+        slot
     }
 
     pub(crate) async fn lease_slot_count(&self) -> usize {

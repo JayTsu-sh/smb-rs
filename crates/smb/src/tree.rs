@@ -502,6 +502,10 @@ impl TreeContext {
             .await
     }
 
+    pub(crate) async fn register_oplock_slot(&self, slot: &Arc<crate::lease::OplockSlot>) {
+        self.upstream.register_oplock_slot(slot).await;
+    }
+
     pub(crate) async fn current_share_object(
         self: &Arc<Self>,
     ) -> crate::Result<crate::runtime::ObjectToken> {

@@ -78,6 +78,7 @@ pub struct LeaseBreakNotify {
 ///
 /// Reference: MS-SMB2 2.2.23.1
 #[smb_message_binrw]
+#[derive(Clone, Copy)]
 #[brw(repr(u8))]
 pub enum OplockLevel {
     /// No oplock is available.

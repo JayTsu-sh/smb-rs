@@ -425,6 +425,13 @@ impl SessionContext {
         self.shares.lock().await.push(share);
     }
 
+    pub(crate) async fn register_oplock_slot(&self, slot: &Arc<crate::lease::OplockSlot>) {
+        self.primary_channel()
+            .upstream()
+            .insert_oplock_slot(slot)
+            .await;
+    }
+
     async fn recover_shares(&self) {
         let shares = {
             let mut shares = self.shares.lock().await;

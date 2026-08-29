@@ -19,7 +19,10 @@
 mod common;
 use common::{make_server_connection, smb_tests_share};
 use serial_test::serial;
-use smb::{FileCreateArgs, LeaseBreakAckOutcome, RequestLease, RequestLeaseV2};
+use smb::{
+    DurableOpenRequest, FileCreateArgs, Guid, LeaseBreakAckOutcome, OplockLevel, RequestLease,
+    RequestLeaseV2,
+};
 use smb_fscc::FileDispositionInformation;
 use smb_msg::{LeaseFlags, LeaseState};
 use std::time::Duration;
@@ -240,6 +243,52 @@ async fn test_lease_break_notify_fanned_out() -> smb::Result<()> {
     );
 
     // Cleanup: drop B first so A's set_info can mark the file for delete.
+    drop(file_b);
+    file_a
+        .set_info(FileDispositionInformation::default())
+        .await?;
+    file_a.close().await?;
+    Ok(())
+}
+
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+#[serial]
+async fn test_batch_oplock_break_invalidated_and_acknowledged() -> smb::Result<()> {
+    let share = smb_tests_share();
+    let (client_a, share_path_a) = make_server_connection(&share, None).await?;
+    let mut breaks = client_a
+        .subscribe_oplock_breaks(share_path_a.server())
+        .await?;
+    let path_rel = "oplock_break_ack.txt";
+    let file_a = client_a
+        .create_file(
+            &share_path_a.with_path(path_rel),
+            &FileCreateArgs::make_overwrite(Default::default(), Default::default())
+                .with_durable(DurableOpenRequest::durable(30_000, Guid::generate())),
+        )
+        .await?
+        .into_file()
+        .expect("durable Resource must be a file");
+
+    let (client_b, share_path_b) = make_server_connection(&share, None).await?;
+    let file_b = client_b
+        .create_file(
+            &share_path_b.with_path(path_rel),
+            &FileCreateArgs::make_overwrite(Default::default(), Default::default()),
+        )
+        .await?
+        .into_file()
+        .expect("conflicting Resource must be a file");
+
+    let event = tokio::time::timeout(Duration::from_secs(10), breaks.recv())
+        .await
+        .expect("OplockBreakNotify must arrive within 10s")
+        .expect("oplock event channel must stay open");
+    assert_eq!(event.file_id, file_a.handle().raw_file_id());
+    assert_eq!(event.previous_level, OplockLevel::Batch);
+    assert!(matches!(event.new_level, OplockLevel::None | OplockLevel::II));
+    assert_eq!(event.ack_outcome, LeaseBreakAckOutcome::Accepted);
+
     drop(file_b);
     file_a
         .set_info(FileDispositionInformation::default())

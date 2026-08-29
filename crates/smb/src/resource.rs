@@ -14,7 +14,7 @@ use crate::{
         AsyncMessageIds, CommandRequest, CommandResponse, CommandSubmission, ResponseOptions,
     },
     connection::connection_info::ConnectionInfo,
-    lease::{LeaseSlot, ResourceProto, SlotReleaseAction},
+    lease::{LeaseSlot, OplockSlot, ResourceProto, SlotReleaseAction},
     tree::TreeContext,
 };
 
@@ -336,6 +336,21 @@ impl Resource {
         // client opts in, [`Client::_create_file`] will attach a slot via
         // [`Resource::attach_lease_slot`] after this function returns.
         let object = upstream.create_resource_object().await?;
+        let oplock_slot = if matches!(
+            response.oplock_level,
+            OplockLevel::II | OplockLevel::Exclusive | OplockLevel::Batch
+        ) {
+            let slot = Arc::new(OplockSlot::new(
+                response.file_id,
+                response.oplock_level,
+                upstream.clone(),
+                object,
+            ));
+            upstream.register_oplock_slot(&slot).await;
+            Some(slot)
+        } else {
+            None
+        };
         let handle = ResourceHandle {
             name: name.to_string(),
             context: upstream.clone(),
@@ -350,6 +365,7 @@ impl Resource {
             access,
             lease_granted,
             durable_granted,
+            oplock_slot,
             lease_slot: None,
             share_type,
             conn_info: conn_info.clone(),
@@ -462,6 +478,7 @@ impl Resource {
                 epoch: proto.epoch_at_grant,
             }),
             durable_granted: None,
+            oplock_slot: None,
             lease_slot: Some(slot.clone()),
             share_type: proto.share_type,
             conn_info: proto.conn_info.clone(),
@@ -663,6 +680,8 @@ pub struct ResourceHandle {
 
     durable_granted: Option<DurableOpenGrant>,
 
+    oplock_slot: Option<Arc<OplockSlot>>,
+
     /// Phase C: when this handle is backed by a cached lease slot, close()
     /// and Drop release a refcount on the slot instead of sending a wire
     /// `Close`. The real `Close` is deferred until the slot is tombstoned
@@ -819,6 +838,10 @@ impl ResourceHandle {
             .await
             {
                 Ok(Ok(Some(candidate))) => {
+                    if let Some(slot) = &self.oplock_slot {
+                        slot.replace(candidate.file_id, candidate.object);
+                        self.context.register_oplock_slot(slot).await;
+                    }
                     self.generation.store(Arc::new(candidate));
                     return Ok(());
                 }

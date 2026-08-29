@@ -684,6 +684,14 @@ impl Client {
         Ok(conn.subscribe_lease_breaks())
     }
 
+    pub async fn subscribe_oplock_breaks(
+        &self,
+        server: &str,
+    ) -> crate::Result<tokio::sync::broadcast::Receiver<crate::OplockBreakEvent>> {
+        let conn = self.get_connection(server).await?;
+        Ok(conn.subscribe_oplock_breaks())
+    }
+
     /// Phase C.5: explicit lease eviction for a single path. Tombstones
     /// the cached slot, removes it from the per-connection table, and
     /// sends the wire `Close` against the cached `FileId` when this

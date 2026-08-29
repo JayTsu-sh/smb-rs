@@ -18,7 +18,7 @@ use crate::connection::connection_info::ConnectionInfo;
 use crate::tree::TreeContext;
 use smb_dtyp::Guid;
 use smb_fscc::FileAccessMask;
-use smb_msg::{CreateDisposition, FileId, LeaseState, ShareType};
+use smb_msg::{CreateDisposition, FileId, LeaseState, OplockLevel, ShareType};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -75,6 +75,58 @@ pub enum LeaseBreakAckOutcome {
     Accepted,
     Failed,
     TimedOut,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct OplockBreakEvent {
+    pub file_id: FileId,
+    pub previous_level: OplockLevel,
+    pub new_level: OplockLevel,
+    pub ack_outcome: LeaseBreakAckOutcome,
+    pub received_at: Instant,
+}
+
+pub(crate) struct OplockSlot {
+    generation: arc_swap::ArcSwap<OplockGeneration>,
+    pub(crate) level: RwLock<OplockLevel>,
+    pub(crate) context: Arc<TreeContext>,
+}
+
+struct OplockGeneration {
+    file_id: FileId,
+    object: crate::runtime::ObjectToken,
+}
+
+impl OplockSlot {
+    pub(crate) fn new(
+        file_id: FileId,
+        level: OplockLevel,
+        context: Arc<TreeContext>,
+        object: crate::runtime::ObjectToken,
+    ) -> Self {
+        Self {
+            generation: arc_swap::ArcSwap::from_pointee(OplockGeneration { file_id, object }),
+            level: RwLock::new(level),
+            context,
+        }
+    }
+
+    pub(crate) fn file_id(&self) -> FileId {
+        self.generation.load().file_id
+    }
+
+    pub(crate) fn object(&self) -> crate::runtime::ObjectToken {
+        self.generation.load().object
+    }
+
+    pub(crate) fn replace(
+        &self,
+        file_id: FileId,
+        object: crate::runtime::ObjectToken,
+    ) {
+        self.generation
+            .store(Arc::new(OplockGeneration { file_id, object }));
+    }
 }
 
 /// Internal context/conn-info prototype captured at slot-insert time so a
