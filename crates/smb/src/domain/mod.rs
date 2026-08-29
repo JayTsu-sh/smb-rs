@@ -1,6 +1,8 @@
 //! SMB domain handles.
 
+mod cursor;
 mod operation;
+pub use cursor::FileCursor;
 pub use operation::{CancelToken, Deadline, Operation, ReplayPolicy};
 
 use std::{
@@ -252,6 +254,14 @@ pub struct File {
 }
 
 impl File {
+    pub fn cursor(&self) -> FileCursor<'_> {
+        FileCursor::new(self)
+    }
+
+    pub(crate) fn opened_len(&self) -> u64 {
+        self.inner.opened_len()
+    }
+
     pub fn read_at(&self, offset: u64, max_len: u32) -> Operation<'_, Bytes> {
         Operation::new(move |context| {
             Box::pin(async move {

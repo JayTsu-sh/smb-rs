@@ -3,6 +3,7 @@
 
 pub mod client;
 mod clock;
+pub mod command;
 pub mod compression;
 pub mod connection;
 pub mod crypto;
@@ -12,7 +13,6 @@ pub mod domain;
 pub mod error;
 pub mod facade;
 pub mod lease;
-pub mod command;
 pub mod resource;
 pub(crate) mod runtime;
 #[cfg(feature = "test-support")]
@@ -41,8 +41,8 @@ pub mod test_support {
 pub use client::UncPath;
 pub use connection::ConnectionConfig;
 pub use domain::{
-    Credentials, Directory, File, FileOpenOptions, Pipe, Resource, Session, Share, SharePath,
-    ShareTarget, CancelToken, Deadline, Operation, ReplayPolicy,
+    CancelToken, Credentials, Deadline, Directory, File, FileCursor, FileOpenOptions, Operation,
+    Pipe, ReplayPolicy, Resource, Session, Share, SharePath, ShareTarget,
 };
 pub use error::Error;
 pub use facade::{Client, ClientConfig};

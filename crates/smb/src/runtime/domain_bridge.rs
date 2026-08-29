@@ -11,14 +11,13 @@ use smb_fscc::{FileAccessMask, FileDispositionInformation};
 use sspi::{AuthIdentity, Secret, Username};
 
 use crate::{
+    Error,
     client::{Client as LegacyClient, ClientConfig as LegacyClientConfig, UncPath},
     resource::{
-        File as LegacyFile, FileCreateArgs, Resource as LegacyResource,
-        file::FileOperationOptions,
+        File as LegacyFile, FileCreateArgs, Resource as LegacyResource, file::FileOperationOptions,
     },
     session::Session as LegacySession,
     tree::Tree as LegacyShare,
-    Error,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,11 +85,7 @@ pub(crate) struct RuntimeShare {
 }
 
 impl RuntimeShare {
-    pub(crate) async fn open_file(
-        &self,
-        path: &str,
-        mode: OpenMode,
-    ) -> crate::Result<RuntimeFile> {
+    pub(crate) async fn open_file(&self, path: &str, mode: OpenMode) -> crate::Result<RuntimeFile> {
         let args = match mode {
             OpenMode::CreateNew => {
                 FileCreateArgs::make_create_new(Default::default(), Default::default())
@@ -107,7 +102,9 @@ impl RuntimeShare {
         };
         match self.inner.create(path, &args).await? {
             LegacyResource::File(file) => Ok(RuntimeFile { inner: file }),
-            _ => Err(Error::InvalidState("server returned a non-file resource".into())),
+            _ => Err(Error::InvalidState(
+                "server returned a non-file resource".into(),
+            )),
         }
     }
 
@@ -121,6 +118,10 @@ pub(crate) struct RuntimeFile {
 }
 
 impl RuntimeFile {
+    pub(crate) fn opened_len(&self) -> u64 {
+        self.inner.end_of_file()
+    }
+
     pub(crate) async fn read_at(
         &self,
         offset: u64,

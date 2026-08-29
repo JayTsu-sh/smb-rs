@@ -2,16 +2,18 @@ use bytes::Bytes;
 #[cfg(feature = "real-server-tests")]
 use smb::{CancelToken, Error};
 use smb::{
-    Client, ClientConfig, Credentials, File, FileOpenOptions, ReplayPolicy, Session, Share,
-    SharePath, ShareTarget,
+    Client, ClientConfig, Credentials, File, FileCursor, FileOpenOptions, ReplayPolicy, Session,
+    Share, SharePath, ShareTarget,
 };
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
 #[cfg(feature = "real-server-tests")]
 mod common;
 
 fn assert_send_sync<T: Send + Sync>() {}
 fn assert_clone<T: Clone>() {}
+fn assert_cursor<T: AsyncRead + AsyncWrite + AsyncSeek + Unpin + Send>() {}
 
 #[test]
 fn public_spine_types_are_send_sync_and_domain_named() {
@@ -22,6 +24,7 @@ fn public_spine_types_are_send_sync_and_domain_named() {
     assert_clone::<Client>();
     assert_clone::<Session>();
     assert_clone::<Share>();
+    assert_cursor::<FileCursor<'static>>();
 
     let target = ShareTarget::new("server", "share").unwrap();
     assert_eq!(target.server(), "server");
@@ -52,6 +55,11 @@ async fn common_and_explicit_session_paths_compile(
     file.read_at_into(0, &mut caller_buffer).await?;
     file.write_at_from(6, b"-slice").await?;
     file.write_all_at(12, Bytes::from_static(b"-all")).await?;
+    let mut cursor = file.cursor();
+    cursor.seek(std::io::SeekFrom::Start(0)).await?;
+    let mut cursor_buffer = [0_u8; 6];
+    cursor.read_exact(&mut cursor_buffer).await?;
+    cursor.write_all(b"cursor").await?;
     file.close().await?;
 
     let session = client
