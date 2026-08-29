@@ -26,7 +26,7 @@ impl BootstrapCommand {
         }
     }
 
-    const fn accepts_status(self, status: Status) -> bool {
+    pub(crate) const fn accepts_status(self, status: Status) -> bool {
         match self {
             Self::Negotiate => matches!(status, Status::Success),
             Self::SessionSetup => {
@@ -59,6 +59,13 @@ impl BootstrapOperation {
 
     pub(crate) const fn command(&self) -> BootstrapCommand {
         self.command
+    }
+
+    pub(crate) fn payload_bytes(&self) -> u64 {
+        self.outgoing
+            .additional_data
+            .as_ref()
+            .map_or(0, |payload| payload.len() as u64)
     }
 
     pub(crate) fn into_outgoing(self) -> OutgoingMessage {

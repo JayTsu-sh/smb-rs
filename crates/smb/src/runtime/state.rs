@@ -156,6 +156,10 @@ pub(crate) struct GenerationState {
 }
 
 impl GenerationState {
+    pub(crate) const fn generation(&self) -> GenerationId {
+        self.generation
+    }
+
     pub(crate) fn new(
         generation: GenerationId,
         initial_message_id: u64,
