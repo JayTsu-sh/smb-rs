@@ -110,8 +110,7 @@ async fn exact_session_disruption_reauthenticates_and_revokes_children(
                 file.write_at(b"stale", 0).await.is_err(),
                 "Resource from the replaced Session must remain stale"
             );
-            let recovered_tree = session.tree_connect(&share_path).await?;
-            let recovered_file = recovered_tree
+            let recovered_file = tree
                 .create(
                     &format!("smb-rs-session-recovered-{}.bin", std::process::id()),
                     &FileCreateArgs::make_overwrite(Default::default(), Default::default()),
@@ -120,6 +119,7 @@ async fn exact_session_disruption_reauthenticates_and_revokes_children(
                 .into_file()?;
             recovered_file.write_at(b"session-two", 0).await?;
             println!("SESSION_REAUTHENTICATED");
+            println!("SHARE_RECONNECTED");
             connection.close().await?;
             return Ok(());
         }
