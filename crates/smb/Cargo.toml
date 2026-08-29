@@ -83,6 +83,70 @@ serde_json = "1"
 zeroize = "1"
 smb-tests = { workspace = true }
 
+[[test]]
+name = "conformance_anonymous"
+required-features = ["test-support"]
+
+[[test]]
+name = "conformance_smb302"
+required-features = ["test-support"]
+
+[[test]]
+name = "conformance_smoke"
+required-features = ["test-support"]
+
+[[test]]
+name = "conformance_windows_dc_ntlm"
+required-features = ["test-support"]
+
+[[test]]
+name = "lifecycle_scenario"
+required-features = ["test-support"]
+
+[[test]]
+name = "basic"
+required-features = ["real-server-tests"]
+
+[[test]]
+name = "closes"
+required-features = ["real-server-tests"]
+
+[[test]]
+name = "dialects"
+required-features = ["real-server-tests"]
+
+[[test]]
+name = "info_query"
+required-features = ["real-server-tests"]
+
+[[test]]
+name = "lease"
+required-features = ["real-server-tests"]
+
+[[test]]
+name = "long_dir"
+required-features = ["real-server-tests"]
+
+[[test]]
+name = "multichannel"
+required-features = ["real-server-tests"]
+
+[[test]]
+name = "notify"
+required-features = ["real-server-tests"]
+
+[[test]]
+name = "ontap_baseline"
+required-features = ["real-server-tests"]
+
+[[test]]
+name = "rpc"
+required-features = ["real-server-tests"]
+
+[[test]]
+name = "wire_data"
+required-features = ["real-server-tests"]
+
 [features]
 default = ["sign", "encrypt", "compress", "std-fs-impls", "netbios-transport"]
 
@@ -127,6 +191,7 @@ __debug-dump-keys = []
 # scripted NegotiateResponse) via BinWrite. Never enable in production
 # — the re-exported items are not subject to SemVer.
 test-support = ["smb-msg/server", "smb-transport/test-support", "dep:serde"]
+real-server-tests = []
 
 # Tests
 test-multichannel = []

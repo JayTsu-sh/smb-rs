@@ -43,6 +43,10 @@ thiserror = { workspace = true }
 smb-tests = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 
+[[test]]
+name = "scripted_transport"
+required-features = ["test-support"]
+
 [features]
 default = ["netbios-transport"]
 
