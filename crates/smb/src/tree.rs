@@ -27,15 +27,52 @@ pub struct TreeConnectInfo {
     share_flags: ShareFlags,
 }
 
+fn validate_tree_connect(
+    content: &smb_msg::TreeConnectResponse,
+    conn_info: &ConnectionInfo,
+    name: &str,
+) -> crate::Result<TreeConnectInfo> {
+    if ((!u32::from_le_bytes(conn_info.dialect.get_tree_connect_caps_mask().into_bytes()))
+        & u32::from_le_bytes(content.capabilities.into_bytes()))
+        != 0
+    {
+        return Err(Error::InvalidMessage(format!(
+            "Invalid share capabilities received for tree '{name}': {:?}",
+            content.capabilities
+        )));
+    }
+    if ((!u32::from_le_bytes(conn_info.dialect.get_share_flags_mask().into_bytes()))
+        & u32::from_le_bytes(content.share_flags.into_bytes()))
+        != 0
+    {
+        return Err(Error::InvalidMessage(format!(
+            "Invalid share flags received for tree '{name}': {:?}",
+            content.share_flags
+        )));
+    }
+    if content.share_flags.encrypt_data() && conn_info.config.encryption_mode.is_disabled() {
+        return Err(Error::InvalidMessage(
+            "Server requires encryption, but client does not support it".to_string(),
+        ));
+    }
+    Ok(TreeConnectInfo {
+        share_type: content.share_type,
+        share_flags: content.share_flags,
+    })
+}
+
 /// Represents an SMB share.
 ///
 /// A Tree is the SMB protocol's representation of a connected share on the server.
 pub struct Tree {
     context: Arc<TreeContext>,
-    conn_info: Arc<ConnectionInfo>,
 }
 
 impl Tree {
+    pub(crate) fn connection_info(&self) -> Arc<ConnectionInfo> {
+        self.context.upstream.conn_info()
+    }
+
     pub(crate) fn requires_encryption(&self) -> crate::Result<bool> {
         Ok(self.context.info()?.share_flags.encrypt_data())
     }
@@ -52,34 +89,7 @@ impl Tree {
 
         let content = response.message.content.to_treeconnect()?;
 
-        // Make sure the share flags from the server are valid to the dialect.
-        if ((!u32::from_le_bytes(conn_info.dialect.get_tree_connect_caps_mask().into_bytes()))
-            & u32::from_le_bytes(content.capabilities.into_bytes()))
-            != 0
-        {
-            return Err(Error::InvalidMessage(format!(
-                "Invalid share flags received from server for tree '{}': {:?}",
-                name, content.share_flags
-            )));
-        }
-
-        // Same for share flags
-        if ((!u32::from_le_bytes(conn_info.dialect.get_share_flags_mask().into_bytes()))
-            & u32::from_le_bytes(content.share_flags.into_bytes()))
-            != 0
-        {
-            return Err(Error::InvalidMessage(format!(
-                "Invalid capabilities received from server for tree '{}': {:?}",
-                name, content.capabilities
-            )));
-        }
-
-        // If encryption is required, make sure it is available.
-        if content.share_flags.encrypt_data() && conn_info.config.encryption_mode.is_disabled() {
-            return Err(Error::InvalidMessage(
-                "Server requires encryption, but client does not support it".to_string(),
-            ));
-        }
+        let tree_connect_info = validate_tree_connect(&content, conn_info, name)?;
 
         let tree_id = response
             .message
@@ -91,23 +101,22 @@ impl Tree {
 
         tracing::info!("Connected to tree {name} (#{tree_id})");
 
-        let tree_connect_info = TreeConnectInfo {
-            share_type: content.share_type,
-            share_flags: content.share_flags,
-        };
         let object = upstream
             .create_child_object(crate::runtime::ObjectKind::Share)
             .await?;
+        let session = upstream.session_object()?;
 
-        let t = Tree {
-            context: TreeContext::new(
+        let context = TreeContext::new(
                 upstream,
                 tree_id,
                 name.to_string(),
                 tree_connect_info,
+                session,
                 object,
-            ),
-            conn_info: conn_info.clone(),
+            );
+        upstream.register_share(Arc::downgrade(&context)).await;
+        let t = Tree {
+            context,
         };
 
         Ok(t)
@@ -132,7 +141,7 @@ impl Tree {
             file_name,
             &self.context,
             args,
-            &self.conn_info,
+            &self.context.upstream.conn_info(),
             info.share_type,
             info.share_flags.dfs(),
         )
@@ -277,7 +286,16 @@ impl Tree {
 struct TreeGeneration {
     tree_id: u32,
     info: TreeConnectInfo,
+    session: crate::runtime::ObjectToken,
     object: crate::runtime::ObjectToken,
+}
+
+struct TreeRecoveryFlag<'a>(&'a AtomicBool);
+
+impl Drop for TreeRecoveryFlag<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 pub(crate) struct TreeContext {
@@ -287,6 +305,9 @@ pub(crate) struct TreeContext {
     upstream: Upstream,
 
     tree_name: String,
+    recovery: tokio::sync::Mutex<()>,
+    recovery_slots: Arc<tokio::sync::Semaphore>,
+    recovering: AtomicBool,
 }
 
 impl TreeContext {
@@ -295,22 +316,141 @@ impl TreeContext {
         tree_id: u32,
         tree_name: String,
         info: TreeConnectInfo,
+        session: crate::runtime::ObjectToken,
         object: crate::runtime::ObjectToken,
     ) -> Arc<TreeContext> {
         Arc::new(TreeContext {
             generation: arc_swap::ArcSwap::from_pointee(TreeGeneration {
                 tree_id,
                 info,
+                session,
                 object,
             }),
             closed: AtomicBool::new(false),
             upstream: upstream.clone(),
             tree_name,
+            recovery: tokio::sync::Mutex::new(()),
+            recovery_slots: Arc::new(tokio::sync::Semaphore::new(
+                upstream.conn_info().config.auto_reconnect.max_waiting_operations,
+            )),
+            recovering: AtomicBool::new(false),
         })
     }
 
     fn generation(&self) -> Arc<TreeGeneration> {
         self.generation.load_full()
+    }
+
+    pub(crate) async fn reconnect(self: &Arc<Self>) -> crate::Result<()> {
+        let _owner = self.recovery.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::InvalidState("Tree is closed".into()));
+        }
+        let previous = self.generation();
+        let session = self.upstream.session_object()?;
+        if previous.session == session {
+            return Ok(());
+        }
+        self.recovering.store(true, Ordering::Release);
+        let recovering = TreeRecoveryFlag(&self.recovering);
+        let conn_info = self.upstream.conn_info();
+        let policy = conn_info.config.auto_reconnect;
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(crate::clock::TokioClock::new());
+        let mut last_error = None;
+        let mut candidate = None;
+        for _attempt in 1..=policy.max_attempts {
+            let future = async {
+                let response = self
+                    .upstream
+                    .send_recv_on_current_session(TreeConnectRequest::new(&self.tree_name).into())
+                    .await?;
+                let content = response.message.content.to_treeconnect()?;
+                let info = validate_tree_connect(&content, &conn_info, &self.tree_name)?;
+                let tree_id = response.message.header.tree_id.ok_or_else(|| {
+                    Error::InvalidMessage("Tree ID is not set in replay response".into())
+                })?;
+                let object = self
+                    .upstream
+                    .create_child_object_on_current_session(crate::runtime::ObjectKind::Share)
+                    .await?;
+                crate::Result::Ok(TreeGeneration {
+                    tree_id,
+                    info,
+                    session,
+                    object,
+                })
+            };
+            match crate::session::recovery_attempt::run_bounded_attempt(
+                clock.clone(),
+                policy.attempt_timeout,
+                future,
+            )
+            .await
+            {
+                Ok(Ok(prepared)) => {
+                    candidate = Some(prepared);
+                    break;
+                }
+                Ok(Err(error)) => last_error = Some(error),
+                Err(_) => last_error = Some(Error::ShareRecoveryWaitTimedOut),
+            }
+        }
+        let Some(candidate) = candidate else {
+            return Err(last_error.unwrap_or_else(|| {
+                Error::InvalidState("Share recovery is disabled".into())
+            }));
+        };
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::InvalidState("Tree closed during recovery".into()));
+        }
+        self.generation.store(Arc::new(candidate));
+        drop(recovering);
+        Ok(())
+    }
+
+    async fn wait_for_reconnect(
+        self: &Arc<Self>,
+        timeout: Option<std::time::Duration>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> crate::Result<()> {
+        let generation = self.generation();
+        if !self.recovering.load(Ordering::Acquire)
+            && generation.session == self.upstream.session_object()?
+        {
+            return Ok(());
+        }
+        let permit = self
+            .recovery_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::ShareRecoveryQueueFull)?;
+        let replay = tokio::spawn({
+            let context = self.clone();
+            async move {
+                let _permit = permit;
+                context.reconnect().await
+            }
+        });
+        tokio::pin!(replay);
+        let deadline = async {
+            match timeout {
+                Some(timeout) => tokio::time::sleep(timeout).await,
+                None => futures_util::future::pending().await,
+            }
+        };
+        tokio::pin!(deadline);
+        let cancelled = async {
+            match cancellation {
+                Some(cancellation) => cancellation.cancelled().await,
+                None => futures_util::future::pending().await,
+            }
+        };
+        tokio::pin!(cancelled);
+        tokio::select! {
+            result = &mut replay => result.map_err(Error::JoinError)?,
+            _ = &mut deadline => Err(Error::ShareRecoveryWaitTimedOut),
+            _ = &mut cancelled => Err(Error::Cancelled("Share recovery wait")),
+        }
     }
 
     fn prepare(
@@ -331,17 +471,24 @@ impl TreeContext {
     }
 
     pub(crate) async fn execute(
-        &self,
+        self: &Arc<Self>,
         msg: CommandRequest,
         options: ResponseOptions<'_>,
     ) -> crate::Result<(CommandSubmission, CommandResponse)> {
+        self.wait_for_reconnect(
+            options.timeout.or_else(|| Some(self.upstream.conn_info().config.timeout())),
+            options.async_cancel.clone(),
+        )
+        .await?;
         let object = self.generation().object;
         self.execute_for(msg, options, object).await
     }
 
     pub(crate) async fn create_resource_object(
-        &self,
+        self: &Arc<Self>,
     ) -> crate::Result<crate::runtime::ObjectToken> {
+        self.wait_for_reconnect(Some(self.upstream.conn_info().config.timeout()), None)
+            .await?;
         self.upstream
             .create_object(self.generation().object, crate::runtime::ObjectKind::Resource)
             .await
@@ -376,7 +523,7 @@ impl TreeContext {
     }
 
     pub(crate) async fn send_recv(
-        &self,
+        self: &Arc<Self>,
         content: RequestContent,
     ) -> crate::Result<crate::command::CommandResponse> {
         self.execute_request(
@@ -397,7 +544,7 @@ impl TreeContext {
     }
 
     pub(crate) async fn execute_content(
-        &self,
+        self: &Arc<Self>,
         content: RequestContent,
         options: crate::command::ResponseOptions<'_>,
     ) -> crate::Result<crate::command::CommandResponse> {
@@ -406,7 +553,7 @@ impl TreeContext {
     }
 
     pub(crate) async fn execute_request(
-        &self,
+        self: &Arc<Self>,
         message: CommandRequest,
         options: crate::command::ResponseOptions<'_>,
     ) -> crate::Result<crate::command::CommandResponse> {

@@ -82,6 +82,12 @@ pub enum Error {
     #[error("Session recovery wait timed out")]
     SessionRecoveryWaitTimedOut,
 
+    #[error("Share recovery wait queue is full")]
+    ShareRecoveryQueueFull,
+
+    #[error("Share recovery wait timed out")]
+    ShareRecoveryWaitTimedOut,
+
     #[error("Invalid state: {0}")]
     InvalidState(String),
     #[error("Unable to transform message: {0}")]

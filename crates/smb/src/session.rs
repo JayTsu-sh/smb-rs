@@ -27,7 +27,7 @@ mod credential;
 mod encryptor_decryptor;
 pub(crate) mod gss;
 mod setup;
-mod recovery_attempt;
+pub(crate) mod recovery_attempt;
 mod signer;
 #[cfg(feature = "kerberos")]
 mod sspi_network_client;
@@ -370,6 +370,7 @@ pub(crate) struct SessionContext {
     recovery: tokio::sync::Mutex<()>,
     recovery_slots: Arc<tokio::sync::Semaphore>,
     recovering: AtomicBool,
+    shares: tokio::sync::Mutex<Vec<std::sync::Weak<crate::tree::TreeContext>>>,
 
     dropping: AtomicBool,
 }
@@ -392,6 +393,7 @@ impl SessionContext {
             recovery: tokio::sync::Mutex::new(()),
             recovery_slots: Arc::new(tokio::sync::Semaphore::new(recovery_capacity)),
             recovering: AtomicBool::new(false),
+            shares: tokio::sync::Mutex::new(Vec::new()),
             dropping: AtomicBool::new(false),
         }
     }
@@ -408,8 +410,36 @@ impl SessionContext {
         self.primary_channel().session_id()
     }
 
-    fn conn_info(&self) -> Arc<ConnectionInfo> {
+    pub(crate) fn conn_info(&self) -> Arc<ConnectionInfo> {
         self.generation().conn_info.clone()
+    }
+
+    pub(crate) fn session_object(&self) -> crate::Result<crate::runtime::ObjectToken> {
+        self.primary_channel().session_state().object()
+    }
+
+    pub(crate) async fn register_share(
+        &self,
+        share: std::sync::Weak<crate::tree::TreeContext>,
+    ) {
+        self.shares.lock().await.push(share);
+    }
+
+    async fn recover_shares(&self) {
+        let shares = {
+            let mut shares = self.shares.lock().await;
+            shares.retain(|share| share.strong_count() != 0);
+            shares.iter().filter_map(std::sync::Weak::upgrade).collect::<Vec<_>>()
+        };
+        let results = futures_util::future::join_all(
+            shares.into_iter().map(|share| async move { share.reconnect().await }),
+        )
+        .await;
+        for result in results {
+            if let Err(error) = result {
+                tracing::warn!(?error, "Share TreeConnect replay failed");
+            }
+        }
     }
 
     async fn wait_for_reauthentication(
@@ -473,7 +503,7 @@ impl SessionContext {
         }
         self.recovering
             .store(true, std::sync::atomic::Ordering::Release);
-        let _recovering = RecoveryFlag(&self.recovering);
+        let recovering = RecoveryFlag(&self.recovering);
         let previous_state = previous_channel.session_state().clone();
         let previous_object = previous_state.object()?;
         let upstream = previous_channel.upstream();
@@ -557,6 +587,8 @@ impl SessionContext {
         if same_generation {
             let _ = worker.session_ended(&previous_state).await;
         }
+        drop(recovering);
+        self.recover_shares().await;
         Ok((old_session_id, new_session_id))
     }
 
@@ -645,6 +677,13 @@ impl SessionContext {
         self.primary_channel().create_child_object(kind).await
     }
 
+    pub(crate) async fn create_child_object_on_current_session(
+        &self,
+        kind: crate::runtime::ObjectKind,
+    ) -> crate::Result<crate::runtime::ObjectToken> {
+        self.primary_channel().create_child_object(kind).await
+    }
+
     pub(crate) async fn create_object(
         &self,
         parent: crate::runtime::ObjectToken,
@@ -669,6 +708,16 @@ impl SessionContext {
         content: RequestContent,
     ) -> crate::Result<CommandResponse> {
         self.execute(CommandRequest::new(content), ResponseOptions::new())
+            .await
+            .map(|(_, incoming)| incoming)
+    }
+
+    pub(crate) async fn send_recv_on_current_session(
+        &self,
+        content: RequestContent,
+    ) -> crate::Result<CommandResponse> {
+        self.primary_channel()
+            .execute(CommandRequest::new(content), ResponseOptions::new())
             .await
             .map(|(_, incoming)| incoming)
     }
@@ -713,6 +762,7 @@ impl Drop for SessionContext {
                 recovery: tokio::sync::Mutex::new(()),
                 recovery_slots: Arc::new(tokio::sync::Semaphore::new(1)),
                 recovering: AtomicBool::new(false),
+                shares: tokio::sync::Mutex::new(Vec::new()),
             };
             Arc::new(temp_handler).logoff_async().await;
         });
