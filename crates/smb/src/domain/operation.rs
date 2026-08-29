@@ -33,9 +33,11 @@ impl OperationContext {
     pub(crate) fn remaining(&self) -> crate::Result<Option<Duration>> {
         self.deadline
             .map(|deadline| {
-                deadline.checked_duration_since(Instant::now()).ok_or_else(|| {
-                    Error::OperationTimeout(TimedOutTask::ReceiveNextMessage, Duration::ZERO)
-                })
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or_else(|| {
+                        Error::OperationTimeout(TimedOutTask::ReceiveNextMessage, Duration::ZERO)
+                    })
             })
             .transpose()
     }
@@ -52,9 +54,8 @@ impl OperationContext {
     }
 }
 
-type Start<'a, T> = Box<
-    dyn FnOnce(OperationContext) -> BoxFuture<'a, crate::Result<T>> + Send + 'a,
->;
+type Start<'a, T> =
+    Box<dyn FnOnce(OperationContext) -> BoxFuture<'a, crate::Result<T>> + Send + 'a>;
 
 /// A lazy domain operation. Constructing or dropping it before first poll has
 /// no protocol side effect.
@@ -115,6 +116,11 @@ impl<'a, T: 'a> Future for Operation<'a, T> {
     type Output = crate::Result<T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.completed {
+            return Poll::Ready(Err(Error::InvalidState(
+                "operation was polled after terminal completion".into(),
+            )));
+        }
         if self.future.is_none() {
             if self.cancellation.is_cancelled()
                 || self
@@ -125,7 +131,10 @@ impl<'a, T: 'a> Future for Operation<'a, T> {
                 self.completed = true;
                 return Poll::Ready(Err(Error::Cancelled("domain operation")));
             }
-            if self.deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            if self
+                .deadline
+                .is_some_and(|deadline| deadline <= Instant::now())
+            {
                 self.completed = true;
                 return Poll::Ready(Err(Error::OperationTimeout(
                     TimedOutTask::ReceiveNextMessage,
@@ -182,7 +191,9 @@ async fn run_bounded<T>(
     let started = Instant::now();
     let deadline_wait = async move {
         match deadline {
-            Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+            Some(deadline) => {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+            }
             None => std::future::pending().await,
         }
     };
@@ -249,7 +260,10 @@ mod tests {
         })
         .cancellation(token.clone());
         token.cancel();
-        assert!(matches!(cancelled.await, Err(Error::Cancelled("domain operation"))));
+        assert!(matches!(
+            cancelled.await,
+            Err(Error::Cancelled("domain operation"))
+        ));
         assert_eq!(starts.load(Ordering::SeqCst), 0);
     }
 
@@ -257,7 +271,10 @@ mod tests {
     fn public_replay_categories_map_exactly_to_runtime_policy() {
         let token = CancelToken::new();
         for (public, runtime) in [
-            (ReplayPolicy::Never, crate::runtime::ReplayPolicy::NeverReplay),
+            (
+                ReplayPolicy::Never,
+                crate::runtime::ReplayPolicy::NeverReplay,
+            ),
             (
                 ReplayPolicy::IfUncommitted,
                 crate::runtime::ReplayPolicy::ReplayIfUncommitted,
@@ -298,5 +315,46 @@ mod tests {
         .await;
         drop(operation);
         assert!(captured.lock().unwrap().as_ref().unwrap().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn explicit_cancel_before_first_poll_never_admits_work() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let observed = starts.clone();
+        let operation = Operation::<()>::new(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        });
+        operation.request_cancel();
+
+        assert!(matches!(
+            operation.await,
+            Err(Error::Cancelled("domain operation"))
+        ));
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_wins_a_simultaneous_deadline_race() {
+        let token = CancelToken::new();
+        let operation = Operation::new(move |_| {
+            Box::pin(std::future::pending()) as BoxFuture<'_, crate::Result<()>>
+        })
+        .timeout(Duration::from_secs(5))
+        .cancellation(token.clone());
+        tokio::pin!(operation);
+
+        poll_fn(|cx| {
+            assert!(operation.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        token.cancel();
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        assert!(matches!(
+            operation.await,
+            Err(Error::Cancelled("domain operation"))
+        ));
     }
 }

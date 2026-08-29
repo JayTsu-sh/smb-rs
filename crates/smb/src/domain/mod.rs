@@ -3,7 +3,10 @@
 mod operation;
 pub use operation::{CancelToken, Deadline, Operation, ReplayPolicy};
 
-use std::{collections::HashMap, sync::{Arc, Weak}};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Weak},
+};
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
@@ -77,7 +80,9 @@ impl SharePath {
                 .split('\\')
                 .any(|component| component == ".." || component.is_empty())
         {
-            return Err(Error::InvalidArgument("path must remain within the Share".into()));
+            return Err(Error::InvalidArgument(
+                "path must remain within the Share".into(),
+            ));
         }
         Ok(Self(path))
     }
@@ -162,11 +167,12 @@ impl DomainClient {
         {
             return Ok(Session { inner });
         }
-        let inner = Arc::new(self
-            .inner
-            .runtime
-            .authenticate(server, username.as_str(), password.to_string())
-            .await?);
+        let inner = Arc::new(
+            self.inner
+                .runtime
+                .authenticate(server, username.as_str(), password.to_string())
+                .await?,
+        );
         self.inner
             .sessions
             .lock()
@@ -214,8 +220,14 @@ impl Share {
         options: FileOpenOptions,
     ) -> Operation<'a, File> {
         let path = path.clone();
-        Operation::new(move |_context| {
+        Operation::new(move |context| {
             Box::pin(async move {
+                context.remaining()?;
+                if context.replay != ReplayPolicy::Never {
+                    return Err(Error::UnsupportedOperation(
+                        "file open currently permits only ReplayPolicy::Never".into(),
+                    ));
+                }
                 let inner = self.inner.open_file(path.as_str(), options.mode).await?;
                 Ok(File { inner })
             })

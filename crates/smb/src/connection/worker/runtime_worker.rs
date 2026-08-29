@@ -1,8 +1,8 @@
 use crate::clock::{Clock, TokioClock};
+use crate::command::{CommandRequest, CommandResponse, CommandSubmission, ResponseOptions};
 use crate::connection::connection_info::ConnectionInfo;
 use crate::connection::preauth_hash::PreauthHashValue;
 use crate::error::TimedOutTask;
-use crate::command::{CommandResponse, CommandRequest, ResponseOptions, CommandSubmission};
 use crate::runtime::{
     GenerationExit, GenerationId, ObjectKind, ObjectToken, OperationResult, RequestKey,
     ResponsePolicy, RuntimeConfig, RuntimeError, RuntimeHandle, TerminalOutcome, TypedOperation,
@@ -43,10 +43,7 @@ impl RuntimeWorker {
             .map_err(|error| self.map_runtime_error(error))
     }
 
-    pub(crate) async fn begin_object_recovery(
-        &self,
-        object: ObjectToken,
-    ) -> Result<()> {
+    pub(crate) async fn begin_object_recovery(&self, object: ObjectToken) -> Result<()> {
         self.runtime
             .begin_object_recovery(object)
             .await
@@ -78,13 +75,8 @@ impl RuntimeWorker {
         generation: GenerationId,
     ) -> Result<Arc<Self>> {
         let clock = Arc::new(TokioClock::new());
-        let config = RuntimeConfig::production(
-            generation,
-            initial_message_id,
-            1,
-            target_credits,
-            timeout,
-        );
+        let config =
+            RuntimeConfig::production(generation, initial_message_id, 1, target_credits, timeout);
         let (runtime, _events) = start_generation(transport, clock.clone(), config);
         Ok(Arc::new(Self {
             runtime,
@@ -272,9 +264,7 @@ impl RuntimeWorker {
     ) -> Result<Vec<CommandSubmission>> {
         let operations = messages
             .into_iter()
-            .map(|message| {
-                TypedOperation::any_status(message).with_dependency(dependency)
-            })
+            .map(|message| TypedOperation::any_status(message).with_dependency(dependency))
             .collect();
         self.runtime
             .submit_compound_detached(
@@ -294,16 +284,57 @@ impl RuntimeWorker {
     }
 
     fn map_runtime_error(&self, error: RuntimeError) -> Error {
-        match error {
-            RuntimeError::Terminal(TerminalOutcome::Cancelled) => {
-                Error::Cancelled("runtime operation")
-            }
-            RuntimeError::Terminal(TerminalOutcome::TimedOut)
-            | RuntimeError::Terminal(TerminalOutcome::OutcomeUnknown) => {
-                Error::OperationTimeout(TimedOutTask::ReceiveNextMessage, self.timeout)
-            }
-            other => Error::InvalidState(other.to_string()),
+        map_runtime_error_value(error, self.timeout)
+    }
+}
+
+fn map_runtime_error_value(error: RuntimeError, timeout: std::time::Duration) -> Error {
+    match error {
+        RuntimeError::Terminal(TerminalOutcome::Cancelled) => Error::Cancelled("runtime operation"),
+        RuntimeError::Terminal(TerminalOutcome::TimedOut) => {
+            Error::OperationTimeout(TimedOutTask::ReceiveNextMessage, timeout)
         }
+        RuntimeError::Terminal(TerminalOutcome::OutcomeUnknown) => Error::OutcomeUnknown,
+        RuntimeError::AdmissionBackpressure => Error::Backpressure("admission"),
+        RuntimeError::ControlBackpressure => Error::Backpressure("control"),
+        RuntimeError::EventBackpressure => Error::Backpressure("event"),
+        RuntimeError::Object(_) | RuntimeError::Terminal(TerminalOutcome::GenerationLost) => {
+            Error::StaleObject
+        }
+        RuntimeError::Closed | RuntimeError::OwnerTerminated => Error::RuntimeTerminated,
+        other => Error::InvalidState(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod public_error_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_terminal_categories_remain_typed_at_the_public_boundary() {
+        let timeout = std::time::Duration::from_secs(1);
+        assert!(matches!(
+            map_runtime_error_value(
+                RuntimeError::Terminal(TerminalOutcome::OutcomeUnknown),
+                timeout,
+            ),
+            Error::OutcomeUnknown
+        ));
+        assert!(matches!(
+            map_runtime_error_value(RuntimeError::AdmissionBackpressure, timeout),
+            Error::Backpressure("admission")
+        ));
+        assert!(matches!(
+            map_runtime_error_value(
+                RuntimeError::Terminal(TerminalOutcome::GenerationLost),
+                timeout,
+            ),
+            Error::StaleObject
+        ));
+        assert!(matches!(
+            map_runtime_error_value(RuntimeError::OwnerTerminated, timeout),
+            Error::RuntimeTerminated
+        ));
     }
 }
 

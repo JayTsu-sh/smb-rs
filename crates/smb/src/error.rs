@@ -57,6 +57,7 @@ pub enum SetupError {
 }
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     #[error("Unexpected Message, {0}")]
     InvalidMessage(String),
@@ -75,6 +76,18 @@ pub enum Error {
 
     #[error("Operation cancelled: {0}")]
     Cancelled(&'static str),
+
+    #[error("Operation outcome is unknown because the request may have committed")]
+    OutcomeUnknown,
+
+    #[error("Operation admission is backpressured: {0}")]
+    Backpressure(&'static str),
+
+    #[error("The logical object is stale or revoked")]
+    StaleObject,
+
+    #[error("The request runtime terminated")]
+    RuntimeTerminated,
 
     #[error("Session recovery wait queue is full")]
     SessionRecoveryQueueFull,
