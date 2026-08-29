@@ -40,6 +40,10 @@ pub struct Tree {
 }
 
 impl Tree {
+    pub(crate) fn requires_encryption(&self) -> crate::Result<bool> {
+        Ok(self.handler.info()?.share_flags.encrypt_data())
+    }
+
     pub(crate) async fn connect(
         name: &str,
         upstream: &Upstream,

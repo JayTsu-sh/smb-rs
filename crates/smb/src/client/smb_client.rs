@@ -18,6 +18,20 @@ use tokio::sync::{Mutex, RwLock};
 
 use super::{config::ClientConfig, unc_path::UncPath};
 
+fn compound_protection(
+    share_requires_encryption: bool,
+    session_requires_encryption: bool,
+    allow_unsigned: bool,
+) -> Protection {
+    if share_requires_encryption || session_requires_encryption {
+        Protection::Encrypt
+    } else if !allow_unsigned {
+        Protection::SignWithChannel
+    } else {
+        Protection::None
+    }
+}
+
 /*
     Note:
     - Most of the operations here are not especially high-performance critical,
@@ -755,8 +769,12 @@ impl Client {
         let tree_id = tree.tree_id();
         let session = self.get_session(path).await?;
         let session_id = session.session_id();
-        let encrypt = session.should_encrypt().await?;
-        let signed = !encrypt && !session.allow_unsigned().await?;
+        let protection = compound_protection(
+            tree.requires_encryption()?,
+            session.should_encrypt().await?,
+            session.allow_unsigned().await?,
+        );
+        let signed = matches!(protection, Protection::SignWithChannel);
         let conn = self.get_connection(path.server()).await?;
         let rel = path.path().unwrap_or("");
 
@@ -770,13 +788,7 @@ impl Client {
             m.message.header.tree_id = Some(tree_id);
             m.message.header.session_id = session_id;
             m.message.header.flags.set_signed(signed);
-            m.security = Some(if encrypt {
-                Protection::Encrypt
-            } else if signed {
-                Protection::SignWithChannel
-            } else {
-                Protection::None
-            });
+            m.security = Some(protection.clone());
             if related {
                 m.message.header.flags.set_related_operations(true);
             }
@@ -1183,6 +1195,27 @@ impl Client {
         }
 
         Ok(Some(result))
+    }
+}
+
+#[cfg(test)]
+mod compound_protection_tests {
+    use super::*;
+
+    #[test]
+    fn share_encryption_overrides_session_signing_policy() {
+        assert!(matches!(
+            compound_protection(true, false, false),
+            Protection::Encrypt
+        ));
+        assert!(matches!(
+            compound_protection(false, false, false),
+            Protection::SignWithChannel
+        ));
+        assert!(matches!(
+            compound_protection(false, false, true),
+            Protection::None
+        ));
     }
 }
 
