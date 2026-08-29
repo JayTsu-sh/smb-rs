@@ -4,7 +4,9 @@ use crate::command::ResponseOptions;
 use smb_fscc::*;
 use smb_msg::*;
 use std::ops::{Deref, DerefMut};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::{Mutex, MutexGuard, mpsc};
 
@@ -242,124 +244,59 @@ impl Directory {
         recursive: bool,
         cancel: tokio_util::sync::CancellationToken,
     ) -> crate::Result<impl futures_core::Stream<Item = crate::Result<FileNotifyInformation>>> {
-        // Since watching for notifications is more passive, this does not require the same level
-        // of synchronization as querying the directory - since we won't DoS the server by sending
-        // too many requests.
-
-        use tokio::select;
-        use tokio_stream::wrappers::ReceiverStream;
-
-        let (sender, receiver) = tokio::sync::mpsc::channel(1024);
-        let (watch_tx, mut watch_rx) = tokio::sync::mpsc::channel(1024);
-
+        const EVENT_CAPACITY: usize = 1024;
+        let (sender, receiver) = tokio::sync::mpsc::channel(EVENT_CAPACITY);
         let receive_options = ResponseOptions::default()
             .with_timeout(Duration::MAX)
-            .with_async_msg_ids(Default::default());
+            .with_async_msg_ids(Default::default())
+            .with_cancellation_token(cancel.clone());
 
-        // Receive task is required to avoid race conditions.
-        // if the receive task is aborted, we might miss a cancellation message.
-        // so cancelling a running watch should only be by cleanup/cancel ack messages,
-        // or stream drop.
         tokio::spawn({
-            let receive_options = receive_options.clone();
-
             let directory = this.clone();
+            let cancel = cancel.clone();
             async move {
                 loop {
-                    select! {
-                        _ = watch_tx.closed() => {
-                            // Receiver dropped, exit the loop.
-                            break;
+                    let result = directory
+                        ._watch_options(filter, recursive, receive_options.clone())
+                        .await;
+                    match result {
+                        DirectoryWatchResult::Notifications(items) => {
+                            if !publish_change_batch(
+                                &sender,
+                                items,
+                                &cancel,
+                                EVENT_CAPACITY,
+                            )
+                            .await
+                            {
+                                return;
+                            }
                         }
-                        result = directory
-                            ._watch_options(filter, recursive, receive_options.clone())
-                            =>  {
-                            let should_stop = matches!(result, DirectoryWatchResult::Cancelled | DirectoryWatchResult::Cleanup);
-                            if watch_tx.send(result).await.is_err() {
-                                break; // Receiver dropped
+                        DirectoryWatchResult::Cancelled => {
+                            if !cancel.is_cancelled() && !sender.is_closed() {
+                                let _ = sender
+                                    .send(Err(Error::Cancelled("watch cancelled unexpectedly")))
+                                    .await;
                             }
-                            if should_stop {
-                                break;
+                            return;
+                        }
+                        DirectoryWatchResult::Cleanup => return,
+                        other => {
+                            let result: crate::Result<Vec<FileNotifyInformation>> = other.into();
+                            if let Err(error) = result {
+                                let _ = sender.send(Err(error)).await;
                             }
+                            return;
                         }
                     }
                 }
             }
         });
 
-        tokio::spawn({
-            let directory = this.clone();
-            async move {
-                let mut cancel_called = false;
-                loop {
-                    select! {
-                        biased;
-                        _ = sender.closed(), if sender.is_closed() && !cancel.is_cancelled() => {
-                            // Sender close. request a cancellation. That triggers the branch above.
-                            tracing::debug!("Watch receiver closed, stopping watch by raising cancellation.");
-                            if !cancel_called {
-                                cancel.cancel();
-                            }
-                        }
-                        _ = cancel.cancelled(), if !cancel_called => {
-                            // Cancellation step 1: send cancel request to server.
-                            tracing::debug!("Watch cancelled by user");
-                            directory.send_cancel(receive_options.async_msg_ids.as_ref().unwrap()).await.ok();
-                            cancel_called = true;
-                            // Now, wait for the server to confirm cancellation.
-                        }
-                        result = watch_rx.recv() => {
-                            match result {
-                                Some(DirectoryWatchResult::Notifications(v)) => {
-                                    for item in v {
-                                        if sender.send(Ok(item)).await.is_err() {
-                                            tracing::debug!("Watch notifications receiver closed, stop sending, begin cancellation.");
-                                            break;
-                                        }
-                                    }
-                                }
-                                Some(DirectoryWatchResult::Cancelled) => {
-                                    if sender.is_closed() {
-                                        // Already closed, ignore - cancellation should be complete anyway.
-                                        tracing::debug!("Watch cancelled after sender closed, ignoring.");
-                                        break;
-                                    }
-
-                                    if !cancel.is_cancelled() {
-                                        sender.send(Err(Error::Cancelled("watch cancelled unexpectedly"))).await.ok();
-                                    }
-
-                                    // Cancellation step 2: exit the loop.
-                                    tracing::debug!("Watch cancellation complete.");
-                                    break;
-                                }
-                                Some(DirectoryWatchResult::Cleanup) => {
-                                    // Server cleaned up the watch, exit the loop.
-                                    tracing::debug!("Watch cleaned up by server. Stopping stream.");
-                                    break;
-                                }
-                                Some(x) => {
-                                    let x: crate::Result<_> = x.into();
-                                    let x = x.unwrap_err();
-                                    tracing::debug!("Error watching directory: {x}. Stopping stream.");
-                                    sender.send(Err(x)).await.map_err(|e| {
-                                        tracing::debug!("Error watching directory after sender closed: {e}. Ignoring.");
-                                        e
-                                    }).ok();
-                                    break; // Exit on error
-                                },
-                                None => {
-                                    tracing::debug!("Watch internal task ended, stopping stream.");
-                                    break; // Internal task ended
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        Ok(ReceiverStream::new(receiver))
+        Ok(DirectoryWatchStream {
+            receiver: tokio_stream::wrappers::ReceiverStream::new(receiver),
+            cancel,
+        })
     }
 
     /// (Internal) Watches the directory for changes, with an optional timeout.
@@ -492,6 +429,107 @@ impl Directory {
             .await?
             .as_quota()?
             .into())
+    }
+}
+
+async fn publish_change_batch(
+    sender: &tokio::sync::mpsc::Sender<crate::Result<FileNotifyInformation>>,
+    items: Vec<FileNotifyInformation>,
+    cancel: &tokio_util::sync::CancellationToken,
+    capacity: usize,
+) -> bool {
+    for item in items {
+        match sender.try_send(Ok(item)) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                cancel.cancel();
+                return false;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                cancel.cancel();
+                let _ = sender
+                    .send(Err(Error::EventQueueOverflow {
+                        event: "change-notify",
+                        capacity,
+                    }))
+                    .await;
+                return false;
+            }
+        }
+    }
+    true
+}
+
+struct DirectoryWatchStream {
+    receiver: tokio_stream::wrappers::ReceiverStream<crate::Result<FileNotifyInformation>>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl futures_core::Stream for DirectoryWatchStream {
+    type Item = crate::Result<FileNotifyInformation>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.receiver).poll_next(cx)
+    }
+}
+
+impl Drop for DirectoryWatchStream {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod watch_stream_tests {
+    use super::*;
+
+    fn notification(name: &str) -> FileNotifyInformation {
+        FileNotifyInformation {
+            action: NotifyAction::Added,
+            file_name: name.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn consumer_lag_cancels_watch_and_reports_typed_overflow() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let publish = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                publish_change_batch(
+                    &sender,
+                    vec![notification("first"), notification("second")],
+                    &cancel,
+                    1,
+                )
+                .await
+            }
+        });
+        assert!(receiver.recv().await.unwrap().is_ok());
+        let overflow = receiver.recv().await.unwrap().unwrap_err();
+        assert!(matches!(
+            overflow,
+            Error::EventQueueOverflow {
+                event: "change-notify",
+                capacity: 1,
+            }
+        ));
+        assert!(!publish.await.unwrap());
+        assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn dropping_stream_cancels_its_owner_task() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_sender, receiver) = tokio::sync::mpsc::channel(1);
+        let stream = DirectoryWatchStream {
+            receiver: tokio_stream::wrappers::ReceiverStream::new(receiver),
+            cancel: cancel.clone(),
+        };
+        drop(stream);
+        assert!(cancel.is_cancelled());
     }
 }
 

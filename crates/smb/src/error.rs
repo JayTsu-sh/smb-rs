@@ -91,6 +91,12 @@ pub enum Error {
     #[error("Resource recovery wait timed out")]
     ResourceRecoveryWaitTimedOut,
 
+    #[error("{event} event queue exceeded its capacity of {capacity}")]
+    EventQueueOverflow {
+        event: &'static str,
+        capacity: usize,
+    },
+
     #[error("Invalid state: {0}")]
     InvalidState(String),
     #[error("Unable to transform message: {0}")]
