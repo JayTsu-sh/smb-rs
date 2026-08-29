@@ -14,3 +14,9 @@ categories.workspace = true
 [dependencies]
 binrw = { workspace = true }
 hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+tokio = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+serde_json = "1"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
