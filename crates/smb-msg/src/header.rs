@@ -156,6 +156,7 @@ make_status! {
     SharingViolation = 0xC0000043: "Sharing Violation",
     ObjectPathNotFound = 0xC000003A: "Object Path Not Found",
     NoEasOnFile = 0xC0000044: "No EAs on File",
+    WrongPassword = 0xC000006A: "Wrong Password",
     LogonFailure = 0xC000006D: "Logon Failure",
     NotMapped = 0xC0000073: "Not Mapped",
     BadImpersonationLevel = 0xC00000A5: "Bad Impersonation Level",

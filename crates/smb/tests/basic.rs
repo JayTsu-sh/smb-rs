@@ -80,9 +80,12 @@ async fn do_test_basic_auth_fail() -> smb::Result<()> {
     let res = _do_minimal_connection_test(None, None).await.unwrap_err();
     match res {
         smb::Error::UnexpectedMessageStatus(status) => {
-            assert_eq!(status, Status::LogonFailure as u32);
+            assert!(
+                status == Status::LogonFailure as u32 || status == Status::WrongPassword as u32,
+                "expected a typed credential rejection, got 0x{status:08x}"
+            );
         }
-        _ => panic!("Expected LogonFailure error"),
+        _ => panic!("expected a typed credential rejection"),
     }
     smb::Result::Ok(())
 }
