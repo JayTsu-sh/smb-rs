@@ -278,6 +278,24 @@ form a cycle or grant RPC access to runtime internals.
    where the runtime implementation genuinely varies or deterministic testing
    requires an adapter.
 
+## Automated enforcement
+
+`docs/architecture/dependency-rules.json` is the machine-readable activation
+ledger for these rules. Run it from the workspace root with:
+
+```text
+cargo run -p smb-tests --bin architecture-check -- docs/architecture/dependency-rules.json
+```
+
+The checker combines Cargo metadata with parsed Rust import paths. Activated
+crate rules reject forbidden reverse dependencies. Module roots become active
+when their directories appear and then reject reverse, skipped-layer, and
+unclassified crate-local imports. A future-wave root appearing early, an
+overdue absent root, a path escaping the workspace, or a temporary adapter that
+survives its `remove_by` wave fails the command. `cargo test -p smb-tests` runs
+the same repository rule set plus violation fixtures, so CI and local checks
+share one Interface.
+
 These rules should be enforced with Rust visibility and crate dependencies
 first. Architectural tests or lint checks may supplement them where visibility
 alone cannot express the constraint.
