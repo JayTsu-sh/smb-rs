@@ -6,7 +6,7 @@ use common::{
     default_connection_config, make_server_connection, smb_test_identity, smb_tests_server,
     smb_tests_share,
 };
-use smb::{Connection, FileCreateArgs, ReadAt, UncPath, WriteAt};
+use smb::{Connection, FileCreateArgs, UncPath, WriteAt};
 use smb_dtyp::Guid;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -51,17 +51,15 @@ async fn exact_session_disruption_is_typed_at_the_w4_2_boundary(
             && generation != initial
         {
             assert!(generation > initial);
-            let mut byte = [0_u8; 1];
             assert!(
-                file.read_at(&mut byte, 0).await.is_err(),
+                file.write_at(b"stale", 1).await.is_err(),
                 "ordinary Resource from the lost generation must not migrate silently"
             );
             println!("RECOVERY_GENERATION_REPLACED");
             connection.close().await?;
             return Ok(());
         }
-        let mut byte = [0_u8; 1];
-        if file.read_at(&mut byte, 0).await.is_err() {
+        if file.write_at(b"probe", 32).await.is_err() {
             // ONTAP's exact CIFS-session close may deliberately preserve the
             // underlying TCP connection. That is a Session-recovery input for
             // W4-3, not a transport-loss input for W4-2. The hard W4-2 boundary
