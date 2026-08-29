@@ -12,6 +12,8 @@ pub mod error;
 pub mod lease;
 pub mod msg_handler;
 pub mod resource;
+#[cfg(feature = "test-support")]
+mod scenario;
 pub mod session;
 pub mod tree;
 
@@ -25,7 +27,12 @@ pub mod tree;
 #[cfg(feature = "test-support")]
 pub mod test_support {
     pub use crate::clock::{Clock, ManualClock, ManualClockError, MonotonicTime, TokioClock};
+    pub use crate::scenario::{
+        LifecycleScenario, ScenarioError, ScenarioEvent, ScenarioReport, ScenarioTaskError,
+        TerminalOutcome, TerminalProbe,
+    };
     pub use crate::session::gss::GssState;
+    pub use smb_transport::test_support::{ScriptedTransport, ScriptedTransportControl};
 }
 
 pub use client::{Client, ClientConfig, UncPath};
