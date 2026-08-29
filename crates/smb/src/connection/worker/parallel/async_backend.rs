@@ -1,3 +1,4 @@
+use crate::clock::{Clock, TokioClock};
 use crate::error::*;
 use crate::msg_handler::IncomingMessage;
 use smb_transport::{IoVec, SmbTransport, SmbTransportRead, SmbTransportWrite, TransportError};
@@ -197,11 +198,13 @@ impl MultiWorkerBackend for AsyncBackend {
                 Error::MessageProcessingError("Failed to receive message.".to_string())
             })?
         } else {
+            let clock = TokioClock::new();
+            let deadline = clock.now().saturating_add(timeout);
             tokio::select! {
                 msg = waiter => {
                     msg.map_err(|_| Error::MessageProcessingError("Failed to receive message.".to_string()))?
                 },
-                _ = tokio::time::sleep(timeout) => {
+                _ = clock.sleep_until(deadline) => {
                     Err(Error::OperationTimeout(TimedOutTask::ReceiveNextMessage, timeout))
                 }
             }

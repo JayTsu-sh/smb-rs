@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 pub mod client;
+mod clock;
 pub mod compression;
 pub mod connection;
 pub mod crypto;
@@ -23,6 +24,7 @@ pub mod tree;
 /// must never be relied upon by downstream code outside of test fixtures.
 #[cfg(feature = "test-support")]
 pub mod test_support {
+    pub use crate::clock::{Clock, ManualClock, ManualClockError, MonotonicTime, TokioClock};
     pub use crate::session::gss::GssState;
 }
 
@@ -44,4 +46,3 @@ pub use smb_transport as transport;
 
 /// SMB Result type
 pub type Result<T> = std::result::Result<T, crate::Error>;
-
