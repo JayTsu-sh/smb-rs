@@ -160,6 +160,10 @@ impl GenerationState {
         self.generation
     }
 
+    pub(crate) const fn operation_limit(&self) -> usize {
+        self.limits.max_operations
+    }
+
     pub(crate) fn new(
         generation: GenerationId,
         initial_message_id: u64,

@@ -53,6 +53,10 @@ pub(crate) enum RuntimeError {
     Wire(&'static str),
     #[error("generation runtime request completed as {0:?}")]
     Terminal(TerminalOutcome),
+    #[error("generation runtime does not own request {0}")]
+    UnknownRequest(RequestKey),
+    #[error("generation runtime request {0} already has a waiter")]
+    AlreadyAwaited(RequestKey),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -163,7 +167,7 @@ impl RuntimeHandle {
                 credit_charge,
                 deadline,
                 acknowledge,
-                terminal,
+                terminal: Some(terminal),
             })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => RuntimeError::AdmissionBackpressure,
@@ -173,6 +177,42 @@ impl RuntimeHandle {
             .await
             .unwrap_or(Err(RuntimeError::OwnerTerminated))?;
         Ok(BootstrapTicket { key, completion })
+    }
+
+    pub(crate) async fn submit_bootstrap_detached(
+        &self,
+        operation: BootstrapOperation,
+        credit_charge: u16,
+        deadline: Option<MonotonicTime>,
+    ) -> Result<RequestKey, RuntimeError> {
+        let (acknowledge, acknowledged) = oneshot::channel();
+        self.bootstrap
+            .try_send(BootstrapAdmission {
+                operation,
+                credit_charge,
+                deadline,
+                acknowledge,
+                terminal: None,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => RuntimeError::AdmissionBackpressure,
+                mpsc::error::TrySendError::Closed(_) => RuntimeError::Closed,
+            })?;
+        acknowledged
+            .await
+            .unwrap_or(Err(RuntimeError::OwnerTerminated))
+    }
+
+    pub(crate) async fn await_bootstrap(
+        &self,
+        key: RequestKey,
+    ) -> Result<BootstrapResult, RuntimeError> {
+        let (reply, result) = oneshot::channel();
+        self.control
+            .send(ControlCommand::AwaitBootstrap { key, reply })
+            .await
+            .map_err(|_| RuntimeError::Closed)?;
+        result.await.unwrap_or(Err(RuntimeError::OwnerTerminated))
     }
 
     pub(crate) async fn submit(
@@ -280,13 +320,14 @@ struct BootstrapAdmission {
     credit_charge: u16,
     deadline: Option<MonotonicTime>,
     acknowledge: oneshot::Sender<Result<RequestKey, RuntimeError>>,
-    terminal: oneshot::Sender<Result<BootstrapResult, RuntimeError>>,
+    terminal: Option<oneshot::Sender<Result<BootstrapResult, RuntimeError>>>,
 }
 
 struct BootstrapPending {
     command: BootstrapCommand,
     request_raw: Option<bytes::Bytes>,
-    terminal: oneshot::Sender<Result<BootstrapResult, RuntimeError>>,
+    terminal: Option<oneshot::Sender<Result<BootstrapResult, RuntimeError>>>,
+    buffered: Option<Result<BootstrapResult, RuntimeError>>,
 }
 
 struct RequestAuthority {
@@ -296,6 +337,10 @@ struct RequestAuthority {
 }
 
 enum ControlCommand {
+    AwaitBootstrap {
+        key: RequestKey,
+        reply: oneshot::Sender<Result<BootstrapResult, RuntimeError>>,
+    },
     Negotiated {
         connection: Arc<ConnectionInfo>,
         reply: oneshot::Sender<Result<(), RuntimeError>>,
@@ -558,9 +603,9 @@ async fn owner_task(
         let _ = terminal.send(Err(fatal.clone().unwrap_or(RuntimeError::Closed)));
     }
     for (_, pending) in authority.bootstrap_pending.drain() {
-        let _ = pending
-            .terminal
-            .send(Err(fatal.clone().unwrap_or(RuntimeError::Closed)));
+        if let Some(terminal) = pending.terminal {
+            let _ = terminal.send(Err(fatal.clone().unwrap_or(RuntimeError::Closed)));
+        }
     }
 
     let close_deadline = close_request
@@ -585,6 +630,14 @@ async fn process_bootstrap_admission(
     pending: &mut HashMap<RequestKey, BootstrapPending>,
     send_queue: &mut VecDeque<WriteCommand>,
 ) {
+    if pending.len() >= state.operation_limit() {
+        let error = RuntimeError::Admission(AdmissionError::OperationsExhausted);
+        if let Some(terminal) = command.terminal {
+            let _ = terminal.send(Err(error.clone()));
+        }
+        let _ = command.acknowledge.send(Err(error));
+        return;
+    }
     let payload_bytes = command.operation.payload_bytes();
     let effects = state.reduce(OwnerEvent::Admit {
         payload_bytes,
@@ -596,7 +649,9 @@ async fn process_bootstrap_admission(
             Some(OwnerEffect::AdmissionRejected(error)) => RuntimeError::Admission(*error),
             _ => RuntimeError::OwnerTerminated,
         };
-        let _ = command.terminal.send(Err(error.clone()));
+        if let Some(terminal) = command.terminal {
+            let _ = terminal.send(Err(error.clone()));
+        }
         let _ = command.acknowledge.send(Err(error));
         return;
     };
@@ -611,7 +666,9 @@ async fn process_bootstrap_admission(
         Err(_) => {
             state.reduce(OwnerEvent::PrepareFailed { key });
             let error = RuntimeError::Wire("prepare-outgoing");
-            let _ = command.terminal.send(Err(error.clone()));
+            if let Some(terminal) = command.terminal {
+                let _ = terminal.send(Err(error.clone()));
+            }
             let _ = command.acknowledge.send(Err(error));
             return;
         }
@@ -625,6 +682,7 @@ async fn process_bootstrap_admission(
             command: operation_command,
             request_raw,
             terminal: command.terminal,
+            buffered: None,
         },
     );
     send_queue.push_back(WriteCommand {
@@ -690,6 +748,21 @@ async fn handle_control(
     close_request: &mut Option<CloseRequest>,
 ) -> bool {
     match command {
+        ControlCommand::AwaitBootstrap { key, reply } => {
+            let Some(pending) = authority.bootstrap_pending.get_mut(&key) else {
+                let _ = reply.send(Err(RuntimeError::UnknownRequest(key)));
+                return false;
+            };
+            if let Some(result) = pending.buffered.take() {
+                authority.bootstrap_pending.remove(&key);
+                let _ = reply.send(result);
+            } else if pending.terminal.is_some() {
+                let _ = reply.send(Err(RuntimeError::AlreadyAwaited(key)));
+            } else {
+                pending.terminal = Some(reply);
+            }
+            false
+        }
         ControlCommand::Negotiated { connection, reply } => {
             let result = wire
                 .negotiated(&connection)
@@ -846,14 +919,16 @@ async fn process_io(
                         )
                     });
                     apply_owner_effects(effects, &mut authority.terminals);
-                    if publishes_response
-                        && let Some(pending) = authority.bootstrap_pending.remove(&key)
-                    {
-                        let _ = pending.terminal.send(Ok(BootstrapResult {
+                    if publishes_response {
+                        complete_bootstrap(
+                            &mut authority.bootstrap_pending,
                             key,
-                            response: message,
-                            request_raw: pending.request_raw,
-                        }));
+                            Ok(BootstrapResult {
+                                key,
+                                response: message,
+                                request_raw: None,
+                            }),
+                        );
                     }
                 }
             }
@@ -937,10 +1012,30 @@ fn apply_bootstrap_effects(
             effect: ReduceEffect::Publish(outcome),
         } = effect
             && *outcome != TerminalOutcome::Response
-            && let Some(pending) = pending.remove(key)
         {
-            let _ = pending.terminal.send(Err(RuntimeError::Terminal(*outcome)));
+            complete_bootstrap(pending, *key, Err(RuntimeError::Terminal(*outcome)));
         }
+    }
+}
+
+fn complete_bootstrap(
+    pending: &mut HashMap<RequestKey, BootstrapPending>,
+    key: RequestKey,
+    mut result: Result<BootstrapResult, RuntimeError>,
+) {
+    let Some(mut entry) = pending.remove(&key) else {
+        return;
+    };
+    if let Ok(completed) = &mut result
+        && completed.request_raw.is_none()
+    {
+        completed.request_raw = entry.request_raw.take();
+    }
+    if let Some(terminal) = entry.terminal.take() {
+        let _ = terminal.send(result);
+    } else {
+        entry.buffered = Some(result);
+        pending.insert(key, entry);
     }
 }
 
@@ -1060,7 +1155,9 @@ async fn fail_waiting_bootstrap(
     error: RuntimeError,
 ) {
     while let Some(command) = admissions.recv().await {
-        let _ = command.terminal.send(Err(error.clone()));
+        if let Some(terminal) = command.terminal {
+            let _ = terminal.send(Err(error.clone()));
+        }
         let _ = command.acknowledge.send(Err(error.clone()));
     }
 }
@@ -1461,6 +1558,22 @@ mod tests {
         BootstrapOperation::new(BootstrapCommand::SessionSetup, outgoing).unwrap()
     }
 
+    fn session_setup_response(message_id: u64) -> Bytes {
+        let mut response = smb_msg::PlainResponse::new(smb_msg::ResponseContent::SessionSetup(
+            smb_msg::SessionSetupResponse {
+                session_flags: smb_msg::SessionFlags::new(),
+                buffer: vec![1, 2, 3],
+            },
+        ));
+        response.header.status = smb_msg::Status::MoreProcessingRequired as u32;
+        response.header.credit_request = 1;
+        response.header.flags.set_server_to_redir(true);
+        response.header.message_id = message_id;
+        let mut encoded = Vec::new();
+        response.write(&mut Cursor::new(&mut encoded)).unwrap();
+        Bytes::from(encoded)
+    }
+
     #[tokio::test]
     async fn runtime_owns_short_write_progress_and_joins_both_pumps_on_close() {
         let (transport, control) = ScriptedTransport::new();
@@ -1817,19 +1930,7 @@ mod tests {
     #[tokio::test]
     async fn typed_session_setup_is_stamped_correlated_and_completed_by_owner() {
         let (transport, control) = ScriptedTransport::new();
-        let mut response = smb_msg::PlainResponse::new(smb_msg::ResponseContent::SessionSetup(
-            smb_msg::SessionSetupResponse {
-                session_flags: smb_msg::SessionFlags::new(),
-                buffer: vec![1, 2, 3],
-            },
-        ));
-        response.header.status = smb_msg::Status::MoreProcessingRequired as u32;
-        response.header.credit_request = 1;
-        response.header.flags.set_server_to_redir(true);
-        response.header.message_id = 10;
-        let mut encoded = Vec::new();
-        response.write(&mut Cursor::new(&mut encoded)).unwrap();
-        control.push_server_frame(Bytes::from(encoded));
+        control.push_server_frame(session_setup_response(10));
 
         let clock = Arc::new(ManualClock::new());
         let (handle, _events) = start_generation(transport, clock.clone(), config());
@@ -1911,6 +2012,71 @@ mod tests {
             ticket.completion().await,
             Err(RuntimeError::Terminal(TerminalOutcome::OutcomeUnknown))
         ));
+        let report = handle
+            .close(clock.now().saturating_add(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        assert_eq!(report.unresolved_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn detached_response_is_buffered_only_by_owner_until_awaited() {
+        let (transport, control) = ScriptedTransport::new();
+        control.push_server_frame(session_setup_response(10));
+        let clock = Arc::new(ManualClock::new());
+        let (handle, mut events) = start_generation(transport, clock.clone(), config());
+        let key = handle
+            .submit_bootstrap_detached(session_setup_operation(true), 1, None)
+            .await
+            .unwrap();
+        loop {
+            if matches!(events.recv().await, Some(RuntimeEvent::InboundFrame { .. })) {
+                break;
+            }
+        }
+        let result = handle.await_bootstrap(key).await.unwrap();
+        assert_eq!(result.key, key);
+        assert!(result.request_raw.is_some());
+        assert!(matches!(
+            handle.await_bootstrap(key).await,
+            Err(RuntimeError::UnknownRequest(found)) if found == key
+        ));
+        let report = handle
+            .close(clock.now().saturating_add(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        assert_eq!(report.unresolved_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn unawaited_detached_results_remain_admission_bounded() {
+        let (transport, control) = ScriptedTransport::new();
+        control.push_server_frame(session_setup_response(10));
+        let clock = Arc::new(ManualClock::new());
+        let mut runtime_config = config();
+        runtime_config.admission_limits.max_operations = 1;
+        let (handle, mut events) = start_generation(transport, clock.clone(), runtime_config);
+        let first = handle
+            .submit_bootstrap_detached(session_setup_operation(false), 1, None)
+            .await
+            .unwrap();
+        loop {
+            if matches!(events.recv().await, Some(RuntimeEvent::InboundFrame { .. })) {
+                break;
+            }
+        }
+        assert!(matches!(
+            handle
+                .submit_bootstrap_detached(session_setup_operation(false), 1, None)
+                .await,
+            Err(RuntimeError::Admission(AdmissionError::OperationsExhausted))
+        ));
+        handle.await_bootstrap(first).await.unwrap();
+        let second = handle
+            .submit_bootstrap_detached(session_setup_operation(false), 1, None)
+            .await
+            .unwrap();
+        assert_eq!(second.message_id, 11);
         let report = handle
             .close(clock.now().saturating_add(Duration::from_secs(1)))
             .await
