@@ -105,6 +105,21 @@ pub async fn make_server_connection_ex(
     Ok((smb, unc_path))
 }
 
+pub fn smb_test_identity() -> smb::Result<sspi::AuthIdentity> {
+    let user = var(TestEnv::USER)
+        .ok()
+        .or_else(|| from_secret_fd(TestEnv::USER_FD, &USER_FROM_FD))
+        .unwrap_or_else(|| TestEnv::DEFAULT_USER.to_string());
+    let password = var(TestEnv::PASSWORD)
+        .ok()
+        .or_else(|| from_secret_fd(TestEnv::PASSWORD_FD, &PASSWORD_FROM_FD))
+        .unwrap_or_else(|| TestEnv::DEFAULT_PASSWORD.to_string());
+    Ok(sspi::AuthIdentity {
+        username: sspi::Username::parse(&user).map_err(|error| smb::Error::SspiError(error.into()))?,
+        password: sspi::Secret::from(password),
+    })
+}
+
 fn from_secret_fd(name: &str, cache: &'static OnceLock<Zeroizing<String>>) -> Option<String> {
     let descriptor = var(name).ok()?;
     let descriptor = descriptor
