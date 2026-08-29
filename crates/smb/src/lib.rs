@@ -41,10 +41,12 @@ pub mod test_support {
 pub use client::UncPath;
 pub use connection::ConnectionConfig;
 pub use domain::{
-    CancelToken, CloseOutcome, Credentials, Deadline, Directory, DirectoryEntries, DirectoryEntry,
-    DirectoryEvent, DirectoryEvents, DirectoryOpenOptions, DirectoryWatchOptions, File, FileCursor,
+    Batch, BatchCommand, BatchOutcome, BatchRef, BatchResult, CancelToken, CloseOutcome,
+    Credentials, Deadline, Directory, DirectoryEntries, DirectoryEntry, DirectoryEvent,
+    DirectoryEvents, DirectoryOpenOptions, DirectoryWatchOptions, File, FileCursor,
     FileOpenOptions, Operation, Pipe, PipeName, ReplayPolicy, Resource, Session, Share, SharePath,
-    ShareTarget,
+    ShareTarget, Transfer, TransferEvents, TransferOptions, TransferProgress, TransferReport,
+    TransferStrategy,
 };
 pub use error::Error;
 pub use facade::{Client, ClientConfig};

@@ -1,9 +1,15 @@
 //! SMB domain handles.
 
+mod batch;
 mod cursor;
 mod operation;
+mod transfer;
+pub use batch::{Batch, BatchCommand, BatchOutcome, BatchRef, BatchResult};
 pub use cursor::FileCursor;
 pub use operation::{CancelToken, Deadline, Operation, ReplayPolicy};
+pub use transfer::{
+    Transfer, TransferEvents, TransferOptions, TransferProgress, TransferReport, TransferStrategy,
+};
 
 use std::{
     collections::HashMap,
@@ -399,6 +405,15 @@ impl File {
 
     pub(crate) fn opened_len(&self) -> u64 {
         self.inner.opened_len()
+    }
+
+    /// Length observed when this handle was opened.
+    pub fn len(&self) -> u64 {
+        self.opened_len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn read_at(&self, offset: u64, max_len: u32) -> Operation<'_, Bytes> {

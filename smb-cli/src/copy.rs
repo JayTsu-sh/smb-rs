@@ -1,12 +1,20 @@
-use crate::{Cli, path::*};
+use crate::{Cli, path::Path};
+use bytes::Bytes;
 use clap::Parser;
+use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
-use smb::{client::Client, protocol::{CreateOptions, FileAccessMask, FileAttributes}, resource::*};
-use std::collections::HashMap;
+use smb::{
+    Client, ClientConfig, Credentials, File, FileOpenOptions, Share, SharePath, ShareTarget,
+    TransferOptions, TransferProgress,
+};
 use std::error::Error;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::{fs, time::sleep};
+use tokio::{
+    fs,
+    io::{AsyncReadExt, AsyncWriteExt},
+};
+
+const COPY_CHUNK_SIZE: usize = 1024 * 1024;
+const REMOTE_CONCURRENCY: usize = 8;
 
 #[derive(Parser, Debug)]
 pub struct CopyCmd {
@@ -21,13 +29,13 @@ pub struct CopyCmd {
 }
 
 enum CopyFileValue {
-    Local(Mutex<fs::File>),
-    Remote(File),
+    Local(fs::File),
+    Remote { file: File, share: Share },
 }
 
 struct CopyFile {
-    path: Path,
     value: CopyFileValue,
+    len: u64,
 }
 
 impl CopyFile {
@@ -35,182 +43,178 @@ impl CopyFile {
         path: &Path,
         client: &Client,
         cli: &Cli,
-        cmd: &CopyCmd,
+        command: &CopyCmd,
         read: bool,
-    ) -> Result<Self, smb::Error> {
-        let value = match path {
-            Path::Local(path_buf) => {
+    ) -> smb::Result<Self> {
+        match path {
+            Path::Local(path) => {
                 let file = fs::OpenOptions::new()
                     .read(read)
                     .write(!read)
                     .create(!read)
-                    .create_new(!read && !cmd.force)
+                    .create_new(!read && !command.force)
                     .truncate(!read)
-                    .open(path_buf)
+                    .open(path)
                     .await?;
-                CopyFileValue::Local(Mutex::new(file))
-            }
-            Path::Remote(unc_path) => {
-                client
-                    .share_connect(unc_path, cli.username.as_str(), cli.password.clone())
-                    .await?;
-                let create_args = if read {
-                    FileCreateArgs::make_open_existing(
-                        FileAccessMask::new().with_generic_read(true),
-                    )
-                } else if cmd.force {
-                    FileCreateArgs::make_overwrite(
-                        FileAttributes::new().with_archive(true),
-                        CreateOptions::new(),
-                    )
+                let len = if read {
+                    file.metadata().await?.len()
                 } else {
-                    FileCreateArgs::make_create_new(
-                        FileAttributes::new().with_archive(true),
-                        CreateOptions::new(),
-                    )
+                    0
                 };
-                let file = client
-                    .create_file(unc_path, &create_args)
-                    .await?
-                    .into_file()?;
-                CopyFileValue::Remote(file)
+                Ok(Self {
+                    value: CopyFileValue::Local(file),
+                    len,
+                })
             }
-        };
-        Ok(CopyFile {
-            path: path.clone(),
-            value,
-        })
+            Path::Remote(path) => {
+                let share_name = path.share().ok_or_else(|| {
+                    smb::Error::InvalidArgument("remote copy path requires a share".into())
+                })?;
+                let relative = path.path().filter(|path| !path.is_empty()).ok_or_else(|| {
+                    smb::Error::InvalidArgument("remote copy path requires a file".into())
+                })?;
+                let target = ShareTarget::new(path.server(), share_name)?;
+                let share = client
+                    .connect_share(
+                        &target,
+                        Credentials::ntlm(cli.username.clone(), cli.password.clone()),
+                    )
+                    .await?;
+                let options = if read {
+                    FileOpenOptions::open_existing()
+                } else if command.force {
+                    FileOpenOptions::overwrite()
+                } else {
+                    FileOpenOptions::create_new()
+                };
+                let file = share.open_file(&SharePath::new(relative)?, options).await?;
+                let len = if read { file.len() } else { 0 };
+                Ok(Self {
+                    value: CopyFileValue::Remote { file, share },
+                    len,
+                })
+            }
+        }
     }
 
-    async fn _get_channel_to_jobs_map(
-        &self,
-        to: &CopyFile,
-        client: &Client,
-    ) -> smb::Result<HashMap<Option<u32>, usize>> {
-        use Path::*;
-
-        const R2R_WORKERS_NO_MC: usize = 8;
-        match (&self.path, &to.path) {
-            (Remote(_), Remote(_)) => return Ok(HashMap::from([(None, R2R_WORKERS_NO_MC)])),
-            (Local(_), Local(_)) => unreachable!(),
-            _ => (),
-        }
-
-        // Remote to/from local file copy
-        // Initialize multi-channel if possible
-        const R2L_L2R_WORKERS_NO_MC: usize = 16;
-        if !client.config().connection.multichannel.is_enabled() {
-            return Ok(HashMap::from([(None, R2L_L2R_WORKERS_NO_MC)]));
-        }
-
-        let remote_address = match &self.path {
-            Remote(p) => p,
-            Local(_) => match &to.path {
-                Remote(p) => p,
-                Local(_) => unreachable!(),
-            },
-        };
-
-        let channels = client.get_channels(remote_address).await?;
-
-        const L2R_R2L_PER_CHANNEL_WORKERS: usize = 16;
-        let channels = channels
-            .iter()
-            .map(|(&channel_id, _)| (Some(channel_id), L2R_R2L_PER_CHANNEL_WORKERS))
-            .collect::<HashMap<Option<u32>, usize>>();
-
-        tracing::debug!("Using {} channels for copy", channels.len());
-        tracing::trace!("Channel to jobs map: {channels:?}");
-
-        Ok(channels)
-    }
-
-    async fn copy_to(self, to: CopyFile, client: &Client) -> Result<(), smb::Error> {
-        use CopyFileValue::*;
-
-        let channel_jobs = self._get_channel_to_jobs_map(&to, client).await?;
-
-        match self.value {
-            Local(from_local) => match to.value {
-                Local(_) => unreachable!(),
-                Remote(to_remote) => Self::do_copy(from_local, to_remote, channel_jobs).await?,
-            },
-            Remote(from_remote) => match to.value {
-                Local(to_local) => Self::do_copy(from_remote, to_local, channel_jobs).await?,
-                Remote(to_remote) => {
-                    if to.path.as_remote().unwrap().server()
-                        == self.path.as_remote().unwrap().server()
-                        && to.path.as_remote().unwrap().share()
-                            == self.path.as_remote().unwrap().share()
-                    {
-                        // Use server-side copy if both files are on the same server
-                        to_remote.srv_copy(&from_remote).await?
-                    } else {
-                        Self::do_copy(from_remote, to_remote, channel_jobs).await?
-                    }
-                }
-            },
+    async fn close(self) -> smb::Result<()> {
+        if let CopyFileValue::Remote { file, share } = self.value {
+            file.close().await?;
+            share.close().await?;
         }
         Ok(())
-    }
-
-    pub async fn do_copy<
-        F: ReadAtChannel + GetLen + Send + Sync + 'static,
-        T: WriteAtChannel + SetLen + Send + Sync + 'static,
-    >(
-        from: F,
-        to: T,
-        channel_jobs: HashMap<Option<u32>, usize>,
-    ) -> smb::Result<()> {
-        let state = prepare_parallel_copy(&from, &to, channel_jobs).await?;
-        let state = Arc::new(state);
-        let progress_handle = Self::progress(state.clone());
-        start_parallel_copy(from, to, state).await?;
-
-        progress_handle.await.unwrap();
-        Ok(())
-    }
-
-    /// Async progress bar task starter.
-    fn progress(state: Arc<CopyState>) -> tokio::task::JoinHandle<()> {
-        tokio::task::spawn(async move { Self::progress_loop(state).await })
-    }
-
-    /// Thread/task entrypoint for measuring and displaying copy progress.
-    async fn progress_loop(state: Arc<CopyState>) {
-        let progress_bar = Self::make_progress_bar(state.total_size());
-        loop {
-            let bytes_copied = state.bytes_copied();
-            progress_bar.set_position(bytes_copied);
-            if bytes_copied >= state.total_size() {
-                break;
-            }
-            sleep(std::time::Duration::from_millis(100)).await;
-        }
-        progress_bar.finish_with_message("Copy complete");
-    }
-
-    /// Returns a new progress bar instance for copying files.
-    fn make_progress_bar(len: u64) -> ProgressBar {
-        let progress = ProgressBar::new(len);
-        progress.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
-                    .unwrap().progress_chars("#>-"));
-        progress
     }
 }
 
-pub async fn copy(cmd: &CopyCmd, cli: &Cli) -> Result<(), Box<dyn Error>> {
-    if matches!(cmd.from, Path::Local(_)) && matches!(cmd.to, Path::Local(_)) {
-        return Err("Copying between two local files is not supported. Use `cp` or `copy` shell commands instead :)".into());
+fn progress_bar(len: u64) -> ProgressBar {
+    let progress = ProgressBar::new(len);
+    progress.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+        )
+        .expect("static progress template is valid")
+        .progress_chars("#>-"),
+    );
+    progress
+}
+
+async fn copy_remote_to_remote(source: &File, destination: &File, len: u64) -> smb::Result<()> {
+    let mut transfer = source.transfer_to(
+        destination,
+        TransferOptions::default()
+            .concurrency(REMOTE_CONCURRENCY)
+            .chunk_size(COPY_CHUNK_SIZE as u32),
+    );
+    let mut events = transfer
+        .take_events()
+        .ok_or_else(|| smb::Error::InvalidState("transfer progress already taken".into()))?;
+    let progress = progress_bar(len);
+    let observe = async {
+        while let Some(event) = events.next().await {
+            if let TransferProgress::ChunkCompleted { transferred, .. } = event {
+                progress.set_position(transferred);
+            }
+        }
+    };
+    let (report, ()) = tokio::join!(transfer, observe);
+    let report = report?;
+    progress.set_position(report.bytes());
+    progress.finish_with_message("Copy complete");
+    Ok(())
+}
+
+async fn copy_local_to_remote(
+    source: &mut fs::File,
+    destination: &File,
+    len: u64,
+) -> smb::Result<()> {
+    let progress = progress_bar(len);
+    let mut offset = 0_u64;
+    let mut buffer = vec![0_u8; COPY_CHUNK_SIZE];
+    loop {
+        let count = source.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        destination
+            .write_all_at(offset, Bytes::copy_from_slice(&buffer[..count]))
+            .await?;
+        offset += count as u64;
+        progress.set_position(offset);
+    }
+    progress.finish_with_message("Copy complete");
+    Ok(())
+}
+
+async fn copy_remote_to_local(
+    source: &File,
+    destination: &mut fs::File,
+    len: u64,
+) -> smb::Result<()> {
+    let progress = progress_bar(len);
+    let mut offset = 0_u64;
+    while offset < len {
+        let length = (len - offset).min(COPY_CHUNK_SIZE as u64) as u32;
+        let bytes = source.read_exact_at(offset, length).await?;
+        destination.write_all(&bytes).await?;
+        offset += bytes.len() as u64;
+        progress.set_position(offset);
+    }
+    progress.finish_with_message("Copy complete");
+    Ok(())
+}
+
+pub async fn copy(command: &CopyCmd, cli: &Cli) -> Result<(), Box<dyn Error>> {
+    if matches!(command.from, Path::Local(_)) && matches!(command.to, Path::Local(_)) {
+        return Err("copying between two local files is not supported".into());
     }
 
-    let client = Client::new(cli.make_smb_client_config()?);
-    let from = CopyFile::open(&cmd.from, &client, cli, cmd, true).await?;
-    let to = CopyFile::open(&cmd.to, &client, cli, cmd, false).await?;
+    let client = Client::new(ClientConfig::default());
+    let mut source = CopyFile::open(&command.from, &client, cli, command, true).await?;
+    let mut destination = CopyFile::open(&command.to, &client, cli, command, false).await?;
+    let source_len = source.len;
+    let result = match (&mut source.value, &mut destination.value) {
+        (CopyFileValue::Local(source), CopyFileValue::Remote { file, .. }) => {
+            copy_local_to_remote(source, file, source_len).await
+        }
+        (CopyFileValue::Remote { file, .. }, CopyFileValue::Local(destination)) => {
+            copy_remote_to_local(file, destination, source_len).await
+        }
+        (
+            CopyFileValue::Remote { file: source, .. },
+            CopyFileValue::Remote {
+                file: destination, ..
+            },
+        ) => copy_remote_to_remote(source, destination, source_len).await,
+        (CopyFileValue::Local(_), CopyFileValue::Local(_)) => unreachable!(),
+    };
 
-    let copy_ok = from.copy_to(to, &client).await;
-
-    client.close().await?;
-
-    Ok(copy_ok?)
+    let destination_close = destination.close().await;
+    let source_close = source.close().await;
+    let client_close = client.close().await;
+    result?;
+    destination_close?;
+    source_close?;
+    client_close?;
+    Ok(())
 }
