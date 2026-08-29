@@ -1,5 +1,5 @@
 {
-  "current_wave": "W1",
+  "current_wave": "W2",
   "crate_rules": [
     {
       "name": "smb-msg",
@@ -52,5 +52,11 @@
       "activation": "not_yet_activated"
     }
   ],
-  "temporary_adapters": []
+  "temporary_adapters": [
+    {
+      "path": "crates/smb/src/connection/transformer.rs",
+      "owner_wave": "W2",
+      "remove_by": "W3"
+    }
+  ]
 }
