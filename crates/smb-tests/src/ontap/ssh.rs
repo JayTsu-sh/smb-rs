@@ -70,11 +70,7 @@ impl SshOntapAdapter {
         if self.volume_owned(plan, false)? || self.share_owned(plan, false)? {
             return Err("preflight run-owned resource names are not absent".into());
         }
-        let normalized = [version.as_str(), cifs.as_str(), aggregate.as_str()]
-            .into_iter()
-            .flat_map(str::split_ascii_whitespace)
-            .collect::<Vec<_>>()
-            .join(" ");
+        let normalized = normalize_preflight(&[&version, &cifs, &aggregate]);
         let state_hash = hex::encode(Sha256::digest(normalized.as_bytes()));
         let ontap_version = version
             .lines()
@@ -352,6 +348,21 @@ fn has_exact_token(output: &str, expected: &str) -> bool {
         .any(|token| token == expected)
 }
 
+fn normalize_preflight(outputs: &[&str]) -> String {
+    outputs
+        .iter()
+        .flat_map(|output| output.lines())
+        .map(|line| line.trim_matches(char::is_control).trim())
+        .filter(|line| {
+            !line.is_empty()
+                && !line.starts_with("Last login time:")
+                && !line.starts_with("Unsuccessful login attempts since last login:")
+        })
+        .flat_map(str::split_ascii_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,5 +394,16 @@ mod tests {
         assert!(SshOntapAdapter::new("target", "", "identity", "secret").is_err());
         assert!(SshOntapAdapter::new("target", "admin", "", "secret").is_err());
         assert!(SshOntapAdapter::new("target", "admin", "identity", "").is_err());
+    }
+
+    #[test]
+    fn preflight_hash_input_ignores_dynamic_login_banner() {
+        let first = "Last login time: 8/29/2026 09:00:00\nNetApp Release stable\n";
+        let second = "Last login time: 8/29/2026 09:01:00\nNetApp Release stable\n";
+        assert_eq!(
+            normalize_preflight(&[first]),
+            normalize_preflight(&[second])
+        );
+        assert_eq!(normalize_preflight(&[first]), "NetApp Release stable");
     }
 }
