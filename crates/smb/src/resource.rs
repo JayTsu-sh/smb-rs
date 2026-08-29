@@ -788,9 +788,7 @@ impl ResourceHandle {
                     .initial_backoff
                     .saturating_mul(1_u32 << shift)
                     .min(policy.maximum_backoff);
-                clock
-                    .sleep_until(clock.now().saturating_add(delay))
-                    .await;
+                clock.sleep_until(clock.now().saturating_add(delay)).await;
             }
             let previous = self.generation.load_full();
             let future = async {
@@ -1157,16 +1155,42 @@ impl ResourceHandle {
         request: T,
         max_output_response: u32,
     ) -> crate::Result<T::Response> {
+        self.fsctl_with_operation(
+            request,
+            max_output_response,
+            file::FileOperationOptions::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn fsctl_with_operation<T: FsctlRequest>(
+        &self,
+        request: T,
+        max_output_response: u32,
+        operation: file::FileOperationOptions,
+    ) -> crate::Result<T::Response> {
         const NO_INPUT_IN_RESPONSE: u32 = 0;
+        let request = CommandRequest::new(RequestContent::Ioctl(IoctlRequest {
+            ctl_code: T::FSCTL_CODE as u32,
+            file_id: self.file_id().await?,
+            max_input_response: NO_INPUT_IN_RESPONSE,
+            max_output_response,
+            flags: IoctlRequestFlags::new().with_is_fsctl(true),
+            buffer: request.into(),
+        }));
+        let mut options = ResponseOptions::new().with_allow_async(true);
+        if let Some(timeout) = operation.timeout {
+            options = options.with_timeout(timeout);
+        }
+        if let Some(cancellation) = operation.cancellation {
+            options = options.with_cancellation_token(cancellation);
+        }
         let ioctl_result = self
-            ._ioctl(
-                T::FSCTL_CODE as u32,
-                request.into(),
-                NO_INPUT_IN_RESPONSE,
-                max_output_response,
-                IoctlRequestFlags::new().with_is_fsctl(true),
-            )
+            .execute_request_with_replay(request, options, operation.replay)
             .await?
+            .message
+            .content
+            .to_ioctl()?
             .parse_fsctl::<T::Response>()?;
         Ok(ioctl_result)
     }
@@ -1457,12 +1481,8 @@ impl ResourceHandle {
         msg: CommandRequest,
         options: ResponseOptions<'_>,
     ) -> crate::Result<CommandResponse> {
-        self.execute_request_with_replay(
-            msg,
-            options,
-            crate::runtime::ReplayPolicy::NeverReplay,
-        )
-        .await
+        self.execute_request_with_replay(msg, options, crate::runtime::ReplayPolicy::NeverReplay)
+            .await
     }
 
     async fn execute_request_with_replay(

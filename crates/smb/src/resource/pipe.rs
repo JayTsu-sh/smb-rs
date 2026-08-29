@@ -94,12 +94,14 @@ impl Pipe {
         &self,
         request: Bytes,
         max_response: u32,
+        operation: FileOperationOptions,
     ) -> crate::Result<Bytes> {
         let response = self
             .handle
-            .fsctl_with_options(
+            .fsctl_with_operation(
                 PipeTransceiveRequest::from(IoctlBuffer::from(request.to_vec())),
                 max_response,
+                operation,
             )
             .await?;
         Ok(Bytes::copy_from_slice(response.as_ref()))

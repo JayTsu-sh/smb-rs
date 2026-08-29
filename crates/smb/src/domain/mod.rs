@@ -803,7 +803,14 @@ impl Pipe {
                         "pipe transact permits only ReplayPolicy::Never".into(),
                     ));
                 }
-                self.inner.transact(request, max_response).await
+                self.inner
+                    .transact(
+                        request,
+                        max_response,
+                        context.remaining()?,
+                        context.cancellation.clone(),
+                    )
+                    .await
             })
         })
     }

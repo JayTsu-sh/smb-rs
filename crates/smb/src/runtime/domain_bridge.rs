@@ -229,8 +229,24 @@ impl RuntimePipe {
             .await
     }
 
-    pub(crate) async fn transact(&self, request: Bytes, max_response: u32) -> crate::Result<Bytes> {
-        self.inner.transact_bytes(request, max_response).await
+    pub(crate) async fn transact(
+        &self,
+        request: Bytes,
+        max_response: u32,
+        timeout: Option<std::time::Duration>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> crate::Result<Bytes> {
+        self.inner
+            .transact_bytes(
+                request,
+                max_response,
+                FileOperationOptions {
+                    timeout,
+                    cancellation: Some(cancellation),
+                    replay: crate::runtime::ReplayPolicy::NeverReplay,
+                },
+            )
+            .await
     }
 
     pub(crate) async fn close(&self) -> crate::Result<()> {
