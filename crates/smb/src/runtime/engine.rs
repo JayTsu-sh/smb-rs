@@ -2297,7 +2297,7 @@ mod tests {
         assert_eq!(report.failed_tasks, 0);
         assert_eq!(
             ticket.completion().await,
-            Ok(TerminalOutcome::GenerationLost)
+            Ok(TerminalOutcome::OutcomeUnknown)
         );
     }
 
@@ -2542,7 +2542,7 @@ mod tests {
         assert_eq!(report.joined_tasks + report.failed_tasks, 2);
         assert_eq!(
             ticket.completion().await,
-            Ok(TerminalOutcome::GenerationLost)
+            Ok(TerminalOutcome::OutcomeUnknown)
         );
     }
 

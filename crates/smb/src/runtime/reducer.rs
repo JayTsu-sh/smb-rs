@@ -205,7 +205,12 @@ impl RequestRecord {
             RequestEvent::Deadline => self.finish_without_response(TerminalOutcome::TimedOut),
             RequestEvent::Disconnect => {
                 self.tombstone = false;
-                self.publish_once(TerminalOutcome::GenerationLost)
+                let outcome = if self.send.committed() {
+                    TerminalOutcome::OutcomeUnknown
+                } else {
+                    TerminalOutcome::GenerationLost
+                };
+                self.publish_once(outcome)
             }
         }
     }
@@ -303,6 +308,17 @@ mod tests {
             request.caller(),
             CallerOutcome::Terminal(TerminalOutcome::OutcomeUnknown)
         );
+    }
+
+    #[test]
+    fn disconnect_after_partial_write_is_outcome_unknown_without_a_tombstone() {
+        let mut request = RequestRecord::new(KEY);
+        request.reduce(RequestEvent::WriteProgress { bytes: 1 });
+        assert_eq!(
+            request.reduce(RequestEvent::Disconnect),
+            ReduceEffect::Publish(TerminalOutcome::OutcomeUnknown)
+        );
+        assert!(!request.is_tombstone());
     }
 
     #[test]
