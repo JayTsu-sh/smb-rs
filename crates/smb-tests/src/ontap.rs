@@ -3,6 +3,10 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 
 const PREFIX: &str = "smbrs";
 
@@ -274,4 +278,153 @@ impl Inventory {
         self.resources.insert(kind, to);
         Ok(())
     }
+
+    fn validate(&self, plan: &Plan) -> Result<(), String> {
+        if self.plan_hash != plan.hash() {
+            return Err("manifest plan hash does not match its inventory".into());
+        }
+        let expected = [ResourceKind::Volume, ResourceKind::Share];
+        if self.resources.len() != expected.len()
+            || expected
+                .iter()
+                .any(|kind| !self.resources.contains_key(kind))
+        {
+            return Err("manifest inventory has missing or unknown resources".into());
+        }
+        Ok(())
+    }
+}
+
+/// A durable Validation run whose transition methods persist before they
+/// expose the new state to callers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunManifest {
+    schema_version: u32,
+    plan: Plan,
+    inventory: Inventory,
+    #[serde(skip)]
+    path: PathBuf,
+}
+
+impl RunManifest {
+    pub fn create(path: impl AsRef<Path>, plan: Plan) -> Result<Self, String> {
+        let path = path.as_ref();
+        if path.exists() {
+            return Err(format!("manifest already exists: {}", path.display()));
+        }
+        let manifest = Self {
+            schema_version: 1,
+            inventory: Inventory::new(&plan),
+            plan,
+            path: path.to_owned(),
+        };
+        manifest.persist()?;
+        Ok(manifest)
+    }
+
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
+        let path = path.as_ref();
+        let bytes = fs::read(path).map_err(io_error("read manifest"))?;
+        let mut manifest: Self =
+            serde_json::from_slice(&bytes).map_err(|error| format!("decode manifest: {error}"))?;
+        if manifest.schema_version != 1 {
+            return Err(format!(
+                "unsupported manifest schema version {}",
+                manifest.schema_version
+            ));
+        }
+        manifest.inventory.validate(&manifest.plan)?;
+        manifest.path = path.to_owned();
+        Ok(manifest)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn plan(&self) -> &Plan {
+        &self.plan
+    }
+
+    pub fn state(&self, kind: ResourceKind) -> Option<Lifecycle> {
+        self.inventory.state(kind)
+    }
+
+    pub fn cleanup_order(&self) -> Vec<ResourceKind> {
+        self.inventory.cleanup_order()
+    }
+
+    pub fn record_created(&mut self, kind: ResourceKind) -> Result<(), String> {
+        self.update(|inventory| inventory.record_created(kind))
+    }
+
+    pub fn record_ready(&mut self, kind: ResourceKind) -> Result<(), String> {
+        self.update(|inventory| inventory.record_ready(kind))
+    }
+
+    pub fn record_deleted(&mut self, kind: ResourceKind) -> Result<(), String> {
+        self.update(|inventory| inventory.record_deleted(kind))
+    }
+
+    pub fn record_ownership_mismatch(&mut self, kind: ResourceKind) -> Result<(), String> {
+        self.update(|inventory| inventory.record_ownership_mismatch(kind))
+    }
+
+    pub fn may_delete(&self, kind: ResourceKind) -> Result<(), String> {
+        self.inventory.may_delete(kind)
+    }
+
+    fn update(
+        &mut self,
+        transition: impl FnOnce(&mut Inventory) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut next = self.clone();
+        transition(&mut next.inventory)?;
+        next.persist()?;
+        self.inventory = next.inventory;
+        Ok(())
+    }
+
+    fn persist(&self) -> Result<(), String> {
+        let parent = self
+            .path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "manifest path requires a UTF-8 file name".to_string())?;
+        let temporary = parent.join(format!(".{file_name}.{:016x}.tmp", rand::random::<u64>()));
+        let result = (|| -> Result<(), String> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)
+                .map_err(io_error("create temporary manifest"))?;
+            let bytes = serde_json::to_vec_pretty(self)
+                .map_err(|error| format!("encode manifest: {error}"))?;
+            file.write_all(&bytes)
+                .map_err(io_error("write temporary manifest"))?;
+            file.write_all(b"\n")
+                .map_err(io_error("terminate temporary manifest"))?;
+            file.sync_all()
+                .map_err(io_error("fsync temporary manifest"))?;
+            fs::rename(&temporary, &self.path).map_err(io_error("replace manifest"))?;
+            File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(io_error("fsync manifest directory"))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+}
+
+fn io_error(operation: &'static str) -> impl FnOnce(io::Error) -> String {
+    move |error| format!("{operation}: {error}")
 }

@@ -1,4 +1,6 @@
-use smb_tests::ontap::{ApplyAuthorization, Inventory, Lifecycle, Plan, ResourceKind};
+use smb_tests::ontap::{ApplyAuthorization, Inventory, Lifecycle, Plan, ResourceKind, RunManifest};
+use std::fs;
+use std::path::PathBuf;
 
 fn fixture() -> Plan {
     Plan::new(
@@ -8,6 +10,16 @@ fn fixture() -> Plan {
         "DOMAIN\\test-user",
     )
     .unwrap()
+}
+
+fn temp_manifest(name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "smb-rs-ontap-{name}-{}-{}.json",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let _ = fs::remove_file(&path);
+    path
 }
 
 #[test]
@@ -81,4 +93,47 @@ fn lifecycle_cannot_skip_ready_or_claim_deleted_without_creation() {
         inventory.state(ResourceKind::Volume),
         Some(Lifecycle::Deleted)
     );
+}
+
+#[test]
+fn manifest_persists_each_transition_and_recovers_without_discovery() {
+    let path = temp_manifest("recover");
+    let mut manifest = RunManifest::create(&path, fixture()).unwrap();
+    manifest.record_created(ResourceKind::Volume).unwrap();
+
+    let recovered = RunManifest::load(&path).unwrap();
+    assert_eq!(
+        recovered.state(ResourceKind::Volume),
+        Some(Lifecycle::Created)
+    );
+    assert_eq!(recovered.cleanup_order(), vec![ResourceKind::Volume]);
+    assert_eq!(recovered.path(), path.as_path());
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn failed_atomic_write_does_not_advance_in_memory_or_durable_state() {
+    let path = temp_manifest("rollback");
+    let mut manifest = RunManifest::create(&path, fixture()).unwrap();
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+
+    assert!(manifest.record_created(ResourceKind::Volume).is_err());
+    assert_eq!(
+        manifest.state(ResourceKind::Volume),
+        Some(Lifecycle::Planned)
+    );
+    fs::remove_dir(path).unwrap();
+}
+
+#[test]
+fn tampered_manifest_is_rejected_before_cleanup_authority_is_granted() {
+    let path = temp_manifest("tamper");
+    let manifest = RunManifest::create(&path, fixture()).unwrap();
+    drop(manifest);
+    let original = fs::read_to_string(&path).unwrap();
+    fs::write(&path, original.replace("data-aggr", "other-aggr")).unwrap();
+
+    assert!(RunManifest::load(&path).is_err());
+    fs::remove_file(path).unwrap();
 }
