@@ -9,10 +9,6 @@ use crate::compression;
 use crate::connection::preauth_hash::PreauthHashState;
 use crate::dialects::DialectImpl;
 use crate::lease::{LeaseBreakEvent, LeaseSlot};
-use std::sync::Arc;
-use tokio::select;
-use tokio::sync::{OnceCell, Semaphore};
-use tokio_util::sync::CancellationToken;
 use crate::{Error, crypto, msg_handler::*, session::Session};
 use actor::{ConnectionActor, ConnectionActorHandle};
 use binrw::prelude::*;
@@ -28,8 +24,12 @@ use smb_msg::{
 use smb_transport::*;
 use std::cmp::max;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::time::Instant;
+use tokio::select;
+use tokio::sync::{OnceCell, Semaphore};
+use tokio_util::sync::CancellationToken;
 pub use transformer::TransformError;
 use worker::{Worker, WorkerImpl};
 
@@ -398,18 +398,13 @@ impl Connection {
                     netname: client_netname.into(),
                 }
                 .into(),
-                EncryptionCapabilities {
-                    ciphers: encrypting_algorithms,
-                }
-                .into(),
-                CompressionCapabilities {
-                    flags: CompressionCapsFlags::new()
-                        .with_chained(!compression_algorithms.is_empty()),
-                    compression_algorithms,
-                }
-                .into(),
-                SigningCapabilities { signing_algorithms }.into(),
             ];
+            Self::append_optional_negotiate_contexts(
+                &mut ctx_list,
+                encrypting_algorithms,
+                compression_algorithms,
+                signing_algorithms,
+            );
             // QUIC
             #[cfg(feature = "quic")]
             if matches!(self.config.transport, TransportConfig::Quic(_)) {
@@ -460,7 +455,9 @@ impl Connection {
             capabilities
         };
 
-        let security_mode = NegotiateSecurityMode::new().with_signing_enabled(has_signing);
+        let security_mode = NegotiateSecurityMode::new()
+            .with_signing_enabled(has_signing)
+            .with_signing_required(has_signing);
 
         NegotiateRequest {
             security_mode,
@@ -468,6 +465,34 @@ impl Connection {
             client_guid,
             dialects: supported_dialects,
             negotiate_context_list: ctx_list,
+        }
+    }
+
+    fn append_optional_negotiate_contexts(
+        contexts: &mut Vec<NegotiateContext>,
+        encrypting_algorithms: Vec<EncryptionCipher>,
+        compression_algorithms: Vec<CompressionAlgorithm>,
+        signing_algorithms: Vec<SigningAlgorithmId>,
+    ) {
+        if !encrypting_algorithms.is_empty() {
+            contexts.push(
+                EncryptionCapabilities {
+                    ciphers: encrypting_algorithms,
+                }
+                .into(),
+            );
+        }
+        if !compression_algorithms.is_empty() {
+            contexts.push(
+                CompressionCapabilities {
+                    flags: CompressionCapsFlags::new().with_chained(true),
+                    compression_algorithms,
+                }
+                .into(),
+            );
+        }
+        if !signing_algorithms.is_empty() {
+            contexts.push(SigningCapabilities { signing_algorithms }.into());
         }
     }
 
@@ -1015,7 +1040,11 @@ impl ConnectionMessageHandler {
     /// server has already revoked.
     async fn apply_lease_break(&self, event: &LeaseBreakEvent) {
         let event_key = event.lease_key.as_u128();
-        let matching = match self.actor.apply_lease_break(event_key, event.new_state).await {
+        let matching = match self
+            .actor
+            .apply_lease_break(event_key, event.new_state)
+            .await
+        {
             Ok(m) => m,
             Err(_) => {
                 // Connection actor has shut down — break fan-out is a
@@ -1326,7 +1355,11 @@ impl MessageHandler for ConnectionMessageHandler {
         // that distinguishes unknown session_id (warn and drop) from a
         // known-but-dropped session (raise InvalidState to surface the
         // ordering bug to callers).
-        let session = match self.actor.get_session(msg.message.header.session_id).await? {
+        let session = match self
+            .actor
+            .get_session(msg.message.header.session_id)
+            .await?
+        {
             Ok(Some(handler)) => handler,
             Ok(None) => {
                 tracing::warn!(
@@ -1486,5 +1519,17 @@ impl Drop for ConnectionMessageHandler {
         tokio::task::spawn(async move {
             worker.stop().await.ok();
         });
+    }
+}
+
+#[cfg(test)]
+mod negotiate_context_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_algorithms_do_not_emit_empty_capability_contexts() {
+        let mut contexts = Vec::new();
+        Connection::append_optional_negotiate_contexts(&mut contexts, vec![], vec![], vec![]);
+        assert!(contexts.is_empty());
     }
 }

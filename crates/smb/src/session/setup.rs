@@ -170,12 +170,18 @@ where
                 None => self.authenticator.next(&[]).await?,
             };
             let is_auth_done = self.authenticator.is_authenticated()?;
+            if is_auth_done && next_buf.is_empty() {
+                break;
+            }
+            let is_final_request = is_auth_done || self.authenticator.session_key().is_ok();
 
             // Branches on is_auth_done; see send_final_setup_request for
             // the signing + preauth-hash contract.
-            let request = self.send_setup_request(next_buf).await?;
+            let request = self.send_setup_request(next_buf, is_final_request).await?;
 
-            let response = self.receive_setup_response(request.msg_id).await?;
+            let response = self
+                .receive_setup_response(request.msg_id, is_final_request)
+                .await?;
             let message_form = response.form;
             let session_id = response.message.header.session_id;
             let session_setup_response = response.message.content.to_sessionsetup()?;
@@ -191,7 +197,7 @@ where
                 self.set_session(session_info).await?;
             }
 
-            if is_auth_done
+            if is_final_request
                 && !session_setup_response
                     .session_flags
                     .is_guest_or_null_session()
@@ -206,7 +212,10 @@ where
             // bookkeeping needed.
 
             self.flags = Some(session_setup_response.session_flags);
-            self.last_setup_response = Some(session_setup_response)
+            self.last_setup_response = Some(session_setup_response);
+            if is_final_request {
+                break;
+            }
         }
 
         self.flags.ok_or(Error::InvalidState(
@@ -363,10 +372,14 @@ where
         Ok(())
     }
 
-    async fn receive_setup_response(&mut self, for_msg_id: u64) -> crate::Result<IncomingMessage> {
+    async fn receive_setup_response(
+        &mut self,
+        for_msg_id: u64,
+        is_final_request: bool,
+    ) -> crate::Result<IncomingMessage> {
         let is_auth_done = self.authenticator.is_authenticated()?;
 
-        let expected_status = if is_auth_done {
+        let expected_status = if is_final_request {
             &[Status::Success]
         } else {
             &[Status::MoreProcessingRequired]
@@ -422,11 +435,14 @@ where
         })
     }
 
-    async fn send_setup_request(&mut self, buf: Vec<u8>) -> crate::Result<SendMessageResult> {
+    async fn send_setup_request(
+        &mut self,
+        buf: Vec<u8>,
+        is_final_request: bool,
+    ) -> crate::Result<SendMessageResult> {
         let request = self.make_request(buf);
-        let is_auth_done = self.authenticator.is_authenticated()?;
 
-        if is_auth_done {
+        if is_final_request {
             self.send_final_setup_request(request).await
         } else {
             self.send_intermediate_setup_request(request).await

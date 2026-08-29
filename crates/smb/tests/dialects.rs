@@ -1,4 +1,4 @@
-use common::{TestConstants, make_server_connection};
+use common::{make_server_connection, smb_tests_share};
 use futures_util::StreamExt;
 use serial_test::serial;
 use smb::{
@@ -51,8 +51,8 @@ async fn test_smb_integration_dialect_encrpytion_mode(
         ..Default::default()
     };
 
-    let (client, share_path) =
-        make_server_connection(TestConstants::DEFAULT_SHARE, Some(connection_config)).await?;
+    let share = smb_tests_share();
+    let (client, share_path) = make_server_connection(&share, Some(connection_config)).await?;
 
     const TEST_FILE: &str = "test.txt";
     const TEST_DATA: &[u8] = b"Hello, World!";
@@ -144,9 +144,10 @@ async fn test_smb_integration_dialect_encrpytion_mode(
 
     // Query file info.
     let all_info = file.query_info::<FileAllInformation>().await?;
-    assert_eq!(
-        all_info.name.file_name.to_string(),
-        "\\".to_string() + TEST_FILE
+    let returned_name = all_info.name.file_name.to_string();
+    assert!(
+        returned_name.starts_with('\\') && returned_name.ends_with(&format!("\\{TEST_FILE}")),
+        "unexpected SMB file name: {returned_name}"
     );
 
     // Query filesystem info.

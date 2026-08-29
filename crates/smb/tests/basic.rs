@@ -4,7 +4,7 @@ mod common;
 use std::str::FromStr;
 use std::time::Duration;
 
-use common::{TestConstants, TestEnv, make_server_connection};
+use common::{TestConstants, TestEnv, make_server_connection, smb_tests_share};
 use serial_test::serial;
 use smb::{Client, ClientConfig, UncPath};
 use smb::{ConnectionConfig, FileCreateArgs};
@@ -16,8 +16,9 @@ async fn _do_minimal_connection_test(
     conn_config: Option<ConnectionConfig>,
     share: Option<&str>,
 ) -> smb::Result<()> {
+    let configured_share = smb_tests_share();
     let (client, share_path) =
-        make_server_connection(share.unwrap_or(TestConstants::DEFAULT_SHARE), conn_config).await?;
+        make_server_connection(share.unwrap_or(&configured_share), conn_config).await?;
 
     // Create a file
     let file = client

@@ -53,16 +53,18 @@ impl MessageSigner {
         header: &mut Header,
         data: &[u8],
     ) -> crate::Result<u128> {
-        // Write header with signature set to 0.
-        let signature_backup = header.signature;
-        header.signature = 0;
-        let mut header_bytes = Cursor::new([0; Header::STRUCT_SIZE]);
-        header.write(&mut header_bytes)?;
-        header.signature = signature_backup;
+        if data.len() < Header::STRUCT_SIZE {
+            return Err(Error::InvalidMessage(
+                "Signed message is shorter than the SMB2 header".to_string(),
+            ));
+        }
+        let mut header_bytes = [0u8; Header::STRUCT_SIZE];
+        header_bytes.copy_from_slice(&data[..Header::STRUCT_SIZE]);
+        header_bytes[48..64].fill(0);
 
         // Start signing session with the header.
         self.signing_algo.start(header);
-        self.signing_algo.update(&header_bytes.into_inner());
+        self.signing_algo.update(&header_bytes);
 
         // Skip the header portion of the raw data.
         if data.len() >= Header::STRUCT_SIZE {

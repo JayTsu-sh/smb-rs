@@ -22,6 +22,69 @@ pub struct Authenticator {
 }
 
 impl Authenticator {
+    fn canonicalize_ber_token(token: Vec<u8>) -> Vec<u8> {
+        fn encode_length(length: usize, output: &mut Vec<u8>) {
+            if length < 128 {
+                output.push(length as u8);
+            } else if length <= u8::MAX as usize {
+                output.extend_from_slice(&[0x81, length as u8]);
+            } else if length <= u16::MAX as usize {
+                output.push(0x82);
+                output.extend_from_slice(&(length as u16).to_be_bytes());
+            }
+        }
+
+        fn canonicalize_one(input: &[u8]) -> Option<(Vec<u8>, usize)> {
+            if input.len() < 2 {
+                return None;
+            }
+            let tag = input[0];
+            let first_len = input[1];
+            let (header_len, value_len) = if first_len & 0x80 == 0 {
+                (2, first_len as usize)
+            } else {
+                let count = (first_len & 0x7f) as usize;
+                if count == 0 || count > 2 || input.len() < 2 + count {
+                    return None;
+                }
+                let mut length = 0usize;
+                for byte in &input[2..2 + count] {
+                    length = (length << 8) | *byte as usize;
+                }
+                (2 + count, length)
+            };
+            let consumed = header_len.checked_add(value_len)?;
+            if consumed > input.len() {
+                return None;
+            }
+
+            let value = &input[header_len..consumed];
+            let canonical_value = if tag & 0x20 != 0 {
+                let mut result = Vec::with_capacity(value.len());
+                let mut offset = 0;
+                while offset < value.len() {
+                    let (child, child_len) = canonicalize_one(&value[offset..])?;
+                    result.extend_from_slice(&child);
+                    offset += child_len;
+                }
+                result
+            } else {
+                value.to_vec()
+            };
+
+            let mut result = Vec::with_capacity(1 + canonical_value.len() + 3);
+            result.push(tag);
+            encode_length(canonical_value.len(), &mut result);
+            result.extend_from_slice(&canonical_value);
+            Some((result, consumed))
+        }
+
+        match canonicalize_one(&token) {
+            Some((canonical, consumed)) if consumed == token.len() => canonical,
+            _ => token,
+        }
+    }
+
     pub fn build(
         identity: AuthIdentity,
         conn_info: &Arc<ConnectionInfo>,
@@ -151,7 +214,10 @@ impl GssState for Authenticator {
         }
 
         let mut input_buffers = vec![];
-        input_buffers.push(SecurityBuffer::new(gss_token.to_owned(), BufferType::Token));
+        input_buffers.push(SecurityBuffer::new(
+            Self::canonicalize_ber_token(gss_token.to_owned()),
+            BufferType::Token,
+        ));
         builder = builder.with_input(&mut input_buffers);
 
         let result = {
@@ -181,5 +247,17 @@ impl GssState for Authenticator {
             .buffer;
 
         Ok(output_buffer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Authenticator;
+
+    #[test]
+    fn canonicalizes_non_minimal_ber_lengths_without_changing_values() {
+        let ber = vec![0xa1, 0x81, 0x06, 0x30, 0x81, 0x03, 0x0a, 0x01, 0x01];
+        let der = Authenticator::canonicalize_ber_token(ber);
+        assert_eq!(der, vec![0xa1, 0x05, 0x30, 0x03, 0x0a, 0x01, 0x01]);
     }
 }
