@@ -7,7 +7,7 @@ use std::{
 use bytes::Bytes;
 use futures_core::future::BoxFuture;
 
-use super::{File, Operation, operation::OperationContext};
+use super::{CancelToken, File, Operation, operation::OperationContext};
 use crate::Error;
 
 type ErasedValue = Box<dyn Any + Send>;
@@ -303,7 +303,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut batch = Batch::new();
         batch.push(command(Arc::clone(&calls), "must-not-run", Ok(1_u8)));
-        let cancellation = crate::CancelToken::new();
+        let cancellation = CancelToken::new();
         cancellation.cancel();
 
         assert!(matches!(
