@@ -35,7 +35,7 @@ pub(crate) enum SendProgress {
 }
 
 impl SendProgress {
-    const fn committed(self) -> bool {
+    pub(crate) const fn committed(self) -> bool {
         matches!(self, Self::Partial { .. } | Self::Complete)
     }
 }
@@ -53,6 +53,7 @@ pub(crate) enum TerminalOutcome {
     Cancelled,
     TimedOut,
     OutcomeUnknown,
+    PreparationFailed,
     GenerationLost,
 }
 
@@ -121,6 +122,22 @@ impl RequestRecord {
 
     pub(crate) const fn is_tombstone(&self) -> bool {
         self.tombstone
+    }
+
+    pub(crate) const fn wire_committed(&self) -> bool {
+        self.send.committed()
+    }
+
+    /// A validated server response proves that the complete request reached
+    /// the wire even when its pump completion event is still queued.
+    pub(crate) fn observe_response_commitment(&mut self) {
+        if !self.send.committed() {
+            self.send = SendProgress::Complete;
+        }
+    }
+
+    pub(crate) fn publish_terminal(&mut self, outcome: TerminalOutcome) -> ReduceEffect {
+        self.publish_once(outcome)
     }
 
     pub(crate) fn reduce(&mut self, event: RequestEvent) -> ReduceEffect {
