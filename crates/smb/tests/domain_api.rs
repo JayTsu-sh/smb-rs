@@ -1,6 +1,8 @@
 use bytes::Bytes;
 #[cfg(feature = "real-server-tests")]
-use smb::{CancelToken, Error};
+use futures_util::StreamExt;
+#[cfg(feature = "real-server-tests")]
+use smb::{CancelToken, DirectoryEvent, DirectoryWatchOptions, Error};
 use smb::{
     Client, ClientConfig, CloseOutcome, Credentials, Directory, DirectoryOpenOptions, File,
     FileCursor, FileOpenOptions, Pipe, PipeName, ReplayPolicy, Session, Share, SharePath,
@@ -114,6 +116,68 @@ async fn domain_spine_roundtrips_without_protocol_escape_hatches() -> smb::Resul
         .connect_share(&target, common::smb_test_credentials())
         .await?;
     let path = SharePath::new("domain-spine-roundtrip.bin")?;
+
+    let directory_path = SharePath::new("domain-directory-roundtrip")?;
+    let directory = share
+        .open_directory(&directory_path, DirectoryOpenOptions::create_new())
+        .timeout(Duration::from_secs(10))
+        .await?;
+    let cancel_watch = CancelToken::new();
+    let mut events = directory.watch(
+        DirectoryWatchOptions::default()
+            .recursive(true)
+            .cancellation(cancel_watch.clone()),
+    );
+    let original = SharePath::new("domain-directory-roundtrip/event-original.bin")?;
+    let renamed = SharePath::new("domain-directory-roundtrip/event-renamed.bin")?;
+    let observe = async {
+        let mut added = false;
+        let mut renamed_pair = false;
+        let mut removed = false;
+        while !(added && renamed_pair && removed) {
+            match events.next().await.transpose()? {
+                Some(DirectoryEvent::Added { path }) if path == "event-original.bin" => {
+                    added = true
+                }
+                Some(DirectoryEvent::Renamed { from, to })
+                    if from == "event-original.bin" && to == "event-renamed.bin" =>
+                {
+                    renamed_pair = true
+                }
+                Some(DirectoryEvent::Removed { path }) if path == "event-renamed.bin" => {
+                    removed = true
+                }
+                Some(_) => {}
+                None => return Err(Error::InvalidState("directory event stream ended".into())),
+            }
+        }
+        smb::Result::Ok(())
+    };
+    let mutate = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let event_file = share
+            .open_file(&original, FileOpenOptions::overwrite())
+            .await?;
+        event_file.rename(&renamed).await?;
+        let entries = directory.collect_entries("*").await?;
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.name() == "event-renamed.bin")
+        );
+        event_file.delete().await?;
+        event_file.close().await?;
+        smb::Result::Ok(())
+    };
+    tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::try_join!(observe, mutate)
+    })
+    .await
+    .map_err(|_| Error::InvalidState("directory event validation timed out".into()))??;
+    cancel_watch.cancel();
+    drop(events);
+    directory.delete().await?;
+    assert_eq!(directory.close().await?, CloseOutcome::Confirmed);
 
     let cancellation = CancelToken::new();
     cancellation.cancel();

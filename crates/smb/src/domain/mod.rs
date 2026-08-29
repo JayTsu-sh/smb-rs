@@ -544,6 +544,20 @@ impl File {
         self.inner.delete().await
     }
 
+    pub fn rename<'a>(&'a self, destination: &'a SharePath) -> Operation<'a, ()> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                if context.replay != ReplayPolicy::Never {
+                    return Err(Error::UnsupportedOperation(
+                        "file rename permits only ReplayPolicy::Never".into(),
+                    ));
+                }
+                self.inner.rename(destination.as_str()).await
+            })
+        })
+    }
+
     pub fn close(&self) -> Operation<'_, CloseOutcome> {
         Operation::new(move |context| {
             Box::pin(async move {

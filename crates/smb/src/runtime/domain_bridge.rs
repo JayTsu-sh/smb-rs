@@ -11,7 +11,7 @@ use futures_core::Stream;
 use futures_util::TryStreamExt;
 use smb_fscc::{
     FileAccessMask, FileAttributes, FileDirectoryInformation, FileDispositionInformation,
-    NotifyAction,
+    FileRenameInformation, NotifyAction,
 };
 use smb_msg::{CreateOptions, NotifyFilter};
 use sspi::{AuthIdentity, Secret, Username};
@@ -390,6 +390,16 @@ impl RuntimeFile {
     pub(crate) async fn delete(&self) -> crate::Result<()> {
         self.inner
             .set_info(FileDispositionInformation::default())
+            .await
+    }
+
+    pub(crate) async fn rename(&self, path: &str) -> crate::Result<()> {
+        self.inner
+            .set_info(FileRenameInformation {
+                replace_if_exists: false.into(),
+                root_directory: 0,
+                file_name: path.into(),
+            })
             .await
     }
 
