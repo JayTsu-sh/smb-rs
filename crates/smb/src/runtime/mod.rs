@@ -8,6 +8,9 @@
 // transition-local allowance here avoids weakening warnings crate-wide.
 #[allow(dead_code)]
 mod engine;
+// Activated by W3-5 as the bootstrap path is cut over incrementally.
+#[allow(dead_code)]
+mod operation;
 #[allow(dead_code)]
 mod reducer;
 #[allow(dead_code)]
