@@ -1,5 +1,8 @@
 //! SMB domain handles.
 
+mod operation;
+pub use operation::{CancelToken, Deadline, Operation, ReplayPolicy};
+
 use std::{collections::HashMap, sync::{Arc, Weak}};
 
 use bytes::Bytes;
@@ -205,13 +208,19 @@ pub struct Share {
 }
 
 impl Share {
-    pub async fn open_file(
-        &self,
+    pub fn open_file<'a>(
+        &'a self,
         path: &SharePath,
         options: FileOpenOptions,
-    ) -> crate::Result<File> {
-        let inner = self.inner.open_file(path.as_str(), options.mode).await?;
-        Ok(File { inner })
+    ) -> Operation<'a, File> {
+        let path = path.clone();
+        Operation::new(move |context| {
+            Box::pin(async move {
+                let _replay = context.replay;
+                let inner = self.inner.open_file(path.as_str(), options.mode).await?;
+                Ok(File { inner })
+            })
+        })
     }
 
     pub async fn close(&self) -> crate::Result<()> {
@@ -232,12 +241,22 @@ pub struct File {
 }
 
 impl File {
-    pub async fn read_at(&self, offset: u64, max_len: u32) -> crate::Result<Bytes> {
-        self.inner.read_at(offset, max_len).await
+    pub fn read_at(&self, offset: u64, max_len: u32) -> Operation<'_, Bytes> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                let _replay = context.replay;
+                self.inner.read_at(offset, max_len).await
+            })
+        })
     }
 
-    pub async fn write_at(&self, offset: u64, bytes: Bytes) -> crate::Result<usize> {
-        self.inner.write_at(offset, bytes).await
+    pub fn write_at(&self, offset: u64, bytes: Bytes) -> Operation<'_, usize> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                let _replay = context.replay;
+                self.inner.write_at(offset, bytes).await
+            })
+        })
     }
 
     pub async fn delete(&self) -> crate::Result<()> {

@@ -42,7 +42,7 @@ pub use client::UncPath;
 pub use connection::ConnectionConfig;
 pub use domain::{
     Credentials, Directory, File, FileOpenOptions, Pipe, Resource, Session, Share, SharePath,
-    ShareTarget,
+    ShareTarget, CancelToken, Deadline, Operation, ReplayPolicy,
 };
 pub use error::Error;
 pub use facade::{Client, ClientConfig};
