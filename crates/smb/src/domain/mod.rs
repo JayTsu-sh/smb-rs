@@ -11,6 +11,8 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures_core::Stream;
+use futures_util::{StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
@@ -545,22 +547,25 @@ pub struct Directory {
     close_authority: FileCloseAuthority,
 }
 
+pub type DirectoryEntries<'a> =
+    std::pin::Pin<Box<dyn Stream<Item = crate::Result<DirectoryEntry>> + Send + 'a>>;
+
 impl Directory {
+    pub fn entries<'a>(&'a self, pattern: &'a str) -> DirectoryEntries<'a> {
+        Box::pin(self.inner.entries(pattern).map(|result| {
+            result.map(|entry| DirectoryEntry {
+                name: entry.name,
+                is_directory: entry.is_directory,
+                len: entry.len,
+            })
+        }))
+    }
+
     pub fn collect_entries<'a>(&'a self, pattern: &'a str) -> Operation<'a, Vec<DirectoryEntry>> {
         Operation::new(move |context| {
             Box::pin(async move {
                 context.remaining()?;
-                Ok(self
-                    .inner
-                    .collect_entries(pattern)
-                    .await?
-                    .into_iter()
-                    .map(|entry| DirectoryEntry {
-                        name: entry.name,
-                        is_directory: entry.is_directory,
-                        len: entry.len,
-                    })
-                    .collect())
+                self.entries(pattern).try_collect().await
             })
         })
     }

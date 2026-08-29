@@ -4,9 +4,10 @@
 //! objects while their implementations are moved behind the runtime/domain
 //! boundary during W5.
 
-use std::sync::Arc;
+use std::{pin::Pin, sync::Arc};
 
 use bytes::Bytes;
+use futures_core::Stream;
 use futures_util::TryStreamExt;
 use smb_fscc::{
     FileAccessMask, FileAttributes, FileDirectoryInformation, FileDispositionInformation,
@@ -182,19 +183,21 @@ pub(crate) struct RuntimeDirectory {
 }
 
 impl RuntimeDirectory {
-    pub(crate) async fn collect_entries(
-        &self,
-        pattern: &str,
-    ) -> crate::Result<Vec<RuntimeDirectoryEntry>> {
-        LegacyDirectory::query::<FileDirectoryInformation>(&self.inner, pattern)
-            .await?
+    pub(crate) fn entries<'a>(
+        &'a self,
+        pattern: &'a str,
+    ) -> Pin<Box<dyn Stream<Item = crate::Result<RuntimeDirectoryEntry>> + Send + 'a>> {
+        Box::pin(
+            futures_util::stream::once(async move {
+                LegacyDirectory::query::<FileDirectoryInformation>(&self.inner, pattern).await
+            })
+            .try_flatten()
             .map_ok(|entry| RuntimeDirectoryEntry {
                 name: entry.file_name.to_string(),
                 is_directory: entry.file_attributes.directory(),
                 len: entry.end_of_file,
-            })
-            .try_collect()
-            .await
+            }),
+        )
     }
 
     pub(crate) async fn delete(&self) -> crate::Result<()> {

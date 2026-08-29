@@ -41,7 +41,7 @@ pub mod test_support {
 pub use client::UncPath;
 pub use connection::ConnectionConfig;
 pub use domain::{
-    CancelToken, CloseOutcome, Credentials, Deadline, Directory, DirectoryEntry,
+    CancelToken, CloseOutcome, Credentials, Deadline, Directory, DirectoryEntries, DirectoryEntry,
     DirectoryOpenOptions, File, FileCursor, FileOpenOptions, Operation, Pipe, ReplayPolicy,
     Resource, Session, Share, SharePath, ShareTarget,
 };
