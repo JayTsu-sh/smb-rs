@@ -43,7 +43,7 @@ pub use connection::ConnectionConfig;
 pub use domain::{
     CancelToken, CloseOutcome, Credentials, Deadline, Directory, DirectoryEntries, DirectoryEntry,
     DirectoryEvent, DirectoryEvents, DirectoryOpenOptions, DirectoryWatchOptions, File, FileCursor,
-    FileOpenOptions, Operation, Pipe, ReplayPolicy, Resource, Session, Share, SharePath,
+    FileOpenOptions, Operation, Pipe, PipeName, ReplayPolicy, Resource, Session, Share, SharePath,
     ShareTarget,
 };
 pub use error::Error;

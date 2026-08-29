@@ -20,7 +20,7 @@ use crate::{
     Error,
     client::{Client as LegacyClient, ClientConfig as LegacyClientConfig, UncPath},
     resource::{
-        Directory as LegacyDirectory, File as LegacyFile, FileCreateArgs,
+        Directory as LegacyDirectory, File as LegacyFile, FileCreateArgs, Pipe as LegacyPipe,
         Resource as LegacyResource, file::FileOperationOptions,
     },
     session::Session as LegacySession,
@@ -168,8 +168,73 @@ impl RuntimeShare {
         }
     }
 
+    pub(crate) async fn open_pipe(&self, name: &str) -> crate::Result<RuntimePipe> {
+        match self
+            .inner
+            .create(name, &FileCreateArgs::make_pipe())
+            .await?
+        {
+            LegacyResource::Pipe(pipe) => Ok(RuntimePipe { inner: pipe }),
+            _ => Err(Error::InvalidState(
+                "server returned a non-pipe resource".into(),
+            )),
+        }
+    }
+
     pub(crate) async fn close(&self) -> crate::Result<()> {
         self.inner.disconnect().await
+    }
+}
+
+pub(crate) struct RuntimePipe {
+    inner: LegacyPipe,
+}
+
+impl RuntimePipe {
+    pub(crate) async fn read(
+        &self,
+        max_len: u32,
+        timeout: Option<std::time::Duration>,
+        cancellation: tokio_util::sync::CancellationToken,
+        replay: crate::runtime::ReplayPolicy,
+    ) -> crate::Result<Bytes> {
+        self.inner
+            .read_bytes_with_options(
+                max_len,
+                FileOperationOptions {
+                    timeout,
+                    cancellation: Some(cancellation),
+                    replay,
+                },
+            )
+            .await
+    }
+
+    pub(crate) async fn write(
+        &self,
+        bytes: Bytes,
+        timeout: Option<std::time::Duration>,
+        cancellation: tokio_util::sync::CancellationToken,
+        replay: crate::runtime::ReplayPolicy,
+    ) -> crate::Result<usize> {
+        self.inner
+            .write_bytes_with_options(
+                bytes,
+                FileOperationOptions {
+                    timeout,
+                    cancellation: Some(cancellation),
+                    replay,
+                },
+            )
+            .await
+    }
+
+    pub(crate) async fn transact(&self, request: Bytes, max_response: u32) -> crate::Result<Bytes> {
+        self.inner.transact_bytes(request, max_response).await
+    }
+
+    pub(crate) async fn close(&self) -> crate::Result<()> {
+        self.inner.close().await
     }
 }
 

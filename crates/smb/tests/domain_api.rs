@@ -3,7 +3,8 @@ use bytes::Bytes;
 use smb::{CancelToken, Error};
 use smb::{
     Client, ClientConfig, CloseOutcome, Credentials, Directory, DirectoryOpenOptions, File,
-    FileCursor, FileOpenOptions, ReplayPolicy, Session, Share, SharePath, ShareTarget,
+    FileCursor, FileOpenOptions, Pipe, PipeName, ReplayPolicy, Session, Share, SharePath,
+    ShareTarget,
 };
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
@@ -22,6 +23,7 @@ fn public_spine_types_are_send_sync_and_domain_named() {
     assert_send_sync::<Share>();
     assert_send_sync::<File>();
     assert_send_sync::<Directory>();
+    assert_send_sync::<Pipe>();
     assert_clone::<Client>();
     assert_clone::<Session>();
     assert_clone::<Share>();
@@ -34,6 +36,18 @@ fn public_spine_types_are_send_sync_and_domain_named() {
         SharePath::new("dir/file.bin").unwrap().as_str(),
         "dir\\file.bin"
     );
+    assert_eq!(PipeName::new("srvsvc").unwrap().as_str(), "srvsvc");
+    assert!(PipeName::new("dir/pipe").is_err());
+}
+
+#[allow(dead_code)]
+async fn pipe_operations_compile(share: &Share) -> smb::Result<()> {
+    let pipe = share.open_pipe(&PipeName::new("srvsvc")?).await?;
+    pipe.write(Bytes::from_static(b"request")).await?;
+    let _ = pipe.read(4096).await?;
+    let _ = pipe.transact(Bytes::from_static(b"request"), 4096).await?;
+    assert_eq!(pipe.close().await?, CloseOutcome::Confirmed);
+    Ok(())
 }
 
 #[allow(dead_code)]

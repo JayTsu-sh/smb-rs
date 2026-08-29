@@ -96,6 +96,30 @@ impl SharePath {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct PipeName(String);
+
+impl PipeName {
+    pub fn new(name: impl Into<String>) -> crate::Result<Self> {
+        let name = name.into();
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains(['/', '\\'])
+            || name.chars().any(char::is_control)
+        {
+            return Err(Error::InvalidArgument(
+                "pipe name must be one non-empty relative component".into(),
+            ));
+        }
+        Ok(Self(name))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileOpenOptions {
     mode: OpenMode,
@@ -276,6 +300,24 @@ impl Share {
                     .await?;
                 Ok(Directory {
                     inner,
+                    close_authority: FileCloseAuthority::new(),
+                })
+            })
+        })
+    }
+
+    pub fn open_pipe<'a>(&'a self, name: &PipeName) -> Operation<'a, Pipe> {
+        let name = name.clone();
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                if context.replay != ReplayPolicy::Never {
+                    return Err(Error::UnsupportedOperation(
+                        "pipe open permits only ReplayPolicy::Never".into(),
+                    ));
+                }
+                Ok(Pipe {
+                    inner: self.inner.open_pipe(name.as_str()).await?,
                     close_authority: FileCloseAuthority::new(),
                 })
             })
@@ -702,7 +744,70 @@ impl Directory {
     }
 }
 
-pub struct Pipe;
+pub struct Pipe {
+    inner: crate::runtime::domain_bridge::RuntimePipe,
+    close_authority: FileCloseAuthority,
+}
+
+impl Pipe {
+    pub fn read(&self, max_len: u32) -> Operation<'_, Bytes> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                self.inner
+                    .read(
+                        max_len,
+                        context.remaining()?,
+                        context.cancellation.clone(),
+                        context.runtime_replay(),
+                    )
+                    .await
+            })
+        })
+    }
+
+    pub fn write(&self, bytes: Bytes) -> Operation<'_, usize> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                self.inner
+                    .write(
+                        bytes,
+                        context.remaining()?,
+                        context.cancellation.clone(),
+                        context.runtime_replay(),
+                    )
+                    .await
+            })
+        })
+    }
+
+    pub fn transact(&self, request: Bytes, max_response: u32) -> Operation<'_, Bytes> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                if context.replay != ReplayPolicy::Never {
+                    return Err(Error::UnsupportedOperation(
+                        "pipe transact permits only ReplayPolicy::Never".into(),
+                    ));
+                }
+                self.inner.transact(request, max_response).await
+            })
+        })
+    }
+
+    pub fn close(&self) -> Operation<'_, CloseOutcome> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                if context.replay != ReplayPolicy::Never {
+                    return Err(Error::UnsupportedOperation(
+                        "pipe close permits only ReplayPolicy::Never".into(),
+                    ));
+                }
+                self.close_authority.close_with(|| self.inner.close()).await
+            })
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {
