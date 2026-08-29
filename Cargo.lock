@@ -2704,8 +2704,10 @@ version = "0.12.0"
 dependencies = [
  "binrw",
  "hex",
+ "rand 0.8.5",
  "serde",
  "serde_json",
+ "sha2",
  "syn 2.0.111",
  "tokio",
 ]
