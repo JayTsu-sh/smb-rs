@@ -2,6 +2,7 @@ mod common;
 use common::*;
 use serial_test::serial;
 use smb::*;
+use smb::{protocol::*, resource::File};
 use std::result::Result;
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]

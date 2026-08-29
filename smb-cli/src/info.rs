@@ -1,12 +1,12 @@
 use crate::Cli;
 use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
-use smb::{FileAccessMask, FileBasicInformation, QueryQuotaInfo, UncPath, client::Client, resource::*};
+use smb::{UncPath, client::Client, protocol::{FileAccessMask, FileBasicInformation, QueryQuotaInfo}, resource::*};
 use std::collections::VecDeque;
 use std::fmt::Display;
 use std::{error::Error, sync::Arc};
 
-type DirectoryInfoQueryType = smb::FileIdBothDirectoryInformation;
+type DirectoryInfoQueryType = smb::protocol::FileIdBothDirectoryInformation;
 
 /// Recursion mode options
 #[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq, PartialOrd, Ord)]
@@ -84,7 +84,7 @@ pub async fn info(cmd: &InfoCmd, cli: &Cli) -> Result<(), Box<dyn Error>> {
             tracing::info!("  - Last access time: {}", info.last_access_time);
             if cmd.show_ea {
                 tracing::info!("  - Extended Attributes (EA):");
-                let basic_ea_info = file.query_info::<smb::FileEaInformation>().await?;
+                let basic_ea_info = file.query_info::<smb::protocol::FileEaInformation>().await?;
                 if basic_ea_info.ea_size > 0 {
                     let ea_info = file
                         .query_full_ea_info_with_options(
@@ -151,7 +151,7 @@ fn display_item_info(info: &DirectoryInfoQueryType, dir_path: &UncPath) {
     }
 }
 
-fn display_quota_info(info: &Vec<smb::FileQuotaInformation>) {
+fn display_quota_info(info: &Vec<smb::protocol::FileQuotaInformation>) {
     for quota in info {
         if quota.quota_limit == u64::MAX && quota.quota_threshold == u64::MAX {
             tracing::trace!("Skipping quota for SID {} with no limit", quota.sid);

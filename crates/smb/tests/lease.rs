@@ -20,8 +20,8 @@ mod common;
 use common::{make_server_connection, smb_tests_share};
 use serial_test::serial;
 use smb::{
-    DurableOpenRequest, FileCreateArgs, Guid, LeaseBreakAckOutcome, OplockLevel, RequestLease,
-    RequestLeaseV2,
+    DurableOpenRequest, FileCreateArgs, LeaseBreakAckOutcome,
+    protocol::{Guid, OplockLevel, RequestLease, RequestLeaseV2},
 };
 use smb_fscc::FileDispositionInformation;
 use smb_msg::{LeaseFlags, LeaseState};
@@ -457,7 +457,7 @@ async fn test_lease_slot_tombstoned_on_break() -> smb::Result<()> {
 #[test_log::test(tokio::test(flavor = "current_thread"))]
 #[serial]
 async fn test_lease_cache_hit_reuses_file_id() -> smb::Result<()> {
-    use smb::FileAccessMask;
+    use smb::protocol::FileAccessMask;
     let share = smb_tests_share();
     let (client, share_path) = make_server_connection(&share, None).await?;
     let conn = client.get_connection(share_path.server()).await?;
@@ -739,8 +739,8 @@ async fn test_flush_idle_leases_sweeps_old_slots() -> smb::Result<()> {
 #[test_log::test(tokio::test(flavor = "current_thread"))]
 #[serial]
 async fn test_compound_set_basic_info() -> smb::Result<()> {
-    use smb::binrw_util::file_time::FileTime;
-    use smb::{FileAccessMask, FileBasicInformation};
+    use smb::protocol::binrw_util::file_time::FileTime;
+    use smb::protocol::{FileAccessMask, FileBasicInformation};
 
     let share = smb_tests_share();
     let (client, share_path) = make_server_connection(&share, None).await?;
@@ -821,7 +821,7 @@ async fn test_compound_set_basic_info() -> smb::Result<()> {
 #[test_log::test(tokio::test(flavor = "current_thread"))]
 #[serial]
 async fn test_client_default_lease_state_auto_injects() -> smb::Result<()> {
-    use smb::{Client, ClientConfig, FileAccessMask};
+    use smb::{client::{Client, ClientConfig}, protocol::FileAccessMask};
     let share = smb_tests_share();
     let mut conn_config = smb::ConnectionConfig {
         timeout: Some(Duration::from_secs(10)),

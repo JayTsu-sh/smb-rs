@@ -170,7 +170,7 @@ fn on_notification(sem: Arc<Semaphore>, notification: FileNotifyInformation) {
 }
 
 async fn delete_file_from_another_connection(
-    client: Arc<smb::Client>,
+    client: Arc<smb::client::Client>,
     share_path: smb::UncPath,
     file_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {

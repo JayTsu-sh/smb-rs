@@ -3,7 +3,7 @@ mod common;
 use bytes::Bytes;
 use common::{make_server_connection, smb_tests_share};
 use serial_test::serial;
-use smb::{FileAccessMask, FileCreateArgs};
+use smb::{FileCreateArgs, protocol::FileAccessMask};
 use smb_fscc::FileDispositionInformation;
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]

@@ -1,8 +1,11 @@
 use bytes::Bytes;
 use smb::{
-    domain::{Credentials, File, FileOpenOptions, Session, Share, SharePath, ShareTarget},
-    facade::{Client, ClientConfig},
+    Client, ClientConfig, Credentials, File, FileOpenOptions, Session, Share, SharePath,
+    ShareTarget,
 };
+
+#[cfg(feature = "real-server-tests")]
+mod common;
 
 fn assert_send_sync<T: Send + Sync>() {}
 
@@ -37,6 +40,38 @@ async fn common_and_explicit_session_paths_compile(
     let share = session.connect_share(target.share()).await?;
     let file = share.open_file(&path, FileOpenOptions::open_existing()).await?;
     let _bytes = file.read_at(0, 6).await?;
+    file.delete().await?;
+    file.close().await?;
+    share.close().await?;
+    session.close().await?;
+    client.close().await
+}
+
+#[cfg(feature = "real-server-tests")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[ignore = "requires an explicitly provisioned writable real-server share"]
+async fn domain_spine_roundtrips_without_protocol_escape_hatches() -> smb::Result<()> {
+    let target = ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?;
+    let client = Client::new(ClientConfig::default());
+    let share = client
+        .connect_share(&target, common::smb_test_credentials())
+        .await?;
+    let path = SharePath::new("domain-spine-roundtrip.bin")?;
+    let file = share
+        .open_file(&path, FileOpenOptions::overwrite())
+        .await?;
+    let payload = Bytes::from_static(b"domain-first");
+    assert_eq!(file.write_at(0, payload.clone()).await?, payload.len());
+    file.close().await?;
+
+    let session = client
+        .authenticate(target.server(), common::smb_test_credentials())
+        .await?;
+    let share = session.connect_share(target.share()).await?;
+    let file = share
+        .open_file(&path, FileOpenOptions::open_existing())
+        .await?;
+    assert_eq!(file.read_at(0, payload.len() as u32).await?, payload);
     file.delete().await?;
     file.close().await?;
     share.close().await?;

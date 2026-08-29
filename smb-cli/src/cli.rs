@@ -7,7 +7,7 @@ use smb::{
     client::ClientConfig,
     connection::{AuthMethodsConfig, EncryptionMode},
 };
-use smb::{Dialect, Guid};
+use smb::protocol::{Dialect, Guid};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]

@@ -4,6 +4,7 @@ use super::Cli;
 use clap::{Parser, Subcommand};
 use smb::*;
 use smb::{client::Client, resource::Resource};
+use smb::protocol::*;
 
 #[derive(Parser, Debug)]
 pub struct SecurityCmd {

@@ -2,7 +2,8 @@ use common::{make_server_connection, smb_tests_share};
 use futures_util::StreamExt;
 use serial_test::serial;
 use smb::{
-    ConnectionConfig, Directory, FileCreateArgs, ReadAt, WriteAt, connection::EncryptionMode,
+    ConnectionConfig, FileCreateArgs, ReadAt, WriteAt, connection::EncryptionMode,
+    resource::Directory,
 };
 use smb_fscc::*;
 use smb_msg::{AdditionalInfo, CreateOptions, Dialect};
