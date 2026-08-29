@@ -365,46 +365,19 @@ impl Transformer {
             }
         }
 
-        // 1. Serialize each member's bytes (header + content). Header still
-        //    has its old `next_command = 0` here; we rewrite it in step 2.
-        let mut member_bufs: Vec<Vec<u8>> = Vec::with_capacity(msgs.len());
-        for m in &msgs {
-            let mut buf = Vec::with_capacity(Header::STRUCT_SIZE + 256);
-            m.message.write(&mut Cursor::new(&mut buf))?;
-            member_bufs.push(buf);
-        }
-
-        // 2. Compute next_command offsets and rewrite each member's header bytes.
-        //    For member i (except last): next_command = 8-byte-aligned len of member i's buffer.
-        //    For last member: next_command = 0 (already).
-        let last = msgs.len() - 1;
-        for i in 0..last {
-            let aligned = (member_bufs[i].len() + 7) & !7usize;
-            msgs[i].message.header.next_command = u32::try_from(aligned).map_err(|_| {
-                crate::Error::InvalidState(format!(
-                    "compound member {i}: aligned size {aligned} does not fit in u32",
-                ))
-            })?;
-            // Rewrite the header bytes in-place with the updated next_command.
-            let mut header_bytes = [0u8; Header::STRUCT_SIZE];
-            msgs[i]
-                .message
-                .header
-                .write(&mut Cursor::new(&mut header_bytes[..]))?;
-            member_bufs[i][..Header::STRUCT_SIZE].copy_from_slice(&header_bytes);
-        }
-
-        // 3. Pad each non-last member to 8-byte alignment FIRST. The
-        //    `next_command` offset we set in step 2 is the padded length,
-        //    and per MS-SMB2 3.1.4.1 the per-member signature MUST cover
-        //    the full byte range the server sees as "this command", i.e.
-        //    the padded buffer. Signing must therefore happen AFTER
-        //    padding so the HMAC input matches what the receiver
-        //    re-hashes during verification.
-        for buf in member_bufs.iter_mut().take(last) {
-            let aligned = (buf.len() + 7) & !7usize;
-            buf.resize(aligned, 0);
-        }
+        let mut builder = WireBuilder::encode(msgs.iter_mut().map(|msg| &mut msg.message), 1)?;
+        builder.finalize_offsets()?;
+        let wire = builder.seal()?;
+        let member_ranges = (0..wire.member_count())
+            .map(|index| {
+                wire.member_range(index).ok_or_else(|| {
+                    crate::Error::InvalidState("missing compound member range".to_string())
+                })
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        let (metadata, payloads) = wire.into_parts();
+        debug_assert!(payloads.is_empty());
+        let mut metadata = metadata.to_vec();
 
         // 4. Sign each member if signing is requested (per-member, over
         //    that member's padded bytes). We snapshot the signer once
@@ -443,38 +416,12 @@ impl Transformer {
                     msg_id: None,
                 }))?;
 
-            for i in 0..msgs.len() {
-                let mut iov: IoVec = IoVec::from(std::mem::take(&mut member_bufs[i]));
+            for (i, range) in member_ranges.iter().enumerate() {
                 let mut signer = signer.clone();
-                signer.sign_message(&mut msgs[i].message.header, &mut iov)?;
-                // After sign_message, iov[0] holds the buffer with the signature
-                // written back into the header. Move it back into member_bufs
-                // without copying (IoVecBuf::Owned -> Vec via mem::take).
-                //
-                // We rely on the signer leaving the IoVec as a single owned
-                // segment (sign_message writes the signature back into the
-                // header bytes that live in iov[0] — no splitting). If a
-                // future signer change starts appending segments, only
-                // iov[0] would be taken back here and the trailing bytes
-                // would silently drop on the floor. Guard against that
-                // regression with an explicit length check.
-                if iov.len() != 1 {
-                    return Err(crate::Error::InvalidState(format!(
-                        "signer split compound member buffer into {} segments; \
-                         exactly 1 expected",
-                        iov.len()
-                    )));
-                }
-                match &mut iov[0] {
-                    smb_transport::IoVecBuf::Owned(v) => {
-                        member_bufs[i] = std::mem::take(v);
-                    }
-                    smb_transport::IoVecBuf::Shared(_) => {
-                        return Err(crate::Error::InvalidState(
-                            "signed compound member buffer was not owned".to_string(),
-                        ));
-                    }
-                }
+                let member = metadata.get_mut(range.clone()).ok_or_else(|| {
+                    crate::Error::InvalidState("compound member range escaped arena".to_string())
+                })?;
+                signer.sign_member(&mut msgs[i].message.header, member)?;
                 tracing::trace!(
                     "Compound member {i} (msg_id {}) signed (signature={}).",
                     msgs[i].message.header.message_id,
@@ -483,13 +430,7 @@ impl Transformer {
             }
         }
 
-        // 5. Concatenate into the output IoVec. Each member is its own
-        //    owned buffer — the transport will gather them on send.
-        let mut out = IoVec::default();
-        for buf in member_bufs {
-            out.add_owned(buf);
-        }
-        Ok(out)
+        Ok(IoVec::from(metadata))
     }
 
     /// Transforms an outgoing message to a raw SMB message.
@@ -510,13 +451,20 @@ impl Transformer {
         };
         let session_id = msg.message.header.session_id;
 
-        let mut outgoing_data = IoVec::default();
-        // Plain header + content (signature is still zero at this point —
-        // `sign_message` patches it back into the buffer below, after the
-        // preauth-hash ingest sees the unsigned bytes).
-        {
-            let buffer = outgoing_data.add_owned(Vec::with_capacity(Header::STRUCT_SIZE));
-            msg.message.write(&mut Cursor::new(buffer))?;
+        let mut builder = WireBuilder::encode(std::iter::once(&mut msg.message), usize::MAX)?;
+        if let Some(data) = msg.additional_data.take() {
+            builder.attach_payload(data)?;
+        }
+        builder.finalize_offsets()?;
+        let wire = builder.seal()?;
+        let (metadata, payloads) = wire.into_parts();
+
+        // Stateless W2 compatibility adapter. Metadata becomes mutable for
+        // the legacy signer; immutable payload segments retain their owner and
+        // pointer. W2-3 removes this metadata thaw.
+        let mut outgoing_data = IoVec::from(metadata.to_vec());
+        for payload in payloads {
+            outgoing_data.add_bytes(payload);
         }
 
         // Per MS-SMB2 §3.1.4.2, Negotiate Requests and *all*
@@ -536,13 +484,6 @@ impl Transformer {
                 // the previous hash state intact, not corrupt it to a
                 // default `Unsupported`.
                 *hash = hash.clone().next(plain)?;
-            }
-        }
-
-        // Additional data, if any (zero-copy via Bytes)
-        if let Some(data) = msg.additional_data.take() {
-            if !data.is_empty() {
-                outgoing_data.add_bytes(data);
             }
         }
 
@@ -1011,4 +952,33 @@ pub enum TransformPhase {
     CompressDecompress,
     /// Encryption and decryption.
     EncryptDecrypt,
+}
+
+#[cfg(test)]
+mod wire_builder_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bytes_write_keeps_payload_identity_through_legacy_adapter() {
+        let payload = Bytes::from_static(b"identity-preserved");
+        let pointer = payload.as_ptr();
+        let outgoing = OutgoingMessage::new(
+            WriteRequest::new(
+                0,
+                FileId::EMPTY,
+                WriteFlags::new(),
+                payload.len() as u32,
+            )
+            .into(),
+        )
+        .with_additional_data(payload);
+
+        let wire = Transformer::default()
+            .transform_outgoing(outgoing)
+            .await
+            .unwrap();
+
+        assert_eq!(wire.len(), 2);
+        assert_eq!(wire[1].as_ptr(), pointer);
+    }
 }

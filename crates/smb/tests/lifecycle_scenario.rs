@@ -22,7 +22,7 @@ async fn scenario_combines_scripted_transport_manual_time_and_owned_tasks() {
     scenario
         .spawn("exchange", move |_cancel| async move {
             let received = read.receive().await.map_err(ScenarioTaskError::from)?;
-            if received != Bytes::from_static(b"server") {
+            if received.as_bytes() != &Bytes::from_static(b"server") {
                 return Err(ScenarioTaskError::failed("unexpected-frame"));
             }
             write

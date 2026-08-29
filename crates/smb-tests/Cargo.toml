@@ -23,4 +23,6 @@ tokio = { workspace = true, features = ["rt"] }
 zeroize = "1"
 
 [dev-dependencies]
+bytes = { workspace = true }
+smb-msg = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

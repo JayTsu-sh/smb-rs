@@ -47,6 +47,17 @@ impl MessageSigner {
         Ok(())
     }
 
+    /// Sign one contiguous compound member inside a shared metadata arena.
+    /// Only that member slice is traversed and only its header is patched.
+    pub fn sign_member(&mut self, header: &mut Header, member: &mut [u8]) -> crate::Result<()> {
+        header.signature = self._calculate_signature_bytes(header, member)?;
+        let header_bytes = member.get_mut(..Header::STRUCT_SIZE).ok_or_else(|| {
+            Error::InvalidMessage("Compound member is shorter than the SMB2 header".to_string())
+        })?;
+        header.write(&mut Cursor::new(header_bytes))?;
+        Ok(())
+    }
+
     /// Calculate signature from contiguous bytes (for incoming verification).
     fn _calculate_signature_bytes(
         &mut self,
