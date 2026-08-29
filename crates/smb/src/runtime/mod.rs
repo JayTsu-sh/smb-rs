@@ -15,6 +15,10 @@ mod operation;
 // over; the allowance is removed when the final object kind is wired.
 #[allow(dead_code)]
 mod object_state;
+// W4-2 starts with a pure reconnect coordinator reducer before transport
+// construction is moved behind it.
+#[allow(dead_code)]
+mod recovery;
 #[allow(dead_code)]
 mod reducer;
 #[allow(dead_code)]
