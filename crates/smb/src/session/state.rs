@@ -45,14 +45,11 @@ impl SessionAlgosFactory {
             ));
         }
 
-        if cfg!(feature = "__debug-dump-keys") {
-            tracing::debug!(
-                "Building session algorithms for dialect {:?} with session key {:02x?} and preauth hash {:02x?}",
-                info.negotiation.dialect_rev,
-                session_key,
-                preauth_hash.as_ref().map(|h| h.as_ref())
-            );
-        }
+        tracing::trace!(
+            dialect = ?info.negotiation.dialect_rev,
+            has_preauth_hash = preauth_hash.is_some(),
+            "Building session algorithms"
+        );
 
         if info.negotiation.dialect_rev.is_smb3() {
             Self::smb3xx_make_ciphers(session_key, preauth_hash, info)
