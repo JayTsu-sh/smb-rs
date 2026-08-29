@@ -39,6 +39,8 @@ fn plan_uses_exact_run_owned_names_and_secret_free_commands() {
     let rendered = plan.render_redacted();
     assert!(rendered.contains("volume create"));
     assert!(rendered.contains("access-control delete"));
+    assert!(rendered.contains("<test-identity>"));
+    assert!(!serde_json::to_string(&plan).unwrap().contains("test-user"));
     assert!(!rendered.to_ascii_lowercase().contains("password"));
 }
 
@@ -53,6 +55,19 @@ fn apply_is_bound_to_the_exact_plan_hash() {
 fn rejects_non_128_bit_lowercase_hex_run_ids() {
     assert!(Plan::new("short", "svm", "aggr", "user").is_err());
     assert!(Plan::new("0123456789ABCDEF0123456789ABCDEF", "svm", "aggr", "user").is_err());
+}
+
+#[test]
+fn preflight_and_runtime_identity_are_cryptographically_bound_without_cleartext() {
+    let unbound = fixture();
+    let unbound_hash = unbound.hash();
+    let plan = unbound.bind_preflight(&"a".repeat(64)).unwrap();
+    assert_ne!(plan.hash(), unbound_hash);
+    assert_eq!(plan.preflight_state_hash(), Some("a".repeat(64).as_str()));
+    assert!(plan.matches_test_identity("DOMAIN\\test-user"));
+    assert!(!plan.matches_test_identity("DOMAIN\\other-user"));
+    let json = serde_json::to_string(&plan).unwrap();
+    assert!(!json.contains("test-user"));
 }
 
 #[test]
@@ -189,6 +204,9 @@ impl OntapAdapter for ScriptedOntap {
     fn delete_share(&mut self, _: &Plan) -> Result<(), String> {
         self.action("delete-share")
     }
+    fn offline_volume(&mut self, _: &Plan) -> Result<(), String> {
+        self.action("offline-volume")
+    }
     fn delete_volume(&mut self, _: &Plan) -> Result<(), String> {
         self.action("delete-volume")
     }
@@ -250,7 +268,10 @@ fn provisioning_failure_runs_owned_reverse_cleanup_and_persists_it() {
         recovered.state(ResourceKind::Volume),
         Some(Lifecycle::Deleted)
     );
-    assert_eq!(recovered.mutations(), &[Mutation::EveryoneAclRemoved]);
+    assert_eq!(
+        recovered.mutations(),
+        &[Mutation::EveryoneAclRemoved, Mutation::VolumeOfflined]
+    );
     assert_eq!(
         adapter.calls,
         vec![
@@ -261,6 +282,7 @@ fn provisioning_failure_runs_owned_reverse_cleanup_and_persists_it() {
             "verify-share-owned",
             "delete-share",
             "verify-volume-owned",
+            "offline-volume",
             "delete-volume",
         ]
     );
@@ -295,6 +317,7 @@ fn recovered_manifest_can_resume_exact_cleanup() {
             "verify-share-owned",
             "delete-share",
             "verify-volume-owned",
+            "offline-volume",
             "delete-volume",
         ]
     );

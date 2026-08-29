@@ -1,0 +1,387 @@
+use super::{OntapAdapter, Plan, ResourceKind};
+use std::io::Write;
+use std::process::{Command, Output, Stdio};
+use zeroize::Zeroizing;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreflightEvidence {
+    pub state_hash: String,
+    pub ontap_version: String,
+}
+
+/// Production Adapter for the ONTAP CLI over SSH. The management password is
+/// consumed by `sshpass` from an inherited descriptor and is never an argument
+/// or environment value.
+pub struct SshOntapAdapter {
+    target: String,
+    user: Zeroizing<String>,
+    test_identity: Zeroizing<String>,
+    password: Zeroizing<String>,
+}
+
+impl SshOntapAdapter {
+    pub fn new(
+        target: &str,
+        user: &str,
+        test_identity: &str,
+        password: &str,
+    ) -> Result<Self, String> {
+        if target.is_empty()
+            || user.is_empty()
+            || test_identity.is_empty()
+            || password.is_empty()
+            || target.chars().any(char::is_control)
+            || user.chars().any(char::is_control)
+            || test_identity.chars().any(char::is_control)
+            || user.contains('@')
+        {
+            return Err("invalid SSH target or user".into());
+        }
+        Ok(Self {
+            target: target.to_owned(),
+            user: Zeroizing::new(user.to_owned()),
+            test_identity: Zeroizing::new(test_identity.to_owned()),
+            password: Zeroizing::new(password.to_owned()),
+        })
+    }
+
+    pub fn preflight(&self, plan: &Plan) -> Result<PreflightEvidence, String> {
+        use sha2::{Digest, Sha256};
+
+        let version = self.run(&["version"])?;
+        let cifs = self.run(&["vserver", "cifs", "show", "-vserver", &plan.svm])?;
+        if !has_exact_token(&cifs, &plan.svm) {
+            return Err("preflight did not find the configured CIFS SVM".into());
+        }
+        let aggregate = self.run(&[
+            "storage",
+            "aggregate",
+            "show",
+            "-aggregate",
+            &plan.aggregate,
+            "-state",
+            "online",
+            "-fields",
+            "aggregate",
+        ])?;
+        if !has_exact_token(&aggregate, &plan.aggregate) {
+            return Err("preflight did not find the configured online aggregate".into());
+        }
+        if self.volume_owned(plan, false)? || self.share_owned(plan, false)? {
+            return Err("preflight run-owned resource names are not absent".into());
+        }
+        let normalized = [version.as_str(), cifs.as_str(), aggregate.as_str()]
+            .into_iter()
+            .flat_map(str::split_ascii_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let state_hash = hex::encode(Sha256::digest(normalized.as_bytes()));
+        let ontap_version = version
+            .lines()
+            .find(|line| line.contains("Release"))
+            .unwrap_or("version-detected")
+            .trim()
+            .to_owned();
+        Ok(PreflightEvidence {
+            state_hash,
+            ontap_version,
+        })
+    }
+
+    fn run(&self, args: &[&str]) -> Result<String, String> {
+        let remote_command = args
+            .iter()
+            .map(|argument| ontap_token(argument))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(" ");
+        let mut child = Command::new("sshpass")
+            .arg("-d0")
+            .arg("ssh")
+            .arg("-o")
+            .arg("BatchMode=no")
+            .arg("-o")
+            .arg("PasswordAuthentication=yes")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=accept-new")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg(format!("{}@{}", self.user.as_str(), self.target))
+            .arg(remote_command)
+            .env_remove("SSHPASS")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("start management SSH command: {error}"))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "management SSH password pipe is unavailable".to_string())?;
+        stdin
+            .write_all(self.password.as_bytes())
+            .and_then(|()| stdin.write_all(b"\n"))
+            .map_err(|error| format!("write management SSH password pipe: {error}"))?;
+        drop(stdin);
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("wait for management SSH command: {error}"))?;
+        decode_output(output)
+    }
+
+    fn volume_owned(&self, plan: &Plan, ready: bool) -> Result<bool, String> {
+        let mut args = vec![
+            "volume",
+            "show",
+            "-vserver",
+            &plan.svm,
+            "-volume",
+            &plan.volume,
+            "-comment",
+            &plan.owner_comment,
+        ];
+        if ready {
+            args.extend([
+                "-aggregate",
+                &plan.aggregate,
+                "-state",
+                "online",
+                "-security-style",
+                "unix",
+                "-junction-path",
+                &plan.junction,
+            ]);
+        }
+        args.extend(["-fields", "volume"]);
+        self.run(&args)
+            .map(|output| has_exact_token(&output, &plan.volume))
+    }
+
+    fn share_owned(&self, plan: &Plan, ready: bool) -> Result<bool, String> {
+        let mut args = vec![
+            "vserver",
+            "cifs",
+            "share",
+            "show",
+            "-vserver",
+            &plan.svm,
+            "-share-name",
+            &plan.share,
+            "-comment",
+            &plan.owner_comment,
+        ];
+        if ready {
+            args.extend(["-path", &plan.junction]);
+        }
+        args.extend(["-fields", "share-name"]);
+        let share_matches = self
+            .run(&args)
+            .map(|output| has_exact_token(&output, &plan.share))?;
+        if !ready || !share_matches {
+            return Ok(share_matches);
+        }
+
+        let granted = self.run(&[
+            "vserver",
+            "cifs",
+            "share",
+            "access-control",
+            "show",
+            "-vserver",
+            &plan.svm,
+            "-share",
+            &plan.share,
+            "-user-or-group",
+            self.test_identity.as_str(),
+            "-permission",
+            "Full_Control",
+        ])?;
+        let everyone = self.run(&[
+            "vserver",
+            "cifs",
+            "share",
+            "access-control",
+            "show",
+            "-vserver",
+            &plan.svm,
+            "-share",
+            &plan.share,
+            "-user-or-group",
+            "Everyone",
+        ])?;
+        Ok(has_exact_token(&granted, self.test_identity.as_str())
+            && !has_exact_token(&everyone, "Everyone"))
+    }
+}
+
+impl OntapAdapter for SshOntapAdapter {
+    fn create_volume(&mut self, plan: &Plan) -> Result<(), String> {
+        self.run_refs(&plan.provision_commands()[0])
+    }
+
+    fn create_share(&mut self, plan: &Plan) -> Result<(), String> {
+        self.run_refs(&plan.provision_commands()[1])
+    }
+
+    fn remove_everyone_acl(&mut self, plan: &Plan) -> Result<(), String> {
+        self.run_refs(&plan.provision_commands()[2])
+    }
+
+    fn grant_test_acl(&mut self, plan: &Plan) -> Result<(), String> {
+        self.run(&[
+            "vserver",
+            "cifs",
+            "share",
+            "access-control",
+            "create",
+            "-vserver",
+            &plan.svm,
+            "-share",
+            &plan.share,
+            "-user-or-group",
+            self.test_identity.as_str(),
+            "-permission",
+            "Full_Control",
+        ])
+        .map(drop)
+    }
+
+    fn verify_ready(&mut self, plan: &Plan, kind: ResourceKind) -> Result<bool, String> {
+        match kind {
+            ResourceKind::Volume => self.volume_owned(plan, true),
+            ResourceKind::Share => self.share_owned(plan, true),
+        }
+    }
+
+    fn verify_owned(&mut self, plan: &Plan, kind: ResourceKind) -> Result<bool, String> {
+        match kind {
+            ResourceKind::Volume => self.volume_owned(plan, false),
+            ResourceKind::Share => self.share_owned(plan, false),
+        }
+    }
+
+    fn delete_share(&mut self, plan: &Plan) -> Result<(), String> {
+        self.run(&[
+            "vserver",
+            "cifs",
+            "share",
+            "delete",
+            "-vserver",
+            &plan.svm,
+            "-share-name",
+            &plan.share,
+        ])
+        .map(drop)
+    }
+
+    fn offline_volume(&mut self, plan: &Plan) -> Result<(), String> {
+        self.run(&[
+            "volume",
+            "offline",
+            "-vserver",
+            &plan.svm,
+            "-volume",
+            &plan.volume,
+            "-foreground",
+            "true",
+        ])
+        .map(drop)
+    }
+
+    fn delete_volume(&mut self, plan: &Plan) -> Result<(), String> {
+        self.run(&[
+            "volume",
+            "delete",
+            "-vserver",
+            &plan.svm,
+            "-volume",
+            &plan.volume,
+            "-foreground",
+            "true",
+        ])
+        .map(drop)
+    }
+}
+
+impl SshOntapAdapter {
+    fn run_refs(&self, owned: &[String]) -> Result<(), String> {
+        let refs = owned.iter().map(String::as_str).collect::<Vec<_>>();
+        self.run(&refs).map(drop)
+    }
+}
+
+fn ontap_token(value: &str) -> Result<String, String> {
+    if !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'_' | b'-' | b'.' | b'/' | b'\\' | b':' | b'@' | b',' | b'<' | b'>'
+                )
+        })
+    {
+        Ok(value.to_owned())
+    } else {
+        Err("ONTAP command contains a non-whitelisted token".into())
+    }
+}
+
+fn decode_output(output: Output) -> Result<String, String> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let empty_query = stdout.contains("There are no entries matching your query.");
+    if (!output.status.success() && !empty_query)
+        || stdout.lines().any(is_cli_error)
+        || stderr.lines().any(is_cli_error)
+    {
+        return Err(format!(
+            "management command failed with status {}",
+            output.status
+        ));
+    }
+    Ok(stdout.into_owned())
+}
+
+fn is_cli_error(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("Error:") || line.starts_with("command failed:")
+}
+
+fn has_exact_token(output: &str, expected: &str) -> bool {
+    output
+        .split_ascii_whitespace()
+        .any(|token| token == expected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_tokens_reject_whitespace_and_metacharacters() {
+        assert_eq!(ontap_token("DOMAIN\\user").unwrap(), "DOMAIN\\user");
+        assert_eq!(
+            ontap_token("oplocks,browsable").unwrap(),
+            "oplocks,browsable"
+        );
+        assert!(ontap_token("a b").is_err());
+        assert!(ontap_token("a;$c").is_err());
+        assert!(ontap_token("a'b").is_err());
+    }
+
+    #[test]
+    fn exact_token_matching_does_not_accept_prefixes() {
+        assert!(has_exact_token(
+            "svm name comment\nsvm exact owned",
+            "exact"
+        ));
+        assert!(!has_exact_token("svm exact-suffix owned", "exact"));
+    }
+
+    #[test]
+    fn rejects_empty_runtime_secrets() {
+        assert!(SshOntapAdapter::new("", "admin", "identity", "secret").is_err());
+        assert!(SshOntapAdapter::new("target", "", "identity", "secret").is_err());
+        assert!(SshOntapAdapter::new("target", "admin", "", "secret").is_err());
+        assert!(SshOntapAdapter::new("target", "admin", "identity", "").is_err());
+    }
+}

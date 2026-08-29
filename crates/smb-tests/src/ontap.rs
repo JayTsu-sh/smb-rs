@@ -10,16 +10,20 @@ use std::path::{Path, PathBuf};
 
 const PREFIX: &str = "smbrs";
 
+mod ssh;
+pub use ssh::{PreflightEvidence, SshOntapAdapter};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
     run_id: String,
     svm: String,
     aggregate: String,
-    test_identity: String,
+    test_identity_digest: String,
     volume: String,
     share: String,
     junction: String,
     owner_comment: String,
+    preflight_state_hash: Option<String>,
 }
 
 impl Plan {
@@ -46,15 +50,19 @@ impl Plan {
             }
         }
         let stem = format!("{PREFIX}_{run_id}");
+        let test_identity_digest = hex::encode(Sha256::digest(
+            [run_id.as_bytes(), b":", test_identity.as_bytes()].concat(),
+        ));
         Ok(Self {
             run_id: run_id.into(),
             svm: svm.into(),
             aggregate: aggregate.into(),
-            test_identity: test_identity.into(),
+            test_identity_digest,
             volume: format!("{stem}_functional"),
             share: format!("{stem}_plain"),
             junction: format!("/{stem}_functional"),
             owner_comment: format!("smb-rs-validation:{run_id}"),
+            preflight_state_hash: None,
         })
     }
 
@@ -63,6 +71,29 @@ impl Plan {
     }
     pub fn share_name(&self) -> &str {
         &self.share
+    }
+
+    pub fn matches_test_identity(&self, identity: &str) -> bool {
+        let digest = hex::encode(Sha256::digest(
+            [self.run_id.as_bytes(), b":", identity.as_bytes()].concat(),
+        ));
+        digest == self.test_identity_digest
+    }
+
+    pub fn bind_preflight(mut self, state_hash: &str) -> Result<Self, String> {
+        if state_hash.len() != 64
+            || !state_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("preflight state hash must be lowercase SHA-256 hexadecimal".into());
+        }
+        self.preflight_state_hash = Some(state_hash.to_owned());
+        Ok(self)
+    }
+
+    pub fn preflight_state_hash(&self) -> Option<&str> {
+        self.preflight_state_hash.as_deref()
     }
 
     pub fn hash(&self) -> String {
@@ -138,7 +169,7 @@ impl Plan {
                 "-share",
                 &self.share,
                 "-user-or-group",
-                &self.test_identity,
+                "<test-identity>",
                 "-permission",
                 "Full_Control",
             ]),
@@ -193,6 +224,7 @@ pub enum Lifecycle {
 pub enum Mutation {
     EveryoneAclRemoved,
     TestIdentityAclGranted,
+    VolumeOfflined,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -464,6 +496,7 @@ pub trait OntapAdapter {
     fn verify_ready(&mut self, plan: &Plan, kind: ResourceKind) -> Result<bool, String>;
     fn verify_owned(&mut self, plan: &Plan, kind: ResourceKind) -> Result<bool, String>;
     fn delete_share(&mut self, plan: &Plan) -> Result<(), String>;
+    fn offline_volume(&mut self, plan: &Plan) -> Result<(), String>;
     fn delete_volume(&mut self, plan: &Plan) -> Result<(), String>;
 }
 
@@ -551,7 +584,20 @@ impl<'a, A: OntapAdapter> ProvisioningRun<'a, A> {
             }
             let deletion = match kind {
                 ResourceKind::Share => self.adapter.delete_share(&plan),
-                ResourceKind::Volume => self.adapter.delete_volume(&plan),
+                ResourceKind::Volume => {
+                    if !self.manifest.mutations.contains(&Mutation::VolumeOfflined) {
+                        if let Err(error) = self.adapter.offline_volume(&plan) {
+                            errors.push(error);
+                            continue;
+                        }
+                        if let Err(error) = self.manifest.record_mutation(Mutation::VolumeOfflined)
+                        {
+                            errors.push(error);
+                            continue;
+                        }
+                    }
+                    self.adapter.delete_volume(&plan)
+                }
             };
             match deletion {
                 Ok(()) => {
