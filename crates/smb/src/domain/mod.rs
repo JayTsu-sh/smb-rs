@@ -524,6 +524,46 @@ pub struct DirectoryEntry {
     len: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DirectoryEvent {
+    Added { path: String },
+    Removed { path: String },
+    Modified { path: String },
+    Renamed { from: String, to: String },
+    StreamAdded { path: String },
+    StreamRemoved { path: String },
+    StreamModified { path: String },
+    IdentifierUnavailable { path: String },
+    IdentifierCollision { path: String },
+}
+
+#[derive(Clone)]
+pub struct DirectoryWatchOptions {
+    recursive: bool,
+    cancellation: CancelToken,
+}
+
+impl Default for DirectoryWatchOptions {
+    fn default() -> Self {
+        Self {
+            recursive: false,
+            cancellation: CancelToken::new(),
+        }
+    }
+}
+
+impl DirectoryWatchOptions {
+    pub const fn recursive(mut self, recursive: bool) -> Self {
+        self.recursive = recursive;
+        self
+    }
+
+    pub fn cancellation(mut self, cancellation: CancelToken) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+}
+
 impl DirectoryEntry {
     pub fn name(&self) -> &str {
         &self.name
@@ -549,6 +589,37 @@ pub struct Directory {
 
 pub type DirectoryEntries<'a> =
     std::pin::Pin<Box<dyn Stream<Item = crate::Result<DirectoryEntry>> + Send + 'a>>;
+pub type DirectoryEvents<'a> =
+    std::pin::Pin<Box<dyn Stream<Item = crate::Result<DirectoryEvent>> + Send + 'a>>;
+
+fn pair_directory_event(
+    rename_from: &mut Option<String>,
+    event: crate::runtime::domain_bridge::RuntimeDirectoryEvent,
+) -> crate::Result<Option<DirectoryEvent>> {
+    use crate::runtime::domain_bridge::RuntimeDirectoryEventKind as Kind;
+
+    let value = match event.kind {
+        Kind::RenamedOld => {
+            *rename_from = Some(event.path);
+            return Ok(None);
+        }
+        Kind::RenamedNew => DirectoryEvent::Renamed {
+            from: rename_from.take().ok_or_else(|| {
+                Error::InvalidMessage("rename new-name event has no old-name pair".into())
+            })?,
+            to: event.path,
+        },
+        Kind::Added => DirectoryEvent::Added { path: event.path },
+        Kind::Removed => DirectoryEvent::Removed { path: event.path },
+        Kind::Modified => DirectoryEvent::Modified { path: event.path },
+        Kind::StreamAdded => DirectoryEvent::StreamAdded { path: event.path },
+        Kind::StreamRemoved => DirectoryEvent::StreamRemoved { path: event.path },
+        Kind::StreamModified => DirectoryEvent::StreamModified { path: event.path },
+        Kind::IdentifierUnavailable => DirectoryEvent::IdentifierUnavailable { path: event.path },
+        Kind::IdentifierCollision => DirectoryEvent::IdentifierCollision { path: event.path },
+    };
+    Ok(Some(value))
+}
 
 impl Directory {
     pub fn entries<'a>(&'a self, pattern: &'a str) -> DirectoryEntries<'a> {
@@ -568,6 +639,43 @@ impl Directory {
                 self.entries(pattern).try_collect().await
             })
         })
+    }
+
+    pub fn watch(&self, options: DirectoryWatchOptions) -> DirectoryEvents<'_> {
+        let raw = self
+            .inner
+            .watch(options.recursive, options.cancellation.clone());
+        Box::pin(futures_util::stream::unfold(
+            (raw, None::<String>, false),
+            |(mut raw, mut rename_from, done)| async move {
+                if done {
+                    return None;
+                }
+                loop {
+                    let Some(result) = raw.next().await else {
+                        return rename_from.map(|from| {
+                            (
+                                Err(Error::InvalidMessage(format!(
+                                    "rename event for {from} has no new-name pair"
+                                ))),
+                                (raw, None, true),
+                            )
+                        });
+                    };
+                    let event = match result {
+                        Ok(event) => event,
+                        Err(error) => return Some((Err(error), (raw, rename_from, true))),
+                    };
+                    match pair_directory_event(&mut rename_from, event) {
+                        Ok(Some(value)) => {
+                            return Some((Ok(value), (raw, rename_from, false)));
+                        }
+                        Ok(None) => continue,
+                        Err(error) => return Some((Err(error), (raw, None, true))),
+                    }
+                }
+            },
+        ))
     }
 
     pub fn delete(&self) -> Operation<'_, ()> {
@@ -654,6 +762,50 @@ mod tests {
         assert_eq!(
             authority.close_with(|| async { Ok(()) }).await.unwrap(),
             CloseOutcome::OutcomeUnknown
+        );
+    }
+
+    #[test]
+    fn directory_rename_events_are_paired_or_rejected() {
+        use crate::runtime::domain_bridge::{
+            RuntimeDirectoryEvent, RuntimeDirectoryEventKind as Kind,
+        };
+
+        let mut from = None;
+        assert!(
+            pair_directory_event(
+                &mut from,
+                RuntimeDirectoryEvent {
+                    kind: Kind::RenamedOld,
+                    path: "old".into(),
+                },
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            pair_directory_event(
+                &mut from,
+                RuntimeDirectoryEvent {
+                    kind: Kind::RenamedNew,
+                    path: "new".into(),
+                },
+            )
+            .unwrap(),
+            Some(DirectoryEvent::Renamed {
+                from: "old".into(),
+                to: "new".into(),
+            })
+        );
+        assert!(
+            pair_directory_event(
+                &mut None,
+                RuntimeDirectoryEvent {
+                    kind: Kind::RenamedNew,
+                    path: "orphan".into(),
+                },
+            )
+            .is_err()
         );
     }
 }

@@ -11,8 +11,9 @@ use futures_core::Stream;
 use futures_util::TryStreamExt;
 use smb_fscc::{
     FileAccessMask, FileAttributes, FileDirectoryInformation, FileDispositionInformation,
+    NotifyAction,
 };
-use smb_msg::CreateOptions;
+use smb_msg::{CreateOptions, NotifyFilter};
 use sspi::{AuthIdentity, Secret, Username};
 
 use crate::{
@@ -178,6 +179,24 @@ pub(crate) struct RuntimeDirectoryEntry {
     pub(crate) len: u64,
 }
 
+pub(crate) enum RuntimeDirectoryEventKind {
+    Added,
+    Removed,
+    Modified,
+    RenamedOld,
+    RenamedNew,
+    StreamAdded,
+    StreamRemoved,
+    StreamModified,
+    IdentifierUnavailable,
+    IdentifierCollision,
+}
+
+pub(crate) struct RuntimeDirectoryEvent {
+    pub(crate) kind: RuntimeDirectoryEventKind,
+    pub(crate) path: String,
+}
+
 pub(crate) struct RuntimeDirectory {
     inner: Arc<LegacyDirectory>,
 }
@@ -196,6 +215,44 @@ impl RuntimeDirectory {
                 name: entry.file_name.to_string(),
                 is_directory: entry.file_attributes.directory(),
                 len: entry.end_of_file,
+            }),
+        )
+    }
+
+    pub(crate) fn watch<'a>(
+        &'a self,
+        recursive: bool,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Pin<Box<dyn Stream<Item = crate::Result<RuntimeDirectoryEvent>> + Send + 'a>> {
+        Box::pin(
+            futures_util::stream::once(async move {
+                LegacyDirectory::watch_stream_cancellable(
+                    &self.inner,
+                    NotifyFilter::all(),
+                    recursive,
+                    cancellation,
+                )
+            })
+            .try_flatten()
+            .map_ok(|event| RuntimeDirectoryEvent {
+                kind: match event.action {
+                    NotifyAction::Added => RuntimeDirectoryEventKind::Added,
+                    NotifyAction::Removed => RuntimeDirectoryEventKind::Removed,
+                    NotifyAction::Modified => RuntimeDirectoryEventKind::Modified,
+                    NotifyAction::RenamedOldName => RuntimeDirectoryEventKind::RenamedOld,
+                    NotifyAction::RenamedNewName => RuntimeDirectoryEventKind::RenamedNew,
+                    NotifyAction::AddedStream => RuntimeDirectoryEventKind::StreamAdded,
+                    NotifyAction::RemovedStream => RuntimeDirectoryEventKind::StreamRemoved,
+                    NotifyAction::ModifiedStream => RuntimeDirectoryEventKind::StreamModified,
+                    NotifyAction::RemovedByDelete => RuntimeDirectoryEventKind::Removed,
+                    NotifyAction::IdNotTunnelled => {
+                        RuntimeDirectoryEventKind::IdentifierUnavailable
+                    }
+                    NotifyAction::TunnelledIdCollision => {
+                        RuntimeDirectoryEventKind::IdentifierCollision
+                    }
+                },
+                path: event.file_name.to_string(),
             }),
         )
     }

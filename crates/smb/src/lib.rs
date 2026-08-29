@@ -42,8 +42,9 @@ pub use client::UncPath;
 pub use connection::ConnectionConfig;
 pub use domain::{
     CancelToken, CloseOutcome, Credentials, Deadline, Directory, DirectoryEntries, DirectoryEntry,
-    DirectoryOpenOptions, File, FileCursor, FileOpenOptions, Operation, Pipe, ReplayPolicy,
-    Resource, Session, Share, SharePath, ShareTarget,
+    DirectoryEvent, DirectoryEvents, DirectoryOpenOptions, DirectoryWatchOptions, File, FileCursor,
+    FileOpenOptions, Operation, Pipe, ReplayPolicy, Resource, Session, Share, SharePath,
+    ShareTarget,
 };
 pub use error::Error;
 pub use facade::{Client, ClientConfig};
