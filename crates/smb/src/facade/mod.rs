@@ -8,6 +8,7 @@ pub struct ClientConfig {
 }
 
 /// Root handle for the domain-first async API.
+#[derive(Clone)]
 pub struct Client {
     domain: DomainClient,
 }

@@ -8,6 +8,7 @@ use smb::{
 mod common;
 
 fn assert_send_sync<T: Send + Sync>() {}
+fn assert_clone<T: Clone>() {}
 
 #[test]
 fn public_spine_types_are_send_sync_and_domain_named() {
@@ -15,6 +16,9 @@ fn public_spine_types_are_send_sync_and_domain_named() {
     assert_send_sync::<Session>();
     assert_send_sync::<Share>();
     assert_send_sync::<File>();
+    assert_clone::<Client>();
+    assert_clone::<Session>();
+    assert_clone::<Share>();
 
     let target = ShareTarget::new("server", "share").unwrap();
     assert_eq!(target.server(), "server");

@@ -107,6 +107,7 @@ impl FileOpenOptions {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct DomainClient {
     runtime: Arc<RuntimeClient>,
 }
