@@ -537,10 +537,32 @@ async fn owner_task(
         target_credits: config.target_credits,
     };
     let mut send_queue = VecDeque::new();
+    let mut waiting_operation = None;
+    let mut waiting_compound = None;
     let mut close_request = None;
     let mut fatal = None;
 
     loop {
+        if let Some(command) = waiting_operation.take() {
+            waiting_operation = process_operation_admission(
+                command,
+                &wire,
+                &mut authority,
+                &mut send_queue,
+                &mut fatal,
+            )
+            .await;
+        }
+        if let Some(command) = waiting_compound.take() {
+            waiting_compound = process_compound_admission(
+                command,
+                &wire,
+                &mut authority,
+                &mut send_queue,
+                &mut fatal,
+            )
+            .await;
+        }
         for _ in 0..config.control_batch.max(1) {
             match control_rx.try_recv() {
                 Ok(command) => {
@@ -587,8 +609,11 @@ async fn owner_task(
                 &mut send_queue,
             );
         }
-        if let Ok(command) = operation_rx.try_recv() {
-            process_operation_admission(
+        if waiting_operation.is_none()
+            && waiting_compound.is_none()
+            && let Ok(command) = operation_rx.try_recv()
+        {
+            waiting_operation = process_operation_admission(
                 command,
                 &wire,
                 &mut authority,
@@ -597,9 +622,18 @@ async fn owner_task(
             )
             .await;
         }
-        if let Ok(command) = compound_rx.try_recv() {
-            process_compound_admission(command, &wire, &mut authority, &mut send_queue, &mut fatal)
-                .await;
+        if waiting_compound.is_none()
+            && waiting_operation.is_none()
+            && let Ok(command) = compound_rx.try_recv()
+        {
+            waiting_compound = process_compound_admission(
+                command,
+                &wire,
+                &mut authority,
+                &mut send_queue,
+                &mut fatal,
+            )
+            .await;
         }
         dispatch_next(&write_tx, &mut authority, &mut send_queue);
 
@@ -650,14 +684,14 @@ async fn owner_task(
                     process_admission(command, &mut authority.state, &mut authority.terminals, &mut send_queue);
                 }
             },
-            command = operation_rx.recv(), if !operation_rx.is_closed() => {
+            command = operation_rx.recv(), if !operation_rx.is_closed() && waiting_operation.is_none() && waiting_compound.is_none() => {
                 if let Some(command) = command {
-                    process_operation_admission(command, &wire, &mut authority, &mut send_queue, &mut fatal).await;
+                    waiting_operation = process_operation_admission(command, &wire, &mut authority, &mut send_queue, &mut fatal).await;
                 }
             },
-            command = compound_rx.recv(), if !compound_rx.is_closed() => {
+            command = compound_rx.recv(), if !compound_rx.is_closed() && waiting_compound.is_none() && waiting_operation.is_none() => {
                 if let Some(command) = command {
-                    process_compound_admission(command, &wire, &mut authority, &mut send_queue, &mut fatal).await;
+                    waiting_compound = process_compound_admission(command, &wire, &mut authority, &mut send_queue, &mut fatal).await;
                 }
             },
             _ = &mut deadline_sleep => {
@@ -703,6 +737,16 @@ async fn owner_task(
         fatal.clone().unwrap_or(RuntimeError::Closed),
     )
     .await;
+    let terminal_error = fatal.clone().unwrap_or(RuntimeError::Closed);
+    if let Some(command) = waiting_operation {
+        if let Some(terminal) = command.terminal {
+            let _ = terminal.send(Err(terminal_error.clone()));
+        }
+        let _ = command.acknowledge.send(Err(terminal_error.clone()));
+    }
+    if let Some(command) = waiting_compound {
+        let _ = command.acknowledge.send(Err(terminal_error));
+    }
     for queued in send_queue {
         queued.cancel_before_write.cancel();
     }
@@ -744,14 +788,14 @@ async fn process_operation_admission(
     authority: &mut RequestAuthority,
     send_queue: &mut VecDeque<WriteCommand>,
     fatal: &mut Option<RuntimeError>,
-) {
+) -> Option<OperationAdmission> {
     if authority.operation_pending.len() >= authority.state.operation_limit() {
         let error = RuntimeError::Admission(AdmissionError::OperationsExhausted);
         if let Some(terminal) = command.terminal {
             let _ = terminal.send(Err(error.clone()));
         }
         let _ = command.acknowledge.send(Err(error));
-        return;
+        return None;
     }
     let payload_bytes = command.operation.payload_bytes();
     let credit_charge = match command.operation.credit_charge(authority.large_mtu) {
@@ -762,9 +806,12 @@ async fn process_operation_admission(
                 let _ = terminal.send(Err(error.clone()));
             }
             let _ = command.acknowledge.send(Err(error));
-            return;
+            return None;
         }
     };
+    if u32::from(credit_charge) > authority.state.available_credits() {
+        return Some(command);
+    }
     let effects = authority.state.reduce(OwnerEvent::Admit {
         payload_bytes,
         credit_charge,
@@ -779,7 +826,7 @@ async fn process_operation_admission(
             let _ = terminal.send(Err(error.clone()));
         }
         let _ = command.acknowledge.send(Err(error));
-        return;
+        return None;
     };
 
     let key = plan.key;
@@ -798,7 +845,7 @@ async fn process_operation_admission(
                 let _ = terminal.send(Err(error.clone()));
             }
             let _ = command.acknowledge.send(Err(error));
-            return;
+            return None;
         }
     };
     let request_raw = retain_raw
@@ -825,6 +872,7 @@ async fn process_operation_admission(
     if let Some(message) = authority.early_responses.remove(&key) {
         process_decoded_response(message, authority, fatal);
     }
+    None
 }
 
 async fn process_compound_admission(
@@ -833,12 +881,12 @@ async fn process_compound_admission(
     authority: &mut RequestAuthority,
     send_queue: &mut VecDeque<WriteCommand>,
     fatal: &mut Option<RuntimeError>,
-) {
+) -> Option<CompoundAdmission> {
     if command.operations.is_empty() {
         let _ = command
             .acknowledge
             .send(Err(RuntimeError::Wire("empty-compound")));
-        return;
+        return None;
     }
     if authority
         .operation_pending
@@ -849,7 +897,30 @@ async fn process_compound_admission(
         let _ = command.acknowledge.send(Err(RuntimeError::Admission(
             AdmissionError::OperationsExhausted,
         )));
-        return;
+        return None;
+    }
+
+    let required_credits = match command
+        .operations
+        .iter()
+        .map(|operation| operation.credit_charge(authority.large_mtu))
+        .try_fold(0u32, |total, charge| {
+            total
+                .checked_add(u32::from(charge?))
+                .ok_or(super::operation::OperationContractError::CreditChargeOverflow {
+                    command: smb_msg::Command::Cancel,
+                })
+        }) {
+        Ok(total) => total,
+        Err(_) => {
+            let _ = command
+                .acknowledge
+                .send(Err(RuntimeError::Wire("credit-charge")));
+            return None;
+        }
+    };
+    if required_credits > authority.state.available_credits() {
+        return Some(command);
     }
 
     let mut admitted = Vec::with_capacity(command.operations.len());
@@ -867,7 +938,7 @@ async fn process_compound_admission(
                 let _ = command
                     .acknowledge
                     .send(Err(RuntimeError::Wire("credit-charge")));
-                return;
+                return None;
             }
         };
         let effects = authority.state.reduce(OwnerEvent::Admit {
@@ -886,7 +957,7 @@ async fn process_compound_admission(
                 _ => RuntimeError::OwnerTerminated,
             };
             let _ = command.acknowledge.send(Err(error));
-            return;
+            return None;
         };
         let key = plan.key;
         let response = operation.response_policy().clone();
@@ -909,7 +980,7 @@ async fn process_compound_admission(
             let _ = command
                 .acknowledge
                 .send(Err(RuntimeError::Wire("prepare-compound")));
-            return;
+            return None;
         }
     };
 
@@ -943,6 +1014,7 @@ async fn process_compound_admission(
         cancel_before_write: CancellationToken::new(),
     });
     let _ = command.acknowledge.send(Ok(submissions));
+    None
 }
 
 struct CloseRequest {
@@ -2315,6 +2387,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report.joined_tasks, 2);
+    }
+
+    #[tokio::test]
+    async fn typed_admission_waits_inside_owner_until_response_returns_credit() {
+        let (transport, control) = ScriptedTransport::new();
+        let clock = Arc::new(ManualClock::new());
+        let mut runtime_config = config();
+        runtime_config.initial_credits = 1;
+        let (handle, mut events) = start_generation(transport, clock.clone(), runtime_config);
+
+        let first = handle
+            .submit_operation(session_setup_operation(false), None)
+            .await
+            .unwrap();
+        let first_key = first.key;
+        loop {
+            if matches!(events.recv().await, Some(RuntimeEvent::WriteComplete { key }) if key == first.key)
+            {
+                break;
+            }
+        }
+
+        let second_submit = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                handle
+                    .submit_operation(session_setup_operation(false), None)
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!second_submit.is_finished());
+
+        control.push_server_frame(session_setup_response(first_key.message_id));
+        first.completion().await.unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(1), second_submit)
+            .await
+            .expect("credit grant must wake owner admission")
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.key.message_id, first_key.message_id + 1);
+        control.push_server_frame(session_setup_response(second.key.message_id));
+        second.completion().await.unwrap();
+
+        let report = handle
+            .close(clock.now().saturating_add(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        assert_eq!(report.unresolved_requests, 0);
     }
 
     #[tokio::test]
