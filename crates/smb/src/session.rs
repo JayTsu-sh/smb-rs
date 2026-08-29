@@ -353,12 +353,23 @@ struct SessionGeneration {
     conn_info: Arc<ConnectionInfo>,
 }
 
+struct RecoveryFlag<'a>(&'a AtomicBool);
+
+impl Drop for RecoveryFlag<'_> {
+    fn drop(&mut self) {
+        self.0
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 pub(crate) struct SessionContext {
     generation: arc_swap::ArcSwap<SessionGeneration>,
 
     channel_contexts: RwLock<HashMap<u32, Arc<ChannelContext>>>,
     credential_provider: Option<SharedCredentialProvider>,
     recovery: tokio::sync::Mutex<()>,
+    recovery_slots: Arc<tokio::sync::Semaphore>,
+    recovering: AtomicBool,
 
     dropping: AtomicBool,
 }
@@ -370,6 +381,7 @@ impl SessionContext {
         credential_provider: Option<SharedCredentialProvider>,
     ) -> Self {
         let primary_channel_id = primary_channel.channel_id();
+        let recovery_capacity = conn_info.config.auto_reconnect.max_waiting_operations;
         Self {
             generation: arc_swap::ArcSwap::from_pointee(SessionGeneration {
                 primary_channel: primary_channel.clone(),
@@ -378,6 +390,8 @@ impl SessionContext {
             channel_contexts: RwLock::new(HashMap::from([(primary_channel_id, primary_channel)])),
             credential_provider,
             recovery: tokio::sync::Mutex::new(()),
+            recovery_slots: Arc::new(tokio::sync::Semaphore::new(recovery_capacity)),
+            recovering: AtomicBool::new(false),
             dropping: AtomicBool::new(false),
         }
     }
@@ -398,6 +412,55 @@ impl SessionContext {
         self.generation().conn_info.clone()
     }
 
+    async fn wait_for_reauthentication(
+        self: &Arc<Self>,
+        timeout: Option<std::time::Duration>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> crate::Result<()> {
+        let primary = self.primary_channel();
+        let expected_session_id = primary.session_id();
+        let connection = primary
+            .upstream()
+            .connection_object()?;
+        if !self.recovering.load(std::sync::atomic::Ordering::Acquire)
+            && primary.session_state().object()?.generation() == connection.generation()
+        {
+            return Ok(());
+        }
+        let permit = self
+            .recovery_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::SessionRecoveryQueueFull)?;
+        let recovery = tokio::spawn({
+            let context = self.clone();
+            async move {
+                let _permit = permit;
+                context.reauthenticate(expected_session_id).await.map(|_| ())
+            }
+        });
+        tokio::pin!(recovery);
+        let deadline = async {
+            match timeout {
+                Some(timeout) => tokio::time::sleep(timeout).await,
+                None => futures_util::future::pending().await,
+            }
+        };
+        tokio::pin!(deadline);
+        let cancelled = async {
+            match cancellation {
+                Some(cancellation) => cancellation.cancelled().await,
+                None => futures_util::future::pending().await,
+            }
+        };
+        tokio::pin!(cancelled);
+        tokio::select! {
+            result = &mut recovery => result.map_err(Error::JoinError)?,
+            _ = &mut deadline => Err(Error::SessionRecoveryWaitTimedOut),
+            _ = &mut cancelled => Err(Error::Cancelled("session recovery wait")),
+        }
+    }
+
     pub(crate) async fn reauthenticate(
         &self,
         expected_session_id: u64,
@@ -408,6 +471,9 @@ impl SessionContext {
         if previous_channel.session_id() != expected_session_id {
             return Ok((expected_session_id, previous_channel.session_id()));
         }
+        self.recovering
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _recovering = RecoveryFlag(&self.recovering);
         let previous_state = previous_channel.session_state().clone();
         let previous_object = previous_state.object()?;
         let upstream = previous_channel.upstream();
@@ -494,7 +560,7 @@ impl SessionContext {
         Ok((old_session_id, new_session_id))
     }
 
-    pub async fn logoff(&self) -> crate::Result<()> {
+    pub async fn logoff(self: &Arc<Self>) -> crate::Result<()> {
         if self
             .dropping
             .swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -543,10 +609,15 @@ impl SessionContext {
     }
 
     pub(crate) async fn execute(
-        &self,
+        self: &Arc<Self>,
         msg: CommandRequest,
         options: ResponseOptions<'_>,
     ) -> crate::Result<(CommandSubmission, CommandResponse)> {
+        self.wait_for_reauthentication(
+            options.timeout.or_else(|| Some(self.conn_info().config.timeout())),
+            options.async_cancel.clone(),
+        )
+        .await?;
         self.resolve_channel(msg.channel_id)
             .await?
             .execute(msg, options)
@@ -566,9 +637,11 @@ impl SessionContext {
     }
 
     pub(crate) async fn create_child_object(
-        &self,
+        self: &Arc<Self>,
         kind: crate::runtime::ObjectKind,
     ) -> crate::Result<crate::runtime::ObjectToken> {
+        self.wait_for_reauthentication(Some(self.conn_info().config.timeout()), None)
+            .await?;
         self.primary_channel().create_child_object(kind).await
     }
 
@@ -592,7 +665,7 @@ impl SessionContext {
     }
 
     pub(crate) async fn send_recv(
-        &self,
+        self: &Arc<Self>,
         content: RequestContent,
     ) -> crate::Result<CommandResponse> {
         self.execute(CommandRequest::new(content), ResponseOptions::new())
@@ -605,7 +678,7 @@ impl SessionContext {
     /// # Notes
     /// This method waits for the logoff response to be received from the server.
     /// It is used when dropping the session.
-    async fn logoff_async(&self) {
+    async fn logoff_async(self: Arc<Self>) {
         self.logoff().await.unwrap_or_else(|e| {
             tracing::error!("Failed to logoff: {e}");
         });
@@ -638,8 +711,10 @@ impl Drop for SessionContext {
                 channel_contexts: Default::default(),
                 credential_provider: None,
                 recovery: tokio::sync::Mutex::new(()),
+                recovery_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+                recovering: AtomicBool::new(false),
             };
-            temp_handler.logoff_async().await;
+            Arc::new(temp_handler).logoff_async().await;
         });
     }
 }

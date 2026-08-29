@@ -76,6 +76,12 @@ pub enum Error {
     #[error("Operation cancelled: {0}")]
     Cancelled(&'static str),
 
+    #[error("Session recovery wait queue is full")]
+    SessionRecoveryQueueFull,
+
+    #[error("Session recovery wait timed out")]
+    SessionRecoveryWaitTimedOut,
+
     #[error("Invalid state: {0}")]
     InvalidState(String),
     #[error("Unable to transform message: {0}")]

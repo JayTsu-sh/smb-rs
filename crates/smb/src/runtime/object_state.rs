@@ -353,7 +353,11 @@ impl ObjectRegistry {
         if record.phase != ObjectPhase::Recovering {
             return Err(ObjectError::ParentNotActive);
         }
-        let revoked = self.revoke_descendants(token);
+        let mut revoked = self.revoke_descendants(token);
+        revoked.sort_by_key(|effect| match effect {
+            ObjectEffect::Revoked(token) => token.id,
+            ObjectEffect::ReplacementPublished { replacement, .. } => replacement.id,
+        });
         let replacement = self.publish_replacement(token)?;
         Ok((replacement, revoked))
     }
