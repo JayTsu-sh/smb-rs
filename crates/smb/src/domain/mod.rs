@@ -3,10 +3,12 @@
 mod batch;
 mod cursor;
 mod operation;
+mod rpc;
 mod transfer;
 pub use batch::{Batch, BatchCommand, BatchOutcome, BatchRef, BatchResult};
 pub use cursor::FileCursor;
 pub use operation::{CancelToken, Deadline, Operation, ReplayPolicy};
+pub use rpc::RpcPipeConnection;
 pub use transfer::{
     Transfer, TransferEvents, TransferOptions, TransferProgress, TransferReport, TransferStrategy,
 };
@@ -949,9 +951,7 @@ mod tests {
 
     #[test]
     fn directory_rename_events_are_paired_or_rejected() {
-        use crate::runtime::port::{
-            RuntimeDirectoryEvent, RuntimeDirectoryEventKind as Kind,
-        };
+        use crate::runtime::port::{RuntimeDirectoryEvent, RuntimeDirectoryEventKind as Kind};
 
         let mut from = None;
         assert!(
