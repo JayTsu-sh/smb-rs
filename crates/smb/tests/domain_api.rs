@@ -344,6 +344,7 @@ async fn domain_batch_and_concurrent_transfer() -> smb::Result<()> {
     let suffix = std::process::id();
     let source_path = SharePath::new(format!("domain-transfer-source-{suffix}.bin"))?;
     let destination_path = SharePath::new(format!("domain-transfer-destination-{suffix}.bin"))?;
+    let single_path = SharePath::new(format!("domain-transfer-single-{suffix}.bin"))?;
     let payload = Bytes::from(
         (0..(2 * 1024 * 1024 + 137))
             .map(|index| (index % 251) as u8)
@@ -361,6 +362,24 @@ async fn domain_batch_and_concurrent_transfer() -> smb::Result<()> {
     let destination = share
         .open_file(&destination_path, FileOpenOptions::overwrite())
         .await?;
+    let single = share
+        .open_file(&single_path, FileOpenOptions::overwrite())
+        .await?;
+
+    let single_report = source
+        .transfer_to(
+            &single,
+            TransferOptions::default()
+                .concurrency(1)
+                .chunk_size(256 * 1024)
+                .timeout(Duration::from_secs(30)),
+        )
+        .await?;
+    assert_eq!(single_report.bytes(), payload.len() as u64);
+    assert_eq!(
+        single.read_exact_at(0, payload.len() as u32).await?,
+        payload
+    );
 
     let marker = Bytes::from_static(b"batch-marker");
     let mut batch = Batch::new();
@@ -413,11 +432,22 @@ async fn domain_batch_and_concurrent_transfer() -> smb::Result<()> {
             .await,
         Err(Error::Cancelled("domain operation"))
     ));
+    assert!(matches!(
+        source
+            .transfer_to(
+                &destination,
+                TransferOptions::default().deadline(Instant::now() - Duration::from_millis(1))
+            )
+            .await,
+        Err(Error::OperationTimeout(..))
+    ));
 
     source.delete().await?;
     destination.delete().await?;
+    single.delete().await?;
     source.close().await?;
     destination.close().await?;
+    single.close().await?;
     share.close().await?;
     client.close().await
 }

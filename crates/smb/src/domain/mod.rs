@@ -423,7 +423,7 @@ impl File {
                 self.inner
                     .read_at(
                         offset,
-                        max_len,
+                        max_len.min(self.inner.maximum_read_size()),
                         timeout,
                         context.cancellation.clone(),
                         context.runtime_replay(),
@@ -436,6 +436,11 @@ impl File {
     pub fn write_at(&self, offset: u64, bytes: Bytes) -> Operation<'_, usize> {
         Operation::new(move |context| {
             Box::pin(async move {
+                if bytes.len() > self.inner.maximum_write_size() as usize {
+                    return Err(Error::InvalidArgument(
+                        "positioned write exceeds the negotiated maximum write size".into(),
+                    ));
+                }
                 let timeout = context.remaining()?;
                 self.inner
                     .write_at(
@@ -458,7 +463,7 @@ impl File {
                     .inner
                     .read_at(
                         offset,
-                        u32::try_from(buffer.len())?,
+                        u32::try_from(buffer.len())?.min(self.inner.maximum_read_size()),
                         timeout,
                         context.cancellation.clone(),
                         context.runtime_replay(),
@@ -474,6 +479,11 @@ impl File {
         Operation::new(move |context| {
             Box::pin(async move {
                 let bytes = Bytes::copy_from_slice(buffer);
+                if bytes.len() > self.inner.maximum_write_size() as usize {
+                    return Err(Error::InvalidArgument(
+                        "positioned write exceeds the negotiated maximum write size".into(),
+                    ));
+                }
                 let timeout = context.remaining()?;
                 self.inner
                     .write_at(

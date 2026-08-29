@@ -179,7 +179,7 @@ impl File {
                 self.inner
                     .read_at(
                         offset,
-                        max_len,
+                        max_len.min(self.inner.maximum_read_size()),
                         context.remaining()?,
                         context.cancellation,
                         replay,
@@ -193,6 +193,11 @@ impl File {
         BatchCommand::new(move |context| {
             Box::pin(async move {
                 let replay = context.runtime_replay();
+                if bytes.len() > self.inner.maximum_write_size() as usize {
+                    return Err(Error::InvalidArgument(
+                        "batch write exceeds the negotiated maximum write size".into(),
+                    ));
+                }
                 self.inner
                     .write_at(
                         offset,
