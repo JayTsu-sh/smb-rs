@@ -30,7 +30,7 @@ use std::time::Instant;
 use tokio::select;
 use tokio::sync::{OnceCell, Semaphore};
 use tokio_util::sync::CancellationToken;
-use worker::{Worker, WorkerImpl};
+use worker::WorkerImpl;
 
 /// Capacity of the per-connection lease-break broadcast. A handful of slow
 /// subscribers wouldn't trail behind by more than this many events; if they
@@ -204,6 +204,7 @@ impl Connection {
         mut transport: Box<dyn SmbTransport>,
         smb2_only_neg: bool,
     ) -> crate::Result<Arc<WorkerImpl>> {
+        let mut initial_message_id = 0;
         // Multi-protocol negotiation: Begin with SMB1, expect SMB2.
         if !smb2_only_neg {
             tracing::debug!("Negotiating multi-protocol: Sending SMB1");
@@ -243,10 +244,10 @@ impl Connection {
                 ));
             }
             // Increase sequence number.
-            self.handler.curr_msg_id.fetch_add(1, Ordering::Relaxed);
+            initial_message_id = 1;
         }
 
-        WorkerImpl::start(transport, self.config.timeout()).await
+        WorkerImpl::start_at(transport, self.config.timeout(), initial_message_id).await
     }
 
     /// This method perofrms the SMB2 negotiation.
@@ -523,7 +524,7 @@ impl Connection {
             .get()
             .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?
             .negotaite_complete(&info)
-            .await;
+            .await?;
 
         // Always start the notify task unless the caller explicitly disabled
         // it. `caps.notifications()` is the SMB 3.1.1 ChangeNotify capability

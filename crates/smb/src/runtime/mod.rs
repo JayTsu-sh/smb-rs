@@ -16,3 +16,7 @@ mod reducer;
 #[allow(dead_code)]
 mod state;
 pub(crate) mod wire;
+
+pub(crate) use engine::{RuntimeConfig, RuntimeError, RuntimeHandle, start_generation};
+pub(crate) use operation::{OperationResult, TypedOperation};
+pub(crate) use reducer::{GenerationId, RequestKey, TerminalOutcome};

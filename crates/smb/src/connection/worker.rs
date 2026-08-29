@@ -1,5 +1,2 @@
-pub mod worker_trait;
-pub use worker_trait::*;
-
-mod parallel;
-pub use parallel::ParallelWorker as WorkerImpl;
+mod runtime_worker;
+pub(crate) use runtime_worker::RuntimeWorker as WorkerImpl;

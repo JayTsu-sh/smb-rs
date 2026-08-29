@@ -132,6 +132,18 @@ pub(crate) struct OperationResult {
     pub(crate) request_raw: Option<Bytes>,
 }
 
+impl OperationResult {
+    pub(crate) fn into_incoming(self) -> IncomingMessage {
+        self.response
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OperationSubmission {
+    pub(crate) key: RequestKey,
+    pub(crate) request_raw: Option<Bytes>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum OperationContractError {
     #[error("typed operation expected {expected:?}, got {actual:?}")]

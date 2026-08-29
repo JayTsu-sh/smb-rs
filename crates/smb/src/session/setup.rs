@@ -564,8 +564,7 @@ where
         self.upstream
             .worker()
             .ok_or_else(|| Error::InvalidState("Worker not available!".to_string()))?
-            .wire_pipeline()
-            .snapshot_preauth_finalized()
+            .preauth_snapshot()
             .await
     }
 

@@ -1,4 +1,4 @@
-use super::operation::{OperationResult, ResponsePolicy, TypedOperation};
+use super::operation::{OperationResult, OperationSubmission, ResponsePolicy, TypedOperation};
 use super::reducer::{GenerationId, ReduceEffect, RequestKey, TerminalOutcome};
 use super::state::{
     AdmissionError, AdmissionLimits, GenerationState, OwnerEffect, OwnerEvent, RequestProgress,
@@ -6,6 +6,7 @@ use super::state::{
 use super::wire::WirePipeline;
 use crate::clock::{Clock, MonotonicTime};
 use crate::connection::connection_info::ConnectionInfo;
+use crate::connection::preauth_hash::PreauthHashValue;
 use crate::session::SessionAndChannel;
 use smb_transport::{
     SendFrame, SmbTransport, SmbTransportRead, SmbTransportWrite, TransportError, TransportFrame,
@@ -31,6 +32,36 @@ pub(crate) struct RuntimeConfig {
     pub(crate) event_capacity: usize,
     pub(crate) control_batch: usize,
     pub(crate) maximum_frame_size: usize,
+    pub(crate) emit_events: bool,
+    pub(crate) decode_unsolicited: bool,
+}
+
+impl RuntimeConfig {
+    pub(crate) fn production(
+        generation: GenerationId,
+        initial_message_id: u64,
+        initial_credits: u32,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            generation,
+            initial_message_id,
+            initial_credits,
+            admission_limits: AdmissionLimits {
+                max_operations: 1024,
+                max_payload_bytes: 256 * 1024 * 1024,
+            },
+            tombstone_drain_timeout: timeout,
+            admission_capacity: 1024,
+            io_capacity: 1024,
+            control_capacity: 256,
+            event_capacity: 1,
+            control_batch: 16,
+            maximum_frame_size: smb_transport::DEFAULT_MAX_FRAME_SIZE,
+            emit_events: false,
+            decode_unsolicited: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -112,6 +143,7 @@ impl RequestTicket {
 pub(crate) struct RuntimeHandle {
     admission: mpsc::Sender<AdmissionCommand>,
     operations: mpsc::Sender<OperationAdmission>,
+    compounds: mpsc::Sender<CompoundAdmission>,
     control: mpsc::Sender<ControlCommand>,
     owner_finished: CancellationToken,
 }
@@ -153,6 +185,27 @@ impl RuntimeHandle {
         result.await.unwrap_or(Err(RuntimeError::OwnerTerminated))
     }
 
+    pub(crate) async fn preauth_snapshot(&self) -> Result<Option<PreauthHashValue>, RuntimeError> {
+        let (reply, result) = oneshot::channel();
+        self.control
+            .send(ControlCommand::PreauthSnapshot { reply })
+            .await
+            .map_err(|_| RuntimeError::Closed)?;
+        result.await.unwrap_or(Err(RuntimeError::OwnerTerminated))
+    }
+
+    pub(crate) fn install_notifications(
+        &self,
+        sender: mpsc::Sender<crate::msg_handler::IncomingMessage>,
+    ) -> Result<(), RuntimeError> {
+        self.control
+            .try_send(ControlCommand::InstallNotifications { sender })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => RuntimeError::ControlBackpressure,
+                mpsc::error::TrySendError::Closed(_) => RuntimeError::Closed,
+            })
+    }
+
     pub(crate) async fn submit_operation(
         &self,
         operation: TypedOperation,
@@ -173,10 +226,13 @@ impl RuntimeHandle {
                 mpsc::error::TrySendError::Full(_) => RuntimeError::AdmissionBackpressure,
                 mpsc::error::TrySendError::Closed(_) => RuntimeError::Closed,
             })?;
-        let key = acknowledged
+        let submission = acknowledged
             .await
             .unwrap_or(Err(RuntimeError::OwnerTerminated))?;
-        Ok(OperationTicket { key, completion })
+        Ok(OperationTicket {
+            key: submission.key,
+            completion,
+        })
     }
 
     pub(crate) async fn submit_operation_detached(
@@ -184,7 +240,7 @@ impl RuntimeHandle {
         operation: TypedOperation,
         credit_charge: u16,
         deadline: Option<MonotonicTime>,
-    ) -> Result<RequestKey, RuntimeError> {
+    ) -> Result<OperationSubmission, RuntimeError> {
         let (acknowledge, acknowledged) = oneshot::channel();
         self.operations
             .try_send(OperationAdmission {
@@ -213,6 +269,27 @@ impl RuntimeHandle {
             .await
             .map_err(|_| RuntimeError::Closed)?;
         result.await.unwrap_or(Err(RuntimeError::OwnerTerminated))
+    }
+
+    pub(crate) async fn submit_compound_detached(
+        &self,
+        operations: Vec<(TypedOperation, u16)>,
+        deadline: Option<MonotonicTime>,
+    ) -> Result<Vec<OperationSubmission>, RuntimeError> {
+        let (acknowledge, acknowledged) = oneshot::channel();
+        self.compounds
+            .try_send(CompoundAdmission {
+                operations,
+                deadline,
+                acknowledge,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => RuntimeError::AdmissionBackpressure,
+                mpsc::error::TrySendError::Closed(_) => RuntimeError::Closed,
+            })?;
+        acknowledged
+            .await
+            .unwrap_or(Err(RuntimeError::OwnerTerminated))
     }
 
     pub(crate) async fn submit(
@@ -281,12 +358,14 @@ pub(crate) fn start_generation(
 ) -> (RuntimeHandle, RuntimeEvents) {
     let (admission_tx, admission_rx) = mpsc::channel(config.admission_capacity.max(1));
     let (operation_tx, operation_rx) = mpsc::channel(config.admission_capacity.max(1));
+    let (compound_tx, compound_rx) = mpsc::channel(config.admission_capacity.max(1));
     let (control_tx, control_rx) = mpsc::channel(config.control_capacity.max(1));
     let (event_tx, event_rx) = mpsc::channel(config.event_capacity.max(1));
     let owner_finished = CancellationToken::new();
     let handle = RuntimeHandle {
         admission: admission_tx,
         operations: operation_tx,
+        compounds: compound_tx,
         control: control_tx,
         owner_finished: owner_finished.clone(),
     };
@@ -297,6 +376,7 @@ pub(crate) fn start_generation(
             config,
             admission_rx,
             operation_rx,
+            compound_rx,
             control_rx,
             event_tx,
         )
@@ -319,8 +399,14 @@ struct OperationAdmission {
     operation: TypedOperation,
     credit_charge: u16,
     deadline: Option<MonotonicTime>,
-    acknowledge: oneshot::Sender<Result<RequestKey, RuntimeError>>,
+    acknowledge: oneshot::Sender<Result<OperationSubmission, RuntimeError>>,
     terminal: Option<oneshot::Sender<Result<OperationResult, RuntimeError>>>,
+}
+
+struct CompoundAdmission {
+    operations: Vec<(TypedOperation, u16)>,
+    deadline: Option<MonotonicTime>,
+    acknowledge: oneshot::Sender<Result<Vec<OperationSubmission>, RuntimeError>>,
 }
 
 struct OperationPending {
@@ -334,9 +420,20 @@ struct RequestAuthority {
     state: GenerationState,
     terminals: HashMap<RequestKey, oneshot::Sender<Result<TerminalOutcome, RuntimeError>>>,
     operation_pending: HashMap<RequestKey, OperationPending>,
+    early_responses: HashMap<RequestKey, crate::msg_handler::IncomingMessage>,
+    frame_members: HashMap<RequestKey, Arc<[RequestKey]>>,
+    frame_cancellations: HashMap<RequestKey, CancellationToken>,
+    deferred_cancellations: HashMap<RequestKey, MonotonicTime>,
+    notifications: Option<mpsc::Sender<crate::msg_handler::IncomingMessage>>,
 }
 
 enum ControlCommand {
+    InstallNotifications {
+        sender: mpsc::Sender<crate::msg_handler::IncomingMessage>,
+    },
+    PreauthSnapshot {
+        reply: oneshot::Sender<Result<Option<PreauthHashValue>, RuntimeError>>,
+    },
     AwaitOperation {
         key: RequestKey,
         reply: oneshot::Sender<Result<OperationResult, RuntimeError>>,
@@ -365,6 +462,7 @@ enum ControlCommand {
 
 struct WriteCommand {
     key: RequestKey,
+    members: Arc<[RequestKey]>,
     frame: SendFrame,
     cancel_before_write: CancellationToken,
 }
@@ -396,6 +494,7 @@ async fn owner_task(
     config: RuntimeConfig,
     mut admission_rx: mpsc::Receiver<AdmissionCommand>,
     mut operation_rx: mpsc::Receiver<OperationAdmission>,
+    mut compound_rx: mpsc::Receiver<CompoundAdmission>,
     mut control_rx: mpsc::Receiver<ControlCommand>,
     event_tx: mpsc::Sender<RuntimeEvent>,
 ) {
@@ -403,6 +502,7 @@ async fn owner_task(
     let Ok((read, write)) = transport.split() else {
         fail_waiting_admissions(&mut admission_rx, RuntimeError::Transport("split")).await;
         fail_waiting_operations(&mut operation_rx, RuntimeError::Transport("split")).await;
+        fail_waiting_compounds(&mut compound_rx, RuntimeError::Transport("split")).await;
         return;
     };
     let (write_tx, write_rx) = mpsc::channel(1);
@@ -427,9 +527,12 @@ async fn owner_task(
         ),
         terminals: HashMap::new(),
         operation_pending: HashMap::new(),
+        early_responses: HashMap::new(),
+        frame_members: HashMap::new(),
+        frame_cancellations: HashMap::new(),
+        deferred_cancellations: HashMap::new(),
+        notifications: None,
     };
-    let mut frame_cancellations = HashMap::new();
-    let mut deferred_cancellations = HashMap::new();
     let mut send_queue = VecDeque::new();
     let mut close_request = None;
     let mut fatal = None;
@@ -442,8 +545,6 @@ async fn owner_task(
                         command,
                         &wire,
                         &mut authority,
-                        &mut frame_cancellations,
-                        &mut deferred_cancellations,
                         &mut send_queue,
                         &mut close_request,
                     )
@@ -451,6 +552,7 @@ async fn owner_task(
                     {
                         admission_rx.close();
                         operation_rx.close();
+                        compound_rx.close();
                     }
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -463,15 +565,16 @@ async fn owner_task(
                 event,
                 &wire,
                 &mut authority,
-                &mut frame_cancellations,
-                &mut deferred_cancellations,
                 &event_tx,
+                config.emit_events,
+                config.decode_unsolicited,
                 &mut fatal,
             )
             .await
         {
             admission_rx.close();
             operation_rx.close();
+            compound_rx.close();
         }
         if let Ok(command) = admission_rx.try_recv() {
             process_admission(
@@ -485,18 +588,17 @@ async fn owner_task(
             process_operation_admission(
                 command,
                 &wire,
-                &mut authority.state,
-                &mut authority.operation_pending,
+                &mut authority,
                 &mut send_queue,
+                &mut fatal,
             )
             .await;
         }
-        dispatch_next(
-            &write_tx,
-            &mut authority.state,
-            &mut send_queue,
-            &mut frame_cancellations,
-        );
+        if let Ok(command) = compound_rx.try_recv() {
+            process_compound_admission(command, &wire, &mut authority, &mut send_queue, &mut fatal)
+                .await;
+        }
+        dispatch_next(&write_tx, &mut authority, &mut send_queue);
 
         if close_request.is_some() || fatal.is_some() {
             break;
@@ -515,10 +617,11 @@ async fn owner_task(
             biased;
             command = control_rx.recv() => match command {
                 Some(command) => {
-                    let close = handle_control(command, &wire, &mut authority, &mut frame_cancellations, &mut deferred_cancellations, &mut send_queue, &mut close_request).await;
+                    let close = handle_control(command, &wire, &mut authority, &mut send_queue, &mut close_request).await;
                     close_admission_if(close, &mut admission_rx);
                     if close {
                         operation_rx.close();
+                        compound_rx.close();
                     }
                 }
                 None if admission_rx.is_closed() => break,
@@ -526,15 +629,17 @@ async fn owner_task(
             },
             event = io_rx.recv() => match event {
                 Some(event) => {
-                    if process_io(event, &wire, &mut authority, &mut frame_cancellations, &mut deferred_cancellations, &event_tx, &mut fatal).await {
+                    if process_io(event, &wire, &mut authority, &event_tx, config.emit_events, config.decode_unsolicited, &mut fatal).await {
                         admission_rx.close();
                         operation_rx.close();
+                        compound_rx.close();
                     }
                 }
                 None => {
                     fatal = Some(RuntimeError::Transport("io-channel-closed"));
                     admission_rx.close();
                     operation_rx.close();
+                    compound_rx.close();
                 }
             },
             command = admission_rx.recv(), if !admission_rx.is_closed() => {
@@ -544,13 +649,12 @@ async fn owner_task(
             },
             command = operation_rx.recv(), if !operation_rx.is_closed() => {
                 if let Some(command) = command {
-                    process_operation_admission(
-                        command,
-                        &wire,
-                        &mut authority.state,
-                        &mut authority.operation_pending,
-                        &mut send_queue,
-                    ).await;
+                    process_operation_admission(command, &wire, &mut authority, &mut send_queue, &mut fatal).await;
+                }
+            },
+            command = compound_rx.recv(), if !compound_rx.is_closed() => {
+                if let Some(command) = command {
+                    process_compound_admission(command, &wire, &mut authority, &mut send_queue, &mut fatal).await;
                 }
             },
             _ = &mut deadline_sleep => {
@@ -561,6 +665,7 @@ async fn owner_task(
                     fatal = Some(RuntimeError::Transport("generation-unhealthy"));
                     admission_rx.close();
                     operation_rx.close();
+                    compound_rx.close();
                 }
             }
             completion = pumps.join_next() => {
@@ -572,14 +677,21 @@ async fn owner_task(
                 }
                 admission_rx.close();
                 operation_rx.close();
+                compound_rx.close();
             }
         }
     }
 
     admission_rx.close();
     operation_rx.close();
+    compound_rx.close();
     fail_waiting_admissions(
         &mut admission_rx,
+        fatal.clone().unwrap_or(RuntimeError::Closed),
+    )
+    .await;
+    fail_waiting_compounds(
+        &mut compound_rx,
         fatal.clone().unwrap_or(RuntimeError::Closed),
     )
     .await;
@@ -591,7 +703,7 @@ async fn owner_task(
     for queued in send_queue {
         queued.cancel_before_write.cancel();
     }
-    for cancellation in frame_cancellations.values() {
+    for cancellation in authority.frame_cancellations.values() {
         cancellation.cancel();
     }
     drop(write_tx);
@@ -626,11 +738,11 @@ async fn owner_task(
 async fn process_operation_admission(
     command: OperationAdmission,
     wire: &WirePipeline,
-    state: &mut GenerationState,
-    pending: &mut HashMap<RequestKey, OperationPending>,
+    authority: &mut RequestAuthority,
     send_queue: &mut VecDeque<WriteCommand>,
+    fatal: &mut Option<RuntimeError>,
 ) {
-    if pending.len() >= state.operation_limit() {
+    if authority.operation_pending.len() >= authority.state.operation_limit() {
         let error = RuntimeError::Admission(AdmissionError::OperationsExhausted);
         if let Some(terminal) = command.terminal {
             let _ = terminal.send(Err(error.clone()));
@@ -639,7 +751,7 @@ async fn process_operation_admission(
         return;
     }
     let payload_bytes = command.operation.payload_bytes();
-    let effects = state.reduce(OwnerEvent::Admit {
+    let effects = authority.state.reduce(OwnerEvent::Admit {
         payload_bytes,
         credit_charge: command.credit_charge,
         caller_deadline: command.deadline,
@@ -664,7 +776,7 @@ async fn process_operation_admission(
     let frame = match wire.transform_outgoing(outgoing).await {
         Ok(frame) => frame,
         Err(_) => {
-            state.reduce(OwnerEvent::PrepareFailed { key });
+            authority.state.reduce(OwnerEvent::PrepareFailed { key });
             let error = RuntimeError::Wire("prepare-outgoing");
             if let Some(terminal) = command.terminal {
                 let _ = terminal.send(Err(error.clone()));
@@ -676,21 +788,133 @@ async fn process_operation_admission(
     let request_raw = retain_raw
         .then(|| frame.segments().first().cloned())
         .flatten();
-    pending.insert(
+    authority.operation_pending.insert(
         key,
         OperationPending {
             response,
-            request_raw,
+            request_raw: request_raw.clone(),
             terminal: command.terminal,
             buffered: None,
         },
     );
     send_queue.push_back(WriteCommand {
         key,
+        members: Arc::from([key]),
         frame,
         cancel_before_write: CancellationToken::new(),
     });
-    let _ = command.acknowledge.send(Ok(key));
+    let _ = command
+        .acknowledge
+        .send(Ok(OperationSubmission { key, request_raw }));
+    if let Some(message) = authority.early_responses.remove(&key) {
+        process_decoded_response(message, authority, fatal);
+    }
+}
+
+async fn process_compound_admission(
+    command: CompoundAdmission,
+    wire: &WirePipeline,
+    authority: &mut RequestAuthority,
+    send_queue: &mut VecDeque<WriteCommand>,
+    fatal: &mut Option<RuntimeError>,
+) {
+    if command.operations.is_empty() {
+        let _ = command
+            .acknowledge
+            .send(Err(RuntimeError::Wire("empty-compound")));
+        return;
+    }
+    if authority
+        .operation_pending
+        .len()
+        .saturating_add(command.operations.len())
+        > authority.state.operation_limit()
+    {
+        let _ = command.acknowledge.send(Err(RuntimeError::Admission(
+            AdmissionError::OperationsExhausted,
+        )));
+        return;
+    }
+
+    let mut admitted = Vec::with_capacity(command.operations.len());
+    let mut outgoing_messages = Vec::with_capacity(command.operations.len());
+    for (operation, credit_charge) in command.operations {
+        let payload_bytes = operation.payload_bytes();
+        let effects = authority.state.reduce(OwnerEvent::Admit {
+            payload_bytes,
+            credit_charge,
+            caller_deadline: command.deadline,
+        });
+        let Some(OwnerEffect::Admitted(plan)) = effects.first() else {
+            for (key, _) in &admitted {
+                authority
+                    .state
+                    .reduce(OwnerEvent::PrepareFailed { key: *key });
+            }
+            let error = match effects.first() {
+                Some(OwnerEffect::AdmissionRejected(error)) => RuntimeError::Admission(*error),
+                _ => RuntimeError::OwnerTerminated,
+            };
+            let _ = command.acknowledge.send(Err(error));
+            return;
+        };
+        let key = plan.key;
+        let response = operation.response_policy().clone();
+        let mut outgoing = operation.into_outgoing();
+        outgoing.message.header.message_id = key.message_id;
+        outgoing.message.header.credit_charge = credit_charge;
+        if outgoing.message.header.credit_request == 0 {
+            outgoing.message.header.credit_request = credit_charge;
+        }
+        admitted.push((key, response));
+        outgoing_messages.push(outgoing);
+    }
+
+    let frame = match wire.transform_outgoing_compound(outgoing_messages).await {
+        Ok(frame) => frame,
+        Err(_) => {
+            for (key, _) in &admitted {
+                authority
+                    .state
+                    .reduce(OwnerEvent::PrepareFailed { key: *key });
+            }
+            let _ = command
+                .acknowledge
+                .send(Err(RuntimeError::Wire("prepare-compound")));
+            return;
+        }
+    };
+
+    let keys = admitted.iter().map(|(key, _)| *key).collect::<Arc<[_]>>();
+    let submissions = keys
+        .iter()
+        .copied()
+        .map(|key| OperationSubmission {
+            key,
+            request_raw: None,
+        })
+        .collect();
+    for (key, response) in admitted {
+        authority.operation_pending.insert(
+            key,
+            OperationPending {
+                response,
+                request_raw: None,
+                terminal: None,
+                buffered: None,
+            },
+        );
+        if let Some(message) = authority.early_responses.remove(&key) {
+            process_decoded_response(message, authority, fatal);
+        }
+    }
+    send_queue.push_back(WriteCommand {
+        key: keys[0],
+        members: keys,
+        frame,
+        cancel_before_write: CancellationToken::new(),
+    });
+    let _ = command.acknowledge.send(Ok(submissions));
 }
 
 struct CloseRequest {
@@ -721,6 +945,7 @@ fn process_admission(
             terminals.insert(key, command.terminal);
             send_queue.push_back(WriteCommand {
                 key,
+                members: Arc::from([key]),
                 frame: command.frame,
                 cancel_before_write: CancellationToken::new(),
             });
@@ -742,12 +967,22 @@ async fn handle_control(
     command: ControlCommand,
     wire: &WirePipeline,
     authority: &mut RequestAuthority,
-    frame_cancellations: &mut HashMap<RequestKey, CancellationToken>,
-    deferred_cancellations: &mut HashMap<RequestKey, MonotonicTime>,
     send_queue: &mut VecDeque<WriteCommand>,
     close_request: &mut Option<CloseRequest>,
 ) -> bool {
     match command {
+        ControlCommand::InstallNotifications { sender } => {
+            authority.notifications = Some(sender);
+            false
+        }
+        ControlCommand::PreauthSnapshot { reply } => {
+            let result = wire
+                .snapshot_preauth_finalized()
+                .await
+                .map_err(|_| RuntimeError::Wire("preauth-snapshot"));
+            let _ = reply.send(result);
+            false
+        }
         ControlCommand::AwaitOperation { key, reply } => {
             let Some(pending) = authority.operation_pending.get_mut(&key) else {
                 let _ = reply.send(Err(RuntimeError::UnknownRequest(key)));
@@ -797,19 +1032,22 @@ async fn handle_control(
             } else {
                 false
             };
-            if let Some(cancellation) = frame_cancellations.get(&key) {
+            if let Some(cancellation) = authority.frame_cancellations.get(&key) {
                 cancellation.cancel();
             }
             let committed = authority
                 .state
                 .request(key)
                 .is_some_and(|request| request.wire_committed());
-            if removed_before_dispatch || committed || !frame_cancellations.contains_key(&key) {
+            if removed_before_dispatch
+                || committed
+                || !authority.frame_cancellations.contains_key(&key)
+            {
                 let effects = authority.state.reduce(OwnerEvent::Cancel { key, now });
                 apply_operation_effects(&effects, &mut authority.operation_pending);
                 apply_owner_effects(effects, &mut authority.terminals);
             } else {
-                deferred_cancellations.entry(key).or_insert(now);
+                authority.deferred_cancellations.entry(key).or_insert(now);
             }
             false
         }
@@ -826,27 +1064,34 @@ async fn handle_control(
 
 fn dispatch_next(
     write_tx: &mpsc::Sender<WriteCommand>,
-    state: &mut GenerationState,
+    authority: &mut RequestAuthority,
     send_queue: &mut VecDeque<WriteCommand>,
-    frame_cancellations: &mut HashMap<RequestKey, CancellationToken>,
 ) {
     let Some(command) = send_queue.pop_front() else {
         return;
     };
     let key = command.key;
+    let members = command.members.clone();
     let cancellation = command.cancel_before_write.clone();
     match write_tx.try_send(command) {
         Ok(()) => {
-            state.reduce(OwnerEvent::Request {
-                key,
-                event: RequestProgress::Queued,
-            });
-            frame_cancellations.insert(key, cancellation);
+            for member in members.iter().copied() {
+                authority.state.reduce(OwnerEvent::Request {
+                    key: member,
+                    event: RequestProgress::Queued,
+                });
+            }
+            authority.frame_members.insert(key, members);
+            authority.frame_cancellations.insert(key, cancellation);
         }
         Err(mpsc::error::TrySendError::Full(command)) => send_queue.push_front(command),
         Err(mpsc::error::TrySendError::Closed(command)) => {
             command.cancel_before_write.cancel();
-            state.reduce(OwnerEvent::PrepareFailed { key });
+            for member in command.members.iter().copied() {
+                authority
+                    .state
+                    .reduce(OwnerEvent::PrepareFailed { key: member });
+            }
         }
     }
 }
@@ -855,15 +1100,15 @@ async fn process_io(
     event: IoEvent,
     wire: &WirePipeline,
     authority: &mut RequestAuthority,
-    frame_cancellations: &mut HashMap<RequestKey, CancellationToken>,
-    deferred_cancellations: &mut HashMap<RequestKey, MonotonicTime>,
     event_tx: &mpsc::Sender<RuntimeEvent>,
+    emit_events: bool,
+    decode_unsolicited: bool,
     fatal: &mut Option<RuntimeError>,
 ) -> bool {
     let runtime_event = match event {
         IoEvent::Inbound(frame) => {
             let bytes = frame.len();
-            if !authority.operation_pending.is_empty() {
+            if decode_unsolicited || !authority.operation_pending.is_empty() {
                 let messages = match wire.transform_incoming_all(frame.into_bytes()).await {
                     Ok(messages) => messages,
                     Err(_) => {
@@ -876,80 +1121,55 @@ async fn process_io(
                         authority.state.generation(),
                         message.message.header.message_id,
                     );
-                    let status = match message.message.header.status() {
-                        Ok(status) => status,
-                        Err(_) => {
-                            *fatal = Some(RuntimeError::Wire("invalid-status"));
-                            break;
+                    if authority.operation_pending.contains_key(&key) {
+                        process_decoded_response(message, authority, fatal);
+                    } else if key.message_id == u64::MAX {
+                        if let Some(notifications) = &authority.notifications
+                            && notifications.try_send(message).is_err()
+                        {
+                            *fatal = Some(RuntimeError::EventBackpressure);
                         }
-                    };
-                    if status == smb_msg::Status::Pending {
-                        let Some(async_id) = message.message.header.async_id else {
-                            *fatal = Some(RuntimeError::Wire("pending-without-async-id"));
-                            break;
-                        };
-                        authority.state.reduce(OwnerEvent::Response {
-                            key,
-                            event: super::state::ResponseEvent::Pending { async_id },
-                            credit_grant: message.message.header.credit_request,
-                        });
-                        continue;
-                    }
-                    let Some(pending) = authority.operation_pending.get(&key) else {
-                        continue;
-                    };
-                    if message.message.header.command != pending.response.wire_command()
-                        || !pending.response.accepts_status(status)
+                    } else if authority.early_responses.len() >= authority.state.operation_limit()
+                        || authority.early_responses.insert(key, message).is_some()
                     {
-                        *fatal = Some(RuntimeError::Wire("operation-response-contract"));
-                        break;
-                    }
-                    let effects = authority.state.reduce(OwnerEvent::Response {
-                        key,
-                        event: super::state::ResponseEvent::Final,
-                        credit_grant: message.message.header.credit_request,
-                    });
-                    let publishes_response = effects.iter().any(|effect| {
-                        matches!(
-                            effect,
-                            OwnerEffect::Request {
-                                key: found,
-                                effect: ReduceEffect::Publish(TerminalOutcome::Response),
-                            } if *found == key
-                        )
-                    });
-                    apply_owner_effects(effects, &mut authority.terminals);
-                    if publishes_response {
-                        complete_operation(
-                            &mut authority.operation_pending,
-                            key,
-                            Ok(OperationResult {
-                                key,
-                                response: message,
-                                request_raw: None,
-                            }),
-                        );
+                        *fatal = Some(RuntimeError::Wire("early-response-overflow-or-duplicate"));
                     }
                 }
             }
             Some(RuntimeEvent::InboundFrame { bytes })
         }
         IoEvent::WriteCancelled(key) => {
-            let now = deferred_cancellations
+            let now = authority
+                .deferred_cancellations
                 .remove(&key)
                 .unwrap_or(MonotonicTime::ZERO);
-            let effects = authority.state.reduce(OwnerEvent::Cancel { key, now });
-            apply_operation_effects(&effects, &mut authority.operation_pending);
-            apply_owner_effects(effects, &mut authority.terminals);
-            frame_cancellations.remove(&key);
+            let members = authority
+                .frame_members
+                .remove(&key)
+                .unwrap_or_else(|| Arc::from([key]));
+            for member in members.iter().copied() {
+                let effects = authority
+                    .state
+                    .reduce(OwnerEvent::Cancel { key: member, now });
+                apply_operation_effects(&effects, &mut authority.operation_pending);
+                apply_owner_effects(effects, &mut authority.terminals);
+            }
+            authority.frame_cancellations.remove(&key);
             None
         }
         IoEvent::WriteProgress { key, bytes } => {
-            authority.state.reduce(OwnerEvent::Request {
-                key,
-                event: RequestProgress::WriteProgress { bytes },
-            });
-            if let Some(now) = deferred_cancellations.remove(&key) {
+            let members = authority
+                .frame_members
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| Arc::from([key]));
+            for member in members.iter().copied() {
+                authority.state.reduce(OwnerEvent::Request {
+                    key: member,
+                    event: RequestProgress::WriteProgress { bytes },
+                });
+            }
+            if let Some(now) = authority.deferred_cancellations.remove(&key) {
                 let effects = authority.state.reduce(OwnerEvent::Cancel { key, now });
                 apply_operation_effects(&effects, &mut authority.operation_pending);
                 apply_owner_effects(effects, &mut authority.terminals);
@@ -957,16 +1177,22 @@ async fn process_io(
             Some(RuntimeEvent::WriteProgress { key, bytes })
         }
         IoEvent::WriteComplete(key) => {
-            authority.state.reduce(OwnerEvent::Request {
-                key,
-                event: RequestProgress::WriteComplete,
-            });
-            if let Some(now) = deferred_cancellations.remove(&key) {
+            let members = authority
+                .frame_members
+                .remove(&key)
+                .unwrap_or_else(|| Arc::from([key]));
+            for member in members.iter().copied() {
+                authority.state.reduce(OwnerEvent::Request {
+                    key: member,
+                    event: RequestProgress::WriteComplete,
+                });
+            }
+            if let Some(now) = authority.deferred_cancellations.remove(&key) {
                 let effects = authority.state.reduce(OwnerEvent::Cancel { key, now });
                 apply_operation_effects(&effects, &mut authority.operation_pending);
                 apply_owner_effects(effects, &mut authority.terminals);
             }
-            frame_cancellations.remove(&key);
+            authority.frame_cancellations.remove(&key);
             Some(RuntimeEvent::WriteComplete { key })
         }
         IoEvent::Failed { pump, error } => {
@@ -978,7 +1204,8 @@ async fn process_io(
         }
         IoEvent::Exited(pump) => Some(RuntimeEvent::PumpExited { pump }),
     };
-    if let Some(event) = runtime_event
+    if emit_events
+        && let Some(event) = runtime_event
         && event_tx.try_send(event).is_err()
     {
         *fatal = Some(RuntimeError::EventBackpressure);
@@ -999,6 +1226,72 @@ fn apply_owner_effects(
         {
             let _ = terminal.send(Ok(outcome));
         }
+    }
+}
+
+fn process_decoded_response(
+    message: crate::msg_handler::IncomingMessage,
+    authority: &mut RequestAuthority,
+    fatal: &mut Option<RuntimeError>,
+) {
+    let key = RequestKey::new(
+        authority.state.generation(),
+        message.message.header.message_id,
+    );
+    let status = match message.message.header.status() {
+        Ok(status) => status,
+        Err(_) => {
+            *fatal = Some(RuntimeError::Wire("invalid-status"));
+            return;
+        }
+    };
+    let Some(pending) = authority.operation_pending.get(&key) else {
+        *fatal = Some(RuntimeError::Wire("response-without-operation"));
+        return;
+    };
+    if status == smb_msg::Status::Pending {
+        let Some(async_id) = message.message.header.async_id else {
+            *fatal = Some(RuntimeError::Wire("pending-without-async-id"));
+            return;
+        };
+        authority.state.reduce(OwnerEvent::Response {
+            key,
+            event: super::state::ResponseEvent::Pending { async_id },
+            credit_grant: message.message.header.credit_request,
+        });
+        return;
+    }
+    if message.message.header.command != pending.response.wire_command()
+        || !pending.response.accepts_status(status)
+    {
+        *fatal = Some(RuntimeError::Wire("operation-response-contract"));
+        return;
+    }
+    let effects = authority.state.reduce(OwnerEvent::Response {
+        key,
+        event: super::state::ResponseEvent::Final,
+        credit_grant: message.message.header.credit_request,
+    });
+    let publishes_response = effects.iter().any(|effect| {
+        matches!(
+            effect,
+            OwnerEffect::Request {
+                key: found,
+                effect: ReduceEffect::Publish(TerminalOutcome::Response),
+            } if *found == key
+        )
+    });
+    apply_owner_effects(effects, &mut authority.terminals);
+    if publishes_response {
+        complete_operation(
+            &mut authority.operation_pending,
+            key,
+            Ok(OperationResult {
+                key,
+                response: message,
+                request_raw: None,
+            }),
+        );
     }
 }
 
@@ -1158,6 +1451,15 @@ async fn fail_waiting_operations(
         if let Some(terminal) = command.terminal {
             let _ = terminal.send(Err(error.clone()));
         }
+        let _ = command.acknowledge.send(Err(error.clone()));
+    }
+}
+
+async fn fail_waiting_compounds(
+    admissions: &mut mpsc::Receiver<CompoundAdmission>,
+    error: RuntimeError,
+) {
+    while let Some(command) = admissions.recv().await {
         let _ = command.acknowledge.send(Err(error.clone()));
     }
 }
@@ -1533,6 +1835,8 @@ mod tests {
             event_capacity: 128,
             control_batch: 2,
             maximum_frame_size: 1024 * 1024,
+            emit_events: true,
+            decode_unsolicited: false,
         }
     }
 
@@ -1637,6 +1941,7 @@ mod tests {
         command_tx
             .send(WriteCommand {
                 key,
+                members: Arc::from([key]),
                 frame: frame(),
                 cancel_before_write: cancellation,
             })
@@ -1666,6 +1971,7 @@ mod tests {
             command_tx
                 .send(WriteCommand {
                     key,
+                    members: Arc::from([key]),
                     frame: frame(),
                     cancel_before_write: CancellationToken::new(),
                 })
@@ -1787,6 +2093,7 @@ mod tests {
         command_tx
             .send(WriteCommand {
                 key,
+                members: Arc::from([key]),
                 frame: frame(),
                 cancel_before_write: cancellation.clone(),
             })
@@ -1820,6 +2127,7 @@ mod tests {
         command_tx
             .send(WriteCommand {
                 key,
+                members: Arc::from([key]),
                 frame: frame(),
                 cancel_before_write: cancellation.clone(),
             })
@@ -2036,10 +2344,12 @@ mod tests {
         control.push_server_frame(session_setup_response(10));
         let clock = Arc::new(ManualClock::new());
         let (handle, mut events) = start_generation(transport, clock.clone(), config());
-        let key = handle
+        let submission = handle
             .submit_operation_detached(session_setup_operation(true), 1, None)
             .await
             .unwrap();
+        let key = submission.key;
+        assert!(submission.request_raw.is_some());
         loop {
             if matches!(events.recv().await, Some(RuntimeEvent::InboundFrame { .. })) {
                 break;
@@ -2060,6 +2370,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_before_admission_is_bounded_and_replayed_through_reducer() {
+        let (transport, control) = ScriptedTransport::new();
+        control.push_server_frame(session_setup_response(10));
+        let clock = Arc::new(ManualClock::new());
+        let mut runtime_config = config();
+        runtime_config.decode_unsolicited = true;
+        let (handle, mut events) = start_generation(transport, clock.clone(), runtime_config);
+        loop {
+            if matches!(events.recv().await, Some(RuntimeEvent::InboundFrame { .. })) {
+                break;
+            }
+        }
+        let ticket = handle
+            .submit_operation(session_setup_operation(false), 1, None)
+            .await
+            .unwrap();
+        let result = ticket.completion().await.unwrap();
+        assert_eq!(result.key.message_id, 10);
+        assert_eq!(
+            result.response.message.header.status().unwrap(),
+            smb_msg::Status::MoreProcessingRequired
+        );
+        let report = handle
+            .close(clock.now().saturating_add(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        assert_eq!(report.unresolved_requests, 0);
+    }
+
+    #[tokio::test]
     async fn unawaited_detached_results_remain_admission_bounded() {
         let (transport, control) = ScriptedTransport::new();
         control.push_server_frame(session_setup_response(10));
@@ -2070,7 +2410,8 @@ mod tests {
         let first = handle
             .submit_operation_detached(session_setup_operation(false), 1, None)
             .await
-            .unwrap();
+            .unwrap()
+            .key;
         loop {
             if matches!(events.recv().await, Some(RuntimeEvent::InboundFrame { .. })) {
                 break;
@@ -2086,8 +2427,55 @@ mod tests {
         let second = handle
             .submit_operation_detached(session_setup_operation(false), 1, None)
             .await
-            .unwrap();
+            .unwrap()
+            .key;
         assert_eq!(second.message_id, 11);
+        let report = handle
+            .close(clock.now().saturating_add(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        assert_eq!(report.unresolved_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn compound_admission_seals_one_frame_and_assigns_every_member() {
+        let (transport, control) = ScriptedTransport::new();
+        let clock = Arc::new(ManualClock::new());
+        let (handle, mut events) = start_generation(transport, clock.clone(), config());
+        let submissions = handle
+            .submit_compound_detached(
+                vec![
+                    (session_setup_operation(false), 1),
+                    (session_setup_operation(false), 1),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            submissions
+                .iter()
+                .map(|submission| submission.key.message_id)
+                .collect::<Vec<_>>(),
+            vec![10, 11]
+        );
+        loop {
+            if matches!(events.recv().await, Some(RuntimeEvent::WriteComplete { key }) if key == submissions[0].key)
+            {
+                break;
+            }
+        }
+        let captured = control.captured_client_frames();
+        assert_eq!(captured.len(), 1);
+        let first = smb_msg::PlainRequest::read(&mut Cursor::new(captured[0].as_ref())).unwrap();
+        assert_eq!(first.header.message_id, 10);
+        assert!(first.header.next_command > 0);
+        let second = smb_msg::PlainRequest::read(&mut Cursor::new(
+            &captured[0][first.header.next_command as usize..],
+        ))
+        .unwrap();
+        assert_eq!(second.header.message_id, 11);
+        assert_eq!(second.header.next_command, 0);
         let report = handle
             .close(clock.now().saturating_add(Duration::from_secs(1)))
             .await

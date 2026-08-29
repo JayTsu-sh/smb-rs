@@ -6,7 +6,6 @@
 use crate::UncPath;
 use crate::connection::connection_info::ConnectionInfo;
 use crate::connection::preauth_hash::PreauthHashValue;
-use crate::connection::worker::Worker;
 use crate::{
     Error,
     connection::ConnectionMessageHandler,
@@ -116,8 +115,7 @@ impl Session {
     {
         let primary_channel = Self::_common_setup(setup_result).await?;
 
-        let handler =
-            Arc::new(SessionMessageHandler::new(primary_channel.handler.clone()));
+        let handler = Arc::new(SessionMessageHandler::new(primary_channel.handler.clone()));
 
         Ok(Session {
             session_handler: handler,
@@ -404,19 +402,13 @@ impl MessageHandler for SessionMessageHandler {
 
 trait WithChannel {
     type Result;
-    async fn work(
-        self,
-        href: &Arc<ChannelMessageHandler>,
-    ) -> crate::Result<Self::Result>;
+    async fn work(self, href: &Arc<ChannelMessageHandler>) -> crate::Result<Self::Result>;
 }
 
 struct SendoWithChannel(OutgoingMessage);
 impl WithChannel for SendoWithChannel {
     type Result = SendMessageResult;
-    async fn work(
-        self,
-        href: &Arc<ChannelMessageHandler>,
-    ) -> crate::Result<Self::Result> {
+    async fn work(self, href: &Arc<ChannelMessageHandler>) -> crate::Result<Self::Result> {
         href.sendo(self.0).await
     }
 }
@@ -424,10 +416,7 @@ impl WithChannel for SendoWithChannel {
 struct RecvoWithChannel<'a>(ReceiveOptions<'a>);
 impl WithChannel for RecvoWithChannel<'_> {
     type Result = IncomingMessage;
-    async fn work(
-        self,
-        href: &Arc<ChannelMessageHandler>,
-    ) -> crate::Result<Self::Result> {
+    async fn work(self, href: &Arc<ChannelMessageHandler>) -> crate::Result<Self::Result> {
         href.recvo(self.0).await
     }
 }
