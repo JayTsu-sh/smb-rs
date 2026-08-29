@@ -1,8 +1,11 @@
 use bytes::Bytes;
+#[cfg(feature = "real-server-tests")]
+use smb::{CancelToken, Error};
 use smb::{
-    Client, ClientConfig, Credentials, File, FileOpenOptions, Session, Share, SharePath,
-    ShareTarget,
+    Client, ClientConfig, Credentials, File, FileOpenOptions, ReplayPolicy, Session, Share,
+    SharePath, ShareTarget,
 };
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "real-server-tests")]
 mod common;
@@ -23,7 +26,10 @@ fn public_spine_types_are_send_sync_and_domain_named() {
     let target = ShareTarget::new("server", "share").unwrap();
     assert_eq!(target.server(), "server");
     assert_eq!(target.share(), "share");
-    assert_eq!(SharePath::new("dir/file.bin").unwrap().as_str(), "dir\\file.bin");
+    assert_eq!(
+        SharePath::new("dir/file.bin").unwrap().as_str(),
+        "dir\\file.bin"
+    );
 }
 
 #[allow(dead_code)]
@@ -34,16 +40,28 @@ async fn common_and_explicit_session_paths_compile(
     let client = Client::new(ClientConfig::default());
     let share = client.connect_share(&target, credentials).await?;
     let path = SharePath::new("domain-spine.bin")?;
-    let file = share.open_file(&path, FileOpenOptions::overwrite()).await?;
-    file.write_at(0, Bytes::from_static(b"domain")).await?;
+    let file = share
+        .open_file(&path, FileOpenOptions::overwrite())
+        .timeout(Duration::from_secs(5))
+        .await?;
+    file.write_at(0, Bytes::from_static(b"domain"))
+        .deadline(Instant::now() + Duration::from_secs(5))
+        .replay(ReplayPolicy::Never)
+        .await?;
     file.close().await?;
 
     let session = client
         .authenticate(target.server(), Credentials::ntlm("user", "secret"))
         .await?;
     let share = session.connect_share(target.share()).await?;
-    let file = share.open_file(&path, FileOpenOptions::open_existing()).await?;
-    let _bytes = file.read_at(0, 6).await?;
+    let file = share
+        .open_file(&path, FileOpenOptions::open_existing())
+        .await?;
+    let _bytes = file
+        .read_at(0, 6)
+        .timeout(Duration::from_secs(5))
+        .replay(ReplayPolicy::Idempotent)
+        .await?;
     file.delete().await?;
     file.close().await?;
     share.close().await?;
@@ -61,11 +79,36 @@ async fn domain_spine_roundtrips_without_protocol_escape_hatches() -> smb::Resul
         .connect_share(&target, common::smb_test_credentials())
         .await?;
     let path = SharePath::new("domain-spine-roundtrip.bin")?;
+
+    let cancellation = CancelToken::new();
+    cancellation.cancel();
+    assert!(matches!(
+        share
+            .open_file(&path, FileOpenOptions::overwrite())
+            .cancellation(cancellation)
+            .await,
+        Err(Error::Cancelled("domain operation"))
+    ));
+    assert!(matches!(
+        share
+            .open_file(&path, FileOpenOptions::overwrite())
+            .deadline(Instant::now() - Duration::from_millis(1))
+            .await,
+        Err(Error::OperationTimeout(..))
+    ));
+
     let file = share
         .open_file(&path, FileOpenOptions::overwrite())
+        .timeout(Duration::from_secs(10))
         .await?;
     let payload = Bytes::from_static(b"domain-first");
-    assert_eq!(file.write_at(0, payload.clone()).await?, payload.len());
+    assert_eq!(
+        file.write_at(0, payload.clone())
+            .timeout(Duration::from_secs(10))
+            .replay(ReplayPolicy::Never)
+            .await?,
+        payload.len()
+    );
     file.close().await?;
 
     let session = client
@@ -75,7 +118,13 @@ async fn domain_spine_roundtrips_without_protocol_escape_hatches() -> smb::Resul
     let file = share
         .open_file(&path, FileOpenOptions::open_existing())
         .await?;
-    assert_eq!(file.read_at(0, payload.len() as u32).await?, payload);
+    assert_eq!(
+        file.read_at(0, payload.len() as u32)
+            .timeout(Duration::from_secs(10))
+            .replay(ReplayPolicy::Idempotent)
+            .await?,
+        payload
+    );
     file.delete().await?;
     file.close().await?;
     share.close().await?;
