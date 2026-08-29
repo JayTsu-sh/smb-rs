@@ -4,8 +4,8 @@ use smb_transport::TransportError;
 use thiserror::Error;
 
 use crate::{UncPath, connection::TransformError};
-use tokio::sync::AcquireError;
 use smb_msg::{Command, ErrorResponse, Status};
+use tokio::sync::AcquireError;
 
 #[derive(Debug)]
 pub enum TimedOutTask {
@@ -87,6 +87,9 @@ pub enum Error {
 
     #[error("Share recovery wait timed out")]
     ShareRecoveryWaitTimedOut,
+
+    #[error("Resource recovery wait timed out")]
+    ResourceRecoveryWaitTimedOut,
 
     #[error("Invalid state: {0}")]
     InvalidState(String),

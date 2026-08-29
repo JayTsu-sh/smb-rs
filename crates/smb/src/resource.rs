@@ -749,44 +749,76 @@ impl ResourceHandle {
             Error::InvalidState("Resource belongs to a stale share generation".into())
         })?;
         let _owner = self.recovery.lock().await;
-        let share = self.context.current_share_object().await?;
-        let previous = self.generation.load_full();
-        if previous.object.generation() == share.generation() {
-            return Ok(());
-        }
-        let contexts: Vec<CreateContextRequest> = vec![
-            DurableHandleReconnectV2::new(previous.file_id, grant.create_guid, grant.persistent)
-                .into(),
-        ];
-        let response = self
-            .context
-            .execute_request(
-                CommandRequest::new(
-                    CreateRequest {
-                        requested_oplock_level: OplockLevel::None,
-                        impersonation_level: ImpersonationLevel::Impersonation,
-                        desired_access: FileAccessMask::new(),
-                        file_attributes: FileAttributes::new(),
-                        share_access: ShareAccessFlags::new(),
-                        create_disposition: CreateDisposition::Open,
-                        create_options: CreateOptions::new(),
-                        name: "".into(),
-                        contexts: contexts.into(),
-                    }
+        let policy = self.conn_info.config.auto_reconnect;
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(crate::clock::TokioClock::new());
+        let mut last_error = None;
+        for _attempt in 1..=policy.max_attempts {
+            let previous = self.generation.load_full();
+            let future = async {
+                let share = self.context.current_share_object().await?;
+                if previous.object.generation() == share.generation() {
+                    return crate::Result::Ok(None);
+                }
+                let contexts: Vec<CreateContextRequest> = vec![
+                    DurableHandleReconnectV2::new(
+                        previous.file_id,
+                        grant.create_guid,
+                        grant.persistent,
+                    )
                     .into(),
-                ),
-                ResponseOptions::new().with_allow_async(true),
+                ];
+                let response = self
+                    .context
+                    .execute_request(
+                        CommandRequest::new(
+                            CreateRequest {
+                                requested_oplock_level: OplockLevel::None,
+                                impersonation_level: ImpersonationLevel::Impersonation,
+                                desired_access: FileAccessMask::new(),
+                                file_attributes: FileAttributes::new(),
+                                share_access: ShareAccessFlags::new(),
+                                create_disposition: CreateDisposition::Open,
+                                create_options: CreateOptions::new(),
+                                name: "".into(),
+                                contexts: contexts.into(),
+                            }
+                            .into(),
+                        ),
+                        ResponseOptions::new().with_allow_async(true),
+                    )
+                    .await?
+                    .message
+                    .content
+                    .to_create()?;
+                if self.context.current_share_object().await? != share {
+                    return Err(Error::InvalidState(
+                        "Share changed during durable reconnect".into(),
+                    ));
+                }
+                let object = self.context.create_resource_object_for(share).await?;
+                crate::Result::Ok(Some(ResourceGeneration {
+                    file_id: response.file_id,
+                    object,
+                }))
+            };
+            match crate::session::recovery_attempt::run_bounded_attempt(
+                clock.clone(),
+                policy.attempt_timeout,
+                future,
             )
-            .await?
-            .message
-            .content
-            .to_create()?;
-        let object = self.context.create_resource_object().await?;
-        self.generation.store(Arc::new(ResourceGeneration {
-            file_id: response.file_id,
-            object,
-        }));
-        Ok(())
+            .await
+            {
+                Ok(Ok(Some(candidate))) => {
+                    self.generation.store(Arc::new(candidate));
+                    return Ok(());
+                }
+                Ok(Ok(None)) => return Ok(()),
+                Ok(Err(error)) => last_error = Some(error),
+                Err(_) => last_error = Some(Error::ResourceRecoveryWaitTimedOut),
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| Error::InvalidState("Durable Resource recovery is disabled".into())))
     }
 
     /// (Internal)

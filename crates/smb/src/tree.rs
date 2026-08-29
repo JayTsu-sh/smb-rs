@@ -510,6 +510,15 @@ impl TreeContext {
         Ok(self.generation().object)
     }
 
+    pub(crate) async fn create_resource_object_for(
+        &self,
+        share: crate::runtime::ObjectToken,
+    ) -> crate::Result<crate::runtime::ObjectToken> {
+        self.upstream
+            .create_object(share, crate::runtime::ObjectKind::Resource)
+            .await
+    }
+
     pub(crate) async fn execute_for(
         &self,
         msg: CommandRequest,
