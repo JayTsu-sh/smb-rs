@@ -1,8 +1,10 @@
 //! SMB domain handles.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::{Arc, Weak}};
 
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
+use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
 use crate::{
@@ -109,13 +111,24 @@ impl FileOpenOptions {
 
 #[derive(Clone)]
 pub(crate) struct DomainClient {
-    runtime: Arc<RuntimeClient>,
+    inner: Arc<DomainClientInner>,
 }
+
+struct DomainClientInner {
+    runtime: RuntimeClient,
+    sessions: Mutex<SessionCache>,
+}
+
+type SessionCacheKey = (String, [u8; 32]);
+type SessionCache = HashMap<SessionCacheKey, Weak<RuntimeSession>>;
 
 impl DomainClient {
     pub(crate) fn new() -> Self {
         Self {
-            runtime: Arc::new(RuntimeClient::new()),
+            inner: Arc::new(DomainClientInner {
+                runtime: RuntimeClient::new(),
+                sessions: Mutex::new(HashMap::new()),
+            }),
         }
     }
 
@@ -129,17 +142,38 @@ impl DomainClient {
                 "anonymous authentication is not activated".into(),
             ));
         };
-        let inner = self
+        let credential_digest: [u8; 32] = Sha256::new()
+            .chain_update(username.as_bytes())
+            .chain_update([0])
+            .chain_update(password.as_bytes())
+            .finalize()
+            .into();
+        let key = (server.to_owned(), credential_digest);
+        if let Some(inner) = self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(&key)
+            .and_then(Weak::upgrade)
+        {
+            return Ok(Session { inner });
+        }
+        let inner = Arc::new(self
+            .inner
             .runtime
             .authenticate(server, username.as_str(), password.to_string())
-            .await?;
-        Ok(Session {
-            inner: Arc::new(inner),
-        })
+            .await?);
+        self.inner
+            .sessions
+            .lock()
+            .await
+            .insert(key, Arc::downgrade(&inner));
+        Ok(Session { inner })
     }
 
     pub(crate) async fn close(&self) -> crate::Result<()> {
-        self.runtime.close().await
+        self.inner.runtime.close().await
     }
 }
 
@@ -154,6 +188,7 @@ impl Session {
         let inner = self.inner.connect_share(name).await?;
         Ok(Share {
             inner: Arc::new(inner),
+            _session: self.inner.clone(),
         })
     }
 
@@ -166,6 +201,7 @@ impl Session {
 #[derive(Clone)]
 pub struct Share {
     inner: Arc<RuntimeShare>,
+    _session: Arc<RuntimeSession>,
 }
 
 impl Share {
