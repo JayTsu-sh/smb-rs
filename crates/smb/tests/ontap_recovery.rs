@@ -75,6 +75,62 @@ async fn exact_session_disruption_is_typed_at_the_w4_2_boundary(
     }
 }
 
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[ignore = "requires isolated ONTAP resources and exact-session disruption"]
+async fn exact_session_disruption_reauthenticates_and_revokes_children(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let server = smb_tests_server();
+    let address: SocketAddr = format!("{server}:445").parse()?;
+    let connection = Arc::new(Connection::build(
+        &server,
+        address,
+        Guid::generate(),
+        default_connection_config(),
+    )?);
+    connection.connect().await?;
+    let session = connection.authenticate(smb_test_identity()?).await?;
+    let share_name = smb_tests_share();
+    let share_path = UncPath::new(&server)?.with_share(&share_name)?;
+    let tree = session.tree_connect(&share_path).await?;
+    let file = tree
+        .create(
+            &format!("smb-rs-session-recovery-{}.bin", std::process::id()),
+            &FileCreateArgs::make_overwrite(Default::default(), Default::default()),
+        )
+        .await?
+        .into_file()?;
+    file.write_at(b"session-one", 0).await?;
+    let initial_session_id = session.session_id();
+    println!("SESSION_RECOVERY_DISRUPTION_READY");
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if session.session_id() != initial_session_id {
+            assert!(
+                file.write_at(b"stale", 0).await.is_err(),
+                "Resource from the replaced Session must remain stale"
+            );
+            let recovered_tree = session.tree_connect(&share_path).await?;
+            let recovered_file = recovered_tree
+                .create(
+                    &format!("smb-rs-session-recovered-{}.bin", std::process::id()),
+                    &FileCreateArgs::make_overwrite(Default::default(), Default::default()),
+                )
+                .await?
+                .into_file()?;
+            recovered_file.write_at(b"session-two", 0).await?;
+            println!("SESSION_REAUTHENTICATED");
+            connection.close().await?;
+            return Ok(());
+        }
+        let _ = file.write_at(b"probe", 32).await;
+        if Instant::now() >= deadline {
+            return Err("Session was not reauthenticated before the deadline".into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn start_disrupting_proxy(
     upstream: SocketAddr,
 ) -> std::io::Result<(SocketAddr, CancellationToken, CancellationToken, tokio::task::JoinHandle<()>)>
