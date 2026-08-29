@@ -34,7 +34,9 @@ use conformance::transcripts::{
     negotiate_response_windows_dc, session_setup_response_final,
     session_setup_response_intermediate,
 };
-use conformance::{MockGss, MockTransport, ScriptedGssStep, assert_signed_final_session_setup};
+use conformance::{
+    MockGss, ScriptedGssStep, ScriptedTransport, assert_signed_final_session_setup,
+};
 use smb::{Connection, ConnectionConfig};
 use smb_dtyp::Guid;
 
@@ -43,7 +45,7 @@ async fn windows_dc_signing_required_signs_final_session_setup() {
     const SESSION_ID: u64 = 0x0029_4cb6_8000_0009;
 
     // -- 1. Set up the mock and queue the scripted server frames. --
-    let (transport, control) = MockTransport::new();
+    let (transport, control) = ScriptedTransport::new();
     control.push_server_frame(negotiate_response_windows_dc());
     control.push_server_frame(session_setup_response_intermediate(SESSION_ID));
     control.push_server_frame(session_setup_response_final(SESSION_ID));
@@ -104,13 +106,13 @@ async fn windows_dc_signing_required_signs_final_session_setup() {
     // The driver's `worker.send()` returns when the message is queued on
     // the worker's send channel, not when `send_raw` actually completes.
     // On a real wire the response cannot arrive before the request goes
-    // out, so the test is naturally serialised; with MockTransport's
+    // out, so the test is naturally serialised; with ScriptedTransport's
     // pre-queued responses the two halves are decoupled, so we must
     // explicitly wait for the captured-frames side effect before
-    // asserting on it. See `TranscriptControl::wait_for_captured_frames`.
+    // asserting on it. See `ScriptedTransportControl::wait_for_client_frames`.
     assert!(
         control
-            .wait_for_captured_frames(3, std::time::Duration::from_secs(2))
+            .wait_for_client_frames(3, std::time::Duration::from_secs(2))
             .await,
         "timed out waiting for 3 client frames; got {}",
         control.client_frame_count()

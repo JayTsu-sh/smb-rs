@@ -122,7 +122,7 @@ __debug-dump-keys = []
 # integration tests can construct server-direction frames (e.g. a
 # scripted NegotiateResponse) via BinWrite. Never enable in production
 # — the re-exported items are not subject to SemVer.
-test-support = ["smb-msg/server"]
+test-support = ["smb-msg/server", "smb-transport/test-support"]
 
 # Tests
 test-multichannel = []

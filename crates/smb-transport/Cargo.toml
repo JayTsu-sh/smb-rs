@@ -41,10 +41,12 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 smb-tests = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [features]
 default = ["netbios-transport"]
 
 netbios-transport = []
+test-support = []
 quic = ["dep:quinn", "dep:rustls", "dep:rustls-platform-verifier"]
 rdma = ["dep:smb-msg"]                                             # , "dep:async-rdma"]

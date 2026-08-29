@@ -1,9 +1,10 @@
 //! Assertion helpers that decode captured client frames from the
-//! [`MockTransport`] into structured SMB views suitable for `assert!`s
+//! `ScriptedTransport` into structured SMB views suitable for `assert!`s
 //! at the protocol level.
 //!
 //! Each helper reads from a raw `Bytes` frame (SMB body without the
-//! 4-byte NetBIOS prefix — that's what [`TranscriptControl::captured_client_frames`]
+//! 4-byte NetBIOS prefix — that's what
+//! `ScriptedTransportControl::captured_client_frames`
 //! returns) and panics with a helpful message when the input doesn't
 //! look like the kind of frame expected.
 

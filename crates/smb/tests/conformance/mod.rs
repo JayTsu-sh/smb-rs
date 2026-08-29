@@ -3,8 +3,8 @@
 //! Deterministic SessionSetup / protocol transcript replay against the
 //! production [`smb::Connection`] code path. See sub-modules:
 //!
-//! - [`mock_transport`] — in-process [`SmbTransport`] with scripted
-//!   server frames and captured client frames
+//! - `smb_transport::test_support` — reusable in-process [`SmbTransport`]
+//!   with scripted server frames and captured client frames
 //! - [`mock_gss`]       — hand-scripted [`GssState`] mock (NTLM-style
 //!   2-round exchange or any other shape)
 //! - [`asserts`]        — protocol-level assertion helpers for the
@@ -20,11 +20,10 @@
 
 pub mod asserts;
 pub mod mock_gss;
-pub mod mock_transport;
 pub mod transcripts;
 
 pub use asserts::{
     ClientFrameHeader, assert_intermediate_session_setup, assert_signed_final_session_setup,
 };
 pub use mock_gss::{MockGss, ScriptedGssStep};
-pub use mock_transport::{MockTransport, TranscriptControl};
+pub use smb_transport::test_support::{ScriptedTransport, ScriptedTransportControl};

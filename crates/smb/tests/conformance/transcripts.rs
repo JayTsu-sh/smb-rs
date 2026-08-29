@@ -1,8 +1,8 @@
 //! Hand-built server-frame factories for transcript-replay tests.
 //!
 //! Each helper returns the raw SMB body bytes (no NetBIOS 4-byte length
-//! prefix — that's added inside [`MockTransport`]) of a single server
-//! response. Tests push them into [`TranscriptControl::push_server_frame`]
+//! prefix — that's added inside `ScriptedTransport`) of a single server
+//! response. Tests push them into `ScriptedTransportControl::push_server_frame`
 //! in the order the production driver will read them.
 //!
 //! These factories use the production `smb-msg` serializer rather than

@@ -2,8 +2,8 @@
 //!
 //! Doesn't drive a real SMB exchange — just exercises:
 //!
-//! 1. `MockTransport::new()` round-trip: a frame pushed via
-//!    `TranscriptControl::push_server_frame` is delivered intact when
+//! 1. `ScriptedTransport::new()` round-trip: a frame pushed via
+//!    `ScriptedTransportControl::push_server_frame` is delivered intact when
 //!    the transport's `receive_exact` is called with the right byte
 //!    counts, and a frame written through `send_raw` is captured intact.
 //! 2. `MockGss::new` / `next` script obeys its scripted step sequence
@@ -19,14 +19,14 @@
 mod conformance;
 
 use bytes::Bytes;
-use conformance::{MockGss, MockTransport, ScriptedGssStep};
+use conformance::{MockGss, ScriptedGssStep, ScriptedTransport};
 use smb::test_support::GssState;
 
 #[tokio::test]
-async fn mock_transport_round_trip() {
+async fn scripted_transport_round_trip() {
     use smb_transport::SmbTransport;
 
-    let (transport, control) = MockTransport::new();
+    let (transport, control) = ScriptedTransport::new();
 
     // Push two server frames so we can verify ordering.
     control.push_server_frame(Bytes::from_static(b"first-server-frame"));

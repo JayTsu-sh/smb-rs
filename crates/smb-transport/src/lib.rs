@@ -9,6 +9,9 @@ pub mod tcp;
 pub mod traits;
 pub mod utils;
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 pub use config::*;
 pub use error::TransportError;
 pub use iovec::*;
@@ -57,4 +60,3 @@ pub fn make_transport(
         }
     }
 }
-
