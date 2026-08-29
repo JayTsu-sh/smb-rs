@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use smb_msg::{FileId, FsctlRequest, IoctlRequest, IoctlRequestFlags};
 
@@ -204,13 +204,11 @@ impl Tree {
     /// Used by the lease cache (Phase C) so cache hits can match opens
     /// against the same tree the original Create was issued on.
     pub fn tree_id(&self) -> u32 {
-        self.context
-            .tree_id
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.context.generation().tree_id
     }
 
     pub(crate) fn object_token(&self) -> crate::runtime::ObjectToken {
-        self.context.object
+        self.context.generation().object
     }
 
     /// Borrow the tree's underlying `Upstream` context reference.
@@ -276,19 +274,22 @@ impl Tree {
     }
 }
 
-pub(crate) struct TreeContext {
-    tree_id: AtomicU32,
-
-    upstream: Upstream,
-
-    tree_name: String,
+struct TreeGeneration {
+    tree_id: u32,
     info: TreeConnectInfo,
     object: crate::runtime::ObjectToken,
 }
 
-impl TreeContext {
-    const INVALID_TREE_ID: u32 = u32::MAX;
+pub(crate) struct TreeContext {
+    generation: arc_swap::ArcSwap<TreeGeneration>,
+    closed: AtomicBool,
 
+    upstream: Upstream,
+
+    tree_name: String,
+}
+
+impl TreeContext {
     pub fn new(
         upstream: &Upstream,
         tree_id: u32,
@@ -297,22 +298,36 @@ impl TreeContext {
         object: crate::runtime::ObjectToken,
     ) -> Arc<TreeContext> {
         Arc::new(TreeContext {
-            tree_id: AtomicU32::new(tree_id),
+            generation: arc_swap::ArcSwap::from_pointee(TreeGeneration {
+                tree_id,
+                info,
+                object,
+            }),
+            closed: AtomicBool::new(false),
             upstream: upstream.clone(),
-            info,
             tree_name,
-            object,
         })
     }
 
-    fn prepare(&self, mut msg: CommandRequest) -> CommandRequest {
+    fn generation(&self) -> Arc<TreeGeneration> {
+        self.generation.load_full()
+    }
+
+    fn prepare(
+        &self,
+        mut msg: CommandRequest,
+    ) -> crate::Result<(CommandRequest, Arc<TreeGeneration>)> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::InvalidState("Tree is closed".to_string()));
+        }
+        let generation = self.generation();
         if !msg.message.header.flags.async_command() {
-            msg.message.header.tree_id = self.tree_id.load(Ordering::Relaxed).into();
-            if self.info.share_flags.encrypt_data() && msg.security.is_none() {
+            msg.message.header.tree_id = generation.tree_id.into();
+            if generation.info.share_flags.encrypt_data() && msg.security.is_none() {
                 msg.security = Some(Protection::Encrypt);
             }
         }
-        msg
+        Ok((msg, generation))
     }
 
     pub(crate) async fn execute(
@@ -320,14 +335,15 @@ impl TreeContext {
         msg: CommandRequest,
         options: ResponseOptions<'_>,
     ) -> crate::Result<(CommandSubmission, CommandResponse)> {
-        self.execute_for(msg, options, self.object).await
+        let object = self.generation().object;
+        self.execute_for(msg, options, object).await
     }
 
     pub(crate) async fn create_resource_object(
         &self,
     ) -> crate::Result<crate::runtime::ObjectToken> {
         self.upstream
-            .create_object(self.object, crate::runtime::ObjectKind::Resource)
+            .create_object(self.generation().object, crate::runtime::ObjectKind::Resource)
             .await
     }
 
@@ -337,20 +353,21 @@ impl TreeContext {
         options: ResponseOptions<'_>,
         dependency: crate::runtime::ObjectToken,
     ) -> crate::Result<(CommandSubmission, CommandResponse)> {
+        let (message, generation) = self.prepare(msg)?;
         let result = self
             .upstream
-            .execute_for(self.prepare(msg), options, dependency)
+            .execute_for(message, options, dependency)
             .await?;
         let incoming = &result.1;
         if !incoming.message.header.flags.async_command()
             && incoming.message.header.tree_id.unwrap_or_default()
-                != self.tree_id.load(Ordering::Relaxed)
+                != generation.tree_id
         {
             return Err(Error::InvalidMessage(
                 "Received message for different tree, or tree disconnecting.".to_string(),
             ));
         }
-        if !incoming.form.encrypted && self.info()?.share_flags.encrypt_data() {
+        if !incoming.form.encrypted && generation.info.share_flags.encrypt_data() {
             return Err(Error::InvalidMessage(
                 "Received unencrypted message on encrypted share".to_string(),
             ));
@@ -404,7 +421,7 @@ impl TreeContext {
         dependency: crate::runtime::ObjectToken,
     ) -> crate::Result<CommandSubmission> {
         self.upstream
-            .submit_for(self.prepare(message), dependency)
+            .submit_for(self.prepare(message)?.0, dependency)
             .await
     }
 
@@ -435,36 +452,41 @@ impl TreeContext {
     }
 
     async fn disconnect(&self) -> crate::Result<()> {
-        let tree_id = self.tree_id.swap(Self::INVALID_TREE_ID, Ordering::Relaxed);
-        if tree_id == Self::INVALID_TREE_ID {
+        if self.closed.swap(true, Ordering::AcqRel) {
             // Already disconnected
             return Ok(());
         }
-        let encrypt = self.info.share_flags.encrypt_data();
-        Self::_disconnect(self.upstream.clone(), tree_id, encrypt, self.object).await
+        let generation = self.generation();
+        Self::_disconnect(
+            self.upstream.clone(),
+            generation.tree_id,
+            generation.info.share_flags.encrypt_data(),
+            generation.object,
+        )
+        .await
     }
 
-    pub fn info(&self) -> crate::Result<&TreeConnectInfo> {
-        if self.tree_id.load(Ordering::Relaxed) == Self::INVALID_TREE_ID {
+    pub fn info(&self) -> crate::Result<Arc<TreeConnectInfo>> {
+        if self.closed.load(Ordering::Acquire) {
             return Err(Error::InvalidState("Tree is closed".to_string()));
         }
-
-        Ok(&self.info)
+        Ok(Arc::new(self.generation().info.clone()))
     }
 }
 
 impl Drop for TreeContext {
     fn drop(&mut self) {
-        let tree_id = self.tree_id.load(Ordering::Relaxed);
-        if tree_id == Self::INVALID_TREE_ID {
+        if self.closed.load(Ordering::Acquire) {
             // Already dropped
             return;
         }
 
+        let generation = self.generation();
         let upstream = self.upstream.clone();
         let tree_name = self.tree_name.clone();
-        let encrypt = self.info.share_flags.encrypt_data();
-        let object = self.object;
+        let tree_id = generation.tree_id;
+        let encrypt = generation.info.share_flags.encrypt_data();
+        let object = generation.object;
         tokio::task::spawn(async move {
             Self::_disconnect(upstream, tree_id, encrypt, object)
                 .await
