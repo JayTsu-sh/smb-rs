@@ -5,7 +5,114 @@
 
 use super::ObjectToken;
 use crate::clock::MonotonicTime;
+use std::collections::VecDeque;
 use std::time::Duration;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct SessionWaitId(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionWaitError {
+    Full,
+    DependencyNotSession,
+    IdExhausted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionWaitOutcome {
+    Ready {
+        id: SessionWaitId,
+        session: ObjectToken,
+    },
+    Cancelled(SessionWaitId),
+    TimedOut(SessionWaitId),
+    RecoveryFailed(SessionWaitId),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SessionWait {
+    id: SessionWaitId,
+    dependency: ObjectToken,
+    deadline: Option<MonotonicTime>,
+}
+
+pub(crate) struct SessionWaitQueue {
+    session: ObjectToken,
+    capacity: usize,
+    next_id: Option<u64>,
+    waits: VecDeque<SessionWait>,
+}
+
+impl SessionWaitQueue {
+    pub(crate) fn new(session: ObjectToken, capacity: usize) -> Self {
+        Self {
+            session,
+            capacity,
+            next_id: Some(0),
+            waits: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    pub(crate) fn enqueue(
+        &mut self,
+        dependency: ObjectToken,
+        deadline: Option<MonotonicTime>,
+    ) -> Result<SessionWaitId, SessionWaitError> {
+        if dependency != self.session {
+            return Err(SessionWaitError::DependencyNotSession);
+        }
+        if self.waits.len() >= self.capacity {
+            return Err(SessionWaitError::Full);
+        }
+        let id = SessionWaitId(self.next_id.ok_or(SessionWaitError::IdExhausted)?);
+        self.next_id = id.0.checked_add(1);
+        self.waits.push_back(SessionWait {
+            id,
+            dependency,
+            deadline,
+        });
+        Ok(id)
+    }
+
+    pub(crate) fn cancel(&mut self, id: SessionWaitId) -> Option<SessionWaitOutcome> {
+        let index = self.waits.iter().position(|wait| wait.id == id)?;
+        self.waits.remove(index)?;
+        Some(SessionWaitOutcome::Cancelled(id))
+    }
+
+    pub(crate) fn advance_time(&mut self, now: MonotonicTime) -> Vec<SessionWaitOutcome> {
+        let mut outcomes = Vec::new();
+        self.waits.retain(|wait| {
+            if wait.deadline.is_some_and(|deadline| deadline <= now) {
+                outcomes.push(SessionWaitOutcome::TimedOut(wait.id));
+                false
+            } else {
+                true
+            }
+        });
+        outcomes
+    }
+
+    pub(crate) fn publish(&mut self, replacement: ObjectToken) -> Vec<SessionWaitOutcome> {
+        let previous = self.session;
+        self.session = replacement;
+        self.waits
+            .drain(..)
+            .filter(|wait| wait.dependency == previous)
+            .map(|wait| SessionWaitOutcome::Ready {
+                id: wait.id,
+                session: replacement,
+            })
+            .collect()
+    }
+
+    pub(crate) fn fail(&mut self) -> Vec<SessionWaitOutcome> {
+        self.waits
+            .drain(..)
+            .map(|wait| SessionWaitOutcome::RecoveryFailed(wait.id))
+            .collect()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SessionRecoveryPolicy {
@@ -354,5 +461,65 @@ mod tests {
                 now: MonotonicTime::ZERO,
             })
             .is_none());
+    }
+
+    #[test]
+    fn session_waits_are_bounded_fifo_and_reject_deeper_dependencies() {
+        let (_, session) = objects(1);
+        let mut registry = ObjectRegistry::new(GenerationId::new(1));
+        let connection = registry.connection();
+        let another_session = registry
+            .create_child(connection, ObjectKind::Session)
+            .unwrap();
+        let share = registry
+            .create_child(another_session, ObjectKind::Share)
+            .unwrap();
+        let mut queue = SessionWaitQueue::new(session, 2);
+        let first = queue.enqueue(session, None).unwrap();
+        let second = queue.enqueue(session, None).unwrap();
+
+        assert_eq!(queue.enqueue(session, None), Err(SessionWaitError::Full));
+        assert_eq!(
+            queue.enqueue(share, None),
+            Err(SessionWaitError::DependencyNotSession)
+        );
+
+        let (_, replacement) = objects(2);
+        assert_eq!(
+            queue.publish(replacement),
+            vec![
+                SessionWaitOutcome::Ready {
+                    id: first,
+                    session: replacement,
+                },
+                SessionWaitOutcome::Ready {
+                    id: second,
+                    session: replacement,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn session_wait_cancel_deadline_and_failure_remove_exact_entries() {
+        let (_, session) = objects(1);
+        let mut queue = SessionWaitQueue::new(session, 3);
+        let cancelled = queue.enqueue(session, None).unwrap();
+        let timed = queue.enqueue(session, Some(MonotonicTime::ZERO)).unwrap();
+        let failed = queue.enqueue(session, None).unwrap();
+
+        assert_eq!(
+            queue.cancel(cancelled),
+            Some(SessionWaitOutcome::Cancelled(cancelled))
+        );
+        assert_eq!(
+            queue.advance_time(MonotonicTime::ZERO),
+            vec![SessionWaitOutcome::TimedOut(timed)]
+        );
+        assert_eq!(
+            queue.fail(),
+            vec![SessionWaitOutcome::RecoveryFailed(failed)]
+        );
+        assert!(queue.cancel(cancelled).is_none());
     }
 }
