@@ -240,7 +240,7 @@ impl GenerationState {
         let Some(message_id) = self.next_message_id else {
             return OwnerEffect::AdmissionRejected(AdmissionError::MessageIdExhausted);
         };
-        self.next_message_id = message_id.checked_add(1);
+        self.next_message_id = message_id.checked_add(u64::from(credit_charge));
         let key = RequestKey::new(self.generation, message_id);
         let plan = PreparationPlan {
             key,
@@ -687,6 +687,15 @@ mod tests {
         assert_eq!(state.admitted_operations(), 1);
         assert_eq!(state.retained_payload_bytes(), 512);
         assert!(state.request(key).is_some());
+    }
+
+    #[test]
+    fn multi_credit_admission_consumes_the_full_message_id_sequence_window() {
+        let mut state = GenerationState::new(GENERATION, 40, 32, LIMITS, DRAIN_TIMEOUT);
+        let first = admit(&mut state, 0, 16);
+        let second = admit(&mut state, 0, 1);
+        assert_eq!(first.message_id, 40);
+        assert_eq!(second.message_id, 56);
     }
 
     #[test]
