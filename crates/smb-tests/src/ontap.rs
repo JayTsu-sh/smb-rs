@@ -231,6 +231,7 @@ pub enum Lifecycle {
 pub enum Mutation {
     EveryoneAclRemoved,
     TestIdentityAclGranted,
+    VolumeUnmounted,
     VolumeOfflined,
 }
 
@@ -586,6 +587,7 @@ pub trait OntapAdapter {
     fn verify_ready(&mut self, plan: &Plan, kind: ResourceKind) -> Result<bool, String>;
     fn verify_owned(&mut self, plan: &Plan, kind: ResourceKind) -> Result<bool, String>;
     fn delete_share(&mut self, plan: &Plan) -> Result<(), String>;
+    fn unmount_volume(&mut self, plan: &Plan) -> Result<(), String>;
     fn offline_volume(&mut self, plan: &Plan) -> Result<(), String>;
     fn delete_volume(&mut self, plan: &Plan) -> Result<(), String>;
 }
@@ -675,6 +677,17 @@ impl<'a, A: OntapAdapter> ProvisioningRun<'a, A> {
             let deletion = match kind {
                 ResourceKind::Share => self.adapter.delete_share(&plan),
                 ResourceKind::Volume => {
+                    if !self.manifest.mutations.contains(&Mutation::VolumeUnmounted) {
+                        if let Err(error) = self.adapter.unmount_volume(&plan) {
+                            errors.push(error);
+                            continue;
+                        }
+                        if let Err(error) = self.manifest.record_mutation(Mutation::VolumeUnmounted)
+                        {
+                            errors.push(error);
+                            continue;
+                        }
+                    }
                     if !self.manifest.mutations.contains(&Mutation::VolumeOfflined) {
                         if let Err(error) = self.adapter.offline_volume(&plan) {
                             errors.push(error);

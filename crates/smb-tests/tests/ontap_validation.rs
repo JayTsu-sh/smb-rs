@@ -224,6 +224,9 @@ impl OntapAdapter for ScriptedOntap {
     fn delete_share(&mut self, _: &Plan) -> Result<(), String> {
         self.action("delete-share")
     }
+    fn unmount_volume(&mut self, _: &Plan) -> Result<(), String> {
+        self.action("unmount-volume")
+    }
     fn offline_volume(&mut self, _: &Plan) -> Result<(), String> {
         self.action("offline-volume")
     }
@@ -290,7 +293,11 @@ fn provisioning_failure_runs_owned_reverse_cleanup_and_persists_it() {
     );
     assert_eq!(
         recovered.mutations(),
-        &[Mutation::EveryoneAclRemoved, Mutation::VolumeOfflined]
+        &[
+            Mutation::EveryoneAclRemoved,
+            Mutation::VolumeUnmounted,
+            Mutation::VolumeOfflined
+        ]
     );
     assert_eq!(
         adapter.calls,
@@ -302,6 +309,7 @@ fn provisioning_failure_runs_owned_reverse_cleanup_and_persists_it() {
             "verify-share-owned",
             "delete-share",
             "verify-volume-owned",
+            "unmount-volume",
             "offline-volume",
             "delete-volume",
         ]
@@ -337,6 +345,7 @@ fn recovered_manifest_can_resume_exact_cleanup() {
             "verify-share-owned",
             "delete-share",
             "verify-volume-owned",
+            "unmount-volume",
             "offline-volume",
             "delete-volume",
         ]

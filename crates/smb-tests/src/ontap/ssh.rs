@@ -269,6 +269,18 @@ impl OntapAdapter for SshOntapAdapter {
         .map(drop)
     }
 
+    fn unmount_volume(&mut self, plan: &Plan) -> Result<(), String> {
+        self.run(&[
+            "volume",
+            "unmount",
+            "-vserver",
+            &plan.svm,
+            "-volume",
+            &plan.volume,
+        ])
+        .map(drop)
+    }
+
     fn offline_volume(&mut self, plan: &Plan) -> Result<(), String> {
         self.run(&[
             "volume",
