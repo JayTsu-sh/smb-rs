@@ -5,6 +5,8 @@ use super::state::{
 };
 use super::wire::WirePipeline;
 use crate::clock::{Clock, MonotonicTime};
+use crate::connection::connection_info::ConnectionInfo;
+use crate::session::SessionAndChannel;
 use smb_transport::{
     SendFrame, SmbTransport, SmbTransportRead, SmbTransportWrite, TransportError, TransportFrame,
 };
@@ -111,6 +113,42 @@ pub(crate) struct RuntimeHandle {
 }
 
 impl RuntimeHandle {
+    pub(crate) async fn negotiated(
+        &self,
+        connection: Arc<ConnectionInfo>,
+    ) -> Result<(), RuntimeError> {
+        let (reply, result) = oneshot::channel();
+        self.control
+            .send(ControlCommand::Negotiated { connection, reply })
+            .await
+            .map_err(|_| RuntimeError::Closed)?;
+        result.await.unwrap_or(Err(RuntimeError::OwnerTerminated))
+    }
+
+    pub(crate) async fn session_started(
+        &self,
+        session: Arc<SessionAndChannel>,
+    ) -> Result<(), RuntimeError> {
+        let (reply, result) = oneshot::channel();
+        self.control
+            .send(ControlCommand::SessionStarted { session, reply })
+            .await
+            .map_err(|_| RuntimeError::Closed)?;
+        result.await.unwrap_or(Err(RuntimeError::OwnerTerminated))
+    }
+
+    pub(crate) async fn session_ended(
+        &self,
+        session: Arc<SessionAndChannel>,
+    ) -> Result<(), RuntimeError> {
+        let (reply, result) = oneshot::channel();
+        self.control
+            .send(ControlCommand::SessionEnded { session, reply })
+            .await
+            .map_err(|_| RuntimeError::Closed)?;
+        result.await.unwrap_or(Err(RuntimeError::OwnerTerminated))
+    }
+
     pub(crate) async fn submit_bootstrap(
         &self,
         operation: BootstrapOperation,
@@ -258,6 +296,18 @@ struct RequestAuthority {
 }
 
 enum ControlCommand {
+    Negotiated {
+        connection: Arc<ConnectionInfo>,
+        reply: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    SessionStarted {
+        session: Arc<SessionAndChannel>,
+        reply: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    SessionEnded {
+        session: Arc<SessionAndChannel>,
+        reply: oneshot::Sender<Result<(), RuntimeError>>,
+    },
     Cancel {
         key: RequestKey,
         now: MonotonicTime,
@@ -345,12 +395,15 @@ async fn owner_task(
                 Ok(command) => {
                     if handle_control(
                         command,
+                        &wire,
                         &mut authority,
                         &mut frame_cancellations,
                         &mut deferred_cancellations,
                         &mut send_queue,
                         &mut close_request,
-                    ) {
+                    )
+                    .await
+                    {
                         admission_rx.close();
                         bootstrap_rx.close();
                     }
@@ -417,7 +470,7 @@ async fn owner_task(
             biased;
             command = control_rx.recv() => match command {
                 Some(command) => {
-                    let close = handle_control(command, &mut authority, &mut frame_cancellations, &mut deferred_cancellations, &mut send_queue, &mut close_request);
+                    let close = handle_control(command, &wire, &mut authority, &mut frame_cancellations, &mut deferred_cancellations, &mut send_queue, &mut close_request).await;
                     close_admission_if(close, &mut admission_rx);
                     if close {
                         bootstrap_rx.close();
@@ -627,8 +680,9 @@ fn process_admission(
     }
 }
 
-fn handle_control(
+async fn handle_control(
     command: ControlCommand,
+    wire: &WirePipeline,
     authority: &mut RequestAuthority,
     frame_cancellations: &mut HashMap<RequestKey, CancellationToken>,
     deferred_cancellations: &mut HashMap<RequestKey, MonotonicTime>,
@@ -636,6 +690,30 @@ fn handle_control(
     close_request: &mut Option<CloseRequest>,
 ) -> bool {
     match command {
+        ControlCommand::Negotiated { connection, reply } => {
+            let result = wire
+                .negotiated(&connection)
+                .await
+                .map_err(|_| RuntimeError::Wire("negotiated-policy"));
+            let _ = reply.send(result);
+            false
+        }
+        ControlCommand::SessionStarted { session, reply } => {
+            let result = wire
+                .session_started(&session)
+                .await
+                .map_err(|_| RuntimeError::Wire("session-started-policy"));
+            let _ = reply.send(result);
+            false
+        }
+        ControlCommand::SessionEnded { session, reply } => {
+            let result = wire
+                .session_ended(&session)
+                .await
+                .map_err(|_| RuntimeError::Wire("session-ended-policy"));
+            let _ = reply.send(result);
+            false
+        }
         ControlCommand::Cancel { key, now } => {
             let removed_before_dispatch = if let Some(position) =
                 send_queue.iter().position(|command| command.key == key)
