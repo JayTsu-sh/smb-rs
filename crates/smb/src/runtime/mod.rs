@@ -20,6 +20,8 @@ mod object_state;
 #[allow(dead_code)]
 mod recovery;
 #[allow(dead_code)]
+mod recovery_driver;
+#[allow(dead_code)]
 mod reducer;
 #[allow(dead_code)]
 mod state;

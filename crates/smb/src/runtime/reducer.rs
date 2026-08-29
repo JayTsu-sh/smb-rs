@@ -8,6 +8,13 @@ impl GenerationId {
     pub(crate) const fn new(value: u64) -> Self {
         Self(value)
     }
+
+    pub(crate) const fn checked_next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
 }
 
 /// Request identity is never meaningful without its generation.

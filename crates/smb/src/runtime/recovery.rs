@@ -15,6 +15,7 @@ pub(crate) struct RecoveryPolicy {
     pub(crate) total_timeout: Duration,
     pub(crate) initial_backoff: Duration,
     pub(crate) maximum_backoff: Duration,
+    pub(crate) maximum_jitter: Duration,
 }
 
 impl RecoveryPolicy {
@@ -25,6 +26,7 @@ impl RecoveryPolicy {
             total_timeout: Duration::ZERO,
             initial_backoff: Duration::ZERO,
             maximum_backoff: Duration::ZERO,
+            maximum_jitter: Duration::ZERO,
         }
     }
 
@@ -58,10 +60,16 @@ pub(crate) enum RecoveryState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RecoveryEvent {
-    TransportLost { now: MonotonicTime },
+    TransportLost {
+        generation: GenerationId,
+        now: MonotonicTime,
+    },
     Wake { now: MonotonicTime },
     AttemptSucceeded { generation: GenerationId },
-    AttemptFailed { now: MonotonicTime },
+    AttemptFailed {
+        now: MonotonicTime,
+        jitter: Duration,
+    },
     Close,
 }
 
@@ -98,7 +106,10 @@ impl RecoveryCoordinator {
                 self.state = RecoveryState::Closed;
                 Some(RecoveryEffect::Closed)
             }
-            (RecoveryState::Connected(_), RecoveryEvent::TransportLost { now }) => {
+            (
+                RecoveryState::Connected(active),
+                RecoveryEvent::TransportLost { generation, now },
+            ) if active == generation => {
                 if self.policy.max_attempts == 0 {
                     self.state = RecoveryState::Failed;
                     return Some(RecoveryEffect::RecoveryFailed);
@@ -141,12 +152,16 @@ impl RecoveryCoordinator {
                     total_deadline,
                     ..
                 },
-                RecoveryEvent::AttemptFailed { now },
+                RecoveryEvent::AttemptFailed { now, jitter },
             ) => {
                 if attempt >= self.policy.max_attempts || now >= total_deadline {
                     self.fail()
                 } else {
-                    self.schedule(attempt + 1, now, total_deadline)
+                    self.schedule(
+                        attempt + 1,
+                        now.saturating_add(jitter.min(self.policy.maximum_jitter)),
+                        total_deadline,
+                    )
                 }
             }
             _ => None,
@@ -189,6 +204,7 @@ mod tests {
             total_timeout: Duration::from_secs(10),
             initial_backoff: SECOND,
             maximum_backoff: Duration::from_secs(4),
+            maximum_jitter: Duration::from_millis(250),
         }
     }
 
@@ -200,7 +216,10 @@ mod tests {
     fn retries_are_bounded_and_publish_one_new_generation() {
         let mut recovery = RecoveryCoordinator::new(GenerationId::new(1), policy());
         assert_eq!(
-            recovery.reduce(RecoveryEvent::TransportLost { now: at(0) }),
+            recovery.reduce(RecoveryEvent::TransportLost {
+                generation: GenerationId::new(1),
+                now: at(0),
+            }),
             Some(RecoveryEffect::ScheduleAttempt { attempt: 1, at: at(0) })
         );
         assert_eq!(
@@ -208,7 +227,10 @@ mod tests {
             Some(RecoveryEffect::StartAttempt { attempt: 1, deadline: at(1) })
         );
         assert_eq!(
-            recovery.reduce(RecoveryEvent::AttemptFailed { now: at(1) }),
+            recovery.reduce(RecoveryEvent::AttemptFailed {
+                now: at(1),
+                jitter: Duration::ZERO,
+            }),
             Some(RecoveryEffect::ScheduleAttempt { attempt: 2, at: at(2) })
         );
         assert_eq!(
@@ -234,7 +256,10 @@ mod tests {
             total_timeout: SECOND,
             ..policy()
         });
-        deadline.reduce(RecoveryEvent::TransportLost { now: at(0) });
+        deadline.reduce(RecoveryEvent::TransportLost {
+            generation: GenerationId::new(1),
+            now: at(0),
+        });
         assert_eq!(
             deadline.reduce(RecoveryEvent::Wake { now: at(1) }),
             Some(RecoveryEffect::RecoveryFailed)
@@ -244,10 +269,16 @@ mod tests {
             max_attempts: 1,
             ..policy()
         });
-        attempts.reduce(RecoveryEvent::TransportLost { now: at(0) });
+        attempts.reduce(RecoveryEvent::TransportLost {
+            generation: GenerationId::new(1),
+            now: at(0),
+        });
         attempts.reduce(RecoveryEvent::Wake { now: at(0) });
         assert_eq!(
-            attempts.reduce(RecoveryEvent::AttemptFailed { now: at(1) }),
+            attempts.reduce(RecoveryEvent::AttemptFailed {
+                now: at(1),
+                jitter: Duration::ZERO,
+            }),
             Some(RecoveryEffect::RecoveryFailed)
         );
     }
@@ -255,9 +286,15 @@ mod tests {
     #[test]
     fn duplicate_fatal_and_close_never_start_another_recovery() {
         let mut recovery = RecoveryCoordinator::new(GenerationId::new(1), policy());
-        recovery.reduce(RecoveryEvent::TransportLost { now: at(0) });
+        recovery.reduce(RecoveryEvent::TransportLost {
+            generation: GenerationId::new(1),
+            now: at(0),
+        });
         assert!(recovery
-            .reduce(RecoveryEvent::TransportLost { now: at(0) })
+            .reduce(RecoveryEvent::TransportLost {
+                generation: GenerationId::new(1),
+                now: at(0),
+            })
             .is_none());
         assert_eq!(recovery.reduce(RecoveryEvent::Close), Some(RecoveryEffect::Closed));
         assert!(recovery.reduce(RecoveryEvent::Wake { now: at(10) }).is_none());
@@ -267,7 +304,10 @@ mod tests {
             RecoveryPolicy::disabled(),
         );
         assert_eq!(
-            disabled.reduce(RecoveryEvent::TransportLost { now: at(0) }),
+            disabled.reduce(RecoveryEvent::TransportLost {
+                generation: GenerationId::new(1),
+                now: at(0),
+            }),
             Some(RecoveryEffect::RecoveryFailed)
         );
     }
