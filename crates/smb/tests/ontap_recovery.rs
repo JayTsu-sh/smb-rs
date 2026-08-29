@@ -115,11 +115,14 @@ async fn exact_session_disruption_reauthenticates_and_revokes_children(
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         if session.session_id() != initial_session_id {
+            println!("SESSION_ID_REPLACED");
             assert!(
                 file.write_at(b"stale", 0).await.is_err(),
                 "Resource from the replaced Session must remain stale"
             );
+            println!("ORDINARY_RESOURCE_REVOKED");
             durable_file.write_at(b"durable-two", 0).await?;
+            println!("DURABLE_WRITE_COMPLETED");
             let recovered_file = tree
                 .create(
                     &format!("smb-rs-session-recovered-{}.bin", std::process::id()),
@@ -127,6 +130,7 @@ async fn exact_session_disruption_reauthenticates_and_revokes_children(
                 )
                 .await?
                 .into_file()?;
+            println!("NEW_RESOURCE_CREATED");
             recovered_file.write_at(b"session-two", 0).await?;
             println!("SESSION_REAUTHENTICATED");
             println!("SHARE_RECONNECTED");

@@ -752,7 +752,17 @@ impl ResourceHandle {
         let policy = self.conn_info.config.auto_reconnect;
         let clock: Arc<dyn crate::clock::Clock> = Arc::new(crate::clock::TokioClock::new());
         let mut last_error = None;
-        for _attempt in 1..=policy.max_attempts {
+        for attempt in 1..=policy.max_attempts {
+            if attempt > 1 {
+                let shift = attempt.saturating_sub(2).min(31);
+                let delay = policy
+                    .initial_backoff
+                    .saturating_mul(1_u32 << shift)
+                    .min(policy.maximum_backoff);
+                clock
+                    .sleep_until(clock.now().saturating_add(delay))
+                    .await;
+            }
             let previous = self.generation.load_full();
             let future = async {
                 let share = self.context.current_share_object().await?;
