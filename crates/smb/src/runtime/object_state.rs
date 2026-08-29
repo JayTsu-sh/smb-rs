@@ -5,6 +5,8 @@
 //! partially replaced dependency chain.
 
 use super::GenerationId;
+use crate::clock::MonotonicTime;
+use std::collections::VecDeque;
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -87,6 +89,137 @@ pub(crate) struct ObjectRegistry {
     next_id: Option<u64>,
     records: HashMap<u64, ObjectRecord>,
     connection: ObjectToken,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct RecoveryWaitId(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryQueueError {
+    Full,
+    IdExhausted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryWaitOutcome {
+    Ready(RecoveryWaitId),
+    Cancelled(RecoveryWaitId),
+    TimedOut(RecoveryWaitId),
+    AncestorFailed(RecoveryWaitId),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RecoveryWait {
+    id: RecoveryWaitId,
+    dependency: ObjectToken,
+    deadline: Option<MonotonicTime>,
+}
+
+/// Bounded FIFO for commands held while an object dependency is recovering.
+/// It stores only opaque wait identity and dependency facts; command payloads
+/// remain in the runtime admission lane that integrates this reducer in W4-2.
+pub(crate) struct RecoveryQueue {
+    capacity: usize,
+    next_id: Option<u64>,
+    waits: VecDeque<RecoveryWait>,
+}
+
+impl RecoveryQueue {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            next_id: Some(0),
+            waits: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    pub(crate) fn enqueue(
+        &mut self,
+        dependency: ObjectToken,
+        deadline: Option<MonotonicTime>,
+    ) -> Result<RecoveryWaitId, RecoveryQueueError> {
+        if self.waits.len() >= self.capacity {
+            return Err(RecoveryQueueError::Full);
+        }
+        let id = RecoveryWaitId(self.next_id.ok_or(RecoveryQueueError::IdExhausted)?);
+        self.next_id = id.0.checked_add(1);
+        self.waits.push_back(RecoveryWait {
+            id,
+            dependency,
+            deadline,
+        });
+        Ok(id)
+    }
+
+    pub(crate) fn cancel(&mut self, id: RecoveryWaitId) -> Option<RecoveryWaitOutcome> {
+        let index = self.waits.iter().position(|wait| wait.id == id)?;
+        self.waits.remove(index)?;
+        Some(RecoveryWaitOutcome::Cancelled(id))
+    }
+
+    pub(crate) fn advance_time(
+        &mut self,
+        now: MonotonicTime,
+    ) -> Vec<RecoveryWaitOutcome> {
+        let mut outcomes = Vec::new();
+        self.waits.retain(|wait| {
+            if wait.deadline.is_some_and(|deadline| deadline <= now) {
+                outcomes.push(RecoveryWaitOutcome::TimedOut(wait.id));
+                false
+            } else {
+                true
+            }
+        });
+        outcomes
+    }
+
+    pub(crate) fn release_ready(
+        &mut self,
+        registry: &ObjectRegistry,
+    ) -> Vec<RecoveryWaitOutcome> {
+        let mut outcomes = Vec::new();
+        self.waits.retain(|wait| {
+            if registry.validate_active(wait.dependency).is_ok() {
+                outcomes.push(RecoveryWaitOutcome::Ready(wait.id));
+                false
+            } else {
+                true
+            }
+        });
+        outcomes
+    }
+
+    pub(crate) fn publish_replacement(&mut self, effect: ObjectEffect) {
+        let ObjectEffect::ReplacementPublished {
+            previous,
+            replacement,
+        } = effect
+        else {
+            return;
+        };
+        for wait in &mut self.waits {
+            if wait.dependency == previous {
+                wait.dependency = replacement;
+            }
+        }
+    }
+
+    pub(crate) fn drain_ancestor(
+        &mut self,
+        registry: &ObjectRegistry,
+        ancestor: ObjectToken,
+    ) -> Vec<RecoveryWaitOutcome> {
+        let mut outcomes = Vec::new();
+        self.waits.retain(|wait| {
+            if wait.dependency == ancestor || registry.is_descendant(wait.dependency, ancestor) {
+                outcomes.push(RecoveryWaitOutcome::AncestorFailed(wait.id));
+                false
+            } else {
+                true
+            }
+        });
+        outcomes
+    }
 }
 
 impl ObjectRegistry {
@@ -371,6 +504,79 @@ mod tests {
         assert_eq!(
             registry.validate_active(foreign),
             Err(ObjectError::ForeignGeneration)
+        );
+    }
+
+    #[test]
+    fn recovery_queue_is_bounded_and_preserves_fifo_on_atomic_publication() {
+        let (mut registry, [_, session, share, resource]) = hierarchy();
+        registry.begin_recovery(session).unwrap();
+        let mut queue = RecoveryQueue::new(3);
+        let first = queue.enqueue(session, None).unwrap();
+        let second = queue.enqueue(share, None).unwrap();
+        let third = queue.enqueue(resource, None).unwrap();
+        assert_eq!(
+            queue.enqueue(resource, None),
+            Err(RecoveryQueueError::Full)
+        );
+
+        let replacement = registry.publish_replacement(session).unwrap();
+        queue.publish_replacement(replacement);
+        assert_eq!(
+            queue.release_ready(&registry),
+            vec![
+                RecoveryWaitOutcome::Ready(first),
+                RecoveryWaitOutcome::Ready(second),
+                RecoveryWaitOutcome::Ready(third),
+            ]
+        );
+    }
+
+    #[test]
+    fn recovery_queue_cancel_and_deadline_remove_only_the_target_wait() {
+        let (_, [_, session, share, _]) = hierarchy();
+        let mut queue = RecoveryQueue::new(3);
+        let cancelled = queue.enqueue(session, None).unwrap();
+        let expired = queue
+            .enqueue(
+                share,
+                Some(MonotonicTime::ZERO.saturating_add(std::time::Duration::from_secs(1))),
+            )
+            .unwrap();
+        assert_eq!(
+            queue.cancel(cancelled),
+            Some(RecoveryWaitOutcome::Cancelled(cancelled))
+        );
+        assert_eq!(
+            queue.advance_time(
+                MonotonicTime::ZERO.saturating_add(std::time::Duration::from_secs(1))
+            ),
+            vec![RecoveryWaitOutcome::TimedOut(expired)]
+        );
+    }
+
+    #[test]
+    fn ancestor_failure_drains_only_its_dependency_subtree() {
+        let (mut registry, [connection, session, share, resource]) = hierarchy();
+        let other_session = registry
+            .create_child(connection, ObjectKind::Session)
+            .unwrap();
+        let mut queue = RecoveryQueue::new(4);
+        let session_wait = queue.enqueue(session, None).unwrap();
+        let share_wait = queue.enqueue(share, None).unwrap();
+        let resource_wait = queue.enqueue(resource, None).unwrap();
+        let other_wait = queue.enqueue(other_session, None).unwrap();
+        assert_eq!(
+            queue.drain_ancestor(&registry, session),
+            vec![
+                RecoveryWaitOutcome::AncestorFailed(session_wait),
+                RecoveryWaitOutcome::AncestorFailed(share_wait),
+                RecoveryWaitOutcome::AncestorFailed(resource_wait),
+            ]
+        );
+        assert_eq!(
+            queue.release_ready(&registry),
+            vec![RecoveryWaitOutcome::Ready(other_wait)]
         );
     }
 }

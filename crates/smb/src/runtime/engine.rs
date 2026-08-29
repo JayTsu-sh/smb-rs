@@ -796,6 +796,10 @@ async fn owner_task(
     }
     drop(write_tx);
     shutdown.cancel();
+    // The owner is the sole authority for both request and domain-object
+    // lifetimes. Revoke the complete hierarchy before publishing disconnect
+    // effects so no token from this generation can survive transport loss.
+    authority.objects.lose_generation();
     let effects = authority.state.reduce(OwnerEvent::Disconnect);
     apply_operation_effects(&effects, &mut authority.operation_pending);
     apply_owner_effects(effects, &mut authority.terminals);
