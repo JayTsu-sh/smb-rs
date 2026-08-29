@@ -491,7 +491,32 @@ impl File {
     pub fn read_exact_at(&self, offset: u64, length: u32) -> Operation<'_, Bytes> {
         Operation::new(move |context| {
             Box::pin(async move {
+                if length == 0 {
+                    return Ok(Bytes::new());
+                }
+                let first = self
+                    .inner
+                    .read_at(
+                        offset,
+                        length,
+                        context.remaining()?,
+                        context.cancellation.clone(),
+                        context.runtime_replay(),
+                    )
+                    .await?;
+                if first.len() == length as usize {
+                    return Ok(first);
+                }
+                if first.is_empty() {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                }
+                if first.len() > length as usize {
+                    return Err(Error::InvalidMessage(
+                        "read response exceeded the requested range".into(),
+                    ));
+                }
                 let mut result = bytes::BytesMut::with_capacity(length as usize);
+                result.extend_from_slice(&first);
                 while result.len() < length as usize {
                     let position = offset.checked_add(result.len() as u64).ok_or_else(|| {
                         Error::InvalidArgument("read range exceeds u64 offsets".into())

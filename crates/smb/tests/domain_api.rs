@@ -2,11 +2,14 @@ use bytes::Bytes;
 #[cfg(feature = "real-server-tests")]
 use futures_util::StreamExt;
 #[cfg(feature = "real-server-tests")]
-use smb::{CancelToken, DirectoryEvent, DirectoryWatchOptions, Error};
+use smb::{
+    Batch, BatchOutcome, CancelToken, DirectoryEvent, DirectoryWatchOptions, Error,
+    TransferOptions, TransferProgress,
+};
 use smb::{
     Client, ClientConfig, CloseOutcome, Credentials, Directory, DirectoryOpenOptions, File,
     FileCursor, FileOpenOptions, Pipe, PipeName, ReplayPolicy, Session, Share, SharePath,
-    ShareTarget,
+    ShareTarget, Transfer, TransferEvents,
 };
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
@@ -16,6 +19,7 @@ mod common;
 
 fn assert_send_sync<T: Send + Sync>() {}
 fn assert_clone<T: Clone>() {}
+fn assert_send<T: Send>() {}
 fn assert_cursor<T: AsyncRead + AsyncWrite + AsyncSeek + Unpin + Send>() {}
 
 #[test]
@@ -30,6 +34,8 @@ fn public_spine_types_are_send_sync_and_domain_named() {
     assert_clone::<Session>();
     assert_clone::<Share>();
     assert_cursor::<FileCursor<'static>>();
+    assert_send::<Transfer<'static>>();
+    assert_send::<TransferEvents>();
 
     let target = ShareTarget::new("server", "share").unwrap();
     assert_eq!(target.server(), "server");
@@ -322,6 +328,96 @@ async fn domain_directory_query_only() -> smb::Result<()> {
     assert!(entries.iter().any(|entry| entry.name() == "."));
     directory.delete().await?;
     directory.close().await?;
+    share.close().await?;
+    client.close().await
+}
+
+#[cfg(feature = "real-server-tests")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[ignore = "requires an isolated writable real-server share"]
+async fn domain_batch_and_concurrent_transfer() -> smb::Result<()> {
+    let target = ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?;
+    let client = Client::new(ClientConfig::default());
+    let share = client
+        .connect_share(&target, common::smb_test_credentials())
+        .await?;
+    let suffix = std::process::id();
+    let source_path = SharePath::new(format!("domain-transfer-source-{suffix}.bin"))?;
+    let destination_path = SharePath::new(format!("domain-transfer-destination-{suffix}.bin"))?;
+    let payload = Bytes::from(
+        (0..(2 * 1024 * 1024 + 137))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>(),
+    );
+
+    let source = share
+        .open_file(&source_path, FileOpenOptions::overwrite())
+        .await?;
+    source.write_all_at(0, payload.clone()).await?;
+    source.close().await?;
+    let source = share
+        .open_file(&source_path, FileOpenOptions::open_existing())
+        .await?;
+    let destination = share
+        .open_file(&destination_path, FileOpenOptions::overwrite())
+        .await?;
+
+    let marker = Bytes::from_static(b"batch-marker");
+    let mut batch = Batch::new();
+    let write = batch.push(destination.batch_write_at(0, marker.clone()));
+    let read = batch.push(destination.batch_read_at(0, marker.len() as u32).after(write));
+    let outcomes = batch.execute().await?;
+    assert!(matches!(
+        outcomes.outcome(write),
+        Some(BatchOutcome::Success(count)) if *count == marker.len()
+    ));
+    assert!(matches!(
+        outcomes.outcome(read),
+        Some(BatchOutcome::Success(bytes)) if *bytes == marker
+    ));
+
+    let mut transfer = source.transfer_to(
+        &destination,
+        TransferOptions::default()
+            .concurrency(4)
+            .chunk_size(256 * 1024)
+            .timeout(Duration::from_secs(30)),
+    );
+    let mut progress = transfer.take_events().expect("events are taken once");
+    let observe = async {
+        let mut last = 0_u64;
+        while let Some(event) = progress.next().await {
+            if let TransferProgress::ChunkCompleted { transferred, .. } = event {
+                last = last.max(transferred);
+            }
+        }
+        last
+    };
+    let (report, observed) = tokio::join!(transfer, observe);
+    let report = report?;
+    assert_eq!(report.bytes(), payload.len() as u64);
+    assert_eq!(observed, payload.len() as u64);
+    assert_eq!(
+        destination.read_exact_at(0, payload.len() as u32).await?,
+        payload
+    );
+
+    let cancellation = CancelToken::new();
+    cancellation.cancel();
+    assert!(matches!(
+        source
+            .transfer_to(
+                &destination,
+                TransferOptions::default().cancellation(cancellation)
+            )
+            .await,
+        Err(Error::Cancelled("domain operation"))
+    ));
+
+    source.delete().await?;
+    destination.delete().await?;
+    source.close().await?;
+    destination.close().await?;
     share.close().await?;
     client.close().await
 }
