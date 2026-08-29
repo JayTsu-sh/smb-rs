@@ -1,4 +1,4 @@
-pub(crate) mod actor;
+mod registry;
 pub mod config;
 pub mod connection_info;
 pub mod preauth_hash;
@@ -10,7 +10,7 @@ use crate::dialects::DialectImpl;
 use crate::lease::{LeaseBreakEvent, LeaseSlot};
 pub use crate::runtime::wire::TransformError;
 use crate::{Error, crypto, msg_handler::*, session::Session};
-use actor::{ConnectionActor, ConnectionActorHandle};
+use registry::ConnectionRegistry;
 use binrw::prelude::*;
 pub use config::*;
 use connection_info::{ConnectionInfo, NegotiatedProperties};
@@ -582,9 +582,9 @@ impl Connection {
         .await?;
         let session_handler = Arc::downgrade(&session.handler);
         self.handler
-            .actor
+            .registry
             .insert_session(session.session_id(), session_handler)
-            .await?;
+            .await;
         Ok(session)
     }
 
@@ -616,9 +616,9 @@ impl Connection {
         .await?;
         let session_handler = Arc::downgrade(&session.handler);
         self.handler
-            .actor
+            .registry
             .insert_session(session.session_id(), session_handler)
-            .await?;
+            .await;
         Ok(session)
     }
 
@@ -814,11 +814,9 @@ pub(crate) struct ConnectionMessageHandler {
     /// consumers when the server sends a `LeaseBreakNotify`.
     lease_event_tx: tokio::sync::broadcast::Sender<LeaseBreakEvent>,
 
-    /// Handle to the per-connection state actor (S7). Owns the
-    /// Phase C lease cache (keyed by share-relative path) and the
-    /// sessions table. All mutation of those maps happens inside the
-    /// actor task; callers send commands and await typed replies.
-    actor: ConnectionActorHandle,
+    /// Domain-only lease/session registry. It owns no task and no request or
+    /// transport authority; every lock is released before wire I/O.
+    registry: ConnectionRegistry,
 }
 
 impl ConnectionMessageHandler {
@@ -831,7 +829,7 @@ impl ConnectionMessageHandler {
             conn_info: OnceCell::new(),
             stop_notifications: Default::default(),
             lease_event_tx,
-            actor: ConnectionActor::spawn(),
+            registry: ConnectionRegistry::new(),
         }
     }
 
@@ -842,7 +840,7 @@ impl ConnectionMessageHandler {
     /// other side) is logically equivalent to no cache hit.
     pub async fn insert_lease_slot(&self, slot: Arc<LeaseSlot>) -> crate::Result<()> {
         use std::sync::atomic::Ordering;
-        let displaced = self.actor.insert_lease(slot).await?;
+        let displaced = self.registry.insert_lease(slot).await;
         if let Some(prev) = displaced {
             // Tombstone the displaced slot. If a live ResourceHandle is
             // still holding it (refcount > 0), its eventual close/Drop
@@ -894,7 +892,7 @@ impl ConnectionMessageHandler {
     /// Return the current number of cached lease slots. Primarily for
     /// observability and tests; not in any hot path.
     pub async fn lease_slot_count(&self) -> crate::Result<usize> {
-        self.actor.lease_slot_count().await
+        Ok(self.registry.lease_slot_count().await)
     }
 
     /// Look up a cached lease slot by path. Returns `None` when there is
@@ -903,7 +901,7 @@ impl ConnectionMessageHandler {
     /// [`Self::try_acquire_lease`] instead so the bump is atomic with the
     /// lookup against concurrent evictions.
     pub async fn peek_lease_slot(&self, path: &str) -> crate::Result<Option<Arc<LeaseSlot>>> {
-        self.actor.peek_lease(path.to_string()).await
+        Ok(self.registry.peek_lease(path).await)
     }
 
     /// Phase C.5 race-free acquire: look up `path` and call
@@ -922,14 +920,14 @@ impl ConnectionMessageHandler {
         requested_disposition: smb_msg::CreateDisposition,
         wants_directory: bool,
     ) -> crate::Result<Option<Arc<LeaseSlot>>> {
-        self.actor
+        Ok(self.registry
             .try_acquire_lease(
-                path.to_string(),
+                path,
                 requested_access,
                 requested_disposition,
                 wants_directory,
             )
-            .await
+            .await)
     }
 
     /// Phase C.5: atomically tombstone a slot keyed by `path`, remove it
@@ -943,7 +941,7 @@ impl ConnectionMessageHandler {
     ///
     /// Returns `None` when `path` had no entry.
     pub async fn take_lease_for_evict(&self, path: &str) -> crate::Result<Option<LeaseEviction>> {
-        self.actor.take_lease_for_evict(path.to_string()).await
+        Ok(self.registry.take_lease_for_evict(path).await)
     }
 
     /// Phase C.5 idle sweep: walk the lease table, tombstone every slot
@@ -956,7 +954,7 @@ impl ConnectionMessageHandler {
         &self,
         older_than: std::time::Duration,
     ) -> crate::Result<Vec<LeaseEviction>> {
-        self.actor.sweep_idle_leases(older_than).await
+        Ok(self.registry.sweep_idle_leases(older_than).await)
     }
 
     /// Spawn a long-running task that consumes the lease-break broadcast
@@ -1011,7 +1009,7 @@ impl ConnectionMessageHandler {
     /// updated to the server's new state.
     ///
     /// The tombstone-store, granted_state update, and table removal all
-    /// happen inside the actor task so a concurrent `try_acquire_lease`
+    /// happen inside one registry critical section so a concurrent `try_acquire_lease`
     /// either runs strictly before (and gets a still-valid slot for
     /// which the wire I/O may racily fail — recoverable) or strictly
     /// after (and finds the slot gone, falling back to a fresh wire
@@ -1020,20 +1018,10 @@ impl ConnectionMessageHandler {
     /// server has already revoked.
     async fn apply_lease_break(&self, event: &LeaseBreakEvent) {
         let event_key = event.lease_key.as_u128();
-        let matching = match self
-            .actor
+        let matching = self
+            .registry
             .apply_lease_break(event_key, event.new_state)
-            .await
-        {
-            Ok(m) => m,
-            Err(_) => {
-                // Connection actor has shut down — break fan-out is a
-                // best-effort cleanup, so swallow the error rather than
-                // panicking the listener task. The connection is on its
-                // way down; the slots will be reclaimed by Drop.
-                return;
-            }
-        };
+            .await;
 
         if matching.is_empty() {
             tracing::trace!(
@@ -1226,15 +1214,11 @@ impl MessageHandler for ConnectionMessageHandler {
             return Ok(());
         }
 
-        // Lookup runs inside the actor task; we receive a typed result
+        // Lookup and weak-reference upgrade run in one registry critical section.
         // that distinguishes unknown session_id (warn and drop) from a
         // known-but-dropped session (raise InvalidState to surface the
         // ordering bug to callers).
-        let session = match self
-            .actor
-            .get_session(msg.message.header.session_id)
-            .await?
-        {
+        let session = match self.registry.get_session(msg.message.header.session_id).await {
             Ok(Some(handler)) => handler,
             Ok(None) => {
                 tracing::warn!(
@@ -1243,7 +1227,7 @@ impl MessageHandler for ConnectionMessageHandler {
                 );
                 return Ok(());
             }
-            Err(actor::SessionGone) => {
+            Err(registry::SessionGone) => {
                 return Err(Error::InvalidState(format!(
                     "Session {} is no longer available",
                     msg.message.header.session_id
@@ -1331,20 +1315,10 @@ impl ConnectionMessageHandler {
     /// that lease slot so the normal handler chain stamps both identifiers and
     /// applies the tree's signing/encryption policy.
     async fn send_lease_break_ack(&self, notify: &smb_msg::LeaseBreakNotify) {
-        let slot = match self
-            .actor
+        let slot = self
+            .registry
             .find_lease_by_key(notify.lease_key.as_u128())
-            .await
-        {
-            Ok(slot) => slot,
-            Err(_) => {
-                tracing::warn!(
-                    lease_key = ?notify.lease_key,
-                    "Cannot send LeaseBreakAck: connection actor stopped",
-                );
-                return;
-            }
-        };
+            .await;
 
         let Some(slot) = slot else {
             tracing::warn!(
