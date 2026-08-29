@@ -16,7 +16,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -119,6 +119,20 @@ pub(crate) struct CloseReport {
     pub(crate) failed_tasks: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum GenerationExitCause {
+    ExplicitClose,
+    Transport(RuntimeError),
+    HandlesDropped,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GenerationExit {
+    pub(crate) generation: GenerationId,
+    pub(crate) cause: GenerationExitCause,
+    pub(crate) report: CloseReport,
+}
+
 pub(crate) struct RequestTicket {
     pub(crate) key: RequestKey,
     completion: oneshot::Receiver<Result<TerminalOutcome, RuntimeError>>,
@@ -152,6 +166,7 @@ pub(crate) struct RuntimeHandle {
     compounds: mpsc::Sender<CompoundAdmission>,
     control: mpsc::Sender<ControlCommand>,
     owner_finished: CancellationToken,
+    exit: watch::Receiver<Option<GenerationExit>>,
     connection_object: ObjectToken,
 }
 
@@ -367,6 +382,27 @@ impl RuntimeHandle {
         self.owner_finished.cancelled().await;
         Ok(report)
     }
+
+    pub(crate) async fn exited(&self) -> GenerationExit {
+        let mut exit = self.exit.clone();
+        loop {
+            if let Some(exit) = exit.borrow().clone() {
+                return exit;
+            }
+            if exit.changed().await.is_err() {
+                return GenerationExit {
+                    generation: self.connection_object.generation(),
+                    cause: GenerationExitCause::Transport(RuntimeError::OwnerTerminated),
+                    report: CloseReport {
+                        timed_out: false,
+                        unresolved_requests: 0,
+                        joined_tasks: 0,
+                        failed_tasks: 1,
+                    },
+                };
+            }
+        }
+    }
 }
 
 pub(crate) struct RuntimeEvents {
@@ -390,6 +426,7 @@ pub(crate) fn start_generation(
     let (control_tx, control_rx) = mpsc::channel(config.control_capacity.max(1));
     let (event_tx, event_rx) = mpsc::channel(config.event_capacity.max(1));
     let owner_finished = CancellationToken::new();
+    let (exit_tx, exit_rx) = watch::channel(None);
     let connection_object = ObjectRegistry::new(config.generation).connection();
     let handle = RuntimeHandle {
         admission: admission_tx,
@@ -397,10 +434,11 @@ pub(crate) fn start_generation(
         compounds: compound_tx,
         control: control_tx,
         owner_finished: owner_finished.clone(),
+        exit: exit_rx,
         connection_object,
     };
     tokio::spawn(async move {
-        owner_task(
+        let exit = owner_task(
             transport,
             clock,
             config,
@@ -411,6 +449,7 @@ pub(crate) fn start_generation(
             event_tx,
         )
         .await;
+        let _ = exit_tx.send(Some(exit));
         owner_finished.cancel();
     });
     (handle, RuntimeEvents { receiver: event_rx })
@@ -537,13 +576,22 @@ async fn owner_task(
     mut compound_rx: mpsc::Receiver<CompoundAdmission>,
     mut control_rx: mpsc::Receiver<ControlCommand>,
     event_tx: mpsc::Sender<RuntimeEvent>,
-) {
+) -> GenerationExit {
     let wire = WirePipeline::default();
     let Ok((read, write)) = transport.split() else {
         fail_waiting_admissions(&mut admission_rx, RuntimeError::Transport("split")).await;
         fail_waiting_operations(&mut operation_rx, RuntimeError::Transport("split")).await;
         fail_waiting_compounds(&mut compound_rx, RuntimeError::Transport("split")).await;
-        return;
+        return GenerationExit {
+            generation: config.generation,
+            cause: GenerationExitCause::Transport(RuntimeError::Transport("split")),
+            report: CloseReport {
+                timed_out: false,
+                unresolved_requests: 0,
+                joined_tasks: 0,
+                failed_tasks: 0,
+            },
+        };
     };
     let (write_tx, write_rx) = mpsc::channel(1);
     let (io_tx, mut io_rx) = mpsc::channel(config.io_capacity.max(1));
@@ -817,13 +865,26 @@ async fn owner_task(
         .map(|request: &CloseRequest| request.deadline);
     let (joined_tasks, failed_tasks, timed_out) =
         join_pumps(&mut pumps, clock.as_ref(), close_deadline).await;
+    let report = CloseReport {
+        timed_out,
+        unresolved_requests: authority.state.unresolved_callers(),
+        joined_tasks,
+        failed_tasks,
+    };
+    let cause = if close_request.is_some() {
+        GenerationExitCause::ExplicitClose
+    } else if let Some(error) = fatal {
+        GenerationExitCause::Transport(error)
+    } else {
+        GenerationExitCause::HandlesDropped
+    };
     if let Some(request) = close_request {
-        let _ = request.reply.send(Ok(CloseReport {
-            timed_out,
-            unresolved_requests: authority.state.unresolved_callers(),
-            joined_tasks,
-            failed_tasks,
-        }));
+        let _ = request.reply.send(Ok(report));
+    }
+    GenerationExit {
+        generation: config.generation,
+        cause,
+        report,
     }
 }
 
@@ -2036,6 +2097,37 @@ mod tests {
             2,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn owner_publishes_typed_transport_exit_after_pumps_join() {
+        let (transport, control) = ScriptedTransport::new();
+        control.fail_read_on(1, std::io::ErrorKind::ConnectionReset);
+        let clock = Arc::new(ManualClock::new());
+        let (handle, _events) = start_generation(transport, clock, config());
+
+        let exit = tokio::time::timeout(Duration::from_secs(1), handle.exited())
+            .await
+            .expect("transport loss must publish generation exit");
+        assert_eq!(exit.generation, GenerationId::new(1));
+        assert!(matches!(exit.cause, GenerationExitCause::Transport(_)));
+        assert_eq!(exit.report.joined_tasks + exit.report.failed_tasks, 2);
+    }
+
+    #[tokio::test]
+    async fn explicit_close_is_not_reported_as_recoverable_transport_loss() {
+        let (transport, _) = ScriptedTransport::new();
+        let clock = Arc::new(ManualClock::new());
+        let (handle, _events) = start_generation(transport, clock.clone(), config());
+        let observer = handle.clone();
+        handle
+            .close(clock.now().saturating_add(Duration::from_secs(1)))
+            .await
+            .unwrap();
+
+        let exit = observer.exited().await;
+        assert_eq!(exit.cause, GenerationExitCause::ExplicitClose);
+        assert_eq!(exit.report.joined_tasks, 2);
     }
 
     fn session_setup_operation(return_raw: bool) -> TypedOperation {
