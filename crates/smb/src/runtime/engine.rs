@@ -196,6 +196,42 @@ impl RuntimeHandle {
             .map_err(|_| RuntimeError::Closed)?;
         result.await.unwrap_or(Err(RuntimeError::OwnerTerminated))
     }
+
+    pub(crate) async fn begin_object_recovery(
+        &self,
+        object: ObjectToken,
+    ) -> Result<(), RuntimeError> {
+        let (reply, result) = oneshot::channel();
+        self.control
+            .send(ControlCommand::BeginObjectRecovery { object, reply })
+            .await
+            .map_err(|_| RuntimeError::Closed)?;
+        result.await.unwrap_or(Err(RuntimeError::OwnerTerminated))
+    }
+
+    pub(crate) async fn publish_object_replacement(
+        &self,
+        object: ObjectToken,
+    ) -> Result<ObjectToken, RuntimeError> {
+        let (reply, result) = oneshot::channel();
+        self.control
+            .send(ControlCommand::PublishObjectReplacement { object, reply })
+            .await
+            .map_err(|_| RuntimeError::Closed)?;
+        result.await.unwrap_or(Err(RuntimeError::OwnerTerminated))
+    }
+
+    pub(crate) async fn fail_object_recovery(
+        &self,
+        object: ObjectToken,
+    ) -> Result<(), RuntimeError> {
+        let (reply, result) = oneshot::channel();
+        self.control
+            .send(ControlCommand::FailObjectRecovery { object, reply })
+            .await
+            .map_err(|_| RuntimeError::Closed)?;
+        result.await.unwrap_or(Err(RuntimeError::OwnerTerminated))
+    }
     pub(crate) async fn negotiated(
         &self,
         connection: Arc<ConnectionInfo>,
@@ -506,6 +542,18 @@ enum ControlCommand {
     },
     LoseObjectGeneration {
         reply: oneshot::Sender<Result<usize, RuntimeError>>,
+    },
+    BeginObjectRecovery {
+        object: ObjectToken,
+        reply: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    PublishObjectReplacement {
+        object: ObjectToken,
+        reply: oneshot::Sender<Result<ObjectToken, RuntimeError>>,
+    },
+    FailObjectRecovery {
+        object: ObjectToken,
+        reply: oneshot::Sender<Result<(), RuntimeError>>,
     },
     InstallNotifications {
         sender: mpsc::Sender<crate::command::CommandResponse>,
@@ -1213,6 +1261,40 @@ async fn handle_control(
         ControlCommand::LoseObjectGeneration { reply } => {
             let revoked = authority.objects.lose_generation().len();
             let _ = reply.send(Ok(revoked));
+            false
+        }
+        ControlCommand::BeginObjectRecovery { object, reply } => {
+            let result = authority
+                .objects
+                .begin_recovery(object)
+                .map_err(RuntimeError::Object);
+            let _ = reply.send(result);
+            false
+        }
+        ControlCommand::PublishObjectReplacement { object, reply } => {
+            let result = authority
+                .objects
+                .publish_replacement_revoking_descendants(object)
+                .map_err(RuntimeError::Object)
+                .and_then(|(effect, _revoked)| match effect {
+                    super::object_state::ObjectEffect::ReplacementPublished {
+                        replacement,
+                        ..
+                    } => Ok(replacement),
+                    super::object_state::ObjectEffect::Revoked(_) => {
+                        Err(RuntimeError::Object(ObjectError::Stale))
+                    }
+                });
+            let _ = reply.send(result);
+            false
+        }
+        ControlCommand::FailObjectRecovery { object, reply } => {
+            let result = authority
+                .objects
+                .fail_recovery(object)
+                .map(|_| ())
+                .map_err(RuntimeError::Object);
+            let _ = reply.send(result);
             false
         }
         ControlCommand::InstallNotifications { sender } => {

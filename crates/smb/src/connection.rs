@@ -667,7 +667,7 @@ impl Connection {
             &conn_info,
         )
         .await?;
-        let session_context = Arc::downgrade(&session.context);
+        let session_context = Arc::downgrade(&session.recovery_context());
         self.context
             .registry
             .insert_session(session.session_id(), session_context)
@@ -702,7 +702,7 @@ impl Connection {
             &conn_info,
         )
         .await?;
-        let session_context = Arc::downgrade(&session.context);
+        let session_context = Arc::downgrade(&session.recovery_context());
         self.context
             .registry
             .insert_session(session.session_id(), session_context)
@@ -1302,7 +1302,7 @@ impl ConnectionCore {
             .map(|generation| generation.worker.clone())
     }
 
-    fn conn_info(&self) -> Option<Arc<ConnectionInfo>> {
+    pub(crate) fn conn_info(&self) -> Option<Arc<ConnectionInfo>> {
         self.generation
             .load_full()
             .map(|generation| generation.conn_info.clone())
@@ -1354,6 +1354,7 @@ impl ConnectionCore {
                             driver.close().await;
                             break;
                         };
+                        context.recover_sessions().await;
                         if !config.disable_notifications
                             && let Err(error) = context.start_notify().await
                         {
@@ -1376,6 +1377,41 @@ impl ConnectionCore {
         if let Some(driver) = self.recovery.get() {
             driver.close().await;
         }
+    }
+
+    async fn recover_sessions(&self) {
+        let sessions = self.registry.recoverable_sessions().await;
+        let results = futures_util::future::join_all(sessions.into_iter().map(|session| async move {
+            let previous = session.session_id();
+            let result = session.reauthenticate(previous).await;
+            (session, result)
+        }))
+        .await;
+        for (session, result) in results {
+            match result {
+                Ok((previous, replacement)) => {
+                    self.registry
+                        .replace_session(previous, replacement, Arc::downgrade(&session))
+                        .await;
+                }
+                Err(error) => tracing::warn!(?error, "session reauthentication failed"),
+            }
+        }
+    }
+
+    pub(crate) async fn recover_session(&self, session_id: u64) -> crate::Result<()> {
+        let session = self
+            .registry
+            .recoverable_sessions()
+            .await
+            .into_iter()
+            .find(|session| session.session_id() == session_id)
+            .ok_or_else(|| Error::InvalidState("Session recovery context is unavailable".into()))?;
+        let (previous, replacement) = session.reauthenticate(session_id).await?;
+        self.registry
+            .replace_session(previous, replacement, Arc::downgrade(&session))
+            .await;
+        Ok(())
     }
 
     /// Stamp an [`CommandRequest`] with connection-level header policy.

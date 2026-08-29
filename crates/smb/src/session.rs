@@ -57,7 +57,6 @@ pub struct Session {
 
     // Message context for this session.
     session_context: Arc<SessionContext>,
-    credential_provider: Option<SharedCredentialProvider>,
 }
 
 impl Session {
@@ -120,21 +119,42 @@ impl Session {
     {
         let primary_channel = Self::_common_setup(setup_result).await?;
 
-        let context = Arc::new(SessionContext::new(primary_channel.context.clone()));
+        let context = Arc::new(SessionContext::new(
+            primary_channel.context.clone(),
+            primary_channel.conn_info.clone(),
+            credential_provider,
+        ));
 
         Ok(Session {
             session_context: context,
             primary_channel,
             alt_channels: Default::default(),
             channel_counter: AtomicU32::new(PRIMARY_CHANNEL_ID + 1),
-            credential_provider,
         })
     }
 
     /// Whether this session owns a capability that can supply fresh
     /// authentication material after a Connection generation change.
     pub fn supports_reauthentication(&self) -> bool {
-        self.credential_provider.is_some()
+        self.session_context.credential_provider.is_some()
+    }
+
+    pub fn session_id(&self) -> u64 {
+        self.session_context.session_id()
+    }
+
+    pub async fn allow_unsigned(&self) -> crate::Result<bool> {
+        let primary = self.session_context.primary_channel();
+        primary.session_state().session.read().await.allow_unsigned()
+    }
+
+    pub async fn should_encrypt(&self) -> crate::Result<bool> {
+        let primary = self.session_context.primary_channel();
+        primary.session_state().session.read().await.should_encrypt()
+    }
+
+    pub(crate) fn recovery_context(&self) -> Arc<SessionContext> {
+        self.session_context.clone()
     }
 
     /// Binds an existing session to a new connection.
@@ -232,7 +252,8 @@ impl Session {
     #[tracing::instrument(level = "debug", skip_all, fields(session_id = self.session_id(), share = %name))]
     pub async fn tree_connect(&self, name: &UncPath) -> crate::Result<Tree> {
         let name = name.clone().with_no_path().to_string();
-        let tree = Tree::connect(&name, &self.session_context, &self.conn_info).await?;
+        let conn_info = self.session_context.conn_info();
+        let tree = Tree::connect(&name, &self.session_context, &conn_info).await?;
         Ok(tree)
     }
 
@@ -325,28 +346,134 @@ impl SessionAndChannel {
     }
 }
 
-pub(crate) struct SessionContext {
-    session_id: u64,
-    // this is used to speed up access to the primary channel context.
-    primary_channel_id: u32,
+struct SessionGeneration {
     primary_channel: Arc<ChannelContext>,
+    conn_info: Arc<ConnectionInfo>,
+}
+
+pub(crate) struct SessionContext {
+    generation: arc_swap::ArcSwap<SessionGeneration>,
 
     channel_contexts: RwLock<HashMap<u32, Arc<ChannelContext>>>,
+    credential_provider: Option<SharedCredentialProvider>,
+    recovery: tokio::sync::Mutex<()>,
 
     dropping: AtomicBool,
 }
 
 impl SessionContext {
-    pub fn new(primary_channel: Arc<ChannelContext>) -> Self {
-        let session_id = primary_channel.session_id();
+    fn new(
+        primary_channel: Arc<ChannelContext>,
+        conn_info: Arc<ConnectionInfo>,
+        credential_provider: Option<SharedCredentialProvider>,
+    ) -> Self {
         let primary_channel_id = primary_channel.channel_id();
         Self {
-            session_id,
-            primary_channel_id,
-            primary_channel: primary_channel.clone(),
+            generation: arc_swap::ArcSwap::from_pointee(SessionGeneration {
+                primary_channel: primary_channel.clone(),
+                conn_info,
+            }),
             channel_contexts: RwLock::new(HashMap::from([(primary_channel_id, primary_channel)])),
+            credential_provider,
+            recovery: tokio::sync::Mutex::new(()),
             dropping: AtomicBool::new(false),
         }
+    }
+
+    fn generation(&self) -> Arc<SessionGeneration> {
+        self.generation.load_full()
+    }
+
+    pub(crate) fn primary_channel(&self) -> Arc<ChannelContext> {
+        self.generation().primary_channel.clone()
+    }
+
+    pub(crate) fn session_id(&self) -> u64 {
+        self.primary_channel().session_id()
+    }
+
+    fn conn_info(&self) -> Arc<ConnectionInfo> {
+        self.generation().conn_info.clone()
+    }
+
+    pub(crate) async fn reauthenticate(
+        &self,
+        expected_session_id: u64,
+    ) -> crate::Result<(u64, u64)> {
+        let _recovery = self.recovery.lock().await;
+        let previous = self.generation();
+        let previous_channel = previous.primary_channel.clone();
+        if previous_channel.session_id() != expected_session_id {
+            return Ok((expected_session_id, previous_channel.session_id()));
+        }
+        let previous_state = previous_channel.session_state().clone();
+        let previous_object = previous_state.object()?;
+        let upstream = previous_channel.upstream();
+        let worker = upstream
+            .worker()
+            .ok_or_else(|| Error::InvalidState("Worker is unavailable for reauthentication".into()))?;
+        let connection = worker.connection_object();
+        let same_generation = previous_object.generation() == connection.generation();
+
+        if same_generation {
+            worker.begin_object_recovery(previous_object).await?;
+        }
+
+        let attempt = async {
+            let provider = self.credential_provider.as_ref().ok_or_else(|| {
+                Error::InvalidState("Session has no reauthentication capability".into())
+            })?;
+            let identity = provider.identity().await?;
+            let conn_info = upstream
+                .conn_info()
+                .ok_or_else(|| Error::InvalidState("Connection is not negotiated".into()))?;
+            let mut setup = SessionSetup::new(
+                identity,
+                &upstream,
+                &conn_info,
+                PRIMARY_CHANNEL_ID,
+                None,
+                SetupKind::New,
+            )
+            .await?;
+            let setup_result = setup.setup().await?;
+            if same_generation {
+                let replacement = worker
+                    .publish_object_replacement(previous_object)
+                    .await?;
+                setup_result.set_object(replacement)?;
+            }
+            let channel = Channel::new(&upstream, &conn_info, &setup_result).await?;
+            crate::Result::Ok((channel, conn_info))
+        }
+        .await;
+
+        let (channel, conn_info) = match attempt {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                if same_generation {
+                    let _ = worker.fail_object_recovery(previous_object).await;
+                }
+                return Err(error);
+            }
+        };
+        let new_session_id = channel.session_id();
+        let old_session_id = previous_channel.session_id();
+        let channel_context = channel.context.clone();
+        self.generation.store(Arc::new(SessionGeneration {
+            primary_channel: channel_context.clone(),
+            conn_info,
+        }));
+        {
+            let mut channels = self.channel_contexts.write().await;
+            channels.clear();
+            channels.insert(channel_context.channel_id(), channel_context);
+        }
+        previous_state.session.write().await.invalidate();
+        if same_generation {
+            let _ = worker.session_ended(&previous_state).await;
+        }
+        Ok((old_session_id, new_session_id))
     }
 
     pub async fn logoff(&self) -> crate::Result<()> {
@@ -358,7 +485,8 @@ impl SessionContext {
         }
 
         {
-            let state = self.primary_channel.session_state().session.read().await;
+            let primary_channel = self.primary_channel();
+            let state = primary_channel.session_state().session.read().await;
             if !state.is_ready() {
                 tracing::trace!("Session not ready, or logged-off already, skipping logoff.");
                 return Ok(());
@@ -371,7 +499,7 @@ impl SessionContext {
 
         // This also invalidates the session object.
         tracing::info!("Session logged off.");
-        self.primary_channel
+        self.primary_channel()
             .session_state()
             .session
             .write()
@@ -382,16 +510,17 @@ impl SessionContext {
     }
 
     async fn resolve_channel(&self, channel_id: Option<u32>) -> crate::Result<Arc<ChannelContext>> {
+        let primary = self.primary_channel();
         match channel_id {
-            None => Ok(self.primary_channel.clone()),
-            Some(id) if id == self.primary_channel_id => Ok(self.primary_channel.clone()),
+            None => Ok(primary),
+            Some(id) if id == primary.channel_id() => Ok(primary),
             Some(id) => self
                 .channel_contexts
                 .read()
                 .await
                 .get(&id)
                 .cloned()
-                .ok_or(Error::ChannelNotFound(self.session_id, id)),
+                .ok_or(Error::ChannelNotFound(self.primary_channel().session_id(), id)),
         }
     }
 
@@ -422,7 +551,7 @@ impl SessionContext {
         &self,
         kind: crate::runtime::ObjectKind,
     ) -> crate::Result<crate::runtime::ObjectToken> {
-        self.primary_channel.create_child_object(kind).await
+        self.primary_channel().create_child_object(kind).await
     }
 
     pub(crate) async fn create_object(
@@ -430,7 +559,7 @@ impl SessionContext {
         parent: crate::runtime::ObjectToken,
         kind: crate::runtime::ObjectKind,
     ) -> crate::Result<crate::runtime::ObjectToken> {
-        self.primary_channel.create_object(parent, kind).await
+        self.primary_channel().create_object(parent, kind).await
     }
 
     pub(crate) async fn submit_for(
@@ -477,17 +606,20 @@ impl Drop for SessionContext {
             return;
         }
 
-        let session_id = self.session_id;
-        let primary_channel_id = self.primary_channel_id;
-        let primary_channel = self.primary_channel.clone();
+        let generation = self.generation();
+        let primary_channel = generation.primary_channel.clone();
+        let conn_info = generation.conn_info.clone();
 
         tokio::task::spawn(async move {
             let temp_handler = SessionContext {
-                session_id,
                 dropping: AtomicBool::new(false),
-                primary_channel_id,
-                primary_channel,
+                generation: arc_swap::ArcSwap::from_pointee(SessionGeneration {
+                    primary_channel,
+                    conn_info,
+                }),
                 channel_contexts: Default::default(),
+                credential_provider: None,
+                recovery: tokio::sync::Mutex::new(()),
             };
             temp_handler.logoff_async().await;
         });

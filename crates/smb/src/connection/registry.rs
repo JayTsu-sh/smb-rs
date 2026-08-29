@@ -15,14 +15,14 @@ use tokio::sync::Mutex;
 
 use super::LeaseEviction;
 use crate::lease::LeaseSlot;
-use crate::session::ChannelContext;
+use crate::session::{ChannelContext, SessionContext};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SessionGone;
 
 #[derive(Default)]
 struct RegistryState {
-    sessions: HashMap<u64, Weak<ChannelContext>>,
+    sessions: HashMap<u64, Weak<SessionContext>>,
     leases: HashMap<String, Arc<LeaseSlot>>,
 }
 
@@ -145,8 +145,25 @@ impl ConnectionRegistry {
             .collect()
     }
 
-    pub(crate) async fn insert_session(&self, session_id: u64, context: Weak<ChannelContext>) {
+    pub(crate) async fn insert_session(&self, session_id: u64, context: Weak<SessionContext>) {
         self.state.lock().await.sessions.insert(session_id, context);
+    }
+
+    pub(crate) async fn replace_session(
+        &self,
+        previous: u64,
+        replacement: u64,
+        context: Weak<SessionContext>,
+    ) {
+        let mut state = self.state.lock().await;
+        state.sessions.remove(&previous);
+        state.sessions.insert(replacement, context);
+    }
+
+    pub(crate) async fn recoverable_sessions(&self) -> Vec<Arc<SessionContext>> {
+        let mut state = self.state.lock().await;
+        state.sessions.retain(|_, context| context.strong_count() != 0);
+        state.sessions.values().filter_map(Weak::upgrade).collect()
     }
 
     pub(crate) async fn get_session(
@@ -155,7 +172,10 @@ impl ConnectionRegistry {
     ) -> Result<Option<Arc<ChannelContext>>, SessionGone> {
         match self.state.lock().await.sessions.get(&session_id) {
             None => Ok(None),
-            Some(context) => context.upgrade().map(Some).ok_or(SessionGone),
+            Some(context) => context
+                .upgrade()
+                .map(|context| Some(context.primary_channel()))
+                .ok_or(SessionGone),
         }
     }
 }

@@ -98,6 +98,10 @@ pub struct ChannelContext {
 }
 
 impl ChannelContext {
+    pub(super) fn upstream(&self) -> ChannelUpstream {
+        self.upstream.clone()
+    }
+
     async fn prepare(&self, mut msg: CommandRequest) -> crate::Result<CommandRequest> {
         if msg.security.is_none() {
             let session = self.session_state.session.read().await;
@@ -141,10 +145,20 @@ impl ChannelContext {
         options: ResponseOptions<'_>,
         dependency: crate::runtime::ObjectToken,
     ) -> crate::Result<(CommandSubmission, CommandResponse)> {
-        let result = self
+        let result = match self
             .upstream
             .execute_for(self.prepare(msg).await?, options, dependency)
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(error @ Error::SignatureVerificationFailed) => {
+                if let Err(recovery_error) = self.upstream.recover_session(self.session_id).await {
+                    tracing::warn!(?recovery_error, "session integrity recovery failed");
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         self._verify_incoming(&result.1).await?;
         Ok(result)
     }

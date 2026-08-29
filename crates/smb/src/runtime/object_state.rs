@@ -345,6 +345,33 @@ impl ObjectRegistry {
         })
     }
 
+    pub(crate) fn publish_replacement_revoking_descendants(
+        &mut self,
+        token: ObjectToken,
+    ) -> Result<(ObjectEffect, Vec<ObjectEffect>), ObjectError> {
+        let record = self.record(token)?;
+        if record.phase != ObjectPhase::Recovering {
+            return Err(ObjectError::ParentNotActive);
+        }
+        let revoked = self.revoke_descendants(token);
+        let replacement = self.publish_replacement(token)?;
+        Ok((replacement, revoked))
+    }
+
+    pub(crate) fn fail_recovery(
+        &mut self,
+        token: ObjectToken,
+    ) -> Result<Vec<ObjectEffect>, ObjectError> {
+        let record = self.record(token)?;
+        if record.phase != ObjectPhase::Recovering {
+            return Err(ObjectError::ParentNotActive);
+        }
+        let mut effects = self.revoke_descendants(token);
+        self.record_mut(token)?.phase = ObjectPhase::Revoked;
+        effects.push(ObjectEffect::Revoked(token));
+        Ok(effects)
+    }
+
     pub(crate) fn begin_close(
         &mut self,
         token: ObjectToken,
@@ -515,6 +542,32 @@ mod tests {
         assert_eq!(previous, session);
         assert_eq!(registry.validate_active(previous), Err(ObjectError::Stale));
         assert_eq!(registry.validate_active(replacement), Ok(()));
+    }
+
+    #[test]
+    fn session_replacement_revokes_share_and_resource_descendants() {
+        let (mut registry, [_, session, share, resource]) = hierarchy();
+        registry.begin_recovery(session).unwrap();
+        let (replacement, revoked) = registry
+            .publish_replacement_revoking_descendants(session)
+            .unwrap();
+        let ObjectEffect::ReplacementPublished { replacement, .. } = replacement else {
+            panic!("expected replacement effect")
+        };
+
+        assert_eq!(
+            revoked,
+            vec![ObjectEffect::Revoked(share), ObjectEffect::Revoked(resource)]
+        );
+        assert_eq!(registry.validate_active(replacement), Ok(()));
+        assert_eq!(
+            registry.validate_active(share),
+            Err(ObjectError::ParentNotActive)
+        );
+        assert_eq!(
+            registry.validate_active(resource),
+            Err(ObjectError::ParentNotActive)
+        );
     }
 
     #[test]

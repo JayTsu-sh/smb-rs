@@ -43,6 +43,33 @@ impl RuntimeWorker {
             .map_err(|error| self.map_runtime_error(error))
     }
 
+    pub(crate) async fn begin_object_recovery(
+        &self,
+        object: ObjectToken,
+    ) -> Result<()> {
+        self.runtime
+            .begin_object_recovery(object)
+            .await
+            .map_err(|error| self.map_runtime_error(error))
+    }
+
+    pub(crate) async fn publish_object_replacement(
+        &self,
+        object: ObjectToken,
+    ) -> Result<ObjectToken> {
+        self.runtime
+            .publish_object_replacement(object)
+            .await
+            .map_err(|error| self.map_runtime_error(error))
+    }
+
+    pub(crate) async fn fail_object_recovery(&self, object: ObjectToken) -> Result<()> {
+        self.runtime
+            .fail_object_recovery(object)
+            .await
+            .map_err(|error| self.map_runtime_error(error))
+    }
+
     pub(crate) async fn start_generation_at(
         transport: Box<dyn SmbTransport>,
         timeout: Duration,
