@@ -6,7 +6,7 @@ use common::{
     default_connection_config, make_server_connection, smb_test_identity, smb_tests_server,
     smb_tests_share,
 };
-use smb::{Connection, FileCreateArgs, UncPath, WriteAt};
+use smb::{Connection, DurableOpenRequest, FileCreateArgs, UncPath, WriteAt};
 use smb_dtyp::Guid;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -100,6 +100,15 @@ async fn exact_session_disruption_reauthenticates_and_revokes_children(
         .await?
         .into_file()?;
     file.write_at(b"session-one", 0).await?;
+    let durable_file = tree
+        .create(
+            &format!("smb-rs-durable-recovery-{}.bin", std::process::id()),
+            &FileCreateArgs::make_overwrite(Default::default(), Default::default())
+                .with_durable(DurableOpenRequest::durable(30_000, Guid::generate())),
+        )
+        .await?
+        .into_file()?;
+    durable_file.write_at(b"durable-one", 0).await?;
     let initial_session_id = session.session_id();
     println!("SESSION_RECOVERY_DISRUPTION_READY");
 
@@ -110,6 +119,7 @@ async fn exact_session_disruption_reauthenticates_and_revokes_children(
                 file.write_at(b"stale", 0).await.is_err(),
                 "Resource from the replaced Session must remain stale"
             );
+            durable_file.write_at(b"durable-two", 0).await?;
             let recovered_file = tree
                 .create(
                     &format!("smb-rs-session-recovered-{}.bin", std::process::id()),
@@ -120,6 +130,7 @@ async fn exact_session_disruption_reauthenticates_and_revokes_children(
             recovered_file.write_at(b"session-two", 0).await?;
             println!("SESSION_REAUTHENTICATED");
             println!("SHARE_RECONNECTED");
+            println!("DURABLE_RESOURCE_RECONNECTED");
             connection.close().await?;
             return Ok(());
         }

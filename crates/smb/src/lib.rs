@@ -41,8 +41,9 @@ pub use connection::{Connection, ConnectionConfig};
 pub use error::Error;
 pub use lease::LeaseBreakEvent;
 pub use resource::{
-    Directory, File, FileCreateArgs, GetLen, LeaseGrant, Pipe, PipeRpcConnection, ReadAt,
-    ReadAtChannel, Resource, ResourceHandle, WriteAt, WriteAtChannel,
+    Directory, DurableOpenGrant, DurableOpenRequest, File, FileCreateArgs, GetLen, LeaseGrant,
+    Pipe, PipeRpcConnection, ReadAt, ReadAtChannel, Resource, ResourceHandle, WriteAt,
+    WriteAtChannel,
 };
 pub use session::Session;
 pub use tree::{DfsRootTreeRef, Tree};
