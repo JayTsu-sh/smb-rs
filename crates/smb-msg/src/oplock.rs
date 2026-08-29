@@ -12,7 +12,7 @@ use smb_msg_derive::*;
 /// and response (server to client) operations. The structure is identical for all three operations.
 ///
 /// Reference: MS-SMB2 2.2.23.1, 2.2.24.1, 2.2.25.1
-#[smb_request_response(size = 12)]
+#[smb_request_response(size = 24)]
 pub struct OplockBreakMsg {
     /// The oplock level. For notifications, this is the maximum level the server will accept.
     /// For acknowledgments, this is the lowered level the client accepts.
@@ -160,6 +160,16 @@ mod tests {
     use crate::*;
 
     use super::*;
+
+    test_binrw_response! {
+        struct OplockBreakMsg {
+            oplock_level: OplockLevel::II as u8,
+            file_id: FileId {
+                persistent: 7,
+                volatile: 9,
+            },
+        } => "180001000000000007000000000000000900000000000000"
+    }
 
     test_binrw_response! {
         struct LeaseBreakNotify {

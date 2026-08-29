@@ -693,6 +693,16 @@ pub struct ResourceHandle {
 }
 
 impl ResourceHandle {
+    /// Returns the currently authoritative oplock level for this open.
+    ///
+    /// The value is updated before an oplock-break acknowledgement is sent.
+    pub fn oplock_level(&self) -> OplockLevel {
+        self.oplock_slot
+            .as_ref()
+            .and_then(|slot| slot.level.read().ok().map(|level| *level))
+            .unwrap_or(OplockLevel::None)
+    }
+
     /// Returns the name of the resource.
     pub fn name(&self) -> &str {
         &self.name

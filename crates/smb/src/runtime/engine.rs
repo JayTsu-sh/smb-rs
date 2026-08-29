@@ -1453,7 +1453,8 @@ async fn process_io(
             if decode_unsolicited || !authority.operation_pending.is_empty() {
                 let messages = match wire.transform_incoming_all(frame.into_bytes()).await {
                     Ok(messages) => messages,
-                    Err(_) => {
+                    Err(error) => {
+                        tracing::warn!(?error, "failed to decode incoming SMB frame");
                         *fatal = Some(RuntimeError::Wire("decode-incoming"));
                         Vec::new()
                     }

@@ -269,6 +269,11 @@ async fn test_batch_oplock_break_invalidated_and_acknowledged() -> smb::Result<(
         .await?
         .into_file()
         .expect("durable Resource must be a file");
+    assert_eq!(
+        file_a.handle().oplock_level(),
+        OplockLevel::Batch,
+        "the server must grant Batch before the break can be validated",
+    );
 
     let (client_b, share_path_b) = make_server_connection(&share, None).await?;
     let file_b = client_b
