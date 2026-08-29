@@ -156,6 +156,9 @@ impl RecoveryDriver {
         if !matches!(exit.cause, GenerationExitCause::Transport(_)) {
             return Err(RecoveryError::NotRecoverable);
         }
+        if self.closed.is_cancelled() {
+            return Err(RecoveryError::Closed);
+        }
         let next_generation = exit
             .generation
             .checked_next()
@@ -565,6 +568,31 @@ mod tests {
         closing_driver.close().await;
         assert!(matches!(
             waiting.await.unwrap(),
+            Err(RecoveryError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_close_wins_transport_exit_recovery_race() {
+        let clock = Arc::new(ManualClock::new());
+        let (exit, connection) = transport_exit(clock.clone()).await;
+        let bootstrap = Arc::new(ScriptedBootstrap {
+            outcomes: std::sync::Mutex::new(VecDeque::from([true])),
+            calls: AtomicUsize::new(0),
+            clock: clock.clone(),
+        });
+        let driver = RecoveryDriver::new(
+            connection,
+            policy(),
+            clock,
+            bootstrap,
+            Arc::new(NoRecoveryJitter),
+        );
+
+        driver.close().await;
+
+        assert!(matches!(
+            driver.recover(exit).await,
             Err(RecoveryError::Closed)
         ));
     }

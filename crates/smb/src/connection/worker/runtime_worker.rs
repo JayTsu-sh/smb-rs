@@ -81,11 +81,14 @@ impl RuntimeWorker {
     }
 
     pub(crate) async fn stop(&self) -> Result<()> {
-        self.runtime
+        match self
+            .runtime
             .close(self.clock.now().saturating_add(self.timeout))
             .await
-            .map(|_| ())
-            .map_err(|error| self.map_runtime_error(error))
+        {
+            Ok(_) | Err(RuntimeError::Closed | RuntimeError::OwnerTerminated) => Ok(()),
+            Err(error) => Err(self.map_runtime_error(error)),
+        }
     }
 
     pub(crate) async fn send_for(
