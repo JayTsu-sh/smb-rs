@@ -157,12 +157,24 @@ rpc_pkts! {
     },
     Response {
         Response = 2,
-        // Fault = 3,
+        Fault = 3,
         BindAck = 12,
         BindNak = 13,
         // AlterContextResp = 15,
         // Shutdown = 17,
     }
+}
+
+/// Connection-oriented DCE/RPC fault body.
+#[binrw::binrw]
+#[derive(Debug, PartialEq, Eq)]
+pub struct DcRpcCoPktFault {
+    pub alloc_hint: u32,
+    pub context_id: u16,
+    pub cancel_count: u8,
+    pub reserved: u8,
+    pub status: u32,
+    pub reserved2: u32,
 }
 
 #[binrw::binrw]

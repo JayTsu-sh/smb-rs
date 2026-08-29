@@ -66,6 +66,13 @@ impl RpcPipeConnection {
         let reply = rpc_write_read(&pipe, Self::START_CALL_ID, request, context).await?;
         let bind_ack = match reply.content() {
             DcRpcCoPktResponseContent::BindAck(value) => value,
+            DcRpcCoPktResponseContent::Fault(fault) => {
+                pipe.close().await?;
+                return Err(SmbRpcError::RemoteFault {
+                    status: fault.status,
+                }
+                .into());
+            }
             content => {
                 return Err(Error::InvalidMessage(format!(
                     "expected RPC BindAck, received {content:?}"
@@ -220,6 +227,11 @@ impl BoundRpcConnection for RpcPipeConnection {
         validate_envelope(&reply).map_err(SmbRpcError::SendReceiveError)?;
         let response = match reply.into_content() {
             DcRpcCoPktResponseContent::Response(value) => value,
+            DcRpcCoPktResponseContent::Fault(fault) => {
+                return Err(SmbRpcError::RemoteFault {
+                    status: fault.status,
+                });
+            }
             content => {
                 return Err(SmbRpcError::SendReceiveError(format!(
                     "expected RPC Response, received {content:?}"

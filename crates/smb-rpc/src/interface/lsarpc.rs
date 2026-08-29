@@ -511,6 +511,10 @@ impl<T> LsaRpc<T>
 where
     T: BoundRpcConnection,
 {
+    pub fn into_connection(self) -> T {
+        self.bound_pipe
+    }
+
     /// Opens a policy handle on the target server.
     ///
     /// The handle must be closed with [`LsaRpc::close`] when no longer needed.

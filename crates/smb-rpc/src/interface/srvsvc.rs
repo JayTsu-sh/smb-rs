@@ -177,6 +177,10 @@ impl<T> SrvSvc<T>
 where
     T: BoundRpcConnection,
 {
+    pub fn into_connection(self) -> T {
+        self.bound_pipe
+    }
+
     pub async fn netr_share_enum(&mut self, server_name: &str) -> crate::Result<Vec<ShareInfo1>> {
         let input_struct = NetrShareEnumIn {
             server_name: NdrPtr::from(server_name.parse::<NdrString<u16>>().unwrap()).into(),
