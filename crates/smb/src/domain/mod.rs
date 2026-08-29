@@ -233,7 +233,23 @@ impl DomainClient {
     }
 
     pub(crate) async fn close(&self) -> crate::Result<()> {
-        self.inner.runtime.close().await
+        let sessions = {
+            let mut cache = self.inner.sessions.lock().await;
+            let sessions = cache.values().filter_map(Weak::upgrade).collect::<Vec<_>>();
+            cache.clear();
+            sessions
+        };
+        let mut first_error = None;
+        for session in sessions {
+            if let Err(error) = session.close().await {
+                first_error.get_or_insert(error);
+            }
+        }
+        let runtime_close = self.inner.runtime.close().await;
+        match (first_error, runtime_close) {
+            (Some(error), _) => Err(error),
+            (None, result) => result,
+        }
     }
 }
 

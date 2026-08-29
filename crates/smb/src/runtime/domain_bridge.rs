@@ -61,7 +61,6 @@ impl RuntimeClient {
         Ok(RuntimeSession {
             inner: Arc::new(session),
             server: server.to_owned(),
-            shares: tokio::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -73,40 +72,17 @@ impl RuntimeClient {
 pub(crate) struct RuntimeSession {
     inner: Arc<LegacySession>,
     server: String,
-    shares: tokio::sync::Mutex<Vec<std::sync::Weak<LegacyShare>>>,
 }
 
 impl RuntimeSession {
     pub(crate) async fn connect_share(&self, share: &str) -> crate::Result<RuntimeShare> {
         let target = UncPath::new(&self.server)?.with_share(share)?;
         let share = Arc::new(self.inner.tree_connect(&target).await?);
-        let mut shares = self.shares.lock().await;
-        shares.retain(|entry| entry.strong_count() != 0);
-        shares.push(Arc::downgrade(&share));
         Ok(RuntimeShare { inner: share })
     }
 
     pub(crate) async fn close(&self) -> crate::Result<()> {
-        let shares = {
-            let mut registry = self.shares.lock().await;
-            let shares = registry
-                .iter()
-                .filter_map(std::sync::Weak::upgrade)
-                .collect::<Vec<_>>();
-            registry.clear();
-            shares
-        };
-        let mut first_error = None;
-        for share in shares {
-            if let Err(error) = share.disconnect().await {
-                first_error.get_or_insert(error);
-            }
-        }
-        let logoff = self.inner.logoff().await;
-        match (first_error, logoff) {
-            (Some(error), _) => Err(error),
-            (None, result) => result,
-        }
+        self.inner.logoff().await
     }
 }
 
