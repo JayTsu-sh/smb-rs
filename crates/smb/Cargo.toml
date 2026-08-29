@@ -140,6 +140,10 @@ name = "ontap_baseline"
 required-features = ["real-server-tests"]
 
 [[test]]
+name = "ontap_recovery"
+required-features = ["real-server-tests", "test-support"]
+
+[[test]]
 name = "rpc"
 required-features = ["real-server-tests"]
 

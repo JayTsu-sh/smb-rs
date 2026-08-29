@@ -716,6 +716,14 @@ impl Connection {
         self.context.conn_info()
     }
 
+    /// Test-only observation of the opaque runtime generation identity.
+    #[cfg(feature = "test-support")]
+    pub fn observed_generation(&self) -> Option<u64> {
+        self.context
+            .worker()
+            .map(|worker| worker.generation().value())
+    }
+
     /// Subscribe to lease-break notifications received on this connection.
     /// See [`ConnectionCore::subscribe_lease_breaks`] for semantics.
     pub fn subscribe_lease_breaks(&self) -> tokio::sync::broadcast::Receiver<LeaseBreakEvent> {

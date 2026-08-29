@@ -15,6 +15,11 @@ impl GenerationId {
             None => None,
         }
     }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) const fn value(self) -> u64 {
+        self.0
+    }
 }
 
 /// Request identity is never meaningful without its generation.

@@ -75,6 +75,11 @@ impl RuntimeWorker {
         self.runtime.exited().await
     }
 
+    #[cfg(feature = "test-support")]
+    pub(crate) const fn generation(&self) -> GenerationId {
+        self.generation
+    }
+
     pub(crate) async fn stop(&self) -> Result<()> {
         self.runtime
             .close(self.clock.now().saturating_add(self.timeout))
