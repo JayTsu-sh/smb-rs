@@ -407,13 +407,13 @@ impl File {
         self.inner.opened_len()
     }
 
-    /// Length observed when this handle was opened.
-    pub fn len(&self) -> u64 {
-        self.opened_len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    pub fn len(&self) -> Operation<'_, u64> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                self.inner.len().await
+            })
+        })
     }
 
     pub fn read_at(&self, offset: u64, max_len: u32) -> Operation<'_, Bytes> {

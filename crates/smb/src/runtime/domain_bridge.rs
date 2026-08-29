@@ -11,7 +11,7 @@ use futures_core::Stream;
 use futures_util::TryStreamExt;
 use smb_fscc::{
     FileAccessMask, FileAttributes, FileDirectoryInformation, FileDispositionInformation,
-    FileRenameInformation, NotifyAction,
+    FileRenameInformation, FileStandardInformation, NotifyAction,
 };
 use smb_msg::{CreateOptions, NotifyFilter};
 use sspi::{AuthIdentity, Secret, Username};
@@ -356,6 +356,14 @@ pub(crate) struct RuntimeFile {
 impl RuntimeFile {
     pub(crate) fn opened_len(&self) -> u64 {
         self.inner.end_of_file()
+    }
+
+    pub(crate) async fn len(&self) -> crate::Result<u64> {
+        Ok(self
+            .inner
+            .query_info::<FileStandardInformation>()
+            .await?
+            .end_of_file)
     }
 
     pub(crate) async fn read_at(

@@ -88,7 +88,7 @@ impl CopyFile {
                     FileOpenOptions::create_new()
                 };
                 let file = share.open_file(&SharePath::new(relative)?, options).await?;
-                let len = if read { file.len() } else { 0 };
+                let len = if read { file.len().await? } else { 0 };
                 Ok(Self {
                     value: CopyFileValue::Remote { file, share },
                     len,

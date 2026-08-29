@@ -170,7 +170,6 @@ impl File {
         };
         let deadline = options.deadline;
         let cancellation = options.cancellation.clone();
-        let length = self.opened_len();
         let operation = Operation::new(move |context| {
             let copy = move |offset: u64, length: u32, cancellation: CancelToken| {
                 async move {
@@ -187,13 +186,10 @@ impl File {
                 }
                 .boxed()
             };
-            Box::pin(run_transfer(
-                length,
-                options,
-                context.cancellation,
-                progress,
-                copy,
-            ))
+            Box::pin(async move {
+                let length = self.inner.len().await?;
+                run_transfer(length, options, context.cancellation, progress, copy).await
+            })
         });
         let operation = match (deadline, cancellation) {
             (Some(deadline), Some(cancellation)) => {
