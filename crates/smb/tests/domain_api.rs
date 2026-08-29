@@ -141,6 +141,43 @@ async fn domain_spine_roundtrips_without_protocol_escape_hatches() -> smb::Resul
             .await?,
         payload
     );
+    let mut first_cursor = file.cursor();
+    let mut second_cursor = file.cursor();
+    let mut first_cursor_bytes = vec![0_u8; payload.len()];
+    let mut second_cursor_bytes = vec![0_u8; payload.len()];
+    first_cursor.read_exact(&mut first_cursor_bytes).await?;
+    second_cursor.read_exact(&mut second_cursor_bytes).await?;
+    assert_eq!(first_cursor_bytes, payload);
+    assert_eq!(second_cursor_bytes, payload);
+    assert_eq!(first_cursor.position(), payload.len() as u64);
+    assert_eq!(second_cursor.position(), payload.len() as u64);
+
+    let slice_suffix = b"-slice";
+    file.write_at_from(payload.len() as u64, slice_suffix)
+        .timeout(Duration::from_secs(10))
+        .await?;
+    let owned_suffix = Bytes::from_static(b"-all");
+    file.write_all_at(
+        (payload.len() + slice_suffix.len()) as u64,
+        owned_suffix.clone(),
+    )
+    .timeout(Duration::from_secs(10))
+    .await?;
+    let expected_len = payload.len() + slice_suffix.len() + owned_suffix.len();
+    let complete = file
+        .read_exact_at(0, expected_len as u32)
+        .timeout(Duration::from_secs(10))
+        .replay(ReplayPolicy::Idempotent)
+        .await?;
+    assert_eq!(&complete[..payload.len()], payload.as_ref());
+    assert_eq!(
+        &complete[payload.len()..payload.len() + slice_suffix.len()],
+        slice_suffix
+    );
+    assert_eq!(
+        &complete[payload.len() + slice_suffix.len()..],
+        owned_suffix
+    );
     file.delete().await?;
     assert_eq!(file.close().await?, CloseOutcome::Confirmed);
     share.close().await?;
