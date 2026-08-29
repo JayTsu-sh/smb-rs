@@ -1,4 +1,7 @@
-use smb_tests::ontap::{ApplyAuthorization, Inventory, Lifecycle, Plan, ResourceKind, RunManifest};
+use smb_tests::ontap::{
+    ApplyAuthorization, Inventory, Lifecycle, Mutation, OntapAdapter, Plan, ProvisioningRun,
+    ResourceKind, RunManifest,
+};
 use std::fs;
 use std::path::PathBuf;
 
@@ -135,5 +138,196 @@ fn tampered_manifest_is_rejected_before_cleanup_authority_is_granted() {
     fs::write(&path, original.replace("data-aggr", "other-aggr")).unwrap();
 
     assert!(RunManifest::load(&path).is_err());
+    fs::remove_file(path).unwrap();
+}
+
+#[derive(Default)]
+struct ScriptedOntap {
+    calls: Vec<&'static str>,
+    fail_at: Option<&'static str>,
+    mismatch: Option<ResourceKind>,
+}
+
+impl ScriptedOntap {
+    fn action(&mut self, name: &'static str) -> Result<(), String> {
+        self.calls.push(name);
+        if self.fail_at == Some(name) {
+            Err(format!("scripted failure at {name}"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl OntapAdapter for ScriptedOntap {
+    fn create_volume(&mut self, _: &Plan) -> Result<(), String> {
+        self.action("create-volume")
+    }
+    fn create_share(&mut self, _: &Plan) -> Result<(), String> {
+        self.action("create-share")
+    }
+    fn remove_everyone_acl(&mut self, _: &Plan) -> Result<(), String> {
+        self.action("remove-everyone-acl")
+    }
+    fn grant_test_acl(&mut self, _: &Plan) -> Result<(), String> {
+        self.action("grant-test-acl")
+    }
+    fn verify_ready(&mut self, _: &Plan, kind: ResourceKind) -> Result<bool, String> {
+        self.calls.push(match kind {
+            ResourceKind::Volume => "verify-volume-ready",
+            ResourceKind::Share => "verify-share-ready",
+        });
+        Ok(self.mismatch != Some(kind))
+    }
+    fn verify_owned(&mut self, _: &Plan, kind: ResourceKind) -> Result<bool, String> {
+        self.calls.push(match kind {
+            ResourceKind::Volume => "verify-volume-owned",
+            ResourceKind::Share => "verify-share-owned",
+        });
+        Ok(self.mismatch != Some(kind))
+    }
+    fn delete_share(&mut self, _: &Plan) -> Result<(), String> {
+        self.action("delete-share")
+    }
+    fn delete_volume(&mut self, _: &Plan) -> Result<(), String> {
+        self.action("delete-volume")
+    }
+}
+
+#[test]
+fn provisioning_persists_ready_resources_in_dependency_order() {
+    let path = temp_manifest("provision");
+    let plan = fixture();
+    let authorization = ApplyAuthorization::new(&plan, &plan.hash()).unwrap();
+    let manifest = RunManifest::create(&path, plan).unwrap();
+    let mut adapter = ScriptedOntap::default();
+
+    ProvisioningRun::new(manifest, &mut adapter)
+        .apply(&authorization)
+        .unwrap();
+    let recovered = RunManifest::load(&path).unwrap();
+    assert_eq!(
+        recovered.state(ResourceKind::Volume),
+        Some(Lifecycle::Ready)
+    );
+    assert_eq!(recovered.state(ResourceKind::Share), Some(Lifecycle::Ready));
+    assert_eq!(
+        adapter.calls,
+        vec![
+            "create-volume",
+            "create-share",
+            "remove-everyone-acl",
+            "grant-test-acl",
+            "verify-volume-ready",
+            "verify-share-ready",
+        ]
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn provisioning_failure_runs_owned_reverse_cleanup_and_persists_it() {
+    let path = temp_manifest("provision-fail");
+    let plan = fixture();
+    let authorization = ApplyAuthorization::new(&plan, &plan.hash()).unwrap();
+    let manifest = RunManifest::create(&path, plan).unwrap();
+    let mut adapter = ScriptedOntap {
+        fail_at: Some("grant-test-acl"),
+        ..Default::default()
+    };
+
+    assert!(
+        ProvisioningRun::new(manifest, &mut adapter)
+            .apply(&authorization)
+            .is_err()
+    );
+    let recovered = RunManifest::load(&path).unwrap();
+    assert_eq!(
+        recovered.state(ResourceKind::Share),
+        Some(Lifecycle::Deleted)
+    );
+    assert_eq!(
+        recovered.state(ResourceKind::Volume),
+        Some(Lifecycle::Deleted)
+    );
+    assert_eq!(recovered.mutations(), &[Mutation::EveryoneAclRemoved]);
+    assert_eq!(
+        adapter.calls,
+        vec![
+            "create-volume",
+            "create-share",
+            "remove-everyone-acl",
+            "grant-test-acl",
+            "verify-share-owned",
+            "delete-share",
+            "verify-volume-owned",
+            "delete-volume",
+        ]
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn recovered_manifest_can_resume_exact_cleanup() {
+    let path = temp_manifest("resume-cleanup");
+    let mut manifest = RunManifest::create(&path, fixture()).unwrap();
+    manifest.record_created(ResourceKind::Volume).unwrap();
+    manifest.record_created(ResourceKind::Share).unwrap();
+    drop(manifest);
+
+    let recovered = RunManifest::load(&path).unwrap();
+    let mut adapter = ScriptedOntap::default();
+    ProvisioningRun::new(recovered, &mut adapter)
+        .cleanup()
+        .unwrap();
+    let final_manifest = RunManifest::load(&path).unwrap();
+    assert_eq!(
+        final_manifest.state(ResourceKind::Share),
+        Some(Lifecycle::Deleted)
+    );
+    assert_eq!(
+        final_manifest.state(ResourceKind::Volume),
+        Some(Lifecycle::Deleted)
+    );
+    assert_eq!(
+        adapter.calls,
+        vec![
+            "verify-share-owned",
+            "delete-share",
+            "verify-volume-owned",
+            "delete-volume",
+        ]
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn ownership_mismatch_stops_that_object_and_parent_cleanup() {
+    let path = temp_manifest("provision-mismatch");
+    let plan = fixture();
+    let authorization = ApplyAuthorization::new(&plan, &plan.hash()).unwrap();
+    let manifest = RunManifest::create(&path, plan).unwrap();
+    let mut adapter = ScriptedOntap {
+        fail_at: Some("grant-test-acl"),
+        mismatch: Some(ResourceKind::Share),
+        ..Default::default()
+    };
+
+    assert!(
+        ProvisioningRun::new(manifest, &mut adapter)
+            .apply(&authorization)
+            .is_err()
+    );
+    let recovered = RunManifest::load(&path).unwrap();
+    assert_eq!(
+        recovered.state(ResourceKind::Share),
+        Some(Lifecycle::OwnershipMismatch)
+    );
+    assert_eq!(
+        recovered.state(ResourceKind::Volume),
+        Some(Lifecycle::Created)
+    );
+    assert!(!adapter.calls.contains(&"delete-share"));
+    assert!(!adapter.calls.contains(&"delete-volume"));
     fs::remove_file(path).unwrap();
 }

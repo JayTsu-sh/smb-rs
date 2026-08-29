@@ -158,17 +158,19 @@ fn args(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
 
-#[derive(Debug)]
-pub struct ApplyAuthorization<'a> {
-    pub plan: &'a Plan,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyAuthorization {
+    plan_hash: String,
 }
 
-impl<'a> ApplyAuthorization<'a> {
-    pub fn new(plan: &'a Plan, supplied_hash: &str) -> Result<Self, String> {
+impl ApplyAuthorization {
+    pub fn new(plan: &Plan, supplied_hash: &str) -> Result<Self, String> {
         if plan.hash() != supplied_hash {
             return Err("apply authorization does not match the exact plan".into());
         }
-        Ok(Self { plan })
+        Ok(Self {
+            plan_hash: supplied_hash.to_owned(),
+        })
     }
 }
 
@@ -185,6 +187,12 @@ pub enum Lifecycle {
     Ready,
     OwnershipMismatch,
     Deleted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Mutation {
+    EveryoneAclRemoved,
+    TestIdentityAclGranted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,6 +310,7 @@ pub struct RunManifest {
     schema_version: u32,
     plan: Plan,
     inventory: Inventory,
+    mutations: Vec<Mutation>,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -315,6 +324,7 @@ impl RunManifest {
         let manifest = Self {
             schema_version: 1,
             inventory: Inventory::new(&plan),
+            mutations: Vec::new(),
             plan,
             path: path.to_owned(),
         };
@@ -374,6 +384,21 @@ impl RunManifest {
         self.inventory.may_delete(kind)
     }
 
+    pub fn mutations(&self) -> &[Mutation] {
+        &self.mutations
+    }
+
+    pub fn record_mutation(&mut self, mutation: Mutation) -> Result<(), String> {
+        let mut next = self.clone();
+        if next.mutations.contains(&mutation) {
+            return Err("mutation is already recorded".into());
+        }
+        next.mutations.push(mutation);
+        next.persist()?;
+        self.mutations = next.mutations;
+        Ok(())
+    }
+
     fn update(
         &mut self,
         transition: impl FnOnce(&mut Inventory) -> Result<(), String>,
@@ -427,4 +452,116 @@ impl RunManifest {
 
 fn io_error(operation: &'static str) -> impl FnOnce(io::Error) -> String {
     move |error| format!("{operation}: {error}")
+}
+
+/// Adapter at the true-external ONTAP seam. Implementations perform one exact
+/// appliance mutation or verification per method.
+pub trait OntapAdapter {
+    fn create_volume(&mut self, plan: &Plan) -> Result<(), String>;
+    fn create_share(&mut self, plan: &Plan) -> Result<(), String>;
+    fn remove_everyone_acl(&mut self, plan: &Plan) -> Result<(), String>;
+    fn grant_test_acl(&mut self, plan: &Plan) -> Result<(), String>;
+    fn verify_ready(&mut self, plan: &Plan, kind: ResourceKind) -> Result<bool, String>;
+    fn verify_owned(&mut self, plan: &Plan, kind: ResourceKind) -> Result<bool, String>;
+    fn delete_share(&mut self, plan: &Plan) -> Result<(), String>;
+    fn delete_volume(&mut self, plan: &Plan) -> Result<(), String>;
+}
+
+/// Transactional provisioning and cleanup orchestration over an ONTAP Adapter.
+pub struct ProvisioningRun<'a, A> {
+    manifest: RunManifest,
+    adapter: &'a mut A,
+}
+
+impl<'a, A: OntapAdapter> ProvisioningRun<'a, A> {
+    pub fn new(manifest: RunManifest, adapter: &'a mut A) -> Self {
+        Self { manifest, adapter }
+    }
+
+    pub fn apply(mut self, authorization: &ApplyAuthorization) -> Result<RunManifest, String> {
+        if self.manifest.plan.hash() != authorization.plan_hash {
+            return Err("apply authorization is for a different manifest".into());
+        }
+        let result = self.provision();
+        if let Err(provision_error) = result {
+            let cleanup_errors = self.cleanup_resources();
+            return Err(if cleanup_errors.is_empty() {
+                provision_error
+            } else {
+                format!(
+                    "{provision_error}; cleanup failed: {}",
+                    cleanup_errors.join("; ")
+                )
+            });
+        }
+        Ok(self.manifest)
+    }
+
+    pub fn cleanup(mut self) -> Result<RunManifest, String> {
+        let errors = self.cleanup_resources();
+        if errors.is_empty() {
+            Ok(self.manifest)
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    fn provision(&mut self) -> Result<(), String> {
+        let plan = self.manifest.plan.clone();
+        self.adapter.create_volume(&plan)?;
+        self.manifest.record_created(ResourceKind::Volume)?;
+        self.adapter.create_share(&plan)?;
+        self.manifest.record_created(ResourceKind::Share)?;
+        self.adapter.remove_everyone_acl(&plan)?;
+        self.manifest
+            .record_mutation(Mutation::EveryoneAclRemoved)?;
+        self.adapter.grant_test_acl(&plan)?;
+        self.manifest
+            .record_mutation(Mutation::TestIdentityAclGranted)?;
+        for kind in [ResourceKind::Volume, ResourceKind::Share] {
+            if !self.adapter.verify_ready(&plan, kind)? {
+                return Err(format!("{kind:?} did not match the ready plan"));
+            }
+            self.manifest.record_ready(kind)?;
+        }
+        Ok(())
+    }
+
+    fn cleanup_resources(&mut self) -> Vec<String> {
+        let plan = self.manifest.plan.clone();
+        let mut errors = Vec::new();
+        for kind in self.manifest.cleanup_order() {
+            if let Err(error) = self.manifest.may_delete(kind) {
+                errors.push(error);
+                continue;
+            }
+            match self.adapter.verify_owned(&plan, kind) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if let Err(error) = self.manifest.record_ownership_mismatch(kind) {
+                        errors.push(error);
+                    }
+                    errors.push(format!("{kind:?} ownership mismatch"));
+                    continue;
+                }
+                Err(error) => {
+                    errors.push(error);
+                    continue;
+                }
+            }
+            let deletion = match kind {
+                ResourceKind::Share => self.adapter.delete_share(&plan),
+                ResourceKind::Volume => self.adapter.delete_volume(&plan),
+            };
+            match deletion {
+                Ok(()) => {
+                    if let Err(error) = self.manifest.record_deleted(kind) {
+                        errors.push(error);
+                    }
+                }
+                Err(error) => errors.push(error),
+            }
+        }
+        errors
+    }
 }
