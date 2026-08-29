@@ -25,6 +25,9 @@ mod recovery_driver;
 // async coordinator is connected to generation publication.
 #[allow(dead_code)]
 mod session_recovery;
+// W4-4 starts with the pure Share TreeConnect replay authority.
+#[allow(dead_code)]
+mod share_recovery;
 #[allow(dead_code)]
 mod reducer;
 #[allow(dead_code)]
