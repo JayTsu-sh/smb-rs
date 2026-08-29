@@ -100,29 +100,16 @@ async fn exact_session_disruption_reauthenticates_and_revokes_children(
         .await?
         .into_file()?;
     file.write_at(b"session-one", 0).await?;
-    let durable_file = tree
-        .create(
-            &format!("smb-rs-durable-recovery-{}.bin", std::process::id()),
-            &FileCreateArgs::make_overwrite(Default::default(), Default::default())
-                .with_durable(DurableOpenRequest::durable(30_000, Guid::generate())),
-        )
-        .await?
-        .into_file()?;
-    durable_file.write_at(b"durable-one", 0).await?;
     let initial_session_id = session.session_id();
     println!("SESSION_RECOVERY_DISRUPTION_READY");
 
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         if session.session_id() != initial_session_id {
-            println!("SESSION_ID_REPLACED");
             assert!(
                 file.write_at(b"stale", 0).await.is_err(),
                 "Resource from the replaced Session must remain stale"
             );
-            println!("ORDINARY_RESOURCE_REVOKED");
-            durable_file.write_at(b"durable-two", 0).await?;
-            println!("DURABLE_WRITE_COMPLETED");
             let recovered_file = tree
                 .create(
                     &format!("smb-rs-session-recovered-{}.bin", std::process::id()),
@@ -130,11 +117,9 @@ async fn exact_session_disruption_reauthenticates_and_revokes_children(
                 )
                 .await?
                 .into_file()?;
-            println!("NEW_RESOURCE_CREATED");
             recovered_file.write_at(b"session-two", 0).await?;
             println!("SESSION_REAUTHENTICATED");
             println!("SHARE_RECONNECTED");
-            println!("DURABLE_RESOURCE_RECONNECTED");
             connection.close().await?;
             return Ok(());
         }
@@ -216,6 +201,15 @@ async fn proxy_transport_loss_recovers_a_negotiated_connection_generation(
         .await?
         .into_file()?;
     file.write_at(b"generation-one", 0).await?;
+    let durable_file = tree
+        .create(
+            &format!("smb-rs-proxy-durable-{}.bin", std::process::id()),
+            &FileCreateArgs::make_overwrite(Default::default(), Default::default())
+                .with_durable(DurableOpenRequest::durable(30_000, Guid::generate())),
+        )
+        .await?
+        .into_file()?;
+    durable_file.write_at(b"durable-one", 0).await?;
     let initial = connection
         .observed_generation()
         .ok_or("connection has no active generation")?;
@@ -238,7 +232,9 @@ async fn proxy_transport_loss_recovers_a_negotiated_connection_generation(
         file.write_at(b"stale", 1).await.is_err(),
         "ordinary Resource from the lost generation must fail before wire admission"
     );
+    durable_file.write_at(b"durable-two", 0).await?;
     println!("RECOVERY_GENERATION_REPLACED");
+    println!("DURABLE_RESOURCE_RECONNECTED");
     connection.close().await?;
     shutdown.cancel();
     proxy_task.await?;
