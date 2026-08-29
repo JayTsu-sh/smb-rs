@@ -154,6 +154,7 @@ make_status! {
     ObjectNameNotFound = 0xC0000034: "Object Name Not Found",
     ObjectNameCollision = 0xC0000035: "Object Name Collision",
     SharingViolation = 0xC0000043: "Sharing Violation",
+    DeletePending = 0xC0000056: "Delete Pending",
     ObjectPathNotFound = 0xC000003A: "Object Path Not Found",
     NoEasOnFile = 0xC0000044: "No EAs on File",
     WrongPassword = 0xC000006A: "Wrong Password",

@@ -1,7 +1,7 @@
+use super::object_state::{ObjectError, ObjectKind, ObjectRegistry, ObjectToken};
 use super::operation::{
     OperationResult, OperationSubmission, ReplayPolicy, ResponsePolicy, TypedOperation,
 };
-use super::object_state::{ObjectError, ObjectKind, ObjectRegistry, ObjectToken};
 use super::reducer::{GenerationId, ReduceEffect, RequestKey, TerminalOutcome};
 use super::state::{
     AdmissionError, AdmissionLimits, GenerationState, OwnerEffect, OwnerEvent, RequestProgress,
@@ -184,7 +184,11 @@ impl RuntimeHandle {
     ) -> Result<ObjectToken, RuntimeError> {
         let (reply, result) = oneshot::channel();
         self.control
-            .send(ControlCommand::CreateObject { parent, kind, reply })
+            .send(ControlCommand::CreateObject {
+                parent,
+                kind,
+                reply,
+            })
             .await
             .map_err(|_| RuntimeError::Closed)?;
         result.await.unwrap_or(Err(RuntimeError::OwnerTerminated))
@@ -521,6 +525,8 @@ struct OperationPending {
     request_raw: Option<bytes::Bytes>,
     terminal: Option<oneshot::Sender<Result<OperationResult, RuntimeError>>>,
     buffered: Option<Result<OperationResult, RuntimeError>>,
+    draining: bool,
+    caller_completed: bool,
 }
 
 struct RequestAuthority {
@@ -1027,6 +1033,8 @@ async fn process_operation_admission(
             request_raw: request_raw.clone(),
             terminal: command.terminal,
             buffered: None,
+            draining: false,
+            caller_completed: false,
         },
     );
     send_queue.push_back(WriteCommand {
@@ -1063,9 +1071,7 @@ async fn process_compound_admission(
         .filter_map(TypedOperation::dependency)
         .find_map(|dependency| authority.objects.validate_active(dependency).err())
     {
-        let _ = command
-            .acknowledge
-            .send(Err(RuntimeError::Object(error)));
+        let _ = command.acknowledge.send(Err(RuntimeError::Object(error)));
         return None;
     }
     if authority
@@ -1085,11 +1091,11 @@ async fn process_compound_admission(
         .iter()
         .map(|operation| operation.credit_charge(authority.large_mtu))
         .try_fold(0u32, |total, charge| {
-            total
-                .checked_add(u32::from(charge?))
-                .ok_or(super::operation::OperationContractError::CreditChargeOverflow {
+            total.checked_add(u32::from(charge?)).ok_or(
+                super::operation::OperationContractError::CreditChargeOverflow {
                     command: smb_msg::Command::Cancel,
-                })
+                },
+            )
         }) {
         Ok(total) => total,
         Err(_) => {
@@ -1186,6 +1192,8 @@ async fn process_compound_admission(
                 request_raw: None,
                 terminal: None,
                 buffered: None,
+                draining: false,
+                caller_completed: false,
             },
         );
         if let Some(message) = authority.early_responses.remove(&key) {
@@ -1288,8 +1296,7 @@ async fn handle_control(
                 .map_err(RuntimeError::Object)
                 .and_then(|(effect, _revoked)| match effect {
                     super::object_state::ObjectEffect::ReplacementPublished {
-                        replacement,
-                        ..
+                        replacement, ..
                     } => Ok(replacement),
                     super::object_state::ObjectEffect::Revoked(_) => {
                         Err(RuntimeError::Object(ObjectError::Stale))
@@ -1325,9 +1332,12 @@ async fn handle_control(
                 return false;
             };
             if let Some(result) = pending.buffered.take() {
-                authority.operation_pending.remove(&key);
+                pending.caller_completed = true;
+                if !pending.draining {
+                    authority.operation_pending.remove(&key);
+                }
                 let _ = reply.send(result);
-            } else if pending.terminal.is_some() {
+            } else if pending.terminal.is_some() || pending.caller_completed {
                 let _ = reply.send(Err(RuntimeError::AlreadyAwaited(key)));
             } else {
                 pending.terminal = Some(reply);
@@ -1635,6 +1645,12 @@ fn process_decoded_response(
                 request_raw: None,
             }),
         );
+    } else if authority
+        .operation_pending
+        .get(&key)
+        .is_some_and(|pending| pending.draining)
+    {
+        authority.operation_pending.remove(&key);
     }
 }
 
@@ -1642,6 +1658,15 @@ fn apply_operation_effects(
     effects: &[OwnerEffect],
     pending: &mut HashMap<RequestKey, OperationPending>,
 ) {
+    for key in effects.iter().filter_map(|effect| match effect {
+        OwnerEffect::BestEffortWireCancel(key) => Some(*key),
+        _ => None,
+    }) {
+        if let Some(entry) = pending.get_mut(&key) {
+            entry.draining = true;
+            entry.request_raw = None;
+        }
+    }
     for effect in effects {
         if let OwnerEffect::Request {
             key,
@@ -1649,7 +1674,18 @@ fn apply_operation_effects(
         } = effect
             && *outcome != TerminalOutcome::Response
         {
-            complete_operation(pending, *key, Err(RuntimeError::Terminal(*outcome)));
+            if pending.get(key).is_some_and(|entry| entry.draining) {
+                let entry = pending.get_mut(key).expect("draining entry must exist");
+                let result = Err(RuntimeError::Terminal(*outcome));
+                if let Some(terminal) = entry.terminal.take() {
+                    let _ = terminal.send(result);
+                    entry.caller_completed = true;
+                } else {
+                    entry.buffered = Some(result);
+                }
+            } else {
+                complete_operation(pending, *key, Err(RuntimeError::Terminal(*outcome)));
+            }
         }
     }
 }
@@ -1723,10 +1759,33 @@ async fn write_pump(
             }
             continue;
         }
+        let progress_permit = tokio::select! {
+            biased;
+            _ = command.cancel_before_write.cancelled() => {
+                if io.send(IoEvent::WriteCancelled(command.key)).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+            permit = io.clone().reserve_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
+        };
         let progressed = Arc::new(AtomicUsize::new(0));
+        let reported = Arc::new(AtomicUsize::new(0));
         let callback_progress = Arc::clone(&progressed);
+        let callback_reported = Arc::clone(&reported);
+        let mut first_progress = Some(progress_permit);
+        let key = command.key;
         let mut observe = move |bytes| {
             callback_progress.fetch_add(bytes, Ordering::Relaxed);
+            if bytes > 0
+                && let Some(permit) = first_progress.take()
+            {
+                callback_reported.fetch_add(bytes, Ordering::Relaxed);
+                permit.send(IoEvent::WriteProgress { key, bytes });
+            }
         };
         let send = write.send_with_progress(&command.frame, &mut observe);
         tokio::pin!(send);
@@ -1743,7 +1802,9 @@ async fn write_pump(
             }
             result = &mut send => result,
         };
-        let bytes = progressed.load(Ordering::Relaxed);
+        let bytes = progressed
+            .load(Ordering::Relaxed)
+            .saturating_sub(reported.load(Ordering::Relaxed));
         if bytes > 0
             && io
                 .send(IoEvent::WriteProgress {
@@ -2264,6 +2325,23 @@ mod tests {
         Bytes::from(encoded)
     }
 
+    fn pending_session_setup_response(message_id: u64, async_id: u64) -> Bytes {
+        let mut response = smb_msg::PlainResponse::new(smb_msg::ResponseContent::SessionSetup(
+            smb_msg::SessionSetupResponse {
+                session_flags: smb_msg::SessionFlags::new(),
+                buffer: Vec::new(),
+            },
+        ));
+        response.header.status = smb_msg::Status::Pending as u32;
+        response.header.credit_request = 1;
+        response.header.flags.set_server_to_redir(true);
+        response.header.message_id = message_id;
+        response.header.to_async(async_id);
+        let mut encoded = Vec::new();
+        response.write(&mut Cursor::new(&mut encoded)).unwrap();
+        Bytes::from(encoded)
+    }
+
     #[tokio::test]
     async fn runtime_owns_short_write_progress_and_joins_both_pumps_on_close() {
         let (transport, control) = ScriptedTransport::new();
@@ -2528,9 +2606,14 @@ mod tests {
             progress_before_release: true,
         });
         let clock = Arc::new(ManualClock::new());
-        let (handle, _events) = start_generation(transport, clock.clone(), config());
+        let (handle, mut events) = start_generation(transport, clock.clone(), config());
         let ticket = handle.submit(frame(), 7, 1, None).await.unwrap();
-        control.progressed.notified().await;
+        loop {
+            if matches!(events.recv().await, Some(RuntimeEvent::WriteProgress { key, .. }) if key == ticket.key)
+            {
+                break;
+            }
+        }
         let deadline = MonotonicTime::ZERO.saturating_add(Duration::from_millis(10));
         let close = tokio::spawn({
             let handle = handle.clone();
@@ -2556,10 +2639,16 @@ mod tests {
         let clock = Arc::new(ManualClock::new());
         let (handle, mut events) = start_generation(transport, clock, config());
         let ticket = handle.submit(frame(), 0, 1, None).await.unwrap();
+        loop {
+            if matches!(events.recv().await, Some(RuntimeEvent::WriteComplete { key }) if key == ticket.key)
+            {
+                break;
+            }
+        }
         trigger.notify_one();
         assert_eq!(
             ticket.completion().await,
-            Ok(TerminalOutcome::GenerationLost)
+            Ok(TerminalOutcome::OutcomeUnknown)
         );
         while tokio::time::timeout(Duration::from_secs(1), events.recv())
             .await
@@ -2578,10 +2667,16 @@ mod tests {
         let clock = Arc::new(ManualClock::new());
         let (handle, mut events) = start_generation(transport, clock, config());
         let ticket = handle.submit(frame(), 0, 1, None).await.unwrap();
+        loop {
+            if matches!(events.recv().await, Some(RuntimeEvent::WriteComplete { key }) if key == ticket.key)
+            {
+                break;
+            }
+        }
         drop(handle);
         assert_eq!(
             ticket.completion().await,
-            Ok(TerminalOutcome::GenerationLost)
+            Ok(TerminalOutcome::OutcomeUnknown)
         );
         while tokio::time::timeout(Duration::from_secs(1), events.recv())
             .await
@@ -2655,6 +2750,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report.joined_tasks, 2);
+    }
+
+    #[tokio::test]
+    async fn committed_cancel_retains_response_policy_until_async_final_drains() {
+        let (transport, control) = ScriptedTransport::new();
+        let clock = Arc::new(ManualClock::new());
+        let (handle, mut events) = start_generation(transport, clock.clone(), config());
+        let ticket = handle
+            .submit_operation(session_setup_operation(false), None)
+            .await
+            .unwrap();
+        let cancelled_key = ticket.key;
+        loop {
+            if matches!(events.recv().await, Some(RuntimeEvent::WriteComplete { key }) if key == ticket.key)
+            {
+                break;
+            }
+        }
+
+        handle.cancel(cancelled_key, clock.now()).unwrap();
+        assert!(matches!(
+            ticket.completion().await,
+            Err(RuntimeError::Terminal(TerminalOutcome::OutcomeUnknown))
+        ));
+        control.push_server_frame(pending_session_setup_response(cancelled_key.message_id, 77));
+        control.push_server_frame(session_setup_response(cancelled_key.message_id));
+        loop {
+            if matches!(events.recv().await, Some(RuntimeEvent::InboundFrame { .. })) {
+                break;
+            }
+        }
+        tokio::task::yield_now().await;
+
+        let next = handle
+            .submit_operation(session_setup_operation(false), None)
+            .await
+            .unwrap();
+        control.push_server_frame(session_setup_response(next.key.message_id));
+        next.completion().await.unwrap();
+        let report = handle
+            .close(clock.now().saturating_add(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        assert_eq!(report.unresolved_requests, 0);
     }
 
     #[tokio::test]

@@ -84,32 +84,36 @@ impl Directory {
                     file_name: pattern.into(),
                 }
                 .into(),
-                ResponseOptions::new().with_cancellation_token(cancellation),
+                ResponseOptions::new()
+                    .with_cmd(Some(Command::QueryDirectory))
+                    .with_status(&[
+                        Status::Success,
+                        Status::NoMoreFiles,
+                        Status::InfoLengthMismatch,
+                        Status::InvalidInfoClass,
+                    ])
+                    .with_cancellation_token(cancellation),
             )
-            .await;
+            .await?;
 
-        let response = match response {
-            Ok(res) => res,
-            Err(Error::UnexpectedMessageStatus(Status::U32_NO_MORE_FILES)) => {
+        match response.message.header.status()? {
+            Status::Success => {}
+            Status::NoMoreFiles => {
                 tracing::debug!("No more files in directory");
                 return Ok(vec![]);
             }
-            Err(Error::UnexpectedMessageStatus(Status::U32_INFO_LENGTH_MISMATCH)) => {
+            Status::InfoLengthMismatch => {
                 return Err(Error::InvalidArgument(format!(
                     "Provided query buffer size {buffer_size} is too small to contain directory information"
                 )));
             }
-            Err(e @ Error::UnexpectedMessageStatus(Status::U32_INVALID_INFO_CLASS)) => {
-                tracing::debug!(
-                    "Error querying directory (server does not support this info class): {e}"
-                );
-                return Err(e);
+            Status::InvalidInfoClass => {
+                return Err(Error::UnexpectedMessageStatus(
+                    Status::U32_INVALID_INFO_CLASS,
+                ));
             }
-            Err(e) => {
-                tracing::error!("Error querying directory: {e}");
-                return Err(e);
-            }
-        };
+            status => return Err(Error::UnexpectedMessageStatus(status as u32)),
+        }
 
         Ok(response
             .message
@@ -348,6 +352,7 @@ impl Directory {
                     status: &[
                         Status::Success,
                         Status::Cancelled,
+                        Status::DeletePending,
                         Status::NotifyCleanup,
                         Status::NotifyEnumDir,
                     ],
@@ -361,6 +366,7 @@ impl Directory {
                 Status::U32_SUCCESS => res,
                 // Cancellation from CancelRequest
                 Status::U32_CANCELLED => return DirectoryWatchResult::Cancelled,
+                Status::U32_DELETE_PENDING => return DirectoryWatchResult::Cleanup,
                 Status::U32_NOTIFY_CLEANUP => return DirectoryWatchResult::Cleanup,
                 Status::U32_NOTIFY_ENUM_DIR => {
                     return DirectoryWatchResult::NotifyEnumDir {

@@ -117,7 +117,8 @@ async fn domain_spine_roundtrips_without_protocol_escape_hatches() -> smb::Resul
         .await?;
     let path = SharePath::new("domain-spine-roundtrip.bin")?;
 
-    let directory_path = SharePath::new("domain-directory-roundtrip")?;
+    let directory_name = format!("domain-directory-roundtrip-{}", std::process::id());
+    let directory_path = SharePath::new(&directory_name)?;
     let directory = share
         .open_directory(&directory_path, DirectoryOpenOptions::create_new())
         .timeout(Duration::from_secs(10))
@@ -128,8 +129,8 @@ async fn domain_spine_roundtrips_without_protocol_escape_hatches() -> smb::Resul
             .recursive(true)
             .cancellation(cancel_watch.clone()),
     );
-    let original = SharePath::new("domain-directory-roundtrip/event-original.bin")?;
-    let renamed = SharePath::new("domain-directory-roundtrip/event-renamed.bin")?;
+    let original = SharePath::new(format!("{directory_name}/event-original.bin"))?;
+    let renamed = SharePath::new(format!("{directory_name}/event-renamed.bin"))?;
     let observe = async {
         let mut added = false;
         let mut renamed_pair = false;
@@ -175,6 +176,12 @@ async fn domain_spine_roundtrips_without_protocol_escape_hatches() -> smb::Resul
     .await
     .map_err(|_| Error::InvalidState("directory event validation timed out".into()))??;
     cancel_watch.cancel();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), events.next())
+            .await
+            .map_err(|_| Error::InvalidState("directory watch cancellation timed out".into()))?
+            .is_none()
+    );
     drop(events);
     directory.delete().await?;
     assert_eq!(directory.close().await?, CloseOutcome::Confirmed);
@@ -295,5 +302,26 @@ async fn domain_named_pipe_open_cancel_and_close() -> smb::Result<()> {
     assert_eq!(pipe.close().await?, CloseOutcome::AlreadyClosed);
     ipc.close().await?;
     session.close().await?;
+    client.close().await
+}
+
+#[cfg(feature = "real-server-tests")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[ignore = "requires an isolated writable real-server share"]
+async fn domain_directory_query_only() -> smb::Result<()> {
+    let target = ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?;
+    let client = Client::new(ClientConfig::default());
+    let share = client
+        .connect_share(&target, common::smb_test_credentials())
+        .await?;
+    let path = SharePath::new(format!("query-only-{}", std::process::id()))?;
+    let directory = share
+        .open_directory(&path, DirectoryOpenOptions::create_new())
+        .await?;
+    let entries = directory.collect_entries("*").await?;
+    assert!(entries.iter().any(|entry| entry.name() == "."));
+    directory.delete().await?;
+    directory.close().await?;
+    share.close().await?;
     client.close().await
 }
