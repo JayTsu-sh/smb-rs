@@ -23,6 +23,7 @@ use tokio::sync::RwLock;
 
 mod authenticator;
 mod channel;
+mod credential;
 mod encryptor_decryptor;
 pub(crate) mod gss;
 mod setup;
@@ -38,6 +39,7 @@ pub use signer::MessageSigner;
 pub use state::{ChannelInfo, SessionInfo};
 
 use setup::*;
+use credential::{SharedCredentialProvider, StaticCredentialProvider};
 
 /// Channel id assigned to a session's primary channel.
 ///
@@ -55,6 +57,7 @@ pub struct Session {
 
     // Message context for this session.
     session_context: Arc<SessionContext>,
+    credential_provider: Option<SharedCredentialProvider>,
 }
 
 impl Session {
@@ -67,8 +70,10 @@ impl Session {
         upstream: &ChannelUpstream,
         conn_info: &Arc<ConnectionInfo>,
     ) -> crate::Result<Session> {
+        let credential_provider: SharedCredentialProvider =
+            Arc::new(StaticCredentialProvider::new(identity));
         let setup_result = SessionSetup::new(
-            identity,
+            credential_provider.identity().await?,
             upstream,
             conn_info,
             PRIMARY_CHANNEL_ID,
@@ -77,7 +82,7 @@ impl Session {
         )
         .await?;
 
-        Self::_finish_create(setup_result).await
+        Self::_finish_create(setup_result, Some(credential_provider)).await
     }
 
     /// Test-only: drive `SessionSetup` with a caller-supplied
@@ -103,10 +108,13 @@ impl Session {
         )
         .await?;
 
-        Self::_finish_create(setup_result).await
+        Self::_finish_create(setup_result, None).await
     }
 
-    async fn _finish_create<G>(setup_result: SessionSetup<'_, G>) -> crate::Result<Session>
+    async fn _finish_create<G>(
+        setup_result: SessionSetup<'_, G>,
+        credential_provider: Option<SharedCredentialProvider>,
+    ) -> crate::Result<Session>
     where
         G: crate::session::gss::GssState,
     {
@@ -119,7 +127,14 @@ impl Session {
             primary_channel,
             alt_channels: Default::default(),
             channel_counter: AtomicU32::new(PRIMARY_CHANNEL_ID + 1),
+            credential_provider,
         })
+    }
+
+    /// Whether this session owns a capability that can supply fresh
+    /// authentication material after a Connection generation change.
+    pub fn supports_reauthentication(&self) -> bool {
+        self.credential_provider.is_some()
     }
 
     /// Binds an existing session to a new connection.
