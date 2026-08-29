@@ -2,13 +2,13 @@ pub(crate) mod actor;
 pub mod config;
 pub mod connection_info;
 pub mod preauth_hash;
-pub mod transformer;
 pub mod worker;
 
 use crate::compression;
 use crate::connection::preauth_hash::PreauthHashState;
 use crate::dialects::DialectImpl;
 use crate::lease::{LeaseBreakEvent, LeaseSlot};
+pub use crate::runtime::wire::TransformError;
 use crate::{Error, crypto, msg_handler::*, session::Session};
 use actor::{ConnectionActor, ConnectionActorHandle};
 use binrw::prelude::*;
@@ -30,7 +30,6 @@ use std::time::Instant;
 use tokio::select;
 use tokio::sync::{OnceCell, Semaphore};
 use tokio_util::sync::CancellationToken;
-pub use transformer::TransformError;
 use worker::{Worker, WorkerImpl};
 
 /// Capacity of the per-connection lease-break broadcast. A handful of slow
@@ -210,10 +209,8 @@ impl Connection {
             tracing::debug!("Negotiating multi-protocol: Sending SMB1");
             // 1. Send SMB1 negotiate request
             let msg_bytes: Vec<u8> = SMB1NegotiateMessage::default().try_into()?;
-            let frame = smb_transport::SendFrame::from_segments(
-                vec![bytes::Bytes::from(msg_bytes)],
-                1,
-            )?;
+            let frame =
+                smb_transport::SendFrame::from_segments(vec![bytes::Bytes::from(msg_bytes)], 1)?;
             transport.send(&frame).await?;
 
             tracing::debug!("Sent SMB1 negotiate request, Receieving SMB2 response");

@@ -244,8 +244,8 @@ impl Deref for Session {
     }
 }
 
-/// Per-session state shared by the transformer (one entry per
-/// `session_id` in [`crate::connection::transformer::Transformer::sessions`]).
+/// Per-session state shared by the runtime wire pipeline (one entry per
+/// `session_id` in [`crate::runtime::wire::WirePipeline::sessions`]).
 ///
 /// # Lock layout (post-S7-T3 C2)
 ///

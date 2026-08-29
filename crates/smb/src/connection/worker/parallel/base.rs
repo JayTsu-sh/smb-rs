@@ -1,6 +1,6 @@
-use crate::connection::transformer::Transformer;
 use crate::connection::worker::Worker;
 use crate::msg_handler::ReceiveOptions;
+use crate::runtime::wire::WirePipeline;
 use smb_msg::ResponseContent;
 use smb_transport::TransportFrame;
 use smb_transport::{SendFrame, SmbTransport, SmbTransportWrite, TransportError};
@@ -35,7 +35,7 @@ where
     /// multi-threaded or async, depending on the crate configuration.
     backend_impl: Mutex<Option<Arc<BackendImplT>>>,
 
-    transformer: Transformer,
+    wire_pipeline: WirePipeline,
 
     /// A channel that is being used to pass on messages that are being received from the server with
     /// no associated message ID (message id -1 - oplock break/server to client notification).
@@ -98,7 +98,7 @@ where
     /// Compound responses come back the same way: server packs N
     /// responses into one frame and the worker's `incoming_data_callback`
     /// fans each out to its matching `msg_id` waiter via
-    /// `Transformer::transform_incoming_all` — there's nothing extra to
+    /// `WirePipeline::transform_incoming_all` — there's nothing extra to
     /// do on the receive side from the caller.
     ///
     /// **The caller is responsible for**:
@@ -125,7 +125,7 @@ where
         // SendMessageResult after the transform.
         let ids: Vec<u64> = msgs.iter().map(|m| m.message.header.message_id).collect();
 
-        let raw = self.transformer.transform_outgoing_compound(msgs).await?;
+        let raw = self.wire_pipeline.transform_outgoing_compound(msgs).await?;
         tracing::trace!(
             "Compound chain ({} members, ids={ids:?}) handed to transport.",
             ids.len()
@@ -154,12 +154,12 @@ where
         // compound chain of N responses (SMB2 NextCommand); we dispatch each
         // chained response to its own awaiter independently.
         let msgs = match self
-            .transformer
+            .wire_pipeline
             .transform_incoming_all(message.into_bytes())
             .await
         {
             Ok(v) => v,
-            // If the transformer can attribute the failure to a single
+            // If the wire pipeline can attribute the failure to a single
             // message id, route the error to that awaiter; otherwise propagate.
             Err(crate::Error::TranformFailed(e)) => match e.msg_id {
                 Some(msg_id) => {
@@ -286,7 +286,7 @@ where
         let worker = Arc::new(ParallelWorker::<T> {
             state: Mutex::new(WorkerAwaitState::new()),
             backend_impl: Default::default(),
-            transformer: Transformer::default(),
+            wire_pipeline: WirePipeline::default(),
             notify_messages_channel: Default::default(),
             sender: tx,
             stopped: AtomicBool::new(false),
@@ -322,7 +322,7 @@ where
         let return_raw_data = msg.return_raw_data;
 
         let id = msg.message.header.message_id;
-        let message = { self.transformer.transform_outgoing(msg).await? };
+        let message = { self.wire_pipeline.transform_outgoing(msg).await? };
 
         tracing::trace!("Message with ID {id} is passed to the worker for sending",);
 
@@ -388,8 +388,8 @@ where
         Ok(result)
     }
 
-    fn transformer(&self) -> &Transformer {
-        &self.transformer
+    fn wire_pipeline(&self) -> &WirePipeline {
+        &self.wire_pipeline
     }
 }
 

@@ -9,14 +9,14 @@ use std::sync::Arc;
 use std::{collections::HashMap, io::Cursor};
 use tokio::sync::{Mutex, RwLock};
 
-use super::connection_info::ConnectionInfo;
+use crate::connection::connection_info::ConnectionInfo;
 
-/// The [`Transformer`] structure is responsible for transforming messages to and from bytes,
+/// The [`WirePipeline`] structure is responsible for transforming messages to and from bytes,
 /// send over NetBios TCP connection.
 ///
-/// See [`Transformer::transform_outgoing`] and [`Transformer::transform_incoming`] for transformation functions.
+/// See [`WirePipeline::transform_outgoing`] and [`WirePipeline::transform_incoming`] for transformation functions.
 #[derive(Default)]
-pub struct Transformer {
+pub struct WirePipeline {
     /// Sessions opened from this connection.
     // This structure is performance-critical, so it uses RwLock to allow concurrent reads.
     // Writes are only done when a session is started or ended - which is *very* rare in high-performance scenarios.
@@ -27,10 +27,10 @@ pub struct Transformer {
     // `Arc<RwLock<SessionInfo>>` that is still kept (state machine).
     sessions: RwLock<HashMap<u64, Arc<SessionAndChannel>>>,
 
-    config: RwLock<TransformerConfig>,
+    config: RwLock<WirePipelineConfig>,
 
     /// Connection-level preauth integrity hash (SMB 3.1.1). The
-    /// transformer is the single authoritative owner per MS-SMB2
+    /// wire pipeline is the single authoritative owner per MS-SMB2
     /// §3.1.4.2: ingested automatically from Negotiate / SessionSetup
     /// plain bytes during `transform_outgoing` / `transform_incoming`,
     /// and surfaced via [`Self::snapshot_preauth_finalized`] for
@@ -47,20 +47,20 @@ pub struct Transformer {
 }
 
 #[derive(Default, Debug)]
-struct TransformerConfig {
+struct WirePipelineConfig {
     /// Compressors for this connection.
     compress: Option<(Compressor, Decompressor)>,
 
     negotiated: bool,
 
     /// Cached snapshot of the negotiated dialect/signing/encryption
-    /// parameters. Populated by [`Transformer::negotiated`] and read by
-    /// the setup-phase signing path so the transformer doesn't need to
+    /// parameters. Populated by [`WirePipeline::negotiated`] and read by
+    /// the setup-phase signing path so the wire pipeline doesn't need to
     /// re-borrow `ConnectionInfo` from the worker on every send.
     conn_info: Option<Arc<ConnectionInfo>>,
 }
 
-impl Transformer {
+impl WirePipeline {
     /// Notifies that the connection negotiation has been completed,
     /// with the given [`ConnectionInfo`].
     pub async fn negotiated(&self, neg_info: &Arc<ConnectionInfo>) -> crate::Result<()> {
@@ -84,7 +84,7 @@ impl Transformer {
 
         // Seed the connection-level preauth hash from the value the
         // negotiator built out of the Negotiate Req + Resp wire bytes.
-        // From now on the transformer is the sole owner: all subsequent
+        // From now on the wire pipeline is the sole owner: all subsequent
         // SessionSetup Req/Resp ingestion happens inside
         // `transform_outgoing` / `transform_incoming`.
         *self.preauth_hash.lock().await = neg_info.preauth_hash.clone();
@@ -102,7 +102,7 @@ impl Transformer {
     ///
     /// This is the public surface for the session-setup driver: it
     /// invokes this after the final SessionSetup Request has been
-    /// dispatched (the transformer auto-ingested the plain bytes during
+    /// dispatched (the wire pipeline auto-ingested the plain bytes during
     /// `transform_outgoing`), and uses the value to derive the channel
     /// SigningKey.
     pub async fn snapshot_preauth_finalized(&self) -> crate::Result<Option<PreauthHashValue>> {
@@ -226,7 +226,7 @@ impl Transformer {
     }
 
     /// Looks up the [`SessionAndChannel`] entry for `session_id`.
-    /// Errs with `InvalidState` when the transformer has no record of
+    /// Errs with `InvalidState` when the wire pipeline has no record of
     /// that session.
     ///
     /// Internal helper for the public `get_signer` / `get_encryptor` /
@@ -251,7 +251,7 @@ impl Transformer {
     /// arriving before `make_channel` finishes).
     ///
     /// Errs with `InvalidState` when no entry for `session_id` is
-    /// in the transformer's sessions table. Callsites map `Ok(None)`
+    /// in the wire pipeline's sessions table. Callsites map `Ok(None)`
     /// to the per-site `TransformError` they need.
     pub(crate) async fn get_signer(&self, session_id: u64) -> crate::Result<Option<MessageSigner>> {
         let entry = self.session_entry(session_id).await?;
@@ -276,7 +276,7 @@ impl Transformer {
     /// Returns `Ok(false)` when the channel hasn't been installed —
     /// matches the swallow-error behaviour of the pre-refactor
     /// closure path. Errs only when `session_id` is unknown to the
-    /// transformer.
+    /// wire pipeline.
     pub(crate) async fn is_binding(&self, session_id: u64) -> crate::Result<bool> {
         let entry = self.session_entry(session_id).await?;
         Ok(entry
@@ -458,7 +458,7 @@ impl Transformer {
         // SessionSetup Requests participate in the connection-level
         // preauth integrity hash. We ingest the plain (signature=0)
         // bytes here so the hash is identical to what the server
-        // computes on receive. Doing it inside the transformer
+        // computes on receive. Doing it inside the wire pipeline
         // centralises the contract: the session-setup driver doesn't
         // need to know which messages count.
         if Self::participates_in_preauth_outgoing(&msg.message.header)
@@ -990,7 +990,7 @@ mod wire_builder_tests {
         )
         .with_additional_data(payload);
 
-        let wire = Transformer::default()
+        let wire = WirePipeline::default()
             .transform_outgoing(outgoing)
             .await
             .unwrap();
@@ -1020,7 +1020,7 @@ mod wire_builder_tests {
         let encryptor = MessageEncryptor::new(
             crate::crypto::make_encrypting_algo(EncryptionCipher::Aes128Gcm, &key).unwrap(),
         );
-        let frame = Transformer::protect_wire_with(
+        let frame = WirePipeline::protect_wire_with(
             builder.seal().unwrap(),
             None,
             Some(encryptor),
@@ -1078,7 +1078,7 @@ mod wire_builder_tests {
             compression_algorithms: vec![CompressionAlgorithm::LZ4],
         });
         let key = [0x24; 16];
-        let frame = Transformer::protect_wire_with(
+        let frame = WirePipeline::protect_wire_with(
             wire,
             Some(Compressor::new(&caps)),
             Some(MessageEncryptor::new(

@@ -119,7 +119,7 @@ impl ChannelMessageHandler {
     /// (Internal)
     ///
     /// Verifies an [`IncomingMessage`] for the current session.
-    /// This is trustworthy only since we trust the [`Transformer`][crate::connection::transformer::Transformer] implementation
+    /// This is trustworthy only since we trust the [`WirePipeline`][crate::runtime::wire::WirePipeline] implementation
     /// to provide the correct IDs and verify signatures and encryption.
     ///
     /// # Arguments

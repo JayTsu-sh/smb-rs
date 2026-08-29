@@ -9,8 +9,8 @@ use smb_transport::SmbTransport;
 use smb_msg::Status;
 
 use crate::{
-    connection::transformer::Transformer,
     msg_handler::{IncomingMessage, OutgoingMessage, SendMessageResult},
+    runtime::wire::WirePipeline,
 };
 
 /// SMB2 connection worker.
@@ -137,18 +137,18 @@ pub trait Worker: Sized + std::fmt::Debug {
         }
     }
 
-    /// Get the transformer for this worker.
-    fn transformer(&self) -> &Transformer;
+    /// Get the runtime-owned wire pipeline for this worker.
+    fn wire_pipeline(&self) -> &WirePipeline;
 
     async fn negotaite_complete(&self, neg: &Arc<ConnectionInfo>) {
-        self.transformer().negotiated(neg).await.unwrap();
+        self.wire_pipeline().negotiated(neg).await.unwrap();
     }
 
     async fn session_started(&self, info: &Arc<SessionAndChannel>) -> crate::Result<()> {
-        self.transformer().session_started(info).await
+        self.wire_pipeline().session_started(info).await
     }
 
     async fn session_ended(&self, info: &Arc<SessionAndChannel>) -> crate::Result<()> {
-        self.transformer().session_ended(info).await
+        self.wire_pipeline().session_ended(info).await
     }
 }

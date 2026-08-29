@@ -20,7 +20,7 @@ pub struct OutgoingMessage {
     /// encrypt_data; session-setup driver for `SnapshotKdfSign`); the
     /// channel layer fills in the default for any message that
     /// arrives with `None` based on session state. Once set, the
-    /// transformer dispatches purely on this enum without inspecting
+    /// wire pipeline dispatches purely on this enum without inspecting
     /// other mutable state — eliminating the class of bug where the
     /// state inference looked at `session.state` to decide and got it
     /// wrong (e.g. the Windows-DC unsigned-final-request regression).
@@ -32,7 +32,7 @@ pub struct OutgoingMessage {
 /// Sealed at construction by the caller (or, for legacy paths,
 /// inferred by `ChannelMessageHandler::sendo` from session state and
 /// stamped into the message before it leaves the channel layer), so
-/// the transformer can dispatch purely on this enum without
+/// the wire pipeline can dispatch purely on this enum without
 /// inspecting other mutable state.
 #[derive(Debug, Clone)]
 pub enum Protection {
@@ -46,7 +46,7 @@ pub enum Protection {
     /// `session_state.channel.signer` at sign time.
     SignWithChannel,
     /// Sign this request with a one-shot key derived from the given
-    /// GSS-supplied SessionKey and the transformer's currently
+    /// GSS-supplied SessionKey and the wire pipeline's currently
     /// finalized preauth hash (after the request's own plain bytes
     /// are ingested). Used exclusively for the final SessionSetup
     /// Request — see MS-SMB2 §3.3.5.5.3.
@@ -92,7 +92,7 @@ impl OutgoingMessage {
     /// (bypassing [`ConnectionMessageHandler::sendo`]). This is the
     /// final SessionSetup Request path, where the driver has manually
     /// run `prepare_outgoing` and installed a channel SigningKey via
-    /// `make_channel`; the transformer's signing path keys off
+    /// `make_channel`; the wire pipeline's signing path keys off
     /// `flags.signed`, so this flip is what makes the request
     /// wire-signed.
     #[doc(hidden)]

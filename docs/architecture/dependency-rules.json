@@ -1,5 +1,5 @@
 {
-  "current_wave": "W2",
+  "current_wave": "W3",
   "crate_rules": [
     {
       "name": "smb-msg",
@@ -46,17 +46,22 @@
       "root": "crates/smb/src/runtime",
       "import_prefix": "crate::runtime",
       "allowed_modules": [],
-      "allowed_crate_prefixes": ["crate::clock", "crate::error"],
+      "allowed_crate_prefixes": [
+        "crate::clock",
+        "crate::compression",
+        "crate::connection::connection_info",
+        "crate::connection::preauth_hash",
+        "crate::crypto",
+        "crate::error",
+        "crate::msg_handler",
+        "crate::session",
+        "crate::Error",
+        "crate::Result"
+      ],
       "deny_unclassified_crate_imports": true,
       "owner_wave": "W3",
-      "activation": "not_yet_activated"
+      "activation": "activated"
     }
   ],
-  "temporary_adapters": [
-    {
-      "path": "crates/smb/src/connection/transformer.rs",
-      "owner_wave": "W2",
-      "remove_by": "W3"
-    }
-  ]
+  "temporary_adapters": []
 }

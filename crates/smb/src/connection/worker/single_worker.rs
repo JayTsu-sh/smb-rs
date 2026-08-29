@@ -1,7 +1,7 @@
 use crate::{
-    connection::transformer::Transformer,
     error::*,
     msg_handler::{IncomingMessage, OutgoingMessage, ReceiveOptions, SendMessageResult},
+    runtime::wire::WirePipeline,
 };
 use smb_transport::{SmbTransport, TransportError};
 use std::sync::OnceLock;
@@ -18,7 +18,7 @@ pub struct SingleWorker {
     // since we can't have mutable references to the same object in multiple threads,
     // which is useful in the async worker.
     transport: Mutex<OnceLock<Box<dyn SmbTransport>>>,
-    transformer: Transformer,
+    wire_pipeline: WirePipeline,
     timeout: Mutex<Option<Duration>>,
 }
 
@@ -27,7 +27,7 @@ impl Worker for SingleWorker {
         transport.set_read_timeout(timeout)?;
         Ok(Arc::new(Self {
             transport: Mutex::new(OnceLock::from(transport)),
-            transformer: Transformer::default(),
+            wire_pipeline: WirePipeline::default(),
             timeout: Mutex::new(Some(timeout)),
         }))
     }
@@ -44,7 +44,7 @@ impl Worker for SingleWorker {
         let msg_id = msg.message.header.message_id;
         let return_raw_data = msg.return_raw_data;
 
-        let msg_to_send = self.transformer.transform_outgoing(msg)?;
+        let msg_to_send = self.wire_pipeline.transform_outgoing(msg)?;
 
         let mut t = self.transport.lock()?;
         t.get_mut()
@@ -100,7 +100,7 @@ impl Worker for SingleWorker {
             transport.set_read_timeout(original_timeout)?;
         }
         // Transform the message
-        let im = self.transformer.transform_incoming(msg)?;
+        let im = self.wire_pipeline.transform_incoming(msg)?;
         // Make sure this is our message.
         // In async clients, this is no issue, but here, we can't deal with unordered/unexpected message IDs.
         if im.message.header.message_id != options.msg_id {
@@ -112,8 +112,8 @@ impl Worker for SingleWorker {
         Ok(im)
     }
 
-    fn transformer(&self) -> &Transformer {
-        &self.transformer
+    fn wire_pipeline(&self) -> &WirePipeline {
+        &self.wire_pipeline
     }
 }
 

@@ -238,7 +238,7 @@ pub struct ChannelInfo {
     /// `true` iff this channel was created for SMB multichannel
     /// session-binding (i.e. it is a secondary channel attached to an
     /// already-Ready primary session). Used by
-    /// [`crate::connection::Transformer::verify_plain_incoming`] to
+    /// [`crate::runtime::wire::WirePipeline::verify_plain_incoming`] to
     /// enable an extra defense-in-depth signature verification on
     /// SessionSetup responses that arrive with the wire-protocol
     /// `signed` flag cleared but a non-zero signature field — a

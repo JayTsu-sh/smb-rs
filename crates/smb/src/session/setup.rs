@@ -208,7 +208,7 @@ where
                 return Err(crate::error::SetupError::UnsignedFinalResponse.into());
             }
             // Intermediate response preauth ingest is now done inside
-            // `Transformer::transform_incoming` (S4-T2); no driver-side
+            // `WirePipeline::transform_incoming` (S4-T2); no driver-side
             // bookkeeping needed.
 
             self.flags = Some(session_setup_response.session_flags);
@@ -451,7 +451,7 @@ where
 
     /// Never signed, so wire bytes == plain bytes (`signature = 0`).
     /// The connection-level preauth hash is fed by
-    /// `Transformer::transform_outgoing` (S4-T2); the driver is hands-off.
+    /// `WirePipeline::transform_outgoing` (S4-T2); the driver is hands-off.
     async fn send_intermediate_setup_request(
         &mut self,
         request: OutgoingMessage,
@@ -470,10 +470,10 @@ where
     ///
     /// Per MS-SMB2 §3.3.5.5.3 the server **requires** this request to
     /// be signed on any non-anonymous SMB 3.x session (Windows DCs in
-    /// particular drop it silently otherwise). The transformer owns
+    /// particular drop it silently otherwise). The wire pipeline owns
     /// the preauth-hash plumbing: we just attach the GSS-derived
     /// SessionKey to the outgoing message via `setup_phase_signing_key`,
-    /// and `Transformer::transform_outgoing` ingests the plain bytes,
+    /// and `WirePipeline::transform_outgoing` ingests the plain bytes,
     /// derives a one-shot signer from the resulting finalized hash, and
     /// signs in place — all in one pass.
     async fn send_final_setup_request(
@@ -496,7 +496,7 @@ where
         });
         let request = request.into_signed();
         // The SnapshotKdfSign Protection set above is what the
-        // transformer dispatches on; `into_signed` just flips the
+        // wire pipeline dispatches on; `into_signed` just flips the
         // wire-protocol signed flag so worker bookkeeping that still
         // inspects `flags.signed` sees a consistent state.
 
@@ -510,7 +510,7 @@ where
         // Install the channel into session_state *after* dispatch so
         // the receive path can verify the matching signed Response —
         // the channel signer is derived from the same preauth hash the
-        // transformer used a moment ago (it's stable now: the
+        // wire pipeline used a moment ago (it's stable now: the
         // SessionSetup Response with status=Success does NOT update
         // the hash per MS-SMB2 §3.1.4.2).
         self.make_channel().await?;
@@ -520,14 +520,14 @@ where
 
     /// Builds the [`ChannelInfo`] for this session's primary channel
     /// (or the bound channel) using the GSS SessionKey and the
-    /// transformer's finalized preauth hash, then installs it into the
-    /// shared `session_state` so the transformer can find the signer
+    /// wire pipeline's finalized preauth hash, then installs it into the
+    /// shared `session_state` so the wire pipeline can find the signer
     /// for the upcoming final SessionSetup Response.
     async fn make_channel(&mut self) -> crate::Result<()> {
         self.on_session_key_exchanged().await?;
         tracing::trace!("Session keys are set.");
 
-        // The preauth hash is owned by the transformer (S4-T1); snapshot
+        // The preauth hash is owned by the wire pipeline (S4-T1); snapshot
         // its current finalized value to derive the channel SigningKey.
         let preauth_snapshot = self.preauth_hash_snapshot().await?;
 
@@ -558,13 +558,13 @@ where
         self.authenticator.session_key()
     }
 
-    /// Snapshot the connection-level preauth hash from the transformer
+    /// Snapshot the connection-level preauth hash from the runtime wire pipeline
     /// (S4-T1).
     async fn preauth_hash_snapshot(&self) -> crate::Result<Option<PreauthHashValue>> {
         self.upstream
             .worker()
             .ok_or_else(|| Error::InvalidState("Worker not available!".to_string()))?
-            .transformer()
+            .wire_pipeline()
             .snapshot_preauth_finalized()
             .await
     }
