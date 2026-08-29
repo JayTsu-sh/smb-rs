@@ -1,4 +1,6 @@
-use super::operation::{OperationResult, OperationSubmission, ResponsePolicy, TypedOperation};
+use super::operation::{
+    OperationResult, OperationSubmission, ReplayPolicy, ResponsePolicy, TypedOperation,
+};
 use super::object_state::{ObjectError, ObjectKind, ObjectRegistry, ObjectToken};
 use super::reducer::{GenerationId, ReduceEffect, RequestKey, TerminalOutcome};
 use super::state::{
@@ -515,6 +517,7 @@ struct CompoundAdmission {
 
 struct OperationPending {
     response: ResponsePolicy,
+    replay: ReplayPolicy,
     request_raw: Option<bytes::Bytes>,
     terminal: Option<oneshot::Sender<Result<OperationResult, RuntimeError>>>,
     buffered: Option<Result<OperationResult, RuntimeError>>,
@@ -995,6 +998,7 @@ async fn process_operation_admission(
 
     let key = plan.key;
     let response = command.operation.response_policy().clone();
+    let replay = command.operation.replay_policy();
     let mut outgoing = command.operation.into_outgoing();
     outgoing.message.header.message_id = key.message_id;
     outgoing.message.header.credit_charge = plan.credit_charge;
@@ -1019,6 +1023,7 @@ async fn process_operation_admission(
         key,
         OperationPending {
             response,
+            replay,
             request_raw: request_raw.clone(),
             terminal: command.terminal,
             buffered: None,
@@ -1105,7 +1110,7 @@ async fn process_compound_admission(
         let credit_charge = match operation.credit_charge(authority.large_mtu) {
             Ok(charge) => charge,
             Err(_) => {
-                for (key, _) in &admitted {
+                for (key, _, _) in &admitted {
                     authority
                         .state
                         .reduce(OwnerEvent::PrepareFailed { key: *key });
@@ -1122,7 +1127,7 @@ async fn process_compound_admission(
             caller_deadline: command.deadline,
         });
         let Some(OwnerEffect::Admitted(plan)) = effects.first() else {
-            for (key, _) in &admitted {
+            for (key, _, _) in &admitted {
                 authority
                     .state
                     .reduce(OwnerEvent::PrepareFailed { key: *key });
@@ -1136,18 +1141,19 @@ async fn process_compound_admission(
         };
         let key = plan.key;
         let response = operation.response_policy().clone();
+        let replay = operation.replay_policy();
         let mut outgoing = operation.into_outgoing();
         outgoing.message.header.message_id = key.message_id;
         outgoing.message.header.credit_charge = plan.credit_charge;
         outgoing.message.header.credit_request = plan.credit_request;
-        admitted.push((key, response));
+        admitted.push((key, response, replay));
         outgoing_messages.push(outgoing);
     }
 
     let frame = match wire.transform_outgoing_compound(outgoing_messages).await {
         Ok(frame) => frame,
         Err(_) => {
-            for (key, _) in &admitted {
+            for (key, _, _) in &admitted {
                 authority
                     .state
                     .reduce(OwnerEvent::PrepareFailed { key: *key });
@@ -1159,7 +1165,10 @@ async fn process_compound_admission(
         }
     };
 
-    let keys = admitted.iter().map(|(key, _)| *key).collect::<Arc<[_]>>();
+    let keys = admitted
+        .iter()
+        .map(|(key, _, _)| *key)
+        .collect::<Arc<[_]>>();
     let submissions = keys
         .iter()
         .copied()
@@ -1168,11 +1177,12 @@ async fn process_compound_admission(
             request_raw: None,
         })
         .collect();
-    for (key, response) in admitted {
+    for (key, response, replay) in admitted {
         authority.operation_pending.insert(
             key,
             OperationPending {
                 response,
+                replay,
                 request_raw: None,
                 terminal: None,
                 buffered: None,

@@ -12,6 +12,42 @@ use std::cmp::max;
 use super::reducer::RequestKey;
 use super::ObjectToken;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ReplayPolicy {
+    #[default]
+    NeverReplay,
+    ReplayIfUncommitted,
+    IdempotentReplay,
+    DurableReconnectOnly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryDecision {
+    FailWithoutReplay,
+    Replay,
+    DurableReconnect,
+    OutcomeUnknown,
+}
+
+impl ReplayPolicy {
+    pub(crate) const fn decide(
+        self,
+        wire_committed: bool,
+        durable_resource: bool,
+    ) -> RecoveryDecision {
+        match self {
+            Self::NeverReplay if wire_committed => RecoveryDecision::OutcomeUnknown,
+            Self::NeverReplay => RecoveryDecision::FailWithoutReplay,
+            Self::ReplayIfUncommitted if wire_committed => RecoveryDecision::OutcomeUnknown,
+            Self::ReplayIfUncommitted => RecoveryDecision::Replay,
+            Self::IdempotentReplay => RecoveryDecision::Replay,
+            Self::DurableReconnectOnly if durable_resource => RecoveryDecision::DurableReconnect,
+            Self::DurableReconnectOnly if wire_committed => RecoveryDecision::OutcomeUnknown,
+            Self::DurableReconnectOnly => RecoveryDecision::FailWithoutReplay,
+        }
+    }
+}
+
 /// Response contract sealed at operation construction. `AnyStatus` exists for
 /// the temporary send/receive facade: the owner still validates command,
 /// direction, framing, transforms, and correlation, while the facade applies
@@ -69,6 +105,7 @@ pub(crate) struct TypedOperation {
     response: ResponsePolicy,
     outgoing: CommandRequest,
     dependency: Option<ObjectToken>,
+    replay: ReplayPolicy,
 }
 
 impl TypedOperation {
@@ -85,6 +122,7 @@ impl TypedOperation {
             response,
             outgoing,
             dependency: None,
+            replay: ReplayPolicy::NeverReplay,
         })
     }
 
@@ -94,6 +132,7 @@ impl TypedOperation {
             response: ResponsePolicy::any(command),
             outgoing,
             dependency: None,
+            replay: ReplayPolicy::NeverReplay,
         }
     }
 
@@ -104,6 +143,15 @@ impl TypedOperation {
 
     pub(crate) const fn dependency(&self) -> Option<ObjectToken> {
         self.dependency
+    }
+
+    pub(crate) fn with_replay_policy(mut self, replay: ReplayPolicy) -> Self {
+        self.replay = replay;
+        self
+    }
+
+    pub(crate) const fn replay_policy(&self) -> ReplayPolicy {
+        self.replay
     }
 
     pub(crate) fn response_policy(&self) -> &ResponsePolicy {
@@ -252,6 +300,48 @@ mod tests {
                 .response_policy()
                 .accepts_status(Status::AccessDenied)
         );
+    }
+
+    #[test]
+    fn replay_policy_distinguishes_commitment_and_durable_proof() {
+        assert_eq!(
+            ReplayPolicy::NeverReplay.decide(false, false),
+            RecoveryDecision::FailWithoutReplay
+        );
+        assert_eq!(
+            ReplayPolicy::NeverReplay.decide(true, false),
+            RecoveryDecision::OutcomeUnknown
+        );
+        assert_eq!(
+            ReplayPolicy::ReplayIfUncommitted.decide(false, false),
+            RecoveryDecision::Replay
+        );
+        assert_eq!(
+            ReplayPolicy::ReplayIfUncommitted.decide(true, false),
+            RecoveryDecision::OutcomeUnknown
+        );
+        assert_eq!(
+            ReplayPolicy::IdempotentReplay.decide(true, false),
+            RecoveryDecision::Replay
+        );
+        assert_eq!(
+            ReplayPolicy::DurableReconnectOnly.decide(false, true),
+            RecoveryDecision::DurableReconnect
+        );
+        assert_eq!(
+            ReplayPolicy::DurableReconnectOnly.decide(true, false),
+            RecoveryDecision::OutcomeUnknown
+        );
+    }
+
+    #[test]
+    fn typed_operation_defaults_to_never_replay() {
+        let operation = TypedOperation::any_status(CommandRequest::new(RequestContent::Cancel(
+            CancelRequest::default(),
+        )));
+        assert_eq!(operation.replay_policy(), ReplayPolicy::NeverReplay);
+        let operation = operation.with_replay_policy(ReplayPolicy::IdempotentReplay);
+        assert_eq!(operation.replay_policy(), ReplayPolicy::IdempotentReplay);
     }
 
     #[test]
