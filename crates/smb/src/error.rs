@@ -10,6 +10,7 @@ use smb_msg::{Command, ErrorResponse, Status};
 #[derive(Debug)]
 pub enum TimedOutTask {
     ReceiveNextMessage,
+    SessionReauthentication,
 }
 
 /// Fine-grained classification of session-setup failures.

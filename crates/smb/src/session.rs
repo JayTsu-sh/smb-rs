@@ -27,6 +27,7 @@ mod credential;
 mod encryptor_decryptor;
 pub(crate) mod gss;
 mod setup;
+mod recovery_attempt;
 mod signer;
 #[cfg(feature = "kerberos")]
 mod sspi_network_client;
@@ -40,6 +41,7 @@ pub use state::{ChannelInfo, SessionInfo};
 
 use setup::*;
 use credential::{SharedCredentialProvider, StaticCredentialProvider};
+use recovery_attempt::run_bounded_attempt;
 
 /// Channel id assigned to a session's primary channel.
 ///
@@ -419,44 +421,60 @@ impl SessionContext {
             worker.begin_object_recovery(previous_object).await?;
         }
 
-        let attempt = async {
-            let provider = self.credential_provider.as_ref().ok_or_else(|| {
-                Error::InvalidState("Session has no reauthentication capability".into())
-            })?;
-            let identity = provider.identity().await?;
-            let conn_info = upstream
-                .conn_info()
-                .ok_or_else(|| Error::InvalidState("Connection is not negotiated".into()))?;
-            let mut setup = SessionSetup::new(
-                identity,
-                &upstream,
-                &conn_info,
-                PRIMARY_CHANNEL_ID,
-                None,
-                SetupKind::New,
-            )
-            .await?;
-            let setup_result = setup.setup().await?;
-            if same_generation {
-                let replacement = worker
-                    .publish_object_replacement(previous_object)
-                    .await?;
-                setup_result.set_object(replacement)?;
-            }
-            let channel = Channel::new(&upstream, &conn_info, &setup_result).await?;
-            crate::Result::Ok((channel, conn_info))
-        }
-        .await;
-
-        let (channel, conn_info) = match attempt {
-            Ok(candidate) => candidate,
-            Err(error) => {
-                if same_generation {
-                    let _ = worker.fail_object_recovery(previous_object).await;
+        let policy = previous.conn_info.config.auto_reconnect;
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(crate::clock::TokioClock::new());
+        let provider = self.credential_provider.as_ref().ok_or_else(|| {
+            Error::InvalidState("Session has no reauthentication capability".into())
+        })?;
+        let mut last_error = None;
+        let mut candidate = None;
+        for _attempt in 1..=policy.max_attempts {
+            let future = async {
+                let identity = provider.identity().await?;
+                let conn_info = upstream
+                    .conn_info()
+                    .ok_or_else(|| Error::InvalidState("Connection is not negotiated".into()))?;
+                let mut setup = SessionSetup::new(
+                    identity,
+                    &upstream,
+                    &conn_info,
+                    PRIMARY_CHANNEL_ID,
+                    None,
+                    SetupKind::New,
+                )
+                .await?;
+                let setup_result = setup.setup().await?;
+                crate::Result::Ok((setup_result, conn_info))
+            };
+            match run_bounded_attempt(clock.clone(), policy.attempt_timeout, future).await {
+                Ok(Ok(prepared)) => {
+                    candidate = Some(prepared);
+                    break;
                 }
-                return Err(error);
+                Ok(Err(error)) => last_error = Some(error),
+                Err(_) => {
+                    last_error = Some(Error::OperationTimeout(
+                        crate::error::TimedOutTask::SessionReauthentication,
+                        policy.attempt_timeout,
+                    ));
+                }
             }
+        }
+        let Some((setup_result, conn_info)) = candidate else {
+            if same_generation {
+                let _ = worker.fail_object_recovery(previous_object).await;
+            }
+            return Err(last_error.unwrap_or_else(|| {
+                Error::InvalidState("Session reauthentication is disabled".into())
+            }));
         };
+        if same_generation {
+            let replacement = worker
+                .publish_object_replacement(previous_object)
+                .await?;
+            setup_result.set_object(replacement)?;
+        }
+        let channel = Channel::new(&upstream, &conn_info, &setup_result).await?;
         let new_session_id = channel.session_id();
         let old_session_id = previous_channel.session_id();
         let channel_context = channel.context.clone();
