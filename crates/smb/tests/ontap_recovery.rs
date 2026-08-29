@@ -32,7 +32,10 @@ async fn connection_transport_recovers_into_a_new_generation(
         .ok_or("connection has no active generation")?;
     println!("RECOVERY_DISRUPTION_READY");
 
-    let deadline = Instant::now() + Duration::from_secs(45);
+    // The management-path session query can be slow on a busy appliance. This
+    // outer orchestration window is deliberately longer than the client's
+    // recovery-policy deadline; it does not relax any reconnect attempt bound.
+    let deadline = Instant::now() + Duration::from_secs(120);
     let replacement = loop {
         if let Some(generation) = connection.observed_generation()
             && generation != initial
