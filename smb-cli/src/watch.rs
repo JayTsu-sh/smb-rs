@@ -1,9 +1,11 @@
 use crate::Cli;
 use clap::Parser;
-use smb::{UncPath, client::Client, protocol::{DirAccessMask, NotifyFilter}, resource::*};
+use futures_util::StreamExt;
+use smb::{
+    CancelToken, Client, ClientConfig, Credentials, Directory, DirectoryOpenOptions,
+    DirectoryWatchOptions, SharePath, ShareTarget, UncPath,
+};
 use std::error::Error;
-use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 
 #[derive(Parser, Debug)]
 pub struct WatchCmd {
@@ -24,48 +26,48 @@ pub async fn watch(cmd: &WatchCmd, cli: &Cli) -> Result<(), Box<dyn Error>> {
         return Err("Path must include a share name".into());
     }
 
-    let client = Client::new(cli.make_smb_client_config()?);
-    client
-        .share_connect(&cmd.path, &cli.username, cli.password.clone())
+    let share_name = cmd.path.share().filter(|share| !share.is_empty()).ok_or(
+        "Path must include a share name",
+    )?;
+    let relative_path = cmd
+        .path
+        .path()
+        .filter(|path| !path.is_empty())
+        .ok_or("Path must include a directory")?;
+    let client = Client::new(ClientConfig::default());
+    let share = client
+        .connect_share(
+            &ShareTarget::new(cmd.path.server(), share_name)?,
+            Credentials::ntlm(cli.username.clone(), cli.password.clone()),
+        )
         .await?;
-
-    let dir_resource = client
-        .create_file(
-            &cmd.path,
-            &FileCreateArgs::make_open_existing(
-                DirAccessMask::new().with_list_directory(true).into(),
-            ),
+    let directory = share
+        .open_directory(
+            &SharePath::new(relative_path)?,
+            DirectoryOpenOptions::open_existing(),
         )
         .await?;
 
-    let dir: Directory = dir_resource
-        .try_into()
-        .map_err(|_| "The specified path is not a directory")?;
-    let dir = Arc::new(dir);
-
     tracing::info!("Watching directory: {}", cmd.path);
     watch_dir(
-        &dir,
-        NotifyFilter::all(),
+        &directory,
         cmd.recursive,
         cmd.number.unwrap_or(usize::MAX),
     )
     .await?;
 
-    dir.close().await?;
+    directory.close().await?;
+    share.close().await?;
     client.close().await?;
     Ok(())
 }
 
 async fn watch_dir(
-    dir: &Arc<Directory>,
-    notify_filter: NotifyFilter,
+    directory: &Directory,
     recursive: bool,
     number: usize,
 ) -> Result<(), Box<dyn Error>> {
-    use futures::StreamExt;
-
-    let cancellation = CancellationToken::new();
+    let cancellation = CancelToken::new();
     ctrlc::set_handler({
         let cancellation = cancellation.clone();
         move || {
@@ -74,7 +76,12 @@ async fn watch_dir(
         }
     })?;
 
-    Directory::watch_stream_cancellable(dir, notify_filter, recursive, cancellation)?
+    directory
+        .watch(
+            DirectoryWatchOptions::default()
+                .recursive(recursive)
+                .cancellation(cancellation),
+        )
         .take(number)
         .for_each(|res| {
             match res {

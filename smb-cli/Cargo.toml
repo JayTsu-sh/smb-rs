@@ -8,7 +8,13 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-smb = { workspace = true, features = ["std-fs-impls"] }
+smb = { workspace = true, features = [
+    "compress",
+    "encrypt",
+    "netbios-transport",
+    "sign",
+    "std-fs-impls",
+] }
 bytes = { workspace = true }
 
 tokio = { workspace = true, features = ["rt-multi-thread"] }
