@@ -25,7 +25,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     Error,
-    runtime::domain_bridge::{OpenMode, RuntimeClient, RuntimeFile, RuntimeSession, RuntimeShare},
+    runtime::port::{OpenMode, RuntimeClient, RuntimeFile, RuntimeSession, RuntimeShare},
 };
 
 /// Authentication material for establishing a logical SMB Session.
@@ -695,7 +695,7 @@ impl DirectoryEntry {
 }
 
 pub struct Directory {
-    inner: crate::runtime::domain_bridge::RuntimeDirectory,
+    inner: crate::runtime::port::RuntimeDirectory,
     close_authority: FileCloseAuthority,
 }
 
@@ -706,9 +706,9 @@ pub type DirectoryEvents<'a> =
 
 fn pair_directory_event(
     rename_from: &mut Option<String>,
-    event: crate::runtime::domain_bridge::RuntimeDirectoryEvent,
+    event: crate::runtime::port::RuntimeDirectoryEvent,
 ) -> crate::Result<Option<DirectoryEvent>> {
-    use crate::runtime::domain_bridge::RuntimeDirectoryEventKind as Kind;
+    use crate::runtime::port::RuntimeDirectoryEventKind as Kind;
 
     let value = match event.kind {
         Kind::RenamedOld => {
@@ -815,7 +815,7 @@ impl Directory {
 }
 
 pub struct Pipe {
-    inner: crate::runtime::domain_bridge::RuntimePipe,
+    inner: crate::runtime::port::RuntimePipe,
     close_authority: FileCloseAuthority,
 }
 
@@ -949,7 +949,7 @@ mod tests {
 
     #[test]
     fn directory_rename_events_are_paired_or_rejected() {
-        use crate::runtime::domain_bridge::{
+        use crate::runtime::port::{
             RuntimeDirectoryEvent, RuntimeDirectoryEventKind as Kind,
         };
 

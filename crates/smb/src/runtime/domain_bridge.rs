@@ -1,8 +1,9 @@
-//! Temporary W5 bridge from domain handles to the accepted W4 runtime path.
+//! Runtime port consumed by the domain layer.
 //!
-//! This module owns no lifecycle state. It wraps the existing W4-backed
-//! objects while their implementations are moved behind the runtime/domain
-//! boundary during W5.
+//! This module owns no lifecycle state. It is the single crate-private
+//! boundary that keeps protocol and runtime implementation types out of the
+//! domain API. The physical file retains its temporary name until W5-6 removes
+//! the remaining legacy implementation dependencies atomically.
 
 use std::{pin::Pin, sync::Arc};
 
