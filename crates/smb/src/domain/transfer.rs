@@ -437,4 +437,41 @@ mod tests {
             Err(Error::Cancelled("transfer chunk"))
         ));
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn transfer_deadline_cancels_every_inflight_chunk() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let copy = {
+            let started = Arc::clone(&started);
+            move |_, _, cancellation: CancelToken| {
+                let started = Arc::clone(&started);
+                async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    cancellation.cancelled().await;
+                    Err(Error::Cancelled("deadline drain"))
+                }
+                .boxed()
+            }
+        };
+        let (progress, _) = broadcast::channel(1);
+        let operation = Operation::new(move |context| {
+            Box::pin(run_transfer(
+                8,
+                TransferOptions::default().concurrency(2).chunk_size(4),
+                context.cancellation,
+                progress,
+                copy,
+            ))
+        })
+        .timeout(Duration::from_secs(1));
+        let running = tokio::spawn(operation);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        assert!(matches!(
+            running.await.unwrap(),
+            Err(Error::OperationTimeout(..))
+        ));
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+    }
 }

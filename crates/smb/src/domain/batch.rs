@@ -292,4 +292,19 @@ mod tests {
         ));
         assert!(calls.lock().unwrap().is_empty());
     }
+
+    #[tokio::test]
+    async fn batch_cancellation_before_poll_has_no_member_side_effects() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut batch = Batch::new();
+        batch.push(command(Arc::clone(&calls), "must-not-run", Ok(1_u8)));
+        let cancellation = crate::CancelToken::new();
+        cancellation.cancel();
+
+        assert!(matches!(
+            batch.execute().cancellation(cancellation).await,
+            Err(Error::Cancelled("domain operation"))
+        ));
+        assert!(calls.lock().unwrap().is_empty());
+    }
 }
