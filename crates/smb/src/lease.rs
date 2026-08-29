@@ -76,6 +76,8 @@ pub(crate) struct ResourceProto {
     /// Shared context chain — `Arc`-backed under the hood, so cloning into
     /// a new ResourceHandle on hit is just a refcount bump.
     pub context: Arc<TreeContext>,
+    /// Runtime-owned identity shared by every cache-hit handle for this open.
+    pub object: crate::runtime::ObjectToken,
     /// Snapshot of the connection's negotiated info at create time; the
     /// same instance every resulting ResourceHandle reads from. Cheap to
     /// clone (Arc).

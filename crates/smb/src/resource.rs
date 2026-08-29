@@ -222,9 +222,11 @@ impl Resource {
         // defaults to None; if a lease was granted and the higher-level
         // client opts in, [`Client::_create_file`] will attach a slot via
         // [`Resource::attach_lease_slot`] after this function returns.
+        let object = upstream.create_resource_object().await?;
         let handle = ResourceHandle {
             name: name.to_string(),
             context: upstream.clone(),
+            object,
             open: AtomicBool::new(true),
             _file_id: response.file_id,
             created: response.creation_time.date_time(),
@@ -328,6 +330,7 @@ impl Resource {
         let handle = ResourceHandle {
             name: slot.path.clone(),
             context: proto.context.clone(),
+            object: proto.object,
             open: AtomicBool::new(true),
             _file_id: slot.file_id,
             created: proto.created,
@@ -387,6 +390,7 @@ impl Resource {
         let epoch_at_grant = h.lease_granted.map(|g| g.epoch).unwrap_or(0);
         Some(Arc::new(ResourceProto {
             context: upstream.clone(),
+            object: h.object,
             conn_info: h.conn_info.clone(),
             created: h.created,
             modified: h.modified,
@@ -514,6 +518,7 @@ impl LeaseGrant {
 pub struct ResourceHandle {
     name: String,
     context: Arc<TreeContext>,
+    object: crate::runtime::ObjectToken,
 
     // Whether the resource is open or not.
     // TODO: Consider using RwLock here on FileId instead of AtomicBool+FileId.
@@ -1073,9 +1078,15 @@ impl ResourceHandle {
     /// Sends a close request to the server for the given file ID.
     /// This should be called properly after taking out the file id (handle) from the resource instance,
     /// to avoid Use-after-free errors.
-    async fn send_close(file_id: FileId, context: &Arc<TreeContext>) -> crate::Result<()> {
+    async fn send_close(
+        file_id: FileId,
+        context: &Arc<TreeContext>,
+        object: crate::runtime::ObjectToken,
+    ) -> crate::Result<()> {
         tracing::trace!("Send close to file with ID: {file_id:?}");
-        let response = context.send_recv(CloseRequest { file_id }.into()).await?;
+        let response = context
+            .send_recv_for(CloseRequest { file_id }.into(), object)
+            .await?;
         tracing::debug!("Close response received for file ID: {file_id:?}, {response:?}");
         Ok(())
     }
@@ -1089,8 +1100,9 @@ impl ResourceHandle {
     pub(crate) async fn send_close_external(
         file_id: FileId,
         context: &Arc<TreeContext>,
+        object: crate::runtime::ObjectToken,
     ) -> crate::Result<()> {
-        Self::send_close(file_id, context).await
+        Self::send_close(file_id, context, object).await
     }
 
     /// Closes the resource.
@@ -1144,7 +1156,7 @@ impl ResourceHandle {
         }
 
         tracing::debug!(file_id = ?self._file_id, "Closing handle");
-        Self::send_close(self._file_id, &self.context).await?;
+        Self::send_close(self._file_id, &self.context, self.object).await?;
 
         tracing::debug!("Closed");
 
@@ -1156,7 +1168,7 @@ impl ResourceHandle {
         &self,
         msg: RequestContent,
     ) -> crate::Result<crate::command::CommandResponse> {
-        self.context.send_recv(msg).await
+        self.context.send_recv_for(msg, self.object).await
     }
 
     #[inline]
@@ -1166,8 +1178,9 @@ impl ResourceHandle {
         options: ResponseOptions<'_>,
     ) -> crate::Result<CommandResponse> {
         self.context
-            .execute_request(CommandRequest::new(msg), options)
+            .execute_for(CommandRequest::new(msg), options, self.object)
             .await
+            .map(|(_, incoming)| incoming)
     }
 
     #[inline]
@@ -1176,7 +1189,10 @@ impl ResourceHandle {
         msg: CommandRequest,
         options: ResponseOptions<'_>,
     ) -> crate::Result<CommandResponse> {
-        self.context.execute_request(msg, options).await
+        self.context
+            .execute_for(msg, options, self.object)
+            .await
+            .map(|(_, incoming)| incoming)
     }
 
     #[inline]
@@ -1188,7 +1204,7 @@ impl ResourceHandle {
             .header
             .to_async(msg_ids.async_id.load(Ordering::Relaxed));
 
-        self.context.submit(outgoing_message).await
+        self.context.submit_for(outgoing_message, self.object).await
     }
 
     /// Returns whether current resource is opened from the same tree as the other resource.
@@ -1236,10 +1252,11 @@ impl Drop for ResourceHandle {
 
         let file_id = self._file_id;
         let context = self.context.clone();
+        let object = self.object;
         tracing::debug!("Spawning task to close file with ID: {file_id:?}");
         tokio::task::spawn(async move {
             if file_id != FileId::EMPTY {
-                if let Err(e) = Self::send_close(file_id, &context).await {
+                if let Err(e) = Self::send_close(file_id, &context, object).await {
                     tracing::error!("Error closing file: {e}");
                 }
             }

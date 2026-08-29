@@ -731,7 +731,16 @@ impl Connection {
     /// twice, which defeats the point of the single-write path.
     pub async fn send_compound(
         &self,
+        msgs: Vec<CommandRequest>,
+    ) -> crate::Result<Vec<CommandResponse>> {
+        self.send_compound_for(msgs, self.context.connection_object()?)
+            .await
+    }
+
+    pub(crate) async fn send_compound_for(
+        &self,
         mut msgs: Vec<CommandRequest>,
+        dependency: crate::runtime::ObjectToken,
     ) -> crate::Result<Vec<CommandResponse>> {
         // CancelRequest has its own bespoke path inside the single-message
         // `submit` (it reuses an already-allocated message_id and skips
@@ -763,7 +772,7 @@ impl Connection {
             .worker
             .get()
             .ok_or(Error::InvalidState("Worker is uninitialized".into()))?;
-        let send_results = worker.send_compound(msgs).await?;
+        let send_results = worker.send_compound_for(msgs, dependency).await?;
 
         let mut responses = Vec::with_capacity(send_results.len());
         for r in send_results {
@@ -819,10 +828,40 @@ pub(crate) struct ConnectionCore {
 }
 
 impl ConnectionCore {
+    pub(crate) fn connection_object(&self) -> crate::Result<crate::runtime::ObjectToken> {
+        Ok(self
+            .worker
+            .get()
+            .ok_or_else(|| Error::InvalidState("Runtime is uninitialized".into()))?
+            .connection_object())
+    }
+
+    pub(crate) async fn create_object(
+        &self,
+        parent: crate::runtime::ObjectToken,
+        kind: crate::runtime::ObjectKind,
+    ) -> crate::Result<crate::runtime::ObjectToken> {
+        self.worker
+            .get()
+            .ok_or_else(|| Error::InvalidState("Runtime is uninitialized".into()))?
+            .create_object(parent, kind)
+            .await
+    }
+
     pub(crate) async fn execute(
+        &self,
+        msg: CommandRequest,
+        options: ResponseOptions<'_>,
+    ) -> crate::Result<(CommandSubmission, CommandResponse)> {
+        self.execute_for(msg, options, self.connection_object()?)
+            .await
+    }
+
+    pub(crate) async fn execute_for(
         &self,
         mut msg: CommandRequest,
         mut options: ResponseOptions<'_>,
+        dependency: crate::runtime::ObjectToken,
     ) -> crate::Result<(CommandSubmission, CommandResponse)> {
         let channel_id = msg.channel_id;
         self.prepare_outgoing(&mut msg).await?;
@@ -831,7 +870,7 @@ impl ConnectionCore {
             .worker
             .get()
             .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?
-            .execute(msg, &options)
+            .execute_for(msg, &options, dependency)
             .await?;
         if !result.1.message.header.flags.server_to_redir() {
             return Err(Error::InvalidMessage(
@@ -839,6 +878,19 @@ impl ConnectionCore {
             ));
         }
         Ok(result)
+    }
+
+    pub(crate) async fn submit_for(
+        &self,
+        mut message: CommandRequest,
+        dependency: crate::runtime::ObjectToken,
+    ) -> crate::Result<CommandSubmission> {
+        self.prepare_outgoing(&mut message).await?;
+        self.worker
+            .get()
+            .ok_or_else(|| Error::InvalidState("Runtime is uninitialized".into()))?
+            .send_for(message, dependency)
+            .await
     }
 
     pub(crate) async fn execute_with_submission(
@@ -948,8 +1000,12 @@ impl ConnectionCore {
                 // context chain back up, which we explicitly avoid.
                 tokio::spawn(async move {
                     if let Err(e) =
-                        crate::resource::ResourceHandle::send_close_external(file_id, &context)
-                            .await
+                        crate::resource::ResourceHandle::send_close_external(
+                            file_id,
+                            &context,
+                            prev.proto.object,
+                        )
+                        .await
                     {
                         tracing::warn!(
                             file_id = ?file_id,

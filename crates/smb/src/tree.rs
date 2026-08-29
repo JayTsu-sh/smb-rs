@@ -15,7 +15,7 @@ use smb_msg::{
 use crate::{Error, Resource, command::Protection, session::SessionContext};
 mod dfs_tree;
 mod ipc_tree;
-use crate::command::CommandRequest;
+use crate::command::{CommandRequest, CommandResponse, CommandSubmission, ResponseOptions};
 pub use dfs_tree::*;
 pub use ipc_tree::*;
 
@@ -95,9 +95,18 @@ impl Tree {
             share_type: content.share_type,
             share_flags: content.share_flags,
         };
+        let object = upstream
+            .create_child_object(crate::runtime::ObjectKind::Share)
+            .await?;
 
         let t = Tree {
-            context: TreeContext::new(upstream, tree_id, name.to_string(), tree_connect_info),
+            context: TreeContext::new(
+                upstream,
+                tree_id,
+                name.to_string(),
+                tree_connect_info,
+                object,
+            ),
             conn_info: conn_info.clone(),
         };
 
@@ -200,6 +209,10 @@ impl Tree {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    pub(crate) fn object_token(&self) -> crate::runtime::ObjectToken {
+        self.context.object
+    }
+
     /// Borrow the tree's underlying `Upstream` context reference.
     /// Phase C uses this from [`crate::resource::Resource::build_lease_proto`]
     /// so the lease cache can construct a `ResourceMessageHandle` against
@@ -270,6 +283,7 @@ pub(crate) struct TreeContext {
 
     tree_name: String,
     info: TreeConnectInfo,
+    object: crate::runtime::ObjectToken,
 }
 
 impl TreeContext {
@@ -280,12 +294,14 @@ impl TreeContext {
         tree_id: u32,
         tree_name: String,
         info: TreeConnectInfo,
+        object: crate::runtime::ObjectToken,
     ) -> Arc<TreeContext> {
         Arc::new(TreeContext {
             tree_id: AtomicU32::new(tree_id),
             upstream: upstream.clone(),
             info,
             tree_name,
+            object,
         })
     }
 
@@ -302,12 +318,29 @@ impl TreeContext {
     pub(crate) async fn execute(
         &self,
         msg: CommandRequest,
-        options: crate::command::ResponseOptions<'_>,
-    ) -> crate::Result<(
-        crate::command::CommandSubmission,
-        crate::command::CommandResponse,
-    )> {
-        let result = self.upstream.execute(self.prepare(msg), options).await?;
+        options: ResponseOptions<'_>,
+    ) -> crate::Result<(CommandSubmission, CommandResponse)> {
+        self.execute_for(msg, options, self.object).await
+    }
+
+    pub(crate) async fn create_resource_object(
+        &self,
+    ) -> crate::Result<crate::runtime::ObjectToken> {
+        self.upstream
+            .create_object(self.object, crate::runtime::ObjectKind::Resource)
+            .await
+    }
+
+    pub(crate) async fn execute_for(
+        &self,
+        msg: CommandRequest,
+        options: ResponseOptions<'_>,
+        dependency: crate::runtime::ObjectToken,
+    ) -> crate::Result<(CommandSubmission, CommandResponse)> {
+        let result = self
+            .upstream
+            .execute_for(self.prepare(msg), options, dependency)
+            .await?;
         let incoming = &result.1;
         if !incoming.message.header.flags.async_command()
             && incoming.message.header.tree_id.unwrap_or_default()
@@ -336,6 +369,16 @@ impl TreeContext {
         .await
     }
 
+    pub(crate) async fn send_recv_for(
+        &self,
+        content: RequestContent,
+        dependency: crate::runtime::ObjectToken,
+    ) -> crate::Result<CommandResponse> {
+        self.execute_for(CommandRequest::new(content), ResponseOptions::new(), dependency)
+            .await
+            .map(|(_, incoming)| incoming)
+    }
+
     pub(crate) async fn execute_content(
         &self,
         content: RequestContent,
@@ -355,14 +398,22 @@ impl TreeContext {
             .map(|(_, incoming)| incoming)
     }
 
-    pub(crate) async fn submit(
+    pub(crate) async fn submit_for(
         &self,
         message: CommandRequest,
-    ) -> crate::Result<crate::command::CommandSubmission> {
-        self.upstream.submit(self.prepare(message)).await
+        dependency: crate::runtime::ObjectToken,
+    ) -> crate::Result<CommandSubmission> {
+        self.upstream
+            .submit_for(self.prepare(message), dependency)
+            .await
     }
 
-    async fn _disconnect(upstream: Upstream, tree_id: u32, encrypt: bool) -> crate::Result<()> {
+    async fn _disconnect(
+        upstream: Upstream,
+        tree_id: u32,
+        encrypt: bool,
+        object: crate::runtime::ObjectToken,
+    ) -> crate::Result<()> {
         // send and receive tree disconnect request & response.
         let request_content: RequestContent = TreeDisconnectRequest::default().into();
         let mut message = CommandRequest::new(request_content);
@@ -371,7 +422,14 @@ impl TreeContext {
         }
         message.message.header.tree_id = Some(tree_id);
 
-        let _response = upstream.execute_request_default(message).await?;
+        let command = message.message.content.associated_cmd();
+        let _response = upstream
+            .execute_for(
+                message,
+                ResponseOptions::new().with_cmd(Some(command)),
+                object,
+            )
+            .await?;
 
         Ok(())
     }
@@ -383,7 +441,7 @@ impl TreeContext {
             return Ok(());
         }
         let encrypt = self.info.share_flags.encrypt_data();
-        Self::_disconnect(self.upstream.clone(), tree_id, encrypt).await
+        Self::_disconnect(self.upstream.clone(), tree_id, encrypt, self.object).await
     }
 
     pub fn info(&self) -> crate::Result<&TreeConnectInfo> {
@@ -406,8 +464,9 @@ impl Drop for TreeContext {
         let upstream = self.upstream.clone();
         let tree_name = self.tree_name.clone();
         let encrypt = self.info.share_flags.encrypt_data();
+        let object = self.object;
         tokio::task::spawn(async move {
-            Self::_disconnect(upstream, tree_id, encrypt)
+            Self::_disconnect(upstream, tree_id, encrypt, object)
                 .await
                 .map_err(|e| {
                     tracing::warn!("Failed to disconnect from tree {}: {e}", tree_name);

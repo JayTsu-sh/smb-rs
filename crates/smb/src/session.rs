@@ -17,7 +17,7 @@ use arc_swap::ArcSwapOption;
 use smb_msg::{Notification, RequestContent, ResponseContent, Status, session_setup::*};
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use tokio::sync::RwLock;
 
@@ -267,6 +267,7 @@ pub struct SessionAndChannel {
 
     pub session: Arc<RwLock<SessionInfo>>,
     pub channel: ArcSwapOption<ChannelInfo>,
+    object: OnceLock<crate::runtime::ObjectToken>,
 }
 
 impl SessionAndChannel {
@@ -275,6 +276,7 @@ impl SessionAndChannel {
             session_id,
             session,
             channel: ArcSwapOption::const_empty(),
+            object: OnceLock::new(),
         }
     }
 
@@ -292,6 +294,19 @@ impl SessionAndChannel {
     /// the channel state they observed.
     pub fn channel(&self) -> Option<Arc<ChannelInfo>> {
         self.channel.load_full()
+    }
+
+    pub(crate) fn set_object(&self, token: crate::runtime::ObjectToken) -> crate::Result<()> {
+        self.object
+            .set(token)
+            .map_err(|_| Error::InvalidState("Session object token already installed".into()))
+    }
+
+    pub(crate) fn object(&self) -> crate::Result<crate::runtime::ObjectToken> {
+        self.object
+            .get()
+            .copied()
+            .ok_or_else(|| Error::InvalidState("Session object token is unavailable".into()))
     }
 }
 
@@ -376,21 +391,49 @@ impl SessionContext {
             .await
     }
 
+    pub(crate) async fn execute_for(
+        &self,
+        msg: CommandRequest,
+        options: ResponseOptions<'_>,
+        dependency: crate::runtime::ObjectToken,
+    ) -> crate::Result<(CommandSubmission, CommandResponse)> {
+        self.resolve_channel(msg.channel_id)
+            .await?
+            .execute_for(msg, options, dependency)
+            .await
+    }
+
+    pub(crate) async fn create_child_object(
+        &self,
+        kind: crate::runtime::ObjectKind,
+    ) -> crate::Result<crate::runtime::ObjectToken> {
+        self.primary_channel.create_child_object(kind).await
+    }
+
+    pub(crate) async fn create_object(
+        &self,
+        parent: crate::runtime::ObjectToken,
+        kind: crate::runtime::ObjectKind,
+    ) -> crate::Result<crate::runtime::ObjectToken> {
+        self.primary_channel.create_object(parent, kind).await
+    }
+
+    pub(crate) async fn submit_for(
+        &self,
+        message: CommandRequest,
+        dependency: crate::runtime::ObjectToken,
+    ) -> crate::Result<CommandSubmission> {
+        self.resolve_channel(message.channel_id)
+            .await?
+            .submit_for(message, dependency)
+            .await
+    }
+
     pub(crate) async fn send_recv(
         &self,
         content: RequestContent,
     ) -> crate::Result<CommandResponse> {
         self.execute(CommandRequest::new(content), ResponseOptions::new())
-            .await
-            .map(|(_, incoming)| incoming)
-    }
-
-    pub(crate) async fn execute_request_default(
-        &self,
-        message: CommandRequest,
-    ) -> crate::Result<CommandResponse> {
-        let command = message.message.content.associated_cmd();
-        self.execute(message, ResponseOptions::new().with_cmd(Some(command)))
             .await
             .map(|(_, incoming)| incoming)
     }
@@ -408,9 +451,6 @@ impl SessionContext {
 }
 
 impl SessionContext {
-    pub(crate) async fn submit(&self, msg: CommandRequest) -> crate::Result<CommandSubmission> {
-        self.resolve_channel(msg.channel_id).await?.submit(msg).await
-    }
 }
 
 impl Drop for SessionContext {

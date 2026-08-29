@@ -846,7 +846,10 @@ impl Client {
         );
 
         let responses = conn
-            .send_compound(vec![create_msg, setinfo_msg, close_msg])
+            .send_compound_for(
+                vec![create_msg, setinfo_msg, close_msg],
+                tree.object_token(),
+            )
             .await?;
 
         // Validate each member's status. We surface the first non-success
@@ -915,7 +918,12 @@ impl Client {
             return;
         }
         if let Err(e) =
-            crate::resource::ResourceHandle::send_close_external(file_id, &context).await
+            crate::resource::ResourceHandle::send_close_external(
+                file_id,
+                &context,
+                eviction.slot.proto.object,
+            )
+            .await
         {
             tracing::warn!(
                 path = label,

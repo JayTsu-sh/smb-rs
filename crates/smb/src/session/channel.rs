@@ -24,6 +24,15 @@ impl Channel {
                 .ok_or_else(|| Error::InvalidState("Channel not set in setup result".into()))?;
             (session.id(), channel.id())
         };
+        if setup_result.object().is_err() {
+            let token = upstream
+                .create_object(
+                    upstream.connection_object()?,
+                    crate::runtime::ObjectKind::Session,
+                )
+                .await?;
+            setup_result.set_object(token)?;
+        }
         let context = ChannelContext::new(session_id, channel_id, upstream, setup_result);
         Ok(Self {
             channel_id,
@@ -122,12 +131,49 @@ impl ChannelContext {
         msg: CommandRequest,
         options: ResponseOptions<'_>,
     ) -> crate::Result<(CommandSubmission, CommandResponse)> {
+        self.execute_for(msg, options, self.session_state.object()?)
+            .await
+    }
+
+    pub(crate) async fn execute_for(
+        &self,
+        msg: CommandRequest,
+        options: ResponseOptions<'_>,
+        dependency: crate::runtime::ObjectToken,
+    ) -> crate::Result<(CommandSubmission, CommandResponse)> {
         let result = self
             .upstream
-            .execute(self.prepare(msg).await?, options)
+            .execute_for(self.prepare(msg).await?, options, dependency)
             .await?;
         self._verify_incoming(&result.1).await?;
         Ok(result)
+    }
+
+    pub(crate) async fn create_child_object(
+        &self,
+        kind: crate::runtime::ObjectKind,
+    ) -> crate::Result<crate::runtime::ObjectToken> {
+        self.upstream
+            .create_object(self.session_state.object()?, kind)
+            .await
+    }
+
+    pub(crate) async fn create_object(
+        &self,
+        parent: crate::runtime::ObjectToken,
+        kind: crate::runtime::ObjectKind,
+    ) -> crate::Result<crate::runtime::ObjectToken> {
+        self.upstream.create_object(parent, kind).await
+    }
+
+    pub(crate) async fn submit_for(
+        &self,
+        message: CommandRequest,
+        dependency: crate::runtime::ObjectToken,
+    ) -> crate::Result<CommandSubmission> {
+        self.upstream
+            .submit_for(self.prepare(message).await?, dependency)
+            .await
     }
 
     fn new(

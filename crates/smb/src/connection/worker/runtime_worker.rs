@@ -4,8 +4,8 @@ use crate::connection::preauth_hash::PreauthHashValue;
 use crate::error::TimedOutTask;
 use crate::command::{CommandResponse, CommandRequest, ResponseOptions, CommandSubmission};
 use crate::runtime::{
-    GenerationId, ObjectToken, OperationResult, RequestKey, ResponsePolicy, RuntimeConfig,
-    RuntimeError, RuntimeHandle, TerminalOutcome, TypedOperation, start_generation,
+    GenerationId, ObjectKind, ObjectToken, OperationResult, RequestKey, ResponsePolicy,
+    RuntimeConfig, RuntimeError, RuntimeHandle, TerminalOutcome, TypedOperation, start_generation,
 };
 use crate::session::SessionAndChannel;
 use crate::{Error, Result};
@@ -29,6 +29,17 @@ pub(crate) struct RuntimeWorker {
 impl RuntimeWorker {
     pub(crate) const fn connection_object(&self) -> ObjectToken {
         self.runtime.connection_object()
+    }
+
+    pub(crate) async fn create_object(
+        &self,
+        parent: ObjectToken,
+        kind: ObjectKind,
+    ) -> Result<ObjectToken> {
+        self.runtime
+            .create_object(parent, kind)
+            .await
+            .map_err(|error| self.map_runtime_error(error))
     }
 
     pub(crate) async fn start_at(
@@ -64,11 +75,19 @@ impl RuntimeWorker {
     }
 
     pub(crate) async fn send(&self, message: CommandRequest) -> Result<CommandSubmission> {
+        self.send_for(message, self.connection_object()).await
+    }
+
+    pub(crate) async fn send_for(
+        &self,
+        message: CommandRequest,
+        dependency: ObjectToken,
+    ) -> Result<CommandSubmission> {
         let deadline = self.clock.now().saturating_add(self.timeout);
         let submission = self
             .runtime
             .submit_operation_detached(
-                TypedOperation::any_status(message).with_dependency(self.connection_object()),
+                TypedOperation::any_status(message).with_dependency(dependency),
                 Some(deadline),
             )
             .await
@@ -79,10 +98,11 @@ impl RuntimeWorker {
         ))
     }
 
-    pub(crate) async fn execute(
+    pub(crate) async fn execute_for(
         &self,
         message: CommandRequest,
         options: &ResponseOptions<'_>,
+        dependency: ObjectToken,
     ) -> Result<(CommandSubmission, CommandResponse)> {
         let command = options
             .cmd
@@ -91,7 +111,7 @@ impl RuntimeWorker {
             .map_err(|error| Error::InvalidArgument(error.to_string()))?;
         let operation = TypedOperation::new(message, policy)
             .map_err(|error| Error::InvalidArgument(error.to_string()))?
-            .with_dependency(self.connection_object());
+            .with_dependency(dependency);
         let timeout = options.timeout.unwrap_or(self.timeout);
         let deadline = self.clock.now().saturating_add(timeout);
         let ticket = self
@@ -188,14 +208,15 @@ impl RuntimeWorker {
             .map_err(|error| self.map_runtime_error(error))
     }
 
-    pub(crate) async fn send_compound(
+    pub(crate) async fn send_compound_for(
         self: &Arc<Self>,
         messages: Vec<CommandRequest>,
+        dependency: ObjectToken,
     ) -> Result<Vec<CommandSubmission>> {
         let operations = messages
             .into_iter()
             .map(|message| {
-                TypedOperation::any_status(message).with_dependency(self.connection_object())
+                TypedOperation::any_status(message).with_dependency(dependency)
             })
             .collect();
         self.runtime
