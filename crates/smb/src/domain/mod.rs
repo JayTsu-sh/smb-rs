@@ -231,7 +231,10 @@ impl Share {
                     ));
                 }
                 let inner = self.inner.open_file(path.as_str(), options.mode).await?;
-                Ok(File { inner })
+                Ok(File {
+                    inner,
+                    close_state: Mutex::new(FileCloseState::Open),
+                })
             })
         })
     }
@@ -251,6 +254,21 @@ pub enum Resource {
 /// Non-cloneable positioned file handle.
 pub struct File {
     inner: RuntimeFile,
+    close_state: Mutex<FileCloseState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CloseOutcome {
+    Confirmed,
+    AlreadyClosed,
+    OutcomeUnknown,
+}
+
+#[derive(Clone, Copy)]
+enum FileCloseState {
+    Open,
+    Confirmed,
+    OutcomeUnknown,
 }
 
 impl File {
@@ -405,8 +423,34 @@ impl File {
         self.inner.delete().await
     }
 
-    pub async fn close(&self) -> crate::Result<()> {
-        self.inner.close().await
+    pub fn close(&self) -> Operation<'_, CloseOutcome> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                if context.replay != ReplayPolicy::Never {
+                    return Err(Error::UnsupportedOperation(
+                        "file close permits only ReplayPolicy::Never".into(),
+                    ));
+                }
+                let mut state = self.close_state.lock().await;
+                match *state {
+                    FileCloseState::Confirmed => return Ok(CloseOutcome::AlreadyClosed),
+                    FileCloseState::OutcomeUnknown => return Ok(CloseOutcome::OutcomeUnknown),
+                    FileCloseState::Open => {}
+                }
+                match self.inner.close().await {
+                    Ok(()) => {
+                        *state = FileCloseState::Confirmed;
+                        Ok(CloseOutcome::Confirmed)
+                    }
+                    Err(Error::OutcomeUnknown) => {
+                        *state = FileCloseState::OutcomeUnknown;
+                        Ok(CloseOutcome::OutcomeUnknown)
+                    }
+                    Err(error) => Err(error),
+                }
+            })
+        })
     }
 }
 

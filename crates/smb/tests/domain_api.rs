@@ -2,8 +2,8 @@ use bytes::Bytes;
 #[cfg(feature = "real-server-tests")]
 use smb::{CancelToken, Error};
 use smb::{
-    Client, ClientConfig, Credentials, File, FileCursor, FileOpenOptions, ReplayPolicy, Session,
-    Share, SharePath, ShareTarget,
+    Client, ClientConfig, CloseOutcome, Credentials, File, FileCursor, FileOpenOptions,
+    ReplayPolicy, Session, Share, SharePath, ShareTarget,
 };
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
@@ -60,7 +60,8 @@ async fn common_and_explicit_session_paths_compile(
     let mut cursor_buffer = [0_u8; 6];
     cursor.read_exact(&mut cursor_buffer).await?;
     cursor.write_all(b"cursor").await?;
-    file.close().await?;
+    assert_eq!(file.close().await?, CloseOutcome::Confirmed);
+    assert_eq!(file.close().await?, CloseOutcome::AlreadyClosed);
 
     let session = client
         .authenticate(target.server(), Credentials::ntlm("user", "secret"))
@@ -75,7 +76,7 @@ async fn common_and_explicit_session_paths_compile(
         .replay(ReplayPolicy::Idempotent)
         .await?;
     file.delete().await?;
-    file.close().await?;
+    assert_eq!(file.close().await?, CloseOutcome::Confirmed);
     share.close().await?;
     session.close().await?;
     client.close().await
@@ -121,7 +122,10 @@ async fn domain_spine_roundtrips_without_protocol_escape_hatches() -> smb::Resul
             .await?,
         payload.len()
     );
-    file.close().await?;
+    let (first_close, second_close) = tokio::join!(file.close(), file.close());
+    let outcomes = [first_close?, second_close?];
+    assert!(outcomes.contains(&CloseOutcome::Confirmed));
+    assert!(outcomes.contains(&CloseOutcome::AlreadyClosed));
 
     let session = client
         .authenticate(target.server(), common::smb_test_credentials())
@@ -138,7 +142,7 @@ async fn domain_spine_roundtrips_without_protocol_escape_hatches() -> smb::Resul
         payload
     );
     file.delete().await?;
-    file.close().await?;
+    assert_eq!(file.close().await?, CloseOutcome::Confirmed);
     share.close().await?;
     session.close().await?;
     client.close().await
