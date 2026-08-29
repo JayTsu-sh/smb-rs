@@ -30,6 +30,44 @@ pub use pipe::*;
 
 type Upstream = Arc<TreeContext>;
 
+/// Opt-in SMB3 durable-v2 open request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableOpenRequest {
+    timeout: u32,
+    create_guid: smb_dtyp::Guid,
+    persistent: bool,
+}
+
+/// Durable-v2 properties granted by the server for this Resource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableOpenGrant {
+    pub timeout: u32,
+    pub persistent: bool,
+    pub create_guid: smb_dtyp::Guid,
+}
+
+impl DurableOpenRequest {
+    pub const fn durable(timeout: u32, create_guid: smb_dtyp::Guid) -> Self {
+        Self {
+            timeout,
+            create_guid,
+            persistent: false,
+        }
+    }
+
+    pub const fn persistent(timeout: u32, create_guid: smb_dtyp::Guid) -> Self {
+        Self {
+            timeout,
+            create_guid,
+            persistent: true,
+        }
+    }
+
+    pub const fn is_persistent(&self) -> bool {
+        self.persistent
+    }
+}
+
 #[derive(Default)]
 pub struct FileCreateArgs {
     pub disposition: CreateDisposition,
@@ -42,6 +80,8 @@ pub struct FileCreateArgs {
     /// server for read/handle/write caching; the granted state is reported
     /// back via [`ResourceHandle::lease_granted`].
     pub lease_request: Option<RequestLease>,
+    /// Optional SMB3 durable-v2 or persistent open request.
+    pub durable_request: Option<DurableOpenRequest>,
 }
 
 impl FileCreateArgs {
@@ -100,6 +140,32 @@ impl FileCreateArgs {
         self.lease_request = Some(lease);
         self
     }
+
+    /// Request an SMB3 durable-v2 or persistent open.
+    pub fn with_durable(mut self, request: DurableOpenRequest) -> Self {
+        self.durable_request = Some(request);
+        self
+    }
+}
+
+fn validate_durable_request(
+    request: DurableOpenRequest,
+    smb3: bool,
+    persistent_handles: bool,
+    continuous_availability: bool,
+) -> crate::Result<()> {
+    if !smb3 {
+        return Err(Error::UnsupportedOperation(
+            "Durable-v2 opens require an SMB3 dialect".into(),
+        ));
+    }
+    if request.persistent && (!persistent_handles || !continuous_availability) {
+        return Err(Error::UnsupportedOperation(
+            "Persistent opens require negotiated persistent handles and a continuously available share"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// A resource opened by a create request.
@@ -139,6 +205,15 @@ impl Resource {
             ));
         }
 
+        if let Some(request) = create_args.durable_request {
+            validate_durable_request(
+                request,
+                conn_info.negotiation.dialect_rev.is_smb3(),
+                conn_info.negotiation.caps.persistent_handles(),
+                upstream.continuously_available()?,
+            )?;
+        }
+
         // 标准 create context 列表：MxAc + QFid 始终发送；lease (RqLs) 仅在调用方显式
         // 请求时附加，保持现有非-lease 调用方零行为变化。
         let mut contexts: Vec<CreateContextRequest> = vec![
@@ -147,6 +222,16 @@ impl Resource {
         ];
         if let Some(lease_req) = create_args.lease_request.as_ref() {
             contexts.push(lease_req.clone().into());
+        }
+        if let Some(request) = create_args.durable_request {
+            contexts.push(
+                DurableHandleRequestV2::new(
+                    request.timeout,
+                    request.persistent,
+                    request.create_guid,
+                )
+                .into(),
+            );
         }
 
         // MS-SMB2 2.2.13: server 只在 RequestedOplockLevel = Lease (0xFF) 时把
@@ -218,6 +303,28 @@ impl Resource {
             None
         };
 
+        let durable_granted = if let Some(request) = create_args.durable_request {
+            let response = CreateContextResponseData::first_dh2q(&response.create_contexts)
+                .ok_or_else(|| {
+                    Error::UnsupportedOperation(
+                        "Server did not grant the requested durable-v2 open".into(),
+                    )
+                })?;
+            let persistent = response.flags.persistent();
+            if request.persistent && !persistent {
+                return Err(Error::UnsupportedOperation(
+                    "Server did not grant the requested persistent open".into(),
+                ));
+            }
+            Some(DurableOpenGrant {
+                timeout: response.timeout,
+                persistent,
+                create_guid: request.create_guid,
+            })
+        } else {
+            None
+        };
+
         // Common information is held in the handle object. `lease_slot`
         // defaults to None; if a lease was granted and the higher-level
         // client opts in, [`Client::_create_file`] will attach a slot via
@@ -233,6 +340,7 @@ impl Resource {
             modified: response.last_write_time.date_time(),
             access,
             lease_granted,
+            durable_granted,
             lease_slot: None,
             share_type,
             conn_info: conn_info.clone(),
@@ -341,6 +449,7 @@ impl Resource {
                 state: granted_state,
                 epoch: proto.epoch_at_grant,
             }),
+            durable_granted: None,
             lease_slot: Some(slot.clone()),
             share_type: proto.share_type,
             conn_info: proto.conn_info.clone(),
@@ -538,6 +647,8 @@ pub struct ResourceHandle {
     /// `None` when no lease was requested or the server didn't grant one.
     lease_granted: Option<LeaseGrant>,
 
+    durable_granted: Option<DurableOpenGrant>,
+
     /// Phase C: when this handle is backed by a cached lease slot, close()
     /// and Drop release a refcount on the slot instead of sending a wire
     /// `Close`. The real `Close` is deferred until the slot is tombstoned
@@ -573,6 +684,11 @@ impl ResourceHandle {
     /// network round-trips.
     pub fn lease_granted(&self) -> Option<LeaseGrant> {
         self.lease_granted
+    }
+
+    /// Returns the server-granted durable-v2 properties for this Resource.
+    pub fn durable_granted(&self) -> Option<DurableOpenGrant> {
+        self.durable_granted
     }
 
     /// Returns the server-assigned `FileId` for this open, *without* the
@@ -1267,7 +1383,8 @@ impl Drop for ResourceHandle {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{FileCreateArgs, LeaseGrant};
+    use super::{DurableOpenRequest, FileCreateArgs, LeaseGrant, validate_durable_request};
+    use smb_dtyp::Guid;
     use smb_fscc::FileAccessMask;
     use smb_msg::{LeaseFlags, LeaseState, RequestLease, RequestLeaseV1, RequestLeaseV2};
 
@@ -1337,5 +1454,28 @@ mod tests {
             args.lease_request.is_none(),
             "default must not request a lease"
         );
+    }
+
+    #[test]
+    fn file_create_args_can_request_a_durable_v2_open() {
+        let request = DurableOpenRequest::durable(
+            30_000,
+            Guid::parse_uuid("00000000-0000-0000-0000-000000000007").unwrap(),
+        );
+        let args = FileCreateArgs::default().with_durable(request);
+        assert_eq!(args.durable_request, Some(request));
+        assert!(!request.is_persistent());
+    }
+
+    #[test]
+    fn persistent_open_requires_negotiated_support_and_a_ca_share() {
+        let request = DurableOpenRequest::persistent(
+            30_000,
+            Guid::parse_uuid("00000000-0000-0000-0000-000000000007").unwrap(),
+        );
+        assert!(validate_durable_request(request, true, true, true).is_ok());
+        assert!(validate_durable_request(request, true, false, true).is_err());
+        assert!(validate_durable_request(request, true, true, false).is_err());
+        assert!(validate_durable_request(request, false, true, true).is_err());
     }
 }

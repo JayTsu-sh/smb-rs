@@ -7,7 +7,7 @@ use crate::FileCreateArgs;
 use crate::connection::connection_info::ConnectionInfo;
 use smb_fscc::{FileAccessMask, FileAttributes};
 use smb_msg::{
-    CreateOptions, RequestContent, ShareFlags, ShareType,
+    CreateOptions, RequestContent, ShareFlags, ShareType, TreeCapabilities,
     create::CreateDisposition,
     tree_connect::{TreeConnectRequest, TreeDisconnectRequest},
 };
@@ -25,6 +25,7 @@ type Upstream = Arc<SessionContext>;
 pub struct TreeConnectInfo {
     share_type: ShareType,
     share_flags: ShareFlags,
+    capabilities: TreeCapabilities,
 }
 
 fn validate_tree_connect(
@@ -58,6 +59,7 @@ fn validate_tree_connect(
     Ok(TreeConnectInfo {
         share_type: content.share_type,
         share_flags: content.share_flags,
+        capabilities: content.capabilities,
     })
 }
 
@@ -618,6 +620,10 @@ impl TreeContext {
             return Err(Error::InvalidState("Tree is closed".to_string()));
         }
         Ok(Arc::new(self.generation().info.clone()))
+    }
+
+    pub(crate) fn continuously_available(&self) -> crate::Result<bool> {
+        Ok(self.info()?.capabilities.continuous_availability())
     }
 }
 

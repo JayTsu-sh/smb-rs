@@ -209,7 +209,7 @@ mod tests {
                 persistent: file,
                 volatile: file + 1,
             },
-            create_guid: Guid::from_u128(7),
+            create_guid: Guid::parse_uuid("00000000-0000-0000-0000-000000000007").unwrap(),
             persistent: false,
         }
     }
@@ -259,7 +259,8 @@ mod tests {
             now: MonotonicTime::ZERO,
         });
         let mut wrong_guid = identity(20);
-        wrong_guid.create_guid = Guid::from_u128(8);
+        wrong_guid.create_guid =
+            Guid::parse_uuid("00000000-0000-0000-0000-000000000008").unwrap();
         assert!(recovery
             .reduce(DurableRecoveryEvent::AttemptSucceeded {
                 share,

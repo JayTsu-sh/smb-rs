@@ -407,6 +407,7 @@ impl Client {
                     options: args.options,
                     desired_access: args.desired_access,
                     lease_request: Some(lease),
+                    durable_request: args.durable_request,
                 };
                 &owned_args
             } else {
