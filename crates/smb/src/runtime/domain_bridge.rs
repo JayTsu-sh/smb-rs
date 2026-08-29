@@ -7,14 +7,19 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use smb_fscc::{FileAccessMask, FileDispositionInformation};
+use futures_util::TryStreamExt;
+use smb_fscc::{
+    FileAccessMask, FileAttributes, FileDirectoryInformation, FileDispositionInformation,
+};
+use smb_msg::CreateOptions;
 use sspi::{AuthIdentity, Secret, Username};
 
 use crate::{
     Error,
     client::{Client as LegacyClient, ClientConfig as LegacyClientConfig, UncPath},
     resource::{
-        File as LegacyFile, FileCreateArgs, Resource as LegacyResource, file::FileOperationOptions,
+        Directory as LegacyDirectory, File as LegacyFile, FileCreateArgs,
+        Resource as LegacyResource, file::FileOperationOptions,
     },
     session::Session as LegacySession,
     tree::Tree as LegacyShare,
@@ -130,8 +135,76 @@ impl RuntimeShare {
         }
     }
 
+    pub(crate) async fn open_directory(
+        &self,
+        path: &str,
+        create: bool,
+    ) -> crate::Result<RuntimeDirectory> {
+        let args = if create {
+            FileCreateArgs::make_create_new(
+                FileAttributes::new().with_directory(true),
+                CreateOptions::new().with_directory_file(true),
+            )
+        } else {
+            FileCreateArgs {
+                options: CreateOptions::new().with_directory_file(true),
+                ..FileCreateArgs::make_open_existing(
+                    FileAccessMask::new()
+                        .with_generic_read(true)
+                        .with_generic_write(true)
+                        .with_delete(true),
+                )
+            }
+        };
+        match self.inner.create(path, &args).await? {
+            LegacyResource::Directory(directory) => Ok(RuntimeDirectory {
+                inner: Arc::new(directory),
+            }),
+            _ => Err(Error::InvalidState(
+                "server returned a non-directory resource".into(),
+            )),
+        }
+    }
+
     pub(crate) async fn close(&self) -> crate::Result<()> {
         self.inner.disconnect().await
+    }
+}
+
+pub(crate) struct RuntimeDirectoryEntry {
+    pub(crate) name: String,
+    pub(crate) is_directory: bool,
+    pub(crate) len: u64,
+}
+
+pub(crate) struct RuntimeDirectory {
+    inner: Arc<LegacyDirectory>,
+}
+
+impl RuntimeDirectory {
+    pub(crate) async fn collect_entries(
+        &self,
+        pattern: &str,
+    ) -> crate::Result<Vec<RuntimeDirectoryEntry>> {
+        LegacyDirectory::query::<FileDirectoryInformation>(&self.inner, pattern)
+            .await?
+            .map_ok(|entry| RuntimeDirectoryEntry {
+                name: entry.file_name.to_string(),
+                is_directory: entry.file_attributes.directory(),
+                len: entry.end_of_file,
+            })
+            .try_collect()
+            .await
+    }
+
+    pub(crate) async fn delete(&self) -> crate::Result<()> {
+        self.inner
+            .set_info(FileDispositionInformation::default())
+            .await
+    }
+
+    pub(crate) async fn close(&self) -> crate::Result<()> {
+        self.inner.close().await
     }
 }
 

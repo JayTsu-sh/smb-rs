@@ -119,6 +119,21 @@ impl FileOpenOptions {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DirectoryOpenOptions {
+    create: bool,
+}
+
+impl DirectoryOpenOptions {
+    pub const fn open_existing() -> Self {
+        Self { create: false }
+    }
+
+    pub const fn create_new() -> Self {
+        Self { create: true }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct DomainClient {
     inner: Arc<DomainClientInner>,
@@ -232,6 +247,32 @@ impl Share {
                 }
                 let inner = self.inner.open_file(path.as_str(), options.mode).await?;
                 Ok(File {
+                    inner,
+                    close_authority: FileCloseAuthority::new(),
+                })
+            })
+        })
+    }
+
+    pub fn open_directory<'a>(
+        &'a self,
+        path: &SharePath,
+        options: DirectoryOpenOptions,
+    ) -> Operation<'a, Directory> {
+        let path = path.clone();
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                if context.replay != ReplayPolicy::Never {
+                    return Err(Error::UnsupportedOperation(
+                        "directory open currently permits only ReplayPolicy::Never".into(),
+                    ));
+                }
+                let inner = self
+                    .inner
+                    .open_directory(path.as_str(), options.create)
+                    .await?;
+                Ok(Directory {
                     inner,
                     close_authority: FileCloseAuthority::new(),
                 })
@@ -474,7 +515,80 @@ impl File {
     }
 }
 
-pub struct Directory;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryEntry {
+    name: String,
+    is_directory: bool,
+    len: u64,
+}
+
+impl DirectoryEntry {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub const fn is_directory(&self) -> bool {
+        self.is_directory
+    }
+
+    pub const fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+pub struct Directory {
+    inner: crate::runtime::domain_bridge::RuntimeDirectory,
+    close_authority: FileCloseAuthority,
+}
+
+impl Directory {
+    pub fn collect_entries<'a>(&'a self, pattern: &'a str) -> Operation<'a, Vec<DirectoryEntry>> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                Ok(self
+                    .inner
+                    .collect_entries(pattern)
+                    .await?
+                    .into_iter()
+                    .map(|entry| DirectoryEntry {
+                        name: entry.name,
+                        is_directory: entry.is_directory,
+                        len: entry.len,
+                    })
+                    .collect())
+            })
+        })
+    }
+
+    pub fn delete(&self) -> Operation<'_, ()> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                self.inner.delete().await
+            })
+        })
+    }
+
+    pub fn close(&self) -> Operation<'_, CloseOutcome> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                if context.replay != ReplayPolicy::Never {
+                    return Err(Error::UnsupportedOperation(
+                        "directory close permits only ReplayPolicy::Never".into(),
+                    ));
+                }
+                self.close_authority.close_with(|| self.inner.close()).await
+            })
+        })
+    }
+}
+
 pub struct Pipe;
 
 #[cfg(test)]

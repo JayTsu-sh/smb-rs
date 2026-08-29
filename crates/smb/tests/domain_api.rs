@@ -2,8 +2,8 @@ use bytes::Bytes;
 #[cfg(feature = "real-server-tests")]
 use smb::{CancelToken, Error};
 use smb::{
-    Client, ClientConfig, CloseOutcome, Credentials, File, FileCursor, FileOpenOptions,
-    ReplayPolicy, Session, Share, SharePath, ShareTarget,
+    Client, ClientConfig, CloseOutcome, Credentials, Directory, DirectoryOpenOptions, File,
+    FileCursor, FileOpenOptions, ReplayPolicy, Session, Share, SharePath, ShareTarget,
 };
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
@@ -21,6 +21,7 @@ fn public_spine_types_are_send_sync_and_domain_named() {
     assert_send_sync::<Session>();
     assert_send_sync::<Share>();
     assert_send_sync::<File>();
+    assert_send_sync::<Directory>();
     assert_clone::<Client>();
     assert_clone::<Session>();
     assert_clone::<Share>();
@@ -43,6 +44,13 @@ async fn common_and_explicit_session_paths_compile(
     let client = Client::new(ClientConfig::default());
     let share = client.connect_share(&target, credentials).await?;
     let path = SharePath::new("domain-spine.bin")?;
+    let directory_path = SharePath::new("domain-directory")?;
+    let directory = share
+        .open_directory(&directory_path, DirectoryOpenOptions::create_new())
+        .await?;
+    let _entries = directory.collect_entries("*").await?;
+    directory.delete().await?;
+    assert_eq!(directory.close().await?, CloseOutcome::Confirmed);
     let file = share
         .open_file(&path, FileOpenOptions::overwrite())
         .timeout(Duration::from_secs(5))
