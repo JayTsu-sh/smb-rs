@@ -21,7 +21,8 @@ pub struct Plan {
     aggregate: String,
     test_identity_digest: String,
     volume: String,
-    share: String,
+    plain_share: String,
+    encrypted_share: String,
     junction: String,
     owner_comment: String,
     preflight_state_hash: Option<String>,
@@ -60,7 +61,8 @@ impl Plan {
             aggregate: aggregate.into(),
             test_identity_digest,
             volume: format!("{stem}_functional"),
-            share: format!("{stem}_plain"),
+            plain_share: format!("{stem}_plain"),
+            encrypted_share: format!("{stem}_encrypted"),
             junction: format!("/{stem}_functional"),
             owner_comment: format!("smb-rs-validation:{run_id}"),
             preflight_state_hash: None,
@@ -70,8 +72,11 @@ impl Plan {
     pub fn volume_name(&self) -> &str {
         &self.volume
     }
-    pub fn share_name(&self) -> &str {
-        &self.share
+    pub fn share_name(&self, role: ShareRole) -> &str {
+        match role {
+            ShareRole::Plain => &self.plain_share,
+            ShareRole::Encrypted => &self.encrypted_share,
+        }
     }
 
     pub fn matches_test_identity(&self, identity: &str) -> bool {
@@ -109,34 +114,41 @@ impl Plan {
     }
 
     pub fn provision_commands(&self) -> Vec<Vec<String>> {
-        vec![
-            args(&[
-                "volume",
-                "create",
-                "-vserver",
-                &self.svm,
-                "-volume",
-                &self.volume,
-                "-aggregate",
-                &self.aggregate,
-                "-size",
-                "2GB",
-                "-security-style",
-                "unix",
-                "-unix-permissions",
-                "0770",
-                "-junction-path",
-                &self.junction,
-                "-comment",
-                &self.owner_comment,
-                "-autosize-mode",
-                "off",
-                "-space-guarantee",
-                "none",
-                "-snapshot-policy",
-                "none",
-            ]),
-            args(&[
+        let mut commands = vec![args(&[
+            "volume",
+            "create",
+            "-vserver",
+            &self.svm,
+            "-volume",
+            &self.volume,
+            "-aggregate",
+            &self.aggregate,
+            "-size",
+            "2GB",
+            "-security-style",
+            "unix",
+            "-unix-permissions",
+            "0770",
+            "-junction-path",
+            &self.junction,
+            "-comment",
+            &self.owner_comment,
+            "-autosize-mode",
+            "off",
+            "-space-guarantee",
+            "none",
+            "-snapshot-policy",
+            "none",
+        ])];
+        for role in [ShareRole::Plain, ShareRole::Encrypted] {
+            let share = self.share_name(role);
+            let properties = match role {
+                ShareRole::Plain => "oplocks,browsable,changenotify,show-previous-versions",
+                ShareRole::Encrypted => {
+                    "oplocks,browsable,changenotify,show-previous-versions,encrypt-data"
+                }
+            };
+            commands.push(args(&[
                 "vserver",
                 "cifs",
                 "share",
@@ -144,15 +156,15 @@ impl Plan {
                 "-vserver",
                 &self.svm,
                 "-share-name",
-                &self.share,
+                share,
                 "-path",
                 &self.junction,
                 "-share-properties",
-                "oplocks,browsable,changenotify,show-previous-versions",
+                properties,
                 "-comment",
                 &self.owner_comment,
-            ]),
-            args(&[
+            ]));
+            commands.push(args(&[
                 "vserver",
                 "cifs",
                 "share",
@@ -161,11 +173,11 @@ impl Plan {
                 "-vserver",
                 &self.svm,
                 "-share",
-                &self.share,
+                share,
                 "-user-or-group",
                 "Everyone",
-            ]),
-            args(&[
+            ]));
+            commands.push(args(&[
                 "vserver",
                 "cifs",
                 "share",
@@ -174,13 +186,14 @@ impl Plan {
                 "-vserver",
                 &self.svm,
                 "-share",
-                &self.share,
+                share,
                 "-user-or-group",
                 "<test-identity>",
                 "-permission",
                 "Full_Control",
-            ]),
-        ]
+            ]));
+        }
+        commands
     }
 
     pub fn render_redacted(&self) -> String {
@@ -215,7 +228,23 @@ impl ApplyAuthorization {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ResourceKind {
     Volume,
-    Share,
+    PlainShare,
+    EncryptedShare,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShareRole {
+    Plain,
+    Encrypted,
+}
+
+impl ShareRole {
+    fn resource(self) -> ResourceKind {
+        match self {
+            Self::Plain => ResourceKind::PlainShare,
+            Self::Encrypted => ResourceKind::EncryptedShare,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,8 +258,10 @@ pub enum Lifecycle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mutation {
-    EveryoneAclRemoved,
-    TestIdentityAclGranted,
+    PlainEveryoneAclRemoved,
+    PlainTestIdentityAclGranted,
+    EncryptedEveryoneAclRemoved,
+    EncryptedTestIdentityAclGranted,
     VolumeUnmounted,
     VolumeOfflined,
 }
@@ -247,7 +278,8 @@ impl Inventory {
             plan_hash: plan.hash(),
             resources: BTreeMap::from([
                 (ResourceKind::Volume, Lifecycle::Planned),
-                (ResourceKind::Share, Lifecycle::Planned),
+                (ResourceKind::PlainShare, Lifecycle::Planned),
+                (ResourceKind::EncryptedShare, Lifecycle::Planned),
             ]),
         }
     }
@@ -285,15 +317,19 @@ impl Inventory {
     }
 
     pub fn cleanup_order(&self) -> Vec<ResourceKind> {
-        [ResourceKind::Share, ResourceKind::Volume]
-            .into_iter()
-            .filter(|kind| {
-                matches!(
-                    self.state(*kind),
-                    Some(Lifecycle::Created | Lifecycle::Ready)
-                )
-            })
-            .collect()
+        [
+            ResourceKind::EncryptedShare,
+            ResourceKind::PlainShare,
+            ResourceKind::Volume,
+        ]
+        .into_iter()
+        .filter(|kind| {
+            matches!(
+                self.state(*kind),
+                Some(Lifecycle::Created | Lifecycle::Ready)
+            )
+        })
+        .collect()
     }
 
     pub fn may_delete(&self, kind: ResourceKind) -> Result<(), String> {
@@ -301,7 +337,9 @@ impl Inventory {
             return Err("resource ownership does not match the manifest".into());
         }
         if kind == ResourceKind::Volume
-            && self.state(ResourceKind::Share) == Some(Lifecycle::OwnershipMismatch)
+            && [ResourceKind::PlainShare, ResourceKind::EncryptedShare]
+                .into_iter()
+                .any(|share| self.state(share) == Some(Lifecycle::OwnershipMismatch))
         {
             return Err("child ownership mismatch blocks parent deletion".into());
         }
@@ -331,7 +369,11 @@ impl Inventory {
         if self.plan_hash != plan.hash() {
             return Err("manifest plan hash does not match its inventory".into());
         }
-        let expected = [ResourceKind::Volume, ResourceKind::Share];
+        let expected = [
+            ResourceKind::Volume,
+            ResourceKind::PlainShare,
+            ResourceKind::EncryptedShare,
+        ];
         if self.resources.len() != expected.len()
             || expected
                 .iter()
@@ -581,12 +623,12 @@ fn io_error(operation: &'static str) -> impl FnOnce(io::Error) -> String {
 /// appliance mutation or verification per method.
 pub trait OntapAdapter {
     fn create_volume(&mut self, plan: &Plan) -> Result<(), String>;
-    fn create_share(&mut self, plan: &Plan) -> Result<(), String>;
-    fn remove_everyone_acl(&mut self, plan: &Plan) -> Result<(), String>;
-    fn grant_test_acl(&mut self, plan: &Plan) -> Result<(), String>;
+    fn create_share(&mut self, plan: &Plan, role: ShareRole) -> Result<(), String>;
+    fn remove_everyone_acl(&mut self, plan: &Plan, role: ShareRole) -> Result<(), String>;
+    fn grant_test_acl(&mut self, plan: &Plan, role: ShareRole) -> Result<(), String>;
     fn verify_ready(&mut self, plan: &Plan, kind: ResourceKind) -> Result<bool, String>;
     fn verify_owned(&mut self, plan: &Plan, kind: ResourceKind) -> Result<bool, String>;
-    fn delete_share(&mut self, plan: &Plan) -> Result<(), String>;
+    fn delete_share(&mut self, plan: &Plan, role: ShareRole) -> Result<(), String>;
     fn unmount_volume(&mut self, plan: &Plan) -> Result<(), String>;
     fn offline_volume(&mut self, plan: &Plan) -> Result<(), String>;
     fn delete_volume(&mut self, plan: &Plan) -> Result<(), String>;
@@ -635,15 +677,25 @@ impl<'a, A: OntapAdapter> ProvisioningRun<'a, A> {
         let plan = self.manifest.plan.clone();
         self.adapter.create_volume(&plan)?;
         self.manifest.record_created(ResourceKind::Volume)?;
-        self.adapter.create_share(&plan)?;
-        self.manifest.record_created(ResourceKind::Share)?;
-        self.adapter.remove_everyone_acl(&plan)?;
-        self.manifest
-            .record_mutation(Mutation::EveryoneAclRemoved)?;
-        self.adapter.grant_test_acl(&plan)?;
-        self.manifest
-            .record_mutation(Mutation::TestIdentityAclGranted)?;
-        for kind in [ResourceKind::Volume, ResourceKind::Share] {
+        for role in [ShareRole::Plain, ShareRole::Encrypted] {
+            self.adapter.create_share(&plan, role)?;
+            self.manifest.record_created(role.resource())?;
+            self.adapter.remove_everyone_acl(&plan, role)?;
+            self.manifest.record_mutation(match role {
+                ShareRole::Plain => Mutation::PlainEveryoneAclRemoved,
+                ShareRole::Encrypted => Mutation::EncryptedEveryoneAclRemoved,
+            })?;
+            self.adapter.grant_test_acl(&plan, role)?;
+            self.manifest.record_mutation(match role {
+                ShareRole::Plain => Mutation::PlainTestIdentityAclGranted,
+                ShareRole::Encrypted => Mutation::EncryptedTestIdentityAclGranted,
+            })?;
+        }
+        for kind in [
+            ResourceKind::Volume,
+            ResourceKind::PlainShare,
+            ResourceKind::EncryptedShare,
+        ] {
             if !self.adapter.verify_ready(&plan, kind)? {
                 return Err(format!("{kind:?} did not match the ready plan"));
             }
@@ -675,7 +727,10 @@ impl<'a, A: OntapAdapter> ProvisioningRun<'a, A> {
                 }
             }
             let deletion = match kind {
-                ResourceKind::Share => self.adapter.delete_share(&plan),
+                ResourceKind::PlainShare => self.adapter.delete_share(&plan, ShareRole::Plain),
+                ResourceKind::EncryptedShare => {
+                    self.adapter.delete_share(&plan, ShareRole::Encrypted)
+                }
                 ResourceKind::Volume => {
                     if !self.manifest.mutations.contains(&Mutation::VolumeUnmounted) {
                         if let Err(error) = self.adapter.unmount_volume(&plan) {

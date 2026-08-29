@@ -1,6 +1,6 @@
 use smb_tests::ontap::{
     ApplyAuthorization, Inventory, Lifecycle, Mutation, OntapAdapter, Plan, ProvisioningRun,
-    ResourceKind, RunManifest,
+    ResourceKind, RunManifest, ShareRole,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -33,12 +33,13 @@ fn plan_uses_exact_run_owned_names_and_secret_free_commands() {
         "smbrs_0123456789abcdef0123456789abcdef_functional"
     );
     assert_eq!(
-        plan.share_name(),
+        plan.share_name(smb_tests::ontap::ShareRole::Plain),
         "smbrs_0123456789abcdef0123456789abcdef_plain"
     );
     let rendered = plan.render_redacted();
     assert!(rendered.contains("volume create"));
     assert!(rendered.contains("access-control delete"));
+    assert!(rendered.contains("encrypt-data"));
     assert!(rendered.contains("<test-identity>"));
     assert!(!serde_json::to_string(&plan).unwrap().contains("test-user"));
     assert!(!rendered.to_ascii_lowercase().contains("password"));
@@ -95,10 +96,17 @@ fn inventory_is_the_only_cleanup_authority_and_cleanup_is_reversed() {
     let plan = fixture();
     let mut inventory = Inventory::new(&plan);
     inventory.record_created(ResourceKind::Volume).unwrap();
-    inventory.record_created(ResourceKind::Share).unwrap();
+    inventory.record_created(ResourceKind::PlainShare).unwrap();
+    inventory
+        .record_created(ResourceKind::EncryptedShare)
+        .unwrap();
     assert_eq!(
         inventory.cleanup_order(),
-        vec![ResourceKind::Share, ResourceKind::Volume]
+        vec![
+            ResourceKind::EncryptedShare,
+            ResourceKind::PlainShare,
+            ResourceKind::Volume
+        ]
     );
 }
 
@@ -107,11 +115,11 @@ fn ownership_mismatch_blocks_parent_deletion() {
     let plan = fixture();
     let mut inventory = Inventory::new(&plan);
     inventory.record_created(ResourceKind::Volume).unwrap();
-    inventory.record_created(ResourceKind::Share).unwrap();
+    inventory.record_created(ResourceKind::PlainShare).unwrap();
     inventory
-        .record_ownership_mismatch(ResourceKind::Share)
+        .record_ownership_mismatch(ResourceKind::PlainShare)
         .unwrap();
-    assert!(inventory.may_delete(ResourceKind::Share).is_err());
+    assert!(inventory.may_delete(ResourceKind::PlainShare).is_err());
     assert!(inventory.may_delete(ResourceKind::Volume).is_err());
 }
 
@@ -198,31 +206,45 @@ impl OntapAdapter for ScriptedOntap {
     fn create_volume(&mut self, _: &Plan) -> Result<(), String> {
         self.action("create-volume")
     }
-    fn create_share(&mut self, _: &Plan) -> Result<(), String> {
-        self.action("create-share")
+    fn create_share(&mut self, _: &Plan, role: ShareRole) -> Result<(), String> {
+        self.action(match role {
+            ShareRole::Plain => "create-plain-share",
+            ShareRole::Encrypted => "create-encrypted-share",
+        })
     }
-    fn remove_everyone_acl(&mut self, _: &Plan) -> Result<(), String> {
-        self.action("remove-everyone-acl")
+    fn remove_everyone_acl(&mut self, _: &Plan, role: ShareRole) -> Result<(), String> {
+        self.action(match role {
+            ShareRole::Plain => "remove-plain-everyone-acl",
+            ShareRole::Encrypted => "remove-encrypted-everyone-acl",
+        })
     }
-    fn grant_test_acl(&mut self, _: &Plan) -> Result<(), String> {
-        self.action("grant-test-acl")
+    fn grant_test_acl(&mut self, _: &Plan, role: ShareRole) -> Result<(), String> {
+        self.action(match role {
+            ShareRole::Plain => "grant-plain-test-acl",
+            ShareRole::Encrypted => "grant-encrypted-test-acl",
+        })
     }
     fn verify_ready(&mut self, _: &Plan, kind: ResourceKind) -> Result<bool, String> {
         self.calls.push(match kind {
             ResourceKind::Volume => "verify-volume-ready",
-            ResourceKind::Share => "verify-share-ready",
+            ResourceKind::PlainShare => "verify-plain-share-ready",
+            ResourceKind::EncryptedShare => "verify-encrypted-share-ready",
         });
         Ok(self.mismatch != Some(kind))
     }
     fn verify_owned(&mut self, _: &Plan, kind: ResourceKind) -> Result<bool, String> {
         self.calls.push(match kind {
             ResourceKind::Volume => "verify-volume-owned",
-            ResourceKind::Share => "verify-share-owned",
+            ResourceKind::PlainShare => "verify-plain-share-owned",
+            ResourceKind::EncryptedShare => "verify-encrypted-share-owned",
         });
         Ok(self.mismatch != Some(kind))
     }
-    fn delete_share(&mut self, _: &Plan) -> Result<(), String> {
-        self.action("delete-share")
+    fn delete_share(&mut self, _: &Plan, role: ShareRole) -> Result<(), String> {
+        self.action(match role {
+            ShareRole::Plain => "delete-plain-share",
+            ShareRole::Encrypted => "delete-encrypted-share",
+        })
     }
     fn unmount_volume(&mut self, _: &Plan) -> Result<(), String> {
         self.action("unmount-volume")
@@ -251,16 +273,27 @@ fn provisioning_persists_ready_resources_in_dependency_order() {
         recovered.state(ResourceKind::Volume),
         Some(Lifecycle::Ready)
     );
-    assert_eq!(recovered.state(ResourceKind::Share), Some(Lifecycle::Ready));
+    assert_eq!(
+        recovered.state(ResourceKind::PlainShare),
+        Some(Lifecycle::Ready)
+    );
+    assert_eq!(
+        recovered.state(ResourceKind::EncryptedShare),
+        Some(Lifecycle::Ready)
+    );
     assert_eq!(
         adapter.calls,
         vec![
             "create-volume",
-            "create-share",
-            "remove-everyone-acl",
-            "grant-test-acl",
+            "create-plain-share",
+            "remove-plain-everyone-acl",
+            "grant-plain-test-acl",
+            "create-encrypted-share",
+            "remove-encrypted-everyone-acl",
+            "grant-encrypted-test-acl",
             "verify-volume-ready",
-            "verify-share-ready",
+            "verify-plain-share-ready",
+            "verify-encrypted-share-ready",
         ]
     );
     fs::remove_file(path).unwrap();
@@ -273,7 +306,7 @@ fn provisioning_failure_runs_owned_reverse_cleanup_and_persists_it() {
     let authorization = ApplyAuthorization::new(&plan, &plan.hash()).unwrap();
     let manifest = RunManifest::create(&path, plan).unwrap();
     let mut adapter = ScriptedOntap {
-        fail_at: Some("grant-test-acl"),
+        fail_at: Some("grant-plain-test-acl"),
         ..Default::default()
     };
 
@@ -284,7 +317,7 @@ fn provisioning_failure_runs_owned_reverse_cleanup_and_persists_it() {
     );
     let recovered = RunManifest::load(&path).unwrap();
     assert_eq!(
-        recovered.state(ResourceKind::Share),
+        recovered.state(ResourceKind::PlainShare),
         Some(Lifecycle::Deleted)
     );
     assert_eq!(
@@ -294,7 +327,7 @@ fn provisioning_failure_runs_owned_reverse_cleanup_and_persists_it() {
     assert_eq!(
         recovered.mutations(),
         &[
-            Mutation::EveryoneAclRemoved,
+            Mutation::PlainEveryoneAclRemoved,
             Mutation::VolumeUnmounted,
             Mutation::VolumeOfflined
         ]
@@ -303,11 +336,11 @@ fn provisioning_failure_runs_owned_reverse_cleanup_and_persists_it() {
         adapter.calls,
         vec![
             "create-volume",
-            "create-share",
-            "remove-everyone-acl",
-            "grant-test-acl",
-            "verify-share-owned",
-            "delete-share",
+            "create-plain-share",
+            "remove-plain-everyone-acl",
+            "grant-plain-test-acl",
+            "verify-plain-share-owned",
+            "delete-plain-share",
             "verify-volume-owned",
             "unmount-volume",
             "offline-volume",
@@ -322,7 +355,10 @@ fn recovered_manifest_can_resume_exact_cleanup() {
     let path = temp_manifest("resume-cleanup");
     let mut manifest = RunManifest::create(&path, fixture()).unwrap();
     manifest.record_created(ResourceKind::Volume).unwrap();
-    manifest.record_created(ResourceKind::Share).unwrap();
+    manifest.record_created(ResourceKind::PlainShare).unwrap();
+    manifest
+        .record_created(ResourceKind::EncryptedShare)
+        .unwrap();
     drop(manifest);
 
     let recovered = RunManifest::load(&path).unwrap();
@@ -332,7 +368,11 @@ fn recovered_manifest_can_resume_exact_cleanup() {
         .unwrap();
     let final_manifest = RunManifest::load(&path).unwrap();
     assert_eq!(
-        final_manifest.state(ResourceKind::Share),
+        final_manifest.state(ResourceKind::PlainShare),
+        Some(Lifecycle::Deleted)
+    );
+    assert_eq!(
+        final_manifest.state(ResourceKind::EncryptedShare),
         Some(Lifecycle::Deleted)
     );
     assert_eq!(
@@ -342,8 +382,10 @@ fn recovered_manifest_can_resume_exact_cleanup() {
     assert_eq!(
         adapter.calls,
         vec![
-            "verify-share-owned",
-            "delete-share",
+            "verify-encrypted-share-owned",
+            "delete-encrypted-share",
+            "verify-plain-share-owned",
+            "delete-plain-share",
             "verify-volume-owned",
             "unmount-volume",
             "offline-volume",
@@ -360,8 +402,8 @@ fn ownership_mismatch_stops_that_object_and_parent_cleanup() {
     let authorization = ApplyAuthorization::new(&plan, &plan.hash()).unwrap();
     let manifest = RunManifest::create(&path, plan).unwrap();
     let mut adapter = ScriptedOntap {
-        fail_at: Some("grant-test-acl"),
-        mismatch: Some(ResourceKind::Share),
+        fail_at: Some("grant-plain-test-acl"),
+        mismatch: Some(ResourceKind::PlainShare),
         ..Default::default()
     };
 
@@ -372,14 +414,14 @@ fn ownership_mismatch_stops_that_object_and_parent_cleanup() {
     );
     let recovered = RunManifest::load(&path).unwrap();
     assert_eq!(
-        recovered.state(ResourceKind::Share),
+        recovered.state(ResourceKind::PlainShare),
         Some(Lifecycle::OwnershipMismatch)
     );
     assert_eq!(
         recovered.state(ResourceKind::Volume),
         Some(Lifecycle::Created)
     );
-    assert!(!adapter.calls.contains(&"delete-share"));
+    assert!(!adapter.calls.contains(&"delete-plain-share"));
     assert!(!adapter.calls.contains(&"delete-volume"));
     fs::remove_file(path).unwrap();
 }

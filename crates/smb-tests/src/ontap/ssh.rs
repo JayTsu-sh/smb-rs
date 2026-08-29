@@ -1,4 +1,4 @@
-use super::{OntapAdapter, Plan, ResourceKind};
+use super::{OntapAdapter, Plan, ResourceKind, ShareRole};
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
 use zeroize::Zeroizing;
@@ -67,7 +67,10 @@ impl SshOntapAdapter {
         if !has_exact_token(&aggregate, &plan.aggregate) {
             return Err("preflight did not find the configured online aggregate".into());
         }
-        if self.volume_owned(plan, false)? || self.share_owned(plan, false)? {
+        if self.volume_owned(plan, false)?
+            || self.share_owned(plan, ShareRole::Plain, false)?
+            || self.share_owned(plan, ShareRole::Encrypted, false)?
+        {
             return Err("preflight run-owned resource names are not absent".into());
         }
         let normalized = normalize_preflight(&[&version, &cifs, &aggregate]);
@@ -152,7 +155,8 @@ impl SshOntapAdapter {
             .map(|output| has_exact_token(&output, &plan.volume))
     }
 
-    fn share_owned(&self, plan: &Plan, ready: bool) -> Result<bool, String> {
+    fn share_owned(&self, plan: &Plan, role: ShareRole, ready: bool) -> Result<bool, String> {
+        let share = plan.share_name(role);
         let mut args = vec![
             "vserver",
             "cifs",
@@ -161,19 +165,39 @@ impl SshOntapAdapter {
             "-vserver",
             &plan.svm,
             "-share-name",
-            &plan.share,
+            share,
             "-comment",
             &plan.owner_comment,
         ];
         if ready {
             args.extend(["-path", &plan.junction]);
         }
-        args.extend(["-fields", "share-name"]);
-        let share_matches = self
-            .run(&args)
-            .map(|output| has_exact_token(&output, &plan.share))?;
+        args.extend([
+            "-fields",
+            if ready {
+                "share-name,share-properties"
+            } else {
+                "share-name"
+            },
+        ]);
+        let share_output = self.run(&args)?;
+        let share_matches = has_exact_token(&share_output, share);
         if !ready || !share_matches {
             return Ok(share_matches);
+        }
+        let required_properties = [
+            "oplocks",
+            "browsable",
+            "changenotify",
+            "show-previous-versions",
+        ];
+        if required_properties
+            .into_iter()
+            .any(|property| !has_list_item(&share_output, property))
+            || (role == ShareRole::Encrypted && !has_list_item(&share_output, "encrypt-data"))
+            || (role == ShareRole::Plain && has_list_item(&share_output, "encrypt-data"))
+        {
+            return Ok(false);
         }
 
         let granted = self.run(&[
@@ -185,7 +209,7 @@ impl SshOntapAdapter {
             "-vserver",
             &plan.svm,
             "-share",
-            &plan.share,
+            share,
             "-user-or-group",
             self.test_identity.as_str(),
             "-permission",
@@ -200,7 +224,7 @@ impl SshOntapAdapter {
             "-vserver",
             &plan.svm,
             "-share",
-            &plan.share,
+            share,
             "-user-or-group",
             "Everyone",
         ])?;
@@ -214,15 +238,24 @@ impl OntapAdapter for SshOntapAdapter {
         self.run_refs(&plan.provision_commands()[0])
     }
 
-    fn create_share(&mut self, plan: &Plan) -> Result<(), String> {
-        self.run_refs(&plan.provision_commands()[1])
+    fn create_share(&mut self, plan: &Plan, role: ShareRole) -> Result<(), String> {
+        let index = match role {
+            ShareRole::Plain => 1,
+            ShareRole::Encrypted => 4,
+        };
+        self.run_refs(&plan.provision_commands()[index])
     }
 
-    fn remove_everyone_acl(&mut self, plan: &Plan) -> Result<(), String> {
-        self.run_refs(&plan.provision_commands()[2])
+    fn remove_everyone_acl(&mut self, plan: &Plan, role: ShareRole) -> Result<(), String> {
+        let index = match role {
+            ShareRole::Plain => 2,
+            ShareRole::Encrypted => 5,
+        };
+        self.run_refs(&plan.provision_commands()[index])
     }
 
-    fn grant_test_acl(&mut self, plan: &Plan) -> Result<(), String> {
+    fn grant_test_acl(&mut self, plan: &Plan, role: ShareRole) -> Result<(), String> {
+        let share = plan.share_name(role);
         self.run(&[
             "vserver",
             "cifs",
@@ -232,7 +265,7 @@ impl OntapAdapter for SshOntapAdapter {
             "-vserver",
             &plan.svm,
             "-share",
-            &plan.share,
+            share,
             "-user-or-group",
             self.test_identity.as_str(),
             "-permission",
@@ -244,18 +277,20 @@ impl OntapAdapter for SshOntapAdapter {
     fn verify_ready(&mut self, plan: &Plan, kind: ResourceKind) -> Result<bool, String> {
         match kind {
             ResourceKind::Volume => self.volume_owned(plan, true),
-            ResourceKind::Share => self.share_owned(plan, true),
+            ResourceKind::PlainShare => self.share_owned(plan, ShareRole::Plain, true),
+            ResourceKind::EncryptedShare => self.share_owned(plan, ShareRole::Encrypted, true),
         }
     }
 
     fn verify_owned(&mut self, plan: &Plan, kind: ResourceKind) -> Result<bool, String> {
         match kind {
             ResourceKind::Volume => self.volume_owned(plan, false),
-            ResourceKind::Share => self.share_owned(plan, false),
+            ResourceKind::PlainShare => self.share_owned(plan, ShareRole::Plain, false),
+            ResourceKind::EncryptedShare => self.share_owned(plan, ShareRole::Encrypted, false),
         }
     }
 
-    fn delete_share(&mut self, plan: &Plan) -> Result<(), String> {
+    fn delete_share(&mut self, plan: &Plan, role: ShareRole) -> Result<(), String> {
         self.run(&[
             "vserver",
             "cifs",
@@ -264,7 +299,7 @@ impl OntapAdapter for SshOntapAdapter {
             "-vserver",
             &plan.svm,
             "-share-name",
-            &plan.share,
+            plan.share_name(role),
         ])
         .map(drop)
     }
@@ -360,6 +395,13 @@ fn has_exact_token(output: &str, expected: &str) -> bool {
         .any(|token| token == expected)
 }
 
+fn has_list_item(output: &str, expected: &str) -> bool {
+    output
+        .split_ascii_whitespace()
+        .flat_map(|token| token.split(','))
+        .any(|item| item == expected)
+}
+
 fn normalize_preflight(outputs: &[&str]) -> String {
     outputs
         .iter()
@@ -398,6 +440,13 @@ mod tests {
             "exact"
         ));
         assert!(!has_exact_token("svm exact-suffix owned", "exact"));
+    }
+
+    #[test]
+    fn share_properties_are_matched_as_exact_list_items() {
+        let output = "share share-properties\nname oplocks,browsable,encrypt-data";
+        assert!(has_list_item(output, "encrypt-data"));
+        assert!(!has_list_item(output, "encrypt"));
     }
 
     #[test]
