@@ -1,4 +1,4 @@
-use super::operation::{BootstrapCommand, BootstrapOperation, BootstrapResult};
+use super::operation::{OperationResult, ResponsePolicy, TypedOperation};
 use super::reducer::{GenerationId, ReduceEffect, RequestKey, TerminalOutcome};
 use super::state::{
     AdmissionError, AdmissionLimits, GenerationState, OwnerEffect, OwnerEvent, RequestProgress,
@@ -87,13 +87,13 @@ pub(crate) struct RequestTicket {
     completion: oneshot::Receiver<Result<TerminalOutcome, RuntimeError>>,
 }
 
-pub(crate) struct BootstrapTicket {
+pub(crate) struct OperationTicket {
     pub(crate) key: RequestKey,
-    completion: oneshot::Receiver<Result<BootstrapResult, RuntimeError>>,
+    completion: oneshot::Receiver<Result<OperationResult, RuntimeError>>,
 }
 
-impl BootstrapTicket {
-    pub(crate) async fn completion(self) -> Result<BootstrapResult, RuntimeError> {
+impl OperationTicket {
+    pub(crate) async fn completion(self) -> Result<OperationResult, RuntimeError> {
         self.completion
             .await
             .unwrap_or(Err(RuntimeError::OwnerTerminated))
@@ -111,7 +111,7 @@ impl RequestTicket {
 #[derive(Clone)]
 pub(crate) struct RuntimeHandle {
     admission: mpsc::Sender<AdmissionCommand>,
-    bootstrap: mpsc::Sender<BootstrapAdmission>,
+    operations: mpsc::Sender<OperationAdmission>,
     control: mpsc::Sender<ControlCommand>,
     owner_finished: CancellationToken,
 }
@@ -153,16 +153,16 @@ impl RuntimeHandle {
         result.await.unwrap_or(Err(RuntimeError::OwnerTerminated))
     }
 
-    pub(crate) async fn submit_bootstrap(
+    pub(crate) async fn submit_operation(
         &self,
-        operation: BootstrapOperation,
+        operation: TypedOperation,
         credit_charge: u16,
         deadline: Option<MonotonicTime>,
-    ) -> Result<BootstrapTicket, RuntimeError> {
+    ) -> Result<OperationTicket, RuntimeError> {
         let (acknowledge, acknowledged) = oneshot::channel();
         let (terminal, completion) = oneshot::channel();
-        self.bootstrap
-            .try_send(BootstrapAdmission {
+        self.operations
+            .try_send(OperationAdmission {
                 operation,
                 credit_charge,
                 deadline,
@@ -176,18 +176,18 @@ impl RuntimeHandle {
         let key = acknowledged
             .await
             .unwrap_or(Err(RuntimeError::OwnerTerminated))?;
-        Ok(BootstrapTicket { key, completion })
+        Ok(OperationTicket { key, completion })
     }
 
-    pub(crate) async fn submit_bootstrap_detached(
+    pub(crate) async fn submit_operation_detached(
         &self,
-        operation: BootstrapOperation,
+        operation: TypedOperation,
         credit_charge: u16,
         deadline: Option<MonotonicTime>,
     ) -> Result<RequestKey, RuntimeError> {
         let (acknowledge, acknowledged) = oneshot::channel();
-        self.bootstrap
-            .try_send(BootstrapAdmission {
+        self.operations
+            .try_send(OperationAdmission {
                 operation,
                 credit_charge,
                 deadline,
@@ -203,13 +203,13 @@ impl RuntimeHandle {
             .unwrap_or(Err(RuntimeError::OwnerTerminated))
     }
 
-    pub(crate) async fn await_bootstrap(
+    pub(crate) async fn await_operation(
         &self,
         key: RequestKey,
-    ) -> Result<BootstrapResult, RuntimeError> {
+    ) -> Result<OperationResult, RuntimeError> {
         let (reply, result) = oneshot::channel();
         self.control
-            .send(ControlCommand::AwaitBootstrap { key, reply })
+            .send(ControlCommand::AwaitOperation { key, reply })
             .await
             .map_err(|_| RuntimeError::Closed)?;
         result.await.unwrap_or(Err(RuntimeError::OwnerTerminated))
@@ -280,13 +280,13 @@ pub(crate) fn start_generation(
     config: RuntimeConfig,
 ) -> (RuntimeHandle, RuntimeEvents) {
     let (admission_tx, admission_rx) = mpsc::channel(config.admission_capacity.max(1));
-    let (bootstrap_tx, bootstrap_rx) = mpsc::channel(config.admission_capacity.max(1));
+    let (operation_tx, operation_rx) = mpsc::channel(config.admission_capacity.max(1));
     let (control_tx, control_rx) = mpsc::channel(config.control_capacity.max(1));
     let (event_tx, event_rx) = mpsc::channel(config.event_capacity.max(1));
     let owner_finished = CancellationToken::new();
     let handle = RuntimeHandle {
         admission: admission_tx,
-        bootstrap: bootstrap_tx,
+        operations: operation_tx,
         control: control_tx,
         owner_finished: owner_finished.clone(),
     };
@@ -296,7 +296,7 @@ pub(crate) fn start_generation(
             clock,
             config,
             admission_rx,
-            bootstrap_rx,
+            operation_rx,
             control_rx,
             event_tx,
         )
@@ -315,31 +315,31 @@ struct AdmissionCommand {
     terminal: oneshot::Sender<Result<TerminalOutcome, RuntimeError>>,
 }
 
-struct BootstrapAdmission {
-    operation: BootstrapOperation,
+struct OperationAdmission {
+    operation: TypedOperation,
     credit_charge: u16,
     deadline: Option<MonotonicTime>,
     acknowledge: oneshot::Sender<Result<RequestKey, RuntimeError>>,
-    terminal: Option<oneshot::Sender<Result<BootstrapResult, RuntimeError>>>,
+    terminal: Option<oneshot::Sender<Result<OperationResult, RuntimeError>>>,
 }
 
-struct BootstrapPending {
-    command: BootstrapCommand,
+struct OperationPending {
+    response: ResponsePolicy,
     request_raw: Option<bytes::Bytes>,
-    terminal: Option<oneshot::Sender<Result<BootstrapResult, RuntimeError>>>,
-    buffered: Option<Result<BootstrapResult, RuntimeError>>,
+    terminal: Option<oneshot::Sender<Result<OperationResult, RuntimeError>>>,
+    buffered: Option<Result<OperationResult, RuntimeError>>,
 }
 
 struct RequestAuthority {
     state: GenerationState,
     terminals: HashMap<RequestKey, oneshot::Sender<Result<TerminalOutcome, RuntimeError>>>,
-    bootstrap_pending: HashMap<RequestKey, BootstrapPending>,
+    operation_pending: HashMap<RequestKey, OperationPending>,
 }
 
 enum ControlCommand {
-    AwaitBootstrap {
+    AwaitOperation {
         key: RequestKey,
-        reply: oneshot::Sender<Result<BootstrapResult, RuntimeError>>,
+        reply: oneshot::Sender<Result<OperationResult, RuntimeError>>,
     },
     Negotiated {
         connection: Arc<ConnectionInfo>,
@@ -395,14 +395,14 @@ async fn owner_task(
     clock: Arc<dyn Clock>,
     config: RuntimeConfig,
     mut admission_rx: mpsc::Receiver<AdmissionCommand>,
-    mut bootstrap_rx: mpsc::Receiver<BootstrapAdmission>,
+    mut operation_rx: mpsc::Receiver<OperationAdmission>,
     mut control_rx: mpsc::Receiver<ControlCommand>,
     event_tx: mpsc::Sender<RuntimeEvent>,
 ) {
     let wire = WirePipeline::default();
     let Ok((read, write)) = transport.split() else {
         fail_waiting_admissions(&mut admission_rx, RuntimeError::Transport("split")).await;
-        fail_waiting_bootstrap(&mut bootstrap_rx, RuntimeError::Transport("split")).await;
+        fail_waiting_operations(&mut operation_rx, RuntimeError::Transport("split")).await;
         return;
     };
     let (write_tx, write_rx) = mpsc::channel(1);
@@ -426,7 +426,7 @@ async fn owner_task(
             config.tombstone_drain_timeout,
         ),
         terminals: HashMap::new(),
-        bootstrap_pending: HashMap::new(),
+        operation_pending: HashMap::new(),
     };
     let mut frame_cancellations = HashMap::new();
     let mut deferred_cancellations = HashMap::new();
@@ -450,7 +450,7 @@ async fn owner_task(
                     .await
                     {
                         admission_rx.close();
-                        bootstrap_rx.close();
+                        operation_rx.close();
                     }
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -471,7 +471,7 @@ async fn owner_task(
             .await
         {
             admission_rx.close();
-            bootstrap_rx.close();
+            operation_rx.close();
         }
         if let Ok(command) = admission_rx.try_recv() {
             process_admission(
@@ -481,12 +481,12 @@ async fn owner_task(
                 &mut send_queue,
             );
         }
-        if let Ok(command) = bootstrap_rx.try_recv() {
-            process_bootstrap_admission(
+        if let Ok(command) = operation_rx.try_recv() {
+            process_operation_admission(
                 command,
                 &wire,
                 &mut authority.state,
-                &mut authority.bootstrap_pending,
+                &mut authority.operation_pending,
                 &mut send_queue,
             )
             .await;
@@ -518,7 +518,7 @@ async fn owner_task(
                     let close = handle_control(command, &wire, &mut authority, &mut frame_cancellations, &mut deferred_cancellations, &mut send_queue, &mut close_request).await;
                     close_admission_if(close, &mut admission_rx);
                     if close {
-                        bootstrap_rx.close();
+                        operation_rx.close();
                     }
                 }
                 None if admission_rx.is_closed() => break,
@@ -528,13 +528,13 @@ async fn owner_task(
                 Some(event) => {
                     if process_io(event, &wire, &mut authority, &mut frame_cancellations, &mut deferred_cancellations, &event_tx, &mut fatal).await {
                         admission_rx.close();
-                        bootstrap_rx.close();
+                        operation_rx.close();
                     }
                 }
                 None => {
                     fatal = Some(RuntimeError::Transport("io-channel-closed"));
                     admission_rx.close();
-                    bootstrap_rx.close();
+                    operation_rx.close();
                 }
             },
             command = admission_rx.recv(), if !admission_rx.is_closed() => {
@@ -542,25 +542,25 @@ async fn owner_task(
                     process_admission(command, &mut authority.state, &mut authority.terminals, &mut send_queue);
                 }
             },
-            command = bootstrap_rx.recv(), if !bootstrap_rx.is_closed() => {
+            command = operation_rx.recv(), if !operation_rx.is_closed() => {
                 if let Some(command) = command {
-                    process_bootstrap_admission(
+                    process_operation_admission(
                         command,
                         &wire,
                         &mut authority.state,
-                        &mut authority.bootstrap_pending,
+                        &mut authority.operation_pending,
                         &mut send_queue,
                     ).await;
                 }
             },
             _ = &mut deadline_sleep => {
                 let effects = authority.state.reduce(OwnerEvent::AdvanceTime { now: clock.now() });
-                apply_bootstrap_effects(&effects, &mut authority.bootstrap_pending);
+                apply_operation_effects(&effects, &mut authority.operation_pending);
                 apply_owner_effects(effects, &mut authority.terminals);
                 if authority.state.is_unhealthy() {
                     fatal = Some(RuntimeError::Transport("generation-unhealthy"));
                     admission_rx.close();
-                    bootstrap_rx.close();
+                    operation_rx.close();
                 }
             }
             completion = pumps.join_next() => {
@@ -571,20 +571,20 @@ async fn owner_task(
                     None => fatal = Some(RuntimeError::Transport("pumps-exited")),
                 }
                 admission_rx.close();
-                bootstrap_rx.close();
+                operation_rx.close();
             }
         }
     }
 
     admission_rx.close();
-    bootstrap_rx.close();
+    operation_rx.close();
     fail_waiting_admissions(
         &mut admission_rx,
         fatal.clone().unwrap_or(RuntimeError::Closed),
     )
     .await;
-    fail_waiting_bootstrap(
-        &mut bootstrap_rx,
+    fail_waiting_operations(
+        &mut operation_rx,
         fatal.clone().unwrap_or(RuntimeError::Closed),
     )
     .await;
@@ -597,12 +597,12 @@ async fn owner_task(
     drop(write_tx);
     shutdown.cancel();
     let effects = authority.state.reduce(OwnerEvent::Disconnect);
-    apply_bootstrap_effects(&effects, &mut authority.bootstrap_pending);
+    apply_operation_effects(&effects, &mut authority.operation_pending);
     apply_owner_effects(effects, &mut authority.terminals);
     for (_, terminal) in authority.terminals.drain() {
         let _ = terminal.send(Err(fatal.clone().unwrap_or(RuntimeError::Closed)));
     }
-    for (_, pending) in authority.bootstrap_pending.drain() {
+    for (_, pending) in authority.operation_pending.drain() {
         if let Some(terminal) = pending.terminal {
             let _ = terminal.send(Err(fatal.clone().unwrap_or(RuntimeError::Closed)));
         }
@@ -623,11 +623,11 @@ async fn owner_task(
     }
 }
 
-async fn process_bootstrap_admission(
-    command: BootstrapAdmission,
+async fn process_operation_admission(
+    command: OperationAdmission,
     wire: &WirePipeline,
     state: &mut GenerationState,
-    pending: &mut HashMap<RequestKey, BootstrapPending>,
+    pending: &mut HashMap<RequestKey, OperationPending>,
     send_queue: &mut VecDeque<WriteCommand>,
 ) {
     if pending.len() >= state.operation_limit() {
@@ -657,7 +657,7 @@ async fn process_bootstrap_admission(
     };
 
     let key = plan.key;
-    let operation_command = command.operation.command();
+    let response = command.operation.response_policy().clone();
     let mut outgoing = command.operation.into_outgoing();
     outgoing.message.header.message_id = key.message_id;
     let retain_raw = outgoing.return_raw_data;
@@ -678,8 +678,8 @@ async fn process_bootstrap_admission(
         .flatten();
     pending.insert(
         key,
-        BootstrapPending {
-            command: operation_command,
+        OperationPending {
+            response,
             request_raw,
             terminal: command.terminal,
             buffered: None,
@@ -748,13 +748,13 @@ async fn handle_control(
     close_request: &mut Option<CloseRequest>,
 ) -> bool {
     match command {
-        ControlCommand::AwaitBootstrap { key, reply } => {
-            let Some(pending) = authority.bootstrap_pending.get_mut(&key) else {
+        ControlCommand::AwaitOperation { key, reply } => {
+            let Some(pending) = authority.operation_pending.get_mut(&key) else {
                 let _ = reply.send(Err(RuntimeError::UnknownRequest(key)));
                 return false;
             };
             if let Some(result) = pending.buffered.take() {
-                authority.bootstrap_pending.remove(&key);
+                authority.operation_pending.remove(&key);
                 let _ = reply.send(result);
             } else if pending.terminal.is_some() {
                 let _ = reply.send(Err(RuntimeError::AlreadyAwaited(key)));
@@ -806,7 +806,7 @@ async fn handle_control(
                 .is_some_and(|request| request.wire_committed());
             if removed_before_dispatch || committed || !frame_cancellations.contains_key(&key) {
                 let effects = authority.state.reduce(OwnerEvent::Cancel { key, now });
-                apply_bootstrap_effects(&effects, &mut authority.bootstrap_pending);
+                apply_operation_effects(&effects, &mut authority.operation_pending);
                 apply_owner_effects(effects, &mut authority.terminals);
             } else {
                 deferred_cancellations.entry(key).or_insert(now);
@@ -863,7 +863,7 @@ async fn process_io(
     let runtime_event = match event {
         IoEvent::Inbound(frame) => {
             let bytes = frame.len();
-            if !authority.bootstrap_pending.is_empty() {
+            if !authority.operation_pending.is_empty() {
                 let messages = match wire.transform_incoming_all(frame.into_bytes()).await {
                     Ok(messages) => messages,
                     Err(_) => {
@@ -895,13 +895,13 @@ async fn process_io(
                         });
                         continue;
                     }
-                    let Some(pending) = authority.bootstrap_pending.get(&key) else {
+                    let Some(pending) = authority.operation_pending.get(&key) else {
                         continue;
                     };
-                    if message.message.header.command != pending.command.wire_command()
-                        || !pending.command.accepts_status(status)
+                    if message.message.header.command != pending.response.wire_command()
+                        || !pending.response.accepts_status(status)
                     {
-                        *fatal = Some(RuntimeError::Wire("bootstrap-response-contract"));
+                        *fatal = Some(RuntimeError::Wire("operation-response-contract"));
                         break;
                     }
                     let effects = authority.state.reduce(OwnerEvent::Response {
@@ -920,10 +920,10 @@ async fn process_io(
                     });
                     apply_owner_effects(effects, &mut authority.terminals);
                     if publishes_response {
-                        complete_bootstrap(
-                            &mut authority.bootstrap_pending,
+                        complete_operation(
+                            &mut authority.operation_pending,
                             key,
-                            Ok(BootstrapResult {
+                            Ok(OperationResult {
                                 key,
                                 response: message,
                                 request_raw: None,
@@ -939,7 +939,7 @@ async fn process_io(
                 .remove(&key)
                 .unwrap_or(MonotonicTime::ZERO);
             let effects = authority.state.reduce(OwnerEvent::Cancel { key, now });
-            apply_bootstrap_effects(&effects, &mut authority.bootstrap_pending);
+            apply_operation_effects(&effects, &mut authority.operation_pending);
             apply_owner_effects(effects, &mut authority.terminals);
             frame_cancellations.remove(&key);
             None
@@ -951,7 +951,7 @@ async fn process_io(
             });
             if let Some(now) = deferred_cancellations.remove(&key) {
                 let effects = authority.state.reduce(OwnerEvent::Cancel { key, now });
-                apply_bootstrap_effects(&effects, &mut authority.bootstrap_pending);
+                apply_operation_effects(&effects, &mut authority.operation_pending);
                 apply_owner_effects(effects, &mut authority.terminals);
             }
             Some(RuntimeEvent::WriteProgress { key, bytes })
@@ -963,7 +963,7 @@ async fn process_io(
             });
             if let Some(now) = deferred_cancellations.remove(&key) {
                 let effects = authority.state.reduce(OwnerEvent::Cancel { key, now });
-                apply_bootstrap_effects(&effects, &mut authority.bootstrap_pending);
+                apply_operation_effects(&effects, &mut authority.operation_pending);
                 apply_owner_effects(effects, &mut authority.terminals);
             }
             frame_cancellations.remove(&key);
@@ -1002,9 +1002,9 @@ fn apply_owner_effects(
     }
 }
 
-fn apply_bootstrap_effects(
+fn apply_operation_effects(
     effects: &[OwnerEffect],
-    pending: &mut HashMap<RequestKey, BootstrapPending>,
+    pending: &mut HashMap<RequestKey, OperationPending>,
 ) {
     for effect in effects {
         if let OwnerEffect::Request {
@@ -1013,15 +1013,15 @@ fn apply_bootstrap_effects(
         } = effect
             && *outcome != TerminalOutcome::Response
         {
-            complete_bootstrap(pending, *key, Err(RuntimeError::Terminal(*outcome)));
+            complete_operation(pending, *key, Err(RuntimeError::Terminal(*outcome)));
         }
     }
 }
 
-fn complete_bootstrap(
-    pending: &mut HashMap<RequestKey, BootstrapPending>,
+fn complete_operation(
+    pending: &mut HashMap<RequestKey, OperationPending>,
     key: RequestKey,
-    mut result: Result<BootstrapResult, RuntimeError>,
+    mut result: Result<OperationResult, RuntimeError>,
 ) {
     let Some(mut entry) = pending.remove(&key) else {
         return;
@@ -1150,8 +1150,8 @@ async fn fail_waiting_admissions(
     }
 }
 
-async fn fail_waiting_bootstrap(
-    admissions: &mut mpsc::Receiver<BootstrapAdmission>,
+async fn fail_waiting_operations(
+    admissions: &mut mpsc::Receiver<OperationAdmission>,
     error: RuntimeError,
 ) {
     while let Some(command) = admissions.recv().await {
@@ -1544,7 +1544,7 @@ mod tests {
         .unwrap()
     }
 
-    fn session_setup_operation(return_raw: bool) -> BootstrapOperation {
+    fn session_setup_operation(return_raw: bool) -> TypedOperation {
         let mut outgoing = crate::msg_handler::OutgoingMessage::new(
             smb_msg::RequestContent::SessionSetup(smb_msg::SessionSetupRequest::new(
                 vec![9, 8, 7],
@@ -1555,7 +1555,18 @@ mod tests {
         )
         .with_return_raw_data(return_raw);
         outgoing.security = Some(crate::msg_handler::Protection::None);
-        BootstrapOperation::new(BootstrapCommand::SessionSetup, outgoing).unwrap()
+        TypedOperation::new(
+            outgoing,
+            ResponsePolicy::one_of(
+                smb_msg::Command::SessionSetup,
+                [
+                    smb_msg::Status::MoreProcessingRequired,
+                    smb_msg::Status::Success,
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap()
     }
 
     fn session_setup_response(message_id: u64) -> Bytes {
@@ -1935,7 +1946,7 @@ mod tests {
         let clock = Arc::new(ManualClock::new());
         let (handle, _events) = start_generation(transport, clock.clone(), config());
         let ticket = handle
-            .submit_bootstrap(session_setup_operation(true), 1, None)
+            .submit_operation(session_setup_operation(true), 1, None)
             .await
             .unwrap();
         assert_eq!(ticket.key.message_id, 10);
@@ -1973,7 +1984,7 @@ mod tests {
         let clock = Arc::new(ManualClock::new());
         let (handle, _events) = start_generation(transport, clock.clone(), config());
         let ticket = handle
-            .submit_bootstrap(session_setup_operation(false), 1, None)
+            .submit_operation(session_setup_operation(false), 1, None)
             .await
             .unwrap();
         let key = ticket.key;
@@ -1997,7 +2008,7 @@ mod tests {
         let (handle, mut events) = start_generation(transport, clock.clone(), config());
         let deadline = clock.now().saturating_add(Duration::from_secs(1));
         let ticket = handle
-            .submit_bootstrap(session_setup_operation(false), 1, Some(deadline))
+            .submit_operation(session_setup_operation(false), 1, Some(deadline))
             .await
             .unwrap();
         let key = ticket.key;
@@ -2026,7 +2037,7 @@ mod tests {
         let clock = Arc::new(ManualClock::new());
         let (handle, mut events) = start_generation(transport, clock.clone(), config());
         let key = handle
-            .submit_bootstrap_detached(session_setup_operation(true), 1, None)
+            .submit_operation_detached(session_setup_operation(true), 1, None)
             .await
             .unwrap();
         loop {
@@ -2034,11 +2045,11 @@ mod tests {
                 break;
             }
         }
-        let result = handle.await_bootstrap(key).await.unwrap();
+        let result = handle.await_operation(key).await.unwrap();
         assert_eq!(result.key, key);
         assert!(result.request_raw.is_some());
         assert!(matches!(
-            handle.await_bootstrap(key).await,
+            handle.await_operation(key).await,
             Err(RuntimeError::UnknownRequest(found)) if found == key
         ));
         let report = handle
@@ -2057,7 +2068,7 @@ mod tests {
         runtime_config.admission_limits.max_operations = 1;
         let (handle, mut events) = start_generation(transport, clock.clone(), runtime_config);
         let first = handle
-            .submit_bootstrap_detached(session_setup_operation(false), 1, None)
+            .submit_operation_detached(session_setup_operation(false), 1, None)
             .await
             .unwrap();
         loop {
@@ -2067,13 +2078,13 @@ mod tests {
         }
         assert!(matches!(
             handle
-                .submit_bootstrap_detached(session_setup_operation(false), 1, None)
+                .submit_operation_detached(session_setup_operation(false), 1, None)
                 .await,
             Err(RuntimeError::Admission(AdmissionError::OperationsExhausted))
         ));
-        handle.await_bootstrap(first).await.unwrap();
+        handle.await_operation(first).await.unwrap();
         let second = handle
-            .submit_bootstrap_detached(session_setup_operation(false), 1, None)
+            .submit_operation_detached(session_setup_operation(false), 1, None)
             .await
             .unwrap();
         assert_eq!(second.message_id, 11);
