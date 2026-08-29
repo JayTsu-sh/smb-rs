@@ -9,6 +9,12 @@ pub enum TransportError {
     InvalidMessage,
     #[error("transport frame length {announced} exceeds hard maximum {maximum}")]
     FrameTooLarge { announced: usize, maximum: usize },
+    #[error("outbound segment count {actual} exceeds transport maximum {maximum}")]
+    SegmentLimitExceeded { actual: usize, maximum: usize },
+    #[error("send cursor advance {requested} exceeds remaining {remaining}")]
+    CursorAdvanceOutOfBounds { requested: usize, remaining: usize },
+    #[error("transport vectored write returned zero before frame completion")]
+    WriteZero,
     #[error("Failed to parse transport message {0}")]
     ParseError(#[from] binrw::Error),
     #[error("Not connected")]

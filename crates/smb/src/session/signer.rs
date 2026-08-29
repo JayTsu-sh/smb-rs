@@ -47,15 +47,36 @@ impl MessageSigner {
         Ok(())
     }
 
-    /// Sign one contiguous compound member inside a shared metadata arena.
-    /// Only that member slice is traversed and only its header is patched.
-    pub fn sign_member(&mut self, header: &mut Header, member: &mut [u8]) -> crate::Result<()> {
-        header.signature = self._calculate_signature_bytes(header, member)?;
-        let header_bytes = member.get_mut(..Header::STRUCT_SIZE).ok_or_else(|| {
-            Error::InvalidMessage("Compound member is shorter than the SMB2 header".to_string())
+    /// Calculate an outgoing signature directly over immutable sealed chunks.
+    /// The first chunk must begin with the SMB2 header.
+    pub(crate) fn signature_for_segments<'a>(
+        &mut self,
+        header: &mut Header,
+        segments: impl IntoIterator<Item = &'a [u8]>,
+    ) -> crate::Result<u128> {
+        let mut segments = segments.into_iter();
+        let first = segments.next().ok_or_else(|| {
+            Error::InvalidMessage("Signed message has no metadata segment".to_string())
         })?;
-        header.write(&mut Cursor::new(header_bytes))?;
-        Ok(())
+        if first.len() < Header::STRUCT_SIZE {
+            return Err(Error::InvalidMessage(
+                "Signed message is shorter than the SMB2 header".to_string(),
+            ));
+        }
+
+        let signature_backup = header.signature;
+        header.signature = 0;
+        let mut header_bytes = Cursor::new([0; Header::STRUCT_SIZE]);
+        header.write(&mut header_bytes)?;
+        header.signature = signature_backup;
+
+        self.signing_algo.start(header);
+        self.signing_algo.update(&header_bytes.into_inner());
+        self.signing_algo.update(&first[Header::STRUCT_SIZE..]);
+        for segment in segments {
+            self.signing_algo.update(segment);
+        }
+        Ok(self.signing_algo.finalize())
     }
 
     /// Calculate signature from contiguous bytes (for incoming verification).
@@ -164,12 +185,20 @@ mod tests {
             make_signing_algo(SigningAlgorithmId::AesGmac, &TEST_SIGNING_KEY)
                 .expect("algo creation failed"),
         );
-        let mut combined = header_data;
+        let mut combined = header_data.clone();
         combined.extend_from_slice(&next_data);
         let signature2 = signer2
             ._calculate_signature_bytes(&mut header, &combined)
             .expect("bytes signature failed");
+        let mut signer3 = MessageSigner::new(
+            make_signing_algo(SigningAlgorithmId::AesGmac, &TEST_SIGNING_KEY)
+                .expect("algo creation failed"),
+        );
+        let signature3 = signer3
+            .signature_for_segments(&mut header, [header_data.as_slice(), next_data.as_slice()])
+            .expect("segmented signature failed");
         assert_eq!(signature, 0x28ebd443faf95c8aab512f813c4b2376);
         assert_eq!(signature2, signature);
+        assert_eq!(signature3, signature);
     }
 }

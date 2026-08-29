@@ -23,6 +23,7 @@ async fn bytes_write_seals_without_payload_copy_or_payload_sized_allocation() {
         let mut builder = WireBuilder::encode(std::iter::once(&mut request), 2).unwrap();
         builder.attach_payload(payload).unwrap();
         builder.finalize_offsets().unwrap();
+        builder.finish_unsigned().unwrap();
         builder.seal().unwrap()
     })
     .await;
@@ -51,6 +52,7 @@ async fn slice_write_records_its_only_payload_copy_at_the_api_boundary() {
         let mut builder = WireBuilder::encode(std::iter::once(&mut request), 2).unwrap();
         builder.attach_payload(payload).unwrap();
         builder.finalize_offsets().unwrap();
+        builder.finish_unsigned().unwrap();
         builder.seal().unwrap()
     })
     .await;

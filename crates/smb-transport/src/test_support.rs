@@ -1,7 +1,8 @@
 //! Deterministic transport Adapter for protocol and lifecycle tests.
 
 use crate::error::{Result, TransportError};
-use crate::{SmbTransport, SmbTransportRead, SmbTransportWrite};
+use crate::iovec::SendCursor;
+use crate::{SendFrame, SmbTransport, SmbTransportRead, SmbTransportWrite};
 use bytes::{Buf, Bytes, BytesMut};
 use futures_core::future::BoxFuture;
 use futures_util::FutureExt;
@@ -103,6 +104,26 @@ impl ScriptedTransportControl {
                 return self.client_frame_count() >= minimum;
             }
         }
+    }
+
+    /// Deterministically drive the production send cursor with writes no
+    /// larger than `maximum_write`, capturing the resulting framed message.
+    pub fn capture_send_frame(&self, frame: &SendFrame, maximum_write: usize) -> Result<()> {
+        if maximum_write == 0 {
+            return Err(TransportError::WriteZero);
+        }
+        let mut writer = ScriptedWrite::new(self.clone());
+        let mut cursor = SendCursor::new(frame)?;
+        while cursor.has_remaining() {
+            let chunk = cursor.chunk();
+            let written = chunk.len().min(maximum_write);
+            if written == 0 {
+                return Err(TransportError::WriteZero);
+            }
+            writer.feed(&chunk[..written])?;
+            cursor.try_advance(written)?;
+        }
+        Ok(())
     }
 
     fn take_read_fault(&self) -> Option<ErrorKind> {
@@ -244,7 +265,7 @@ struct ScriptedWrite {
 }
 
 enum WritePhase {
-    Header,
+    Header { bytes: [u8; 4], filled: usize },
     Body(usize),
 }
 
@@ -252,30 +273,40 @@ impl ScriptedWrite {
     fn new(control: ScriptedTransportControl) -> Self {
         Self {
             control,
-            phase: WritePhase::Header,
+            phase: WritePhase::Header {
+                bytes: [0; 4],
+                filled: 0,
+            },
             body: Vec::new(),
         }
     }
 
     fn feed(&mut self, mut bytes: &[u8]) -> Result<()> {
         while !bytes.is_empty() {
-            match self.phase {
-                WritePhase::Header => {
-                    if bytes.len() < 4 {
-                        return Err(TransportError::InvalidMessage);
+            let mut transition = None;
+            match &mut self.phase {
+                WritePhase::Header {
+                    bytes: header,
+                    filled,
+                } => {
+                    let count = (4 - *filled).min(bytes.len());
+                    header[*filled..*filled + count].copy_from_slice(&bytes[..count]);
+                    *filled += count;
+                    bytes = &bytes[count..];
+                    if *filled < 4 {
+                        continue;
                     }
-                    let length = u32::from_be_bytes(bytes[..4].try_into().expect("four bytes"));
+                    let length = u32::from_be_bytes(*header);
                     self.body.clear();
                     self.body.reserve(length as usize);
-                    self.phase = WritePhase::Body(length as usize);
-                    bytes = &bytes[4..];
+                    transition = Some(WritePhase::Body(length as usize));
                 }
                 WritePhase::Body(remaining) => {
-                    let count = remaining.min(bytes.len());
+                    let count = (*remaining).min(bytes.len());
                     self.body.extend_from_slice(&bytes[..count]);
                     bytes = &bytes[count..];
-                    let remaining = remaining - count;
-                    if remaining == 0 {
+                    *remaining -= count;
+                    if *remaining == 0 {
                         self.control
                             .inner
                             .client_frames
@@ -283,11 +314,15 @@ impl ScriptedWrite {
                             .expect("scripted transport client frames poisoned")
                             .push(Bytes::from(std::mem::take(&mut self.body)));
                         self.control.inner.frame_captured.notify_waiters();
-                        self.phase = WritePhase::Header;
-                    } else {
-                        self.phase = WritePhase::Body(remaining);
+                        transition = Some(WritePhase::Header {
+                            bytes: [0; 4],
+                            filled: 0,
+                        });
                     }
                 }
+            }
+            if let Some(next) = transition {
+                self.phase = next;
             }
         }
         Ok(())

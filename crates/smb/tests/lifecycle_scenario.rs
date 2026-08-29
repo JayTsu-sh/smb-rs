@@ -6,7 +6,7 @@ use smb::test_support::{
     Clock, LifecycleScenario, ScenarioError, ScenarioEvent, ScenarioTaskError,
     ScriptedTransportControl, TerminalOutcome, TerminalProbe,
 };
-use smb::transport::{IoVec, SmbTransport};
+use smb::transport::{IoVec, SendFrame, SmbTransport};
 use std::io::ErrorKind;
 use std::task::Poll;
 use std::time::Duration;
@@ -25,10 +25,8 @@ async fn scenario_combines_scripted_transport_manual_time_and_owned_tasks() {
             if received.as_bytes() != &Bytes::from_static(b"server") {
                 return Err(ScenarioTaskError::failed("unexpected-frame"));
             }
-            write
-                .send(&IoVec::from(b"client".to_vec()))
-                .await
-                .map_err(ScenarioTaskError::from)?;
+            let frame = SendFrame::from_iovec(IoVec::from(b"client".to_vec()))?;
+            write.send(&frame).await.map_err(ScenarioTaskError::from)?;
             Ok(())
         })
         .expect("task name is unique");
@@ -145,10 +143,9 @@ async fn transport_faults_support_partial_write_and_close_scenarios() {
     let (mut read, mut write) = transport.split().expect("transport splits");
 
     let read_error = read.receive().await.expect_err("close-like read fault");
-    let write_error = write
-        .send(&IoVec::from(vec![b"header".to_vec(), b"payload".to_vec()]))
-        .await
-        .expect_err("body send_raw fault");
+    let frame = SendFrame::from_iovec(IoVec::from(vec![b"header".to_vec(), b"payload".to_vec()]))
+        .expect("valid frame");
+    let write_error = write.send(&frame).await.expect_err("body send_raw fault");
 
     assert!(matches!(
         read_error,
@@ -170,7 +167,8 @@ async fn cancellation_before_send_leaves_no_client_frame() {
     let (_, mut write) = transport.split().expect("transport splits");
     scenario
         .spawn("cancel-before-send", move |cancel| async move {
-            let payload = IoVec::from(b"must-not-send".to_vec());
+            let payload =
+                SendFrame::from_iovec(IoVec::from(b"must-not-send".to_vec())).expect("valid frame");
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => Err(ScenarioTaskError::cancelled()),

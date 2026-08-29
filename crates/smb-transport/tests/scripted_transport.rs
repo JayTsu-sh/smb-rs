@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use smb_transport::test_support::ScriptedTransport;
-use smb_transport::{IoVec, SmbTransport};
+use smb_transport::{IoVec, SendFrame, SmbTransport};
 use std::io::ErrorKind;
 use std::time::Duration;
 
@@ -95,12 +95,11 @@ async fn scheduled_write_fault_keeps_frames_captured_before_the_fault() {
     control.fail_write_on(3, ErrorKind::BrokenPipe);
     let (_, mut write) = transport.split().expect("scripted transport splits");
 
-    write
-        .send(&IoVec::from(b"first".to_vec()))
-        .await
-        .expect("first frame succeeds");
+    let first = SendFrame::from_iovec(IoVec::from(b"first".to_vec())).unwrap();
+    write.send(&first).await.expect("first frame succeeds");
+    let second = SendFrame::from_iovec(IoVec::from(b"second".to_vec())).unwrap();
     let error = write
-        .send(&IoVec::from(b"second".to_vec()))
+        .send(&second)
         .await
         .expect_err("third send_raw operation must fail");
 
@@ -122,6 +121,7 @@ async fn scatter_gather_write_is_captured_as_one_frame_without_polling() {
     payload.add_bytes(Bytes::from_static(b"shared-"));
     payload.add_owned(b"owned".to_vec());
 
+    let payload = SendFrame::from_iovec(payload).unwrap();
     write.send(&payload).await.expect("scatter write succeeds");
     assert!(
         control
@@ -132,4 +132,33 @@ async fn scatter_gather_write_is_captured_as_one_frame_without_polling() {
         control.captured_client_frames(),
         vec![Bytes::from_static(b"shared-owned")]
     );
+}
+
+#[test]
+fn production_cursor_survives_every_scripted_short_write_size() {
+    for maximum_write in 1..=15 {
+        let (_transport, control) = ScriptedTransport::new();
+        let frame = SendFrame::from_segments(
+            vec![
+                Bytes::from_static(b"meta"),
+                Bytes::new(),
+                Bytes::from_static(b"payload"),
+            ],
+            3,
+        )
+        .unwrap();
+        control.capture_send_frame(&frame, maximum_write).unwrap();
+        assert_eq!(
+            control.captured_client_frames(),
+            vec![Bytes::from_static(b"metapayload")],
+            "maximum_write={maximum_write}",
+        );
+    }
+
+    let (_transport, control) = ScriptedTransport::new();
+    let frame = SendFrame::from_segments(vec![Bytes::from_static(b"x")], 1).unwrap();
+    assert!(matches!(
+        control.capture_send_frame(&frame, 0),
+        Err(smb_transport::TransportError::WriteZero)
+    ));
 }

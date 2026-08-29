@@ -1,8 +1,8 @@
 use crate::connection::transformer::Transformer;
 use crate::connection::worker::Worker;
 use crate::msg_handler::ReceiveOptions;
-use smb_transport::TransportFrame;
 use smb_msg::ResponseContent;
+use smb_transport::TransportFrame;
 use smb_transport::{IoVec, SmbTransport, SmbTransportWrite, TransportError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -267,7 +267,8 @@ where
                 }
             }
         };
-        wtransport.send(&message).await?;
+        let frame = smb_transport::SendFrame::from_iovec(message)?;
+        wtransport.send(&frame).await?;
 
         Ok(())
     }

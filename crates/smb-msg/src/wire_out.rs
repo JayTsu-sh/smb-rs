@@ -10,6 +10,7 @@ use crate::{Header, PlainRequest, Result, SmbMsgError};
 enum BuildState {
     Encoded,
     OffsetsFinalized,
+    Protected,
 }
 
 /// Mutable codec-owned construction state for one SMB wire message.
@@ -19,6 +20,7 @@ pub struct WireBuilder {
     member_ranges: Vec<Range<usize>>,
     segment_limit: usize,
     state: BuildState,
+    patched_members: usize,
 }
 
 impl WireBuilder {
@@ -76,6 +78,7 @@ impl WireBuilder {
             member_ranges,
             segment_limit,
             state: BuildState::Encoded,
+            patched_members: 0,
         })
     }
 
@@ -100,8 +103,66 @@ impl WireBuilder {
         Ok(())
     }
 
-    pub fn seal(self) -> Result<WireMessage> {
+    /// Ordered chunks covered by one SMB signature. A single request includes
+    /// its metadata followed by payload segments; compound members are limited
+    /// to their validated padded metadata range.
+    pub fn signing_segments(&self, member: usize) -> Result<impl Iterator<Item = &[u8]>> {
         self.require_state(BuildState::OffsetsFinalized)?;
+        let range = self.builder_member_range(member)?;
+        let metadata = self
+            .metadata
+            .get(range)
+            .ok_or_else(|| invalid("signature member range escaped metadata"))?;
+        let payloads = if self.member_count() == 1 {
+            self.payloads.as_slice()
+        } else {
+            &[]
+        };
+        Ok(std::iter::once(metadata).chain(payloads.iter().map(Bytes::as_ref)))
+    }
+
+    /// Patch exactly the 16-byte SMB2 header signature field. Members must be
+    /// patched in wire order, preventing duplicate or skipped signatures.
+    pub fn patch_signature(&mut self, member: usize, signature: u128) -> Result<()> {
+        self.require_state(BuildState::OffsetsFinalized)?;
+        if member != self.patched_members {
+            return Err(invalid("signature patches must follow member order"));
+        }
+        let range = self.builder_member_range(member)?;
+        let start = range
+            .start
+            .checked_add(48)
+            .ok_or_else(|| invalid("signature range overflow"))?;
+        let end = start + 16;
+        let target = self
+            .metadata
+            .get_mut(start..end)
+            .ok_or_else(|| invalid("signature range escaped metadata"))?;
+        target.copy_from_slice(&signature.to_le_bytes());
+        self.patched_members += 1;
+        Ok(())
+    }
+
+    pub fn finish_signed(&mut self) -> Result<()> {
+        self.require_state(BuildState::OffsetsFinalized)?;
+        if self.patched_members != self.member_count() {
+            return Err(invalid("not every wire member has a signature"));
+        }
+        self.state = BuildState::Protected;
+        Ok(())
+    }
+
+    pub fn finish_unsigned(&mut self) -> Result<()> {
+        self.require_state(BuildState::OffsetsFinalized)?;
+        if self.patched_members != 0 {
+            return Err(invalid("partially signed message cannot become unsigned"));
+        }
+        self.state = BuildState::Protected;
+        Ok(())
+    }
+
+    pub fn seal(self) -> Result<WireMessage> {
+        self.require_state(BuildState::Protected)?;
         let total_len = self
             .payloads
             .iter()
@@ -122,6 +183,25 @@ impl WireBuilder {
             Ok(())
         } else {
             Err(invalid("invalid wire builder state transition"))
+        }
+    }
+
+    fn member_count(&self) -> usize {
+        self.member_ranges.len().max(1)
+    }
+
+    fn builder_member_range(&self, index: usize) -> Result<Range<usize>> {
+        if self.member_ranges.is_empty() {
+            if index == 0 {
+                Ok(0..self.metadata.len())
+            } else {
+                Err(invalid("wire member index out of bounds"))
+            }
+        } else {
+            self.member_ranges
+                .get(index)
+                .cloned()
+                .ok_or_else(|| invalid("wire member index out of bounds"))
         }
     }
 }
@@ -267,6 +347,7 @@ mod tests {
         let mut builder = WireBuilder::encode(&mut requests, 2).unwrap();
         builder.attach_payload(payload).unwrap();
         builder.finalize_offsets().unwrap();
+        builder.finish_unsigned().unwrap();
         let message = builder.seal().unwrap();
         assert_eq!(message.segment_count(), 2);
         assert_eq!(message.segments().nth(1).unwrap().as_ptr(), pointer);
@@ -286,6 +367,7 @@ mod tests {
         let mut builder = WireBuilder::encode(std::iter::once(&mut request), 2).unwrap();
         builder.attach_payload(payload).unwrap();
         builder.finalize_offsets().unwrap();
+        builder.finish_unsigned().unwrap();
         let actual = builder
             .seal()
             .unwrap()
@@ -302,6 +384,7 @@ mod tests {
         requests[0].header.command = Command::Write;
         let mut builder = WireBuilder::encode(&mut requests, 1).unwrap();
         builder.finalize_offsets().unwrap();
+        builder.finish_unsigned().unwrap();
         let message = builder.seal().unwrap();
         assert_eq!(message.segment_count(), 1);
         assert_eq!(message.member_count(), 2);
@@ -325,11 +408,62 @@ mod tests {
     }
 
     #[test]
+    fn signing_state_rejects_skipped_duplicate_and_partial_protection() {
+        let mut requests = [write_request(1), write_request(2)];
+        let mut builder = WireBuilder::encode(&mut requests, 1).unwrap();
+        builder.finalize_offsets().unwrap();
+
+        assert!(builder.finish_signed().is_err());
+        assert!(builder.patch_signature(1, 1).is_err());
+        builder.patch_signature(0, 1).unwrap();
+        assert!(builder.patch_signature(0, 1).is_err());
+        assert!(builder.finish_unsigned().is_err());
+        assert!(builder.finish_signed().is_err());
+        builder.patch_signature(1, 2).unwrap();
+        builder.finish_signed().unwrap();
+        assert!(builder.signing_segments(0).is_err());
+        assert!(builder.seal().is_ok());
+    }
+
+    #[test]
+    fn signature_patch_changes_only_header_field_and_preserves_payload_owner() {
+        let payload = Bytes::from_static(b"signed-payload");
+        let payload_pointer = payload.as_ptr();
+        let mut requests = [write_request(payload.len() as u32)];
+        let mut builder = WireBuilder::encode(&mut requests, 2).unwrap();
+        builder.attach_payload(payload).unwrap();
+        builder.finalize_offsets().unwrap();
+        let before = builder
+            .signing_segments(0)
+            .unwrap()
+            .next()
+            .unwrap()
+            .to_vec();
+
+        let signature = 0x0011_2233_4455_6677_8899_aabb_ccdd_eeff;
+        builder.patch_signature(0, signature).unwrap();
+        let after = builder
+            .signing_segments(0)
+            .unwrap()
+            .next()
+            .unwrap()
+            .to_vec();
+        assert_eq!(&before[..48], &after[..48]);
+        assert_eq!(&before[64..], &after[64..]);
+        assert_eq!(&after[48..64], &signature.to_le_bytes());
+
+        builder.finish_signed().unwrap();
+        let message = builder.seal().unwrap();
+        assert_eq!(message.segments().nth(1).unwrap().as_ptr(), payload_pointer);
+    }
+
+    #[test]
     fn empty_payload_does_not_consume_a_segment() {
         let mut requests = [write_request(0)];
         let mut builder = WireBuilder::encode(&mut requests, 1).unwrap();
         builder.attach_payload(Bytes::new()).unwrap();
         builder.finalize_offsets().unwrap();
+        builder.finish_unsigned().unwrap();
         assert_eq!(builder.seal().unwrap().segment_count(), 1);
     }
 
@@ -344,6 +478,7 @@ mod tests {
         builder.attach_payload(first).unwrap();
         builder.attach_payload(second).unwrap();
         builder.finalize_offsets().unwrap();
+        builder.finish_unsigned().unwrap();
         let message = builder.seal().unwrap();
         let segments = message.segments().collect::<Vec<_>>();
         assert_eq!(segments[1].as_ptr(), first_pointer);

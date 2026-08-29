@@ -151,23 +151,36 @@ impl SmbTransportWrite for TcpTransport {
 
     /// Override send for TCP async: use `write_all_buf` with vectored I/O support.
     /// This sends header + all IoVec buffers using minimal syscalls via `Buf::chunks_vectored`.
-    fn send<'a>(&'a mut self, data: &'a crate::IoVec) -> BoxFuture<'a, Result<()>> {
-        use crate::iovec::HeaderAndIoVec;
+    fn send<'a>(&'a mut self, data: &'a crate::SendFrame) -> BoxFuture<'a, Result<()>> {
+        use crate::iovec::SendCursor;
+        use bytes::Buf;
         use tokio::io::AsyncWriteExt;
 
         async {
-            let header = crate::SmbTcpMessageHeader {
-                stream_protocol_length: data.total_size() as u32,
-            };
-            let mut header_buf = [0u8; crate::SmbTcpMessageHeader::SIZE];
-            header.write(&mut std::io::Cursor::new(header_buf.as_mut_slice()))?;
-
-            let mut buf = HeaderAndIoVec::new(&header_buf, data);
+            const MAX_VECTORED_SEGMENTS: usize = 63;
+            if data.segments().len() > MAX_VECTORED_SEGMENTS {
+                return Err(TransportError::SegmentLimitExceeded {
+                    actual: data.segments().len(),
+                    maximum: MAX_VECTORED_SEGMENTS,
+                });
+            }
+            let mut buf = SendCursor::new(data)?;
             let writer = self.writer.as_mut().ok_or(TransportError::NotConnected)?;
-            writer
-                .write_all_buf(&mut buf)
-                .await
-                .map_err(Self::map_tcp_error)?;
+            while buf.has_remaining() {
+                let written = {
+                    let mut slices =
+                        std::array::from_fn::<_, 64, _>(|_| std::io::IoSlice::new(&[]));
+                    let count = buf.chunks_vectored(&mut slices);
+                    writer
+                        .write_vectored(&slices[..count])
+                        .await
+                        .map_err(Self::map_tcp_error)?
+                };
+                if written == 0 {
+                    return Err(TransportError::WriteZero);
+                }
+                buf.try_advance(written)?;
+            }
 
             Ok(())
         }

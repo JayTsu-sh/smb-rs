@@ -210,7 +210,8 @@ impl Connection {
             tracing::debug!("Negotiating multi-protocol: Sending SMB1");
             // 1. Send SMB1 negotiate request
             let msg_bytes: Vec<u8> = SMB1NegotiateMessage::default().try_into()?;
-            transport.send(&IoVec::from(msg_bytes)).await?;
+            let frame = smb_transport::SendFrame::from_iovec(IoVec::from(msg_bytes))?;
+            transport.send(&frame).await?;
 
             tracing::debug!("Sent SMB1 negotiate request, Receieving SMB2 response");
             // 2. Expect SMB2 negotiate response

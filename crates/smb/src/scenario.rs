@@ -111,6 +111,11 @@ impl From<smb_transport::TransportError> for ScenarioTaskError {
             smb_transport::TransportError::AlreadyConnected => "transport-already-connected",
             smb_transport::TransportError::InvalidMessage => "transport-invalid-message",
             smb_transport::TransportError::FrameTooLarge { .. } => "transport-frame-too-large",
+            smb_transport::TransportError::SegmentLimitExceeded { .. } => "transport-segment-limit",
+            smb_transport::TransportError::CursorAdvanceOutOfBounds { .. } => {
+                "transport-cursor-bounds"
+            }
+            smb_transport::TransportError::WriteZero => "transport-write-zero",
             smb_transport::TransportError::ParseError(_) => "transport-parse",
             smb_transport::TransportError::NotConnected => "transport-not-connected",
             smb_transport::TransportError::AlreadySplit => "transport-already-split",

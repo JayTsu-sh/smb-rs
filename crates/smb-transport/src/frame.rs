@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use crate::{TransportError, error::Result};
+use crate::{IoVec, TransportError, error::Result};
 
 /// Default hard ceiling for one direct-TCP SMB payload (the framing field is
 /// 24 bits wide). The length is checked before allocating the receive arena.
@@ -38,6 +38,58 @@ impl TransportFrame {
     }
 }
 
+/// Immutable outbound segments accepted by transport. Conversion from the
+/// W2 compatibility `IoVec` consumes every owner; shared payload pointers are
+/// preserved and owned metadata is frozen without another copy.
+#[derive(Clone, Debug)]
+pub struct SendFrame {
+    segments: Vec<Bytes>,
+    total_len: usize,
+}
+
+impl SendFrame {
+    pub fn from_iovec(iovec: IoVec) -> Result<Self> {
+        Self::from_segments(iovec.into_bytes(), usize::MAX)
+    }
+
+    pub fn from_segments(segments: Vec<Bytes>, maximum_segments: usize) -> Result<Self> {
+        if segments.is_empty() {
+            return Err(TransportError::InvalidMessage);
+        }
+        if segments.len() > maximum_segments {
+            return Err(TransportError::SegmentLimitExceeded {
+                actual: segments.len(),
+                maximum: maximum_segments,
+            });
+        }
+        let total_len = segments
+            .iter()
+            .try_fold(0_usize, |total, segment| total.checked_add(segment.len()));
+        let total_len = total_len.ok_or(TransportError::InvalidMessage)?;
+        if total_len == 0 {
+            return Err(TransportError::InvalidMessage);
+        }
+        if total_len > u32::MAX as usize {
+            return Err(TransportError::FrameTooLarge {
+                announced: total_len,
+                maximum: u32::MAX as usize,
+            });
+        }
+        Ok(Self {
+            segments,
+            total_len,
+        })
+    }
+
+    pub fn total_len(&self) -> usize {
+        self.total_len
+    }
+
+    pub fn segments(&self) -> &[Bytes] {
+        &self.segments
+    }
+}
+
 impl AsRef<[u8]> for TransportFrame {
     fn as_ref(&self) -> &[u8] {
         self.0.as_ref()
@@ -60,6 +112,21 @@ mod tests {
             Err(TransportError::FrameTooLarge {
                 announced: 5,
                 maximum: 4
+            })
+        ));
+    }
+
+    #[test]
+    fn outbound_frame_rejects_empty_and_segment_overflow() {
+        assert!(matches!(
+            SendFrame::from_segments(vec![Bytes::new()], 1),
+            Err(TransportError::InvalidMessage)
+        ));
+        assert!(matches!(
+            SendFrame::from_segments(vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")], 1),
+            Err(TransportError::SegmentLimitExceeded {
+                actual: 2,
+                maximum: 1
             })
         ));
     }

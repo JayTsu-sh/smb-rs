@@ -367,17 +367,6 @@ impl Transformer {
 
         let mut builder = WireBuilder::encode(msgs.iter_mut().map(|msg| &mut msg.message), 1)?;
         builder.finalize_offsets()?;
-        let wire = builder.seal()?;
-        let member_ranges = (0..wire.member_count())
-            .map(|index| {
-                wire.member_range(index).ok_or_else(|| {
-                    crate::Error::InvalidState("missing compound member range".to_string())
-                })
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
-        let (metadata, payloads) = wire.into_parts();
-        debug_assert!(payloads.is_empty());
-        let mut metadata = metadata.to_vec();
 
         // 4. Sign each member if signing is requested (per-member, over
         //    that member's padded bytes). We snapshot the signer once
@@ -416,21 +405,29 @@ impl Transformer {
                     msg_id: None,
                 }))?;
 
-            for (i, range) in member_ranges.iter().enumerate() {
+            for (i, msg) in msgs.iter_mut().enumerate() {
                 let mut signer = signer.clone();
-                let member = metadata.get_mut(range.clone()).ok_or_else(|| {
-                    crate::Error::InvalidState("compound member range escaped arena".to_string())
-                })?;
-                signer.sign_member(&mut msgs[i].message.header, member)?;
+                let signature = signer.signature_for_segments(
+                    &mut msg.message.header,
+                    builder.signing_segments(i)?,
+                )?;
+                msg.message.header.signature = signature;
+                builder.patch_signature(i, signature)?;
                 tracing::trace!(
                     "Compound member {i} (msg_id {}) signed (signature={}).",
-                    msgs[i].message.header.message_id,
-                    msgs[i].message.header.signature,
+                    msg.message.header.message_id,
+                    msg.message.header.signature,
                 );
             }
+            builder.finish_signed()?;
+        } else {
+            builder.finish_unsigned()?;
         }
 
-        Ok(IoVec::from(metadata))
+        let wire = builder.seal()?;
+        let (metadata, payloads) = wire.into_parts();
+        debug_assert!(payloads.is_empty());
+        Ok(IoVec::from(smb_transport::IoVecBuf::from(metadata)))
     }
 
     /// Transforms an outgoing message to a raw SMB message.
@@ -456,16 +453,6 @@ impl Transformer {
             builder.attach_payload(data)?;
         }
         builder.finalize_offsets()?;
-        let wire = builder.seal()?;
-        let (metadata, payloads) = wire.into_parts();
-
-        // Stateless W2 compatibility adapter. Metadata becomes mutable for
-        // the legacy signer; immutable payload segments retain their owner and
-        // pointer. W2-3 removes this metadata thaw.
-        let mut outgoing_data = IoVec::from(metadata.to_vec());
-        for payload in payloads {
-            outgoing_data.add_bytes(payload);
-        }
 
         // Per MS-SMB2 §3.1.4.2, Negotiate Requests and *all*
         // SessionSetup Requests participate in the connection-level
@@ -478,7 +465,7 @@ impl Transformer {
             && !(msg.message.header.command == Command::SessionSetup
                 && msg.message.header.flags.signed())
         {
-            if let Some(plain) = outgoing_data.first() {
+            if let Some(plain) = builder.signing_segments(0)?.next() {
                 let mut hash = self.preauth_hash.lock().await;
                 // Clone-then-replace: if `next` errors we want to keep
                 // the previous hash state intact, not corrupt it to a
@@ -488,13 +475,13 @@ impl Transformer {
         }
 
         // 1. Sign
+        let mut setup_session_key = None;
         if should_sign {
             debug_assert!(
                 !should_encrypt,
                 "Should not sign and encrypt at the same time!"
             );
 
-            let mut setup_session_key = None;
             let mut signer =
                 if let Some(Protection::SnapshotKdfSign { session_key }) = msg.security.take() {
                     setup_session_key = Some(session_key);
@@ -516,26 +503,39 @@ impl Transformer {
                         }))?
                 };
 
-            signer.sign_message(&mut msg.message.header, &mut outgoing_data)?;
-
-            if let Some(session_key) = setup_session_key {
-                if let Some(signed_request) = outgoing_data.first() {
-                    let mut hash = self.preauth_hash.lock().await;
-                    *hash = hash.clone().next(signed_request)?;
-                }
-                let response_signer = self.derive_setup_phase_signer(&session_key).await?;
-                self.setup_signers
-                    .lock()
-                    .await
-                    .insert(session_id, response_signer);
-            }
+            let signature = signer
+                .signature_for_segments(&mut msg.message.header, builder.signing_segments(0)?)?;
+            msg.message.header.signature = signature;
+            builder.patch_signature(0, signature)?;
+            builder.finish_signed()?;
 
             tracing::debug!(
                 "Message #{} signed (signature={}).",
                 msg.message.header.message_id,
                 msg.message.header.signature
             );
-        };
+        } else {
+            builder.finish_unsigned()?;
+        }
+
+        let wire = builder.seal()?;
+        let (metadata, payloads) = wire.into_parts();
+        let mut outgoing_data = IoVec::from(smb_transport::IoVecBuf::from(metadata));
+        for payload in payloads {
+            outgoing_data.add_bytes(payload);
+        }
+
+        if let Some(session_key) = setup_session_key {
+            if let Some(signed_request) = outgoing_data.first() {
+                let mut hash = self.preauth_hash.lock().await;
+                *hash = hash.clone().next(signed_request)?;
+            }
+            let response_signer = self.derive_setup_phase_signer(&session_key).await?;
+            self.setup_signers
+                .lock()
+                .await
+                .insert(session_id, response_signer);
+        }
 
         // 2. Compress
         const COMPRESSION_THRESHOLD: usize = 1024;
@@ -963,13 +963,7 @@ mod wire_builder_tests {
         let payload = Bytes::from_static(b"identity-preserved");
         let pointer = payload.as_ptr();
         let outgoing = OutgoingMessage::new(
-            WriteRequest::new(
-                0,
-                FileId::EMPTY,
-                WriteFlags::new(),
-                payload.len() as u32,
-            )
-            .into(),
+            WriteRequest::new(0, FileId::EMPTY, WriteFlags::new(), payload.len() as u32).into(),
         )
         .with_additional_data(payload);
 

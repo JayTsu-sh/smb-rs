@@ -5,7 +5,7 @@ use futures_util::FutureExt;
 use std::{io::Cursor, net::SocketAddr};
 
 use crate::{
-    DEFAULT_MAX_FRAME_SIZE, IoVec, SmbTcpMessageHeader, TransportError, TransportFrame,
+    DEFAULT_MAX_FRAME_SIZE, SendFrame, SmbTcpMessageHeader, TransportError, TransportFrame,
     error::Result,
 };
 
@@ -31,17 +31,17 @@ pub trait SmbTransport: Send + SmbTransportRead + SmbTransportWrite {
 pub trait SmbTransportWrite: Send {
     fn send_raw<'a>(&'a mut self, buf: &'a [u8]) -> BoxFuture<'a, Result<()>>;
 
-    fn send<'a>(&'a mut self, data: &'a IoVec) -> BoxFuture<'a, Result<()>> {
+    fn send<'a>(&'a mut self, data: &'a SendFrame) -> BoxFuture<'a, Result<()>> {
         async {
             // Transport Header (stack-allocated, no heap allocation for 4 bytes)
             let header = SmbTcpMessageHeader {
-                stream_protocol_length: data.total_size() as u32,
+                stream_protocol_length: data.total_len() as u32,
             };
             let mut header_buf = [0u8; SmbTcpMessageHeader::SIZE];
             header.write(&mut Cursor::new(header_buf.as_mut_slice()))?;
             self.send_raw(&header_buf).await?;
 
-            for buf in data.iter() {
+            for buf in data.segments() {
                 self.send_raw(buf).await?;
             }
 

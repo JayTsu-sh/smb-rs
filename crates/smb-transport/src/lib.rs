@@ -15,7 +15,7 @@ pub mod test_support;
 
 pub use config::*;
 pub use error::TransportError;
-pub use frame::{DEFAULT_MAX_FRAME_SIZE, TransportFrame};
+pub use frame::{DEFAULT_MAX_FRAME_SIZE, SendFrame, TransportFrame};
 pub use iovec::*;
 
 pub use tcp::{SmbTcpMessageHeader, TcpTransport};
