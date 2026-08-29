@@ -10,6 +10,14 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::{Mutex, MutexGuard, mpsc};
 
+struct QueryCancellation(tokio_util::sync::CancellationToken);
+
+impl Drop for QueryCancellation {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// A directory resource on the server.
 /// This is used to query the directory for its contents,
 /// and may not be created directly -- but via [Resource][super::Resource], opened
@@ -45,6 +53,7 @@ impl Directory {
         pattern: &str,
         restart: bool,
         buffer_size: u32,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> crate::Result<Vec<T>>
     where
         T: QueryDirectoryInfoValue + for<'a> binrw::prelude::BinWrite<Args<'a> = ()>,
@@ -65,7 +74,7 @@ impl Directory {
 
         let response = self
             .handle
-            .send_receive(
+            .execute_content(
                 QueryDirectoryRequest {
                     file_information_class: T::CLASS_ID,
                     flags: QueryDirectoryFlags::new().with_restart_scans(restart),
@@ -75,6 +84,7 @@ impl Directory {
                     file_name: pattern.into(),
                 }
                 .into(),
+                ResponseOptions::new().with_cancellation_token(cancellation),
             )
             .await;
 
@@ -261,13 +271,7 @@ impl Directory {
                         .await;
                     match result {
                         DirectoryWatchResult::Notifications(items) => {
-                            if !publish_change_batch(
-                                &sender,
-                                items,
-                                &cancel,
-                                EVENT_CAPACITY,
-                            )
-                            .await
+                            if !publish_change_batch(&sender, items, &cancel, EVENT_CAPACITY).await
                             {
                                 return;
                             }
@@ -531,6 +535,13 @@ mod watch_stream_tests {
         drop(stream);
         assert!(cancel.is_cancelled());
     }
+
+    #[test]
+    fn dropping_query_lifetime_cancels_an_inflight_page() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        drop(QueryCancellation(cancel.clone()));
+        assert!(cancel.is_cancelled());
+    }
 }
 
 /// Single result from a directory watch operation.
@@ -605,6 +616,7 @@ pub mod iter_stream {
         /// to prevent multiple queries at the same time.
         /// See [Directory::query] for more information.
         _lock_guard: MutexGuard<'a, ()>,
+        _cancellation: QueryCancellation,
     }
 
     impl<'a, T> QueryDirectoryStream<'a, T>
@@ -618,9 +630,11 @@ pub mod iter_stream {
         ) -> crate::Result<Self> {
             let (sender, receiver) = tokio::sync::mpsc::channel(1024);
             let notify_fetch_next = Arc::new(tokio::sync::Notify::new());
+            let cancellation = tokio_util::sync::CancellationToken::new();
             {
                 let notify_fetch_next = notify_fetch_next.clone();
                 let directory = directory.clone();
+                let cancellation = cancellation.clone();
                 tokio::spawn(async move {
                     Self::fetch_loop(
                         directory,
@@ -628,6 +642,7 @@ pub mod iter_stream {
                         buffer_size,
                         sender,
                         notify_fetch_next.clone(),
+                        cancellation,
                     )
                     .await;
                 });
@@ -637,6 +652,7 @@ pub mod iter_stream {
                 receiver,
                 notify_fetch_next,
                 _lock_guard: guard,
+                _cancellation: QueryCancellation(cancellation),
             })
         }
 
@@ -646,11 +662,12 @@ pub mod iter_stream {
             buffer_size: u32,
             sender: mpsc::Sender<crate::Result<T>>,
             notify_fetch_next: Arc<tokio::sync::Notify>,
+            cancellation: tokio_util::sync::CancellationToken,
         ) {
             let mut is_first = true;
             loop {
                 let result = directory
-                    .send_query::<T>(&pattern, is_first, buffer_size)
+                    .send_query::<T>(&pattern, is_first, buffer_size, cancellation.clone())
                     .await;
                 is_first = false;
 
@@ -698,6 +715,12 @@ pub mod iter_stream {
                 Poll::Ready(None) => Poll::Ready(None), // Stream is closed!
                 Poll::Pending => Poll::Pending,
             }
+        }
+    }
+
+    impl<T> Drop for QueryDirectoryStream<'_, T> {
+        fn drop(&mut self) {
+            self.notify_fetch_next.notify_waiters();
         }
     }
 }
