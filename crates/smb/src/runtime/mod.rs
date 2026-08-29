@@ -21,6 +21,10 @@ mod object_state;
 mod recovery;
 #[allow(dead_code)]
 mod recovery_driver;
+// W4-3 starts with the pure Session reauthentication authority before its
+// async coordinator is connected to generation publication.
+#[allow(dead_code)]
+mod session_recovery;
 #[allow(dead_code)]
 mod reducer;
 #[allow(dead_code)]
