@@ -24,6 +24,23 @@ pub struct OplockBreakMsg {
     file_id: FileId,
 }
 
+impl OplockBreakMsg {
+    pub const fn new(oplock_level: OplockLevel, file_id: FileId) -> Self {
+        Self {
+            oplock_level: oplock_level as u8,
+            file_id,
+        }
+    }
+
+    pub fn oplock_level(&self) -> Result<OplockLevel, binrw::Error> {
+        OplockLevel::read(&mut std::io::Cursor::new([self.oplock_level]))
+    }
+
+    pub const fn file_id(&self) -> FileId {
+        self.file_id
+    }
+}
+
 /// Lease Break Notification message.
 ///
 /// Sent by the server when the underlying object store indicates that a lease is being broken,
@@ -167,5 +184,16 @@ mod tests {
             lease_key: "70c8619e-165d-315e-d492-a01b0cbb3af2".parse().unwrap(),
             lease_state: LeaseState::new(),
         } => "24000000000000009e61c8705d165e31d492a01b0cbb3af2000000000000000000000000"
+    }
+
+    #[test]
+    fn oplock_break_interface_retains_level_and_file_identity() {
+        let file_id = FileId {
+            persistent: 7,
+            volatile: 9,
+        };
+        let message = OplockBreakMsg::new(OplockLevel::II, file_id);
+        assert_eq!(message.oplock_level().unwrap(), OplockLevel::II);
+        assert_eq!(message.file_id(), file_id);
     }
 }
