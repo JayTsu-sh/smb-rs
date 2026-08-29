@@ -202,8 +202,8 @@ impl PipeRpcConnection {
             )
             .await?;
         let content = read_result.message.content.to_read()?;
-        let data_end = content.data_offset + content.data_length;
-        let raw_data = &read_result.raw[content.data_offset..data_end];
+        let data_range = content.data_range(read_result.raw.len())?;
+        let raw_data = &read_result.raw[data_range.as_range()];
         let response = DceRpcCoResponsePkt::try_from(raw_data)?;
 
         if response.packed_drep() != Self::PACKED_DREP {

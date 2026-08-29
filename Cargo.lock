@@ -2666,6 +2666,7 @@ name = "smb-msg"
 version = "0.12.0"
 dependencies = [
  "binrw",
+ "bytes",
  "const_format",
  "modular-bitfield",
  "pastey",

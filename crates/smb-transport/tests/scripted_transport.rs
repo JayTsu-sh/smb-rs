@@ -12,8 +12,28 @@ async fn scripted_server_frame_round_trips_through_transport_interface() {
     let (mut read, _) = transport.split().expect("scripted transport splits");
     let received = read.receive().await.expect("scripted frame is readable");
 
-    assert_eq!(received, Bytes::from_static(b"server-frame"));
+    assert_eq!(received.as_bytes(), &Bytes::from_static(b"server-frame"));
     assert_eq!(control.pending_server_frames(), 0);
+}
+
+#[tokio::test]
+async fn announced_frame_over_limit_is_rejected_before_body_read() {
+    let (transport, control) = ScriptedTransport::new();
+    control.push_server_frame(Bytes::from_static(b"too-large"));
+    let (mut read, _) = transport.split().expect("scripted transport splits");
+
+    let error = read
+        .receive_with_limit(4)
+        .await
+        .expect_err("announced length exceeds cap");
+
+    assert!(matches!(
+        error,
+        smb_transport::TransportError::FrameTooLarge {
+            announced: 9,
+            maximum: 4
+        }
+    ));
 }
 
 #[tokio::test]

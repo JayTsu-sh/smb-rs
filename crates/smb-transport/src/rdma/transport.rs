@@ -612,8 +612,12 @@ impl SmbTransportRead for RdmaTransport {
 
     fn receive<'a>(
         &'a mut self,
-    ) -> futures_core::future::BoxFuture<'a, crate::error::Result<Vec<u8>>> {
-        async { Ok(self._receive_fragmented_data().await?) }.boxed()
+    ) -> futures_core::future::BoxFuture<'a, crate::error::Result<crate::TransportFrame>> {
+        async {
+            let bytes = bytes::Bytes::from(self._receive_fragmented_data().await?);
+            crate::TransportFrame::from_bytes(bytes, crate::DEFAULT_MAX_FRAME_SIZE)
+        }
+        .boxed()
     }
 }
 

@@ -104,16 +104,33 @@ pub struct ReadResponse {
     /// The absolute offset within the raw message where read data begins.
     #[br(calc = _data_offset.value as usize)]
     #[bw(ignore)]
-    pub data_offset: usize,
+    data_offset: usize,
 
     /// The length of the read data in bytes.
     #[br(calc = _data_length as usize)]
     #[bw(ignore)]
-    pub data_length: usize,
+    data_length: usize,
 }
 
 impl ReadResponse {
     pub const STRUCT_SIZE: usize = 17;
+
+    /// Validate the server-controlled data offset and length against the exact
+    /// compound member that owns this response.
+    pub fn data_range(&self, member_len: usize) -> crate::Result<crate::WireRange> {
+        crate::WireRange::validate(
+            "ReadResponse.data",
+            self.data_offset,
+            self.data_length,
+            member_len,
+            Header::STRUCT_SIZE + Self::STRUCT_SIZE - 1,
+            1,
+        )
+    }
+
+    pub fn data_len(&self) -> usize {
+        self.data_length
+    }
 }
 
 /// Flags for read operations.
@@ -234,6 +251,22 @@ pub struct WriteFlags {
 #[cfg(test)]
 mod tests {
     use crate::*;
+
+    #[test]
+    fn read_data_range_is_checked_against_compound_member() {
+        let response = ReadResponse {
+            data_offset: 80,
+            data_length: 16,
+        };
+        assert_eq!(response.data_range(96).unwrap().as_range(), 80..96);
+        assert!(response.data_range(95).is_err());
+
+        let overflow = ReadResponse {
+            data_offset: usize::MAX,
+            data_length: 2,
+        };
+        assert!(overflow.data_range(usize::MAX).is_err());
+    }
 
     use super::*;
 

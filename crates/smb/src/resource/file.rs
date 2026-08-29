@@ -95,14 +95,10 @@ impl File {
 
         // Zero-copy path: extract data directly from raw bytes using offset metadata,
         // avoiding the intermediate Vec<u8> allocation that binrw would otherwise create.
-        let data_end = content.data_offset + content.data_length;
-        if data_end > response.raw.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Read response data extends beyond raw message bounds",
-            ));
-        }
-        let raw_data = &response.raw[content.data_offset..data_end];
+        let data_range = content
+            .data_range(response.raw.len())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let raw_data = &response.raw[data_range.as_range()];
         let actual_read_length = raw_data.len();
 
         tracing::debug!(
@@ -151,16 +147,12 @@ impl File {
             .to_read()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        let data_end = content.data_offset + content.data_length;
-        if data_end > response.raw.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Read response data extends beyond raw message bounds",
-            ));
-        }
+        let data_range = content
+            .data_range(response.raw.len())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        // Zero-copy: slice the Bytes without any memory copy.
-        Ok(response.raw.slice(content.data_offset..data_end))
+        // Zero-copy: slice the immutable frame owner without copying payload.
+        Ok(response.raw.slice(data_range.as_range()))
     }
 
     /// Builds and sends a read request, returning the incoming response message.

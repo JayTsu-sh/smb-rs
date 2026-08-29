@@ -538,8 +538,6 @@ mod tests {
             .content
             .to_read()
             .expect("expected read response");
-        assert_eq!(read_response.data_length, 0x400);
-        // data_offset points to the absolute position within the raw message
-        assert!(read_response.data_offset >= smb_msg::Header::STRUCT_SIZE);
+        assert_eq!(read_response.data_len(), 0x400);
     }
 }

@@ -7,6 +7,8 @@ pub enum TransportError {
     AlreadyConnected,
     #[error("Invalid transport message")]
     InvalidMessage,
+    #[error("transport frame length {announced} exceeds hard maximum {maximum}")]
+    FrameTooLarge { announced: usize, maximum: usize },
     #[error("Failed to parse transport message {0}")]
     ParseError(#[from] binrw::Error),
     #[error("Not connected")]

@@ -1,5 +1,6 @@
 //! Full Request & Response enums, including plain or transformed (encrypted/compressed).
 
+use bytes::Bytes;
 use binrw::prelude::*;
 use smb_msg_derive::*;
 
@@ -25,5 +26,15 @@ impl TryFrom<&[u8]> for Response {
     type Error = binrw::Error;
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         Response::read(&mut std::io::Cursor::new(value))
+    }
+}
+
+#[cfg(feature = "client")]
+impl Response {
+    /// Decode fixed metadata while retaining the exact immutable frame that
+    /// backs all subsequently validated variable-field ranges.
+    pub fn decode_frame(frame: Bytes) -> crate::Result<crate::DecodedFrame<Self>> {
+        let value = Self::try_from(frame.as_ref())?;
+        Ok(crate::DecodedFrame::new(frame, value))
     }
 }

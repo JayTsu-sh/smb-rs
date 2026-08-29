@@ -1,10 +1,13 @@
 use binrw::{BinRead, BinWrite};
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use futures_core::future::BoxFuture;
 use futures_util::FutureExt;
 use std::{io::Cursor, net::SocketAddr};
 
-use crate::{IoVec, SmbTcpMessageHeader, error::Result};
+use crate::{
+    DEFAULT_MAX_FRAME_SIZE, IoVec, SmbTcpMessageHeader, TransportError, TransportFrame,
+    error::Result,
+};
 
 #[allow(async_fn_in_trait)]
 pub trait SmbTransport: Send + SmbTransportRead + SmbTransportWrite {
@@ -60,8 +63,16 @@ pub trait SmbTransportRead: Send {
     /// Receive an SMB message from the transport, returning the raw bytes as `Bytes`.
     ///
     /// Uses `BytesMut` internally for zero-copy `freeze()` into `Bytes`.
-    fn receive<'a>(&'a mut self) -> BoxFuture<'a, Result<Bytes>> {
-        async {
+    fn receive<'a>(&'a mut self) -> BoxFuture<'a, Result<TransportFrame>> {
+        self.receive_with_limit(DEFAULT_MAX_FRAME_SIZE)
+    }
+
+    /// Receive one complete frame with a caller-selected hard allocation cap.
+    fn receive_with_limit<'a>(
+        &'a mut self,
+        maximum: usize,
+    ) -> BoxFuture<'a, Result<TransportFrame>> {
+        async move {
             // Transport Header
             let mut header_data = [0; SmbTcpMessageHeader::SIZE];
             self.receive_exact(&mut header_data).await?;
@@ -69,6 +80,12 @@ pub trait SmbTransportRead: Send {
 
             // Content - use BytesMut for zero-copy freeze into Bytes.
             let len = header.stream_protocol_length as usize;
+            if len > maximum {
+                return Err(TransportError::FrameTooLarge {
+                    announced: len,
+                    maximum,
+                });
+            }
             let mut data = BytesMut::zeroed(len);
             self.receive_exact(&mut data).await?;
 
@@ -78,7 +95,7 @@ pub trait SmbTransportRead: Send {
                 &data[..]
             );
 
-            Ok(data.freeze())
+            TransportFrame::from_bytes(data.freeze(), maximum)
         }
         .boxed()
     }
@@ -87,19 +104,19 @@ pub trait SmbTransportRead: Send {
 pub trait SmbTransportReadExt: SmbTransportRead {
     /// Use this method to receive a SMB message from the server.
     /// This returns the message itself, dropping the transport header.
-    fn receive<'a>(&'a mut self) -> BoxFuture<'a, Result<Bytes>>;
+    fn receive<'a>(&'a mut self) -> BoxFuture<'a, Result<TransportFrame>>;
 }
 
 impl SmbTransportReadExt for dyn SmbTransportRead + '_ {
     #[inline]
-    fn receive<'a>(&'a mut self) -> BoxFuture<'a, Result<Bytes>> {
+    fn receive<'a>(&'a mut self) -> BoxFuture<'a, Result<TransportFrame>> {
         self.receive()
     }
 }
 
 impl SmbTransportReadExt for dyn SmbTransport + '_ {
     #[inline]
-    fn receive<'a>(&'a mut self) -> BoxFuture<'a, Result<Bytes>> {
+    fn receive<'a>(&'a mut self) -> BoxFuture<'a, Result<TransportFrame>> {
         self.receive()
     }
 }

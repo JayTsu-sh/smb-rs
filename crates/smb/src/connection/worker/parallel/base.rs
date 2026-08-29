@@ -1,7 +1,7 @@
 use crate::connection::transformer::Transformer;
 use crate::connection::worker::Worker;
 use crate::msg_handler::ReceiveOptions;
-use bytes::Bytes;
+use smb_transport::TransportFrame;
 use smb_msg::ResponseContent;
 use smb_transport::{IoVec, SmbTransport, SmbTransportWrite, TransportError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -146,7 +146,7 @@ where
     /// notifies the awaiting tasks.
     pub(crate) async fn incoming_data_callback(
         self: &Arc<Self>,
-        message: Result<Bytes, TransportError>,
+        message: Result<TransportFrame, TransportError>,
     ) -> crate::Result<()> {
         tracing::trace!("Received message from server.");
         let message = message?;
@@ -154,7 +154,11 @@ where
         // Transform the message(s). A single NetBIOS frame can contain a
         // compound chain of N responses (SMB2 NextCommand); we dispatch each
         // chained response to its own awaiter independently.
-        let msgs = match self.transformer.transform_incoming_all(message).await {
+        let msgs = match self
+            .transformer
+            .transform_incoming_all(message.into_bytes())
+            .await
+        {
             Ok(v) => v,
             // If the transformer can attribute the failure to a single
             // message id, route the error to that awaiter; otherwise propagate.

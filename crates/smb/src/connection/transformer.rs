@@ -674,7 +674,7 @@ impl Transformer {
     /// server is required to preserve relative to the request chain (MS-SMB2
     /// 3.3.5.2.7).
     pub async fn transform_incoming_all(&self, data: Bytes) -> crate::Result<Vec<IncomingMessage>> {
-        let message = Response::try_from(data.as_ref())?;
+        let (message, data) = Response::decode_frame(data)?.into_parts();
         let mut form = MessageForm::default();
 
         // 1. Decrypt (whole chain)
@@ -797,7 +797,7 @@ impl Transformer {
     ///
     /// Accepts `Bytes` for zero-copy slicing of the raw data in downstream consumers.
     pub async fn transform_incoming(&self, data: Bytes) -> crate::Result<IncomingMessage> {
-        let message = Response::try_from(data.as_ref())?;
+        let (message, data) = Response::decode_frame(data)?.into_parts();
 
         let mut form = MessageForm::default();
 

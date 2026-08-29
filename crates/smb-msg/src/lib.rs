@@ -23,6 +23,7 @@ pub mod query_dir;
 pub mod session_setup;
 pub mod smb1;
 pub mod tree_connect;
+mod wire_range;
 
 pub use cancel::*;
 pub use compressed::*;
@@ -44,6 +45,7 @@ pub use plain::*;
 pub use query_dir::*;
 pub use session_setup::*;
 pub use tree_connect::*;
+pub use wire_range::{DecodedFrame, WireRange};
 
 #[cfg(test)]
 mod test;
@@ -70,6 +72,13 @@ pub enum SmbMsgError {
 
     #[error("Invalid data: {0}")]
     InvalidData(String),
+
+    #[error("invalid wire range for {field}: offset={offset}, length={length}")]
+    InvalidWireRange {
+        field: &'static str,
+        offset: usize,
+        length: usize,
+    },
 
     #[error("Invalid negotiate dialect cast to dialect: {0:?}")]
     InvalidDialect(NegotiateDialect),

@@ -4,6 +4,7 @@ use std::time::Duration;
 
 pub mod config;
 pub mod error;
+pub mod frame;
 pub mod iovec;
 pub mod tcp;
 pub mod traits;
@@ -14,6 +15,7 @@ pub mod test_support;
 
 pub use config::*;
 pub use error::TransportError;
+pub use frame::{DEFAULT_MAX_FRAME_SIZE, TransportFrame};
 pub use iovec::*;
 
 pub use tcp::{SmbTcpMessageHeader, TcpTransport};
