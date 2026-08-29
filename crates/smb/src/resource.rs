@@ -168,6 +168,16 @@ fn validate_durable_request(
     Ok(())
 }
 
+fn requested_oplock_level(create_args: &FileCreateArgs) -> OplockLevel {
+    if create_args.lease_request.is_some() {
+        OplockLevel::Lease
+    } else if create_args.durable_request.is_some() {
+        OplockLevel::Batch
+    } else {
+        OplockLevel::None
+    }
+}
+
 /// A resource opened by a create request.
 pub enum Resource {
     File(File),
@@ -237,11 +247,7 @@ impl Resource {
         // MS-SMB2 2.2.13: server 只在 RequestedOplockLevel = Lease (0xFF) 时把
         // `RqLs` context 当 lease 处理；任何其他值（含 None）都让 server 静默忽略。
         // 因此 lease 请求必须把 oplock level 同步切到 Lease。
-        let requested_oplock_level = if create_args.lease_request.is_some() {
-            OplockLevel::Lease
-        } else {
-            OplockLevel::None
-        };
+        let requested_oplock_level = requested_oplock_level(create_args);
 
         let mut msg = CommandRequest::new(
             CreateRequest {
@@ -1460,10 +1466,15 @@ impl Drop for ResourceHandle {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{DurableOpenRequest, FileCreateArgs, LeaseGrant, validate_durable_request};
+    use super::{
+        DurableOpenRequest, FileCreateArgs, LeaseGrant, requested_oplock_level,
+        validate_durable_request,
+    };
     use smb_dtyp::Guid;
     use smb_fscc::FileAccessMask;
-    use smb_msg::{LeaseFlags, LeaseState, RequestLease, RequestLeaseV1, RequestLeaseV2};
+    use smb_msg::{
+        LeaseFlags, LeaseState, OplockLevel, RequestLease, RequestLeaseV1, RequestLeaseV2,
+    };
 
     fn make_state(read: bool, handle: bool, write: bool) -> LeaseState {
         LeaseState::new()
@@ -1554,5 +1565,18 @@ mod tests {
         assert!(validate_durable_request(request, true, false, true).is_err());
         assert!(validate_durable_request(request, true, true, false).is_err());
         assert!(validate_durable_request(request, false, true, true).is_err());
+    }
+
+    #[test]
+    fn durable_open_without_a_lease_requests_a_batch_oplock() {
+        let args = FileCreateArgs::default().with_durable(DurableOpenRequest::durable(
+            30_000,
+            Guid::parse_uuid("00000000-0000-0000-0000-000000000007").unwrap(),
+        ));
+        assert_eq!(requested_oplock_level(&args), OplockLevel::Batch);
+        assert_eq!(
+            requested_oplock_level(&FileCreateArgs::default()),
+            OplockLevel::None
+        );
     }
 }

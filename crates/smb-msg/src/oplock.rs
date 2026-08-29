@@ -68,7 +68,9 @@ pub enum OplockLevel {
     /// A level II oplock is available.
     II = 1,
     /// Exclusive oplock is available.
-    Exclusive = 2,
+    Exclusive = 0x08,
+    /// A batch oplock is requested or granted.
+    Batch = 0x09,
     /// Lease semantics are in effect for this open. Used in
     /// `CreateRequest::requested_oplock_level` to signal "I'm sending an
     /// `RqLs` create context; treat this as a lease request rather than an
