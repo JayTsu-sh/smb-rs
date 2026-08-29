@@ -29,11 +29,9 @@ use time::PrimitiveDateTime;
 /// into a `Copy`-cheap form for fan-out across subscribers.
 ///
 /// The client-side reaction is two-step:
-/// 1. Receive the [`LeaseBreakEvent`] (this struct) and start invalidating
-///    any cached state keyed on `lease_key`.
-/// 2. Send a `LeaseBreakAck` back to the server within the 35-second timeout.
-///    Phase B sends the ack automatically before publishing the event; Phase C
-///    will additionally drive any deferred `Close` for the affected handle.
+/// Before this event is published, the connection atomically invalidates
+/// cached state keyed on `lease_key`, then completes or times out the required
+/// `LeaseBreakAck`.
 ///
 /// Reference: MS-SMB2 2.2.23.2 (LeaseBreakNotification).
 #[derive(Debug, Clone, Copy)]
@@ -57,6 +55,9 @@ pub struct LeaseBreakEvent {
     /// 35-second timeout. `false` indicates the server is just informing
     /// us of an unconditional downgrade; no reply is required.
     pub ack_required: bool,
+    /// Terminal result of the bounded protocol acknowledgement. Cache
+    /// invalidation has already completed before this result is published.
+    pub ack_outcome: LeaseBreakAckOutcome,
     /// Wall-clock instant the client received the notification. Today
     /// this is purely observational (surfaced in tracing on the
     /// listener task); kept on the event so the future ack-timeout
@@ -66,6 +67,14 @@ pub struct LeaseBreakEvent {
     // exists. The 35s window from MS-SMB2 2.2.23.2 is currently
     // bounded only by the connection-wide notify task latency.
     pub received_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum LeaseBreakAckOutcome {
+    NotRequired,
+    Accepted,
+    Failed,
+    TimedOut,
 }
 
 /// Internal context/conn-info prototype captured at slot-insert time so a

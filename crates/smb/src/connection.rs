@@ -8,7 +8,7 @@ use crate::compression;
 use crate::clock::TokioClock;
 use crate::connection::preauth_hash::PreauthHashState;
 use crate::dialects::DialectImpl;
-use crate::lease::{LeaseBreakEvent, LeaseSlot};
+use crate::lease::{LeaseBreakAckOutcome, LeaseBreakEvent, LeaseSlot};
 use crate::runtime::{
     GenerationBootstrap, GenerationId, GenerationPublication, RandomRecoveryJitter,
     PreparedGeneration, RecoveryDriver, RecoveryError, RuntimeError,
@@ -33,16 +33,14 @@ use smb_transport::*;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use std::sync::Weak;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::select;
 use tokio_util::sync::CancellationToken;
 use worker::WorkerImpl;
 
 /// Capacity of the per-connection lease-break broadcast. A handful of slow
-/// subscribers wouldn't trail behind by more than this many events; if they
-/// do, they receive `RecvError::Lagged` and miss the older notifications —
-/// acceptable since the ack itself has already been sent by the connection
-/// task and the subscriber's role is just to invalidate cached state.
+/// subscribers wouldn't trail behind by more than this many events. Internal
+/// cache invalidation is authoritative and does not depend on this channel.
 const LEASE_BREAK_CHANNEL_CAPACITY: usize = 64;
 
 /// Represents an SMB connection.
@@ -623,11 +621,6 @@ impl Connection {
             self.context.start_notify().await?;
             tracing::debug!("Notification job started.");
 
-            // Phase C.2: the break-listener consumes the per-connection
-            // lease_event_tx broadcast (fed by handle_lease_break) and
-            // tombstones matching slots in lease_table so new opens
-            // miss the cache after a server-side break.
-            self.context.start_lease_break_listener();
         }
 
         if recoverable {
@@ -1201,52 +1194,6 @@ impl ConnectionCore {
         Ok(self.registry.sweep_idle_leases(older_than).await)
     }
 
-    /// Spawn a long-running task that consumes the lease-break broadcast
-    /// and tombstones matching slots in `lease_table`. Idempotent — only
-    /// the first call subscribes; subsequent calls are no-ops. Async-only:
-    /// the broadcast channel doesn't exist in sync builds.
-    fn start_lease_break_listener(self: &Arc<Self>) {
-        let mut rx = self.lease_event_tx.subscribe();
-        let self_clone = self.clone();
-        let stop = self.stop_notifications.clone();
-        tokio::spawn(async move {
-            loop {
-                select! {
-                    _ = stop.cancelled() => {
-                        tracing::debug!("Lease break listener cancelled.");
-                        break;
-                    }
-                    next = rx.recv() => {
-                        match next {
-                            Ok(event) => {
-                                self_clone.apply_lease_break(&event).await;
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                                // Listener fell behind the producer. The
-                                // ack for the missed events has already
-                                // been sent by handle_lease_break; the
-                                // only consequence here is that we may
-                                // miss some tombstones. The next break
-                                // for the same lease_key will recover us.
-                                tracing::warn!(
-                                    skipped,
-                                    "Lease break listener lagged; some tombstones may have been missed",
-                                );
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                tracing::debug!(
-                                    "Lease break channel closed; exiting listener.",
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            tracing::debug!("Lease break listener task stopped.");
-        });
-    }
-
     /// Apply a single [`LeaseBreakEvent`] to the connection's lease table.
     /// All slots whose `lease_key` matches the event are tombstoned,
     /// removed from the table, and their `granted_state` snapshot
@@ -1260,7 +1207,7 @@ impl ConnectionCore {
     /// Create). Without this fence the in-flight acquirer could observe
     /// `tombstoned == false`, bump refcount, and hand out a FileId the
     /// server has already revoked.
-    async fn apply_lease_break(&self, event: &LeaseBreakEvent) {
+    async fn apply_lease_break(&self, event: &LeaseBreakEvent) -> Vec<Arc<LeaseSlot>> {
         let event_key = event.lease_key.as_u128();
         let matching = self
             .registry
@@ -1272,7 +1219,7 @@ impl ConnectionCore {
                 lease_key = ?event.lease_key,
                 "Break event has no matching slot in this connection's cache",
             );
-            return;
+            return matching;
         }
         for slot in &matching {
             tracing::debug!(
@@ -1282,6 +1229,7 @@ impl ConnectionCore {
                 "Lease slot tombstoned + removed by server break",
             );
         }
+        matching
     }
 
     /// Subscribe to lease-break notifications received on this connection.
@@ -1621,35 +1569,43 @@ impl ConnectionCore {
             "LeaseBreakNotify received"
         );
 
-        // ACK FIRST (latency-critical path): NetApp-class clustered storage
-        // doesn't always wait the spec-mandated 60s for the ack before
-        // completing the open that caused the break — some tear down the
-        // lease entry as soon as they dispatch the notify, returning
-        // STATUS_NETWORK_NAME_DELETED for a "stale" ack. Send it before
-        // the in-memory broadcast so the wire-time gap is minimal.
+        let received_at = Instant::now();
+        let mut event = LeaseBreakEvent {
+            lease_key: notify.lease_key,
+            current_state: notify.current_lease_state,
+            new_state: notify.new_lease_state,
+            epoch: notify.new_epoch,
+            ack_required,
+            ack_outcome: LeaseBreakAckOutcome::NotRequired,
+            received_at,
+        };
+
+        // Invalidate under the registry's one critical section before any
+        // acknowledgement can unblock the conflicting server operation.
+        let invalidated = self.apply_lease_break(&event).await;
         if ack_required {
-            self.send_lease_break_ack(&notify).await;
+            const ACK_DEADLINE: Duration = Duration::from_secs(35);
+            event.ack_outcome = match tokio::time::timeout(
+                ACK_DEADLINE,
+                self.send_lease_break_ack(invalidated.first(), &notify),
+            )
+            .await
+            {
+                Ok(Ok(())) => LeaseBreakAckOutcome::Accepted,
+                Ok(Err(error)) => {
+                    tracing::warn!(?error, "LeaseBreakAck failed");
+                    LeaseBreakAckOutcome::Failed
+                }
+                Err(_) => {
+                    tracing::warn!("LeaseBreakAck deadline elapsed");
+                    LeaseBreakAckOutcome::TimedOut
+                }
+            };
         }
 
-        // FAN OUT EVENT (after ack so wire-time is minimized)
-        //
-        // Subscribers (Phase C lease_table, Phase D cifs handle_cache)
-        // see this event regardless of whether the ack reached the server
-        // — they invalidate their cached state because the lease is
-        // logically broken from this moment on.
-        {
-            let event = LeaseBreakEvent {
-                lease_key: notify.lease_key,
-                current_state: notify.current_lease_state,
-                new_state: notify.new_lease_state,
-                epoch: notify.new_epoch,
-                ack_required,
-                received_at: Instant::now(),
-            };
-            // send returns Err only when there are zero active receivers,
-            // which is normal during early bring-up; ignore it.
-            let _ = self.lease_event_tx.send(event);
-        }
+        // Public consumer lag cannot affect internal cache correctness: the
+        // authoritative invalidation above has already completed.
+        let _ = self.lease_event_tx.send(event);
 
         Ok(())
     }
@@ -1660,41 +1616,30 @@ impl ConnectionCore {
     /// of the open that owns the lease. Route through the context retained in
     /// that lease slot so the normal context chain stamps both identifiers and
     /// applies the tree's signing/encryption policy.
-    async fn send_lease_break_ack(&self, notify: &smb_msg::LeaseBreakNotify) {
-        let slot = self
-            .registry
-            .find_lease_by_key(notify.lease_key.as_u128())
-            .await;
-
-        let Some(slot) = slot else {
-            tracing::warn!(
-                lease_key = ?notify.lease_key,
-                "Cannot send LeaseBreakAck: matching lease open is not cached",
-            );
-            return;
-        };
+    async fn send_lease_break_ack(
+        &self,
+        slot: Option<&Arc<LeaseSlot>>,
+        notify: &smb_msg::LeaseBreakNotify,
+    ) -> crate::Result<()> {
+        let slot = slot.ok_or_else(|| {
+            Error::InvalidState("Cannot acknowledge lease break without its owning Resource".into())
+        })?;
 
         let ack = LeaseBreakAck {
             lease_key: notify.lease_key,
             lease_state: notify.new_lease_state,
         };
-        match slot
+        slot
             .proto
             .context
             .send_recv(RequestContent::LeaseBreakAck(ack))
-            .await
-        {
-            Ok(_) => tracing::debug!(
-                lease_key = ?notify.lease_key,
-                tree_id = slot.tree_id,
-                "LeaseBreakAck accepted",
-            ),
-            Err(e) => tracing::warn!(
-                lease_key = ?notify.lease_key,
-                error = ?e,
-                "LeaseBreakAck send failed — server will revoke the lease",
-            ),
-        }
+            .await?;
+        tracing::debug!(
+            lease_key = ?notify.lease_key,
+            tree_id = slot.tree_id,
+            "LeaseBreakAck accepted",
+        );
+        Ok(())
     }
 }
 

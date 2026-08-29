@@ -52,16 +52,6 @@ impl ConnectionRegistry {
         self.state.lock().await.leases.get(path).cloned()
     }
 
-    pub(crate) async fn find_lease_by_key(&self, lease_key: u128) -> Option<Arc<LeaseSlot>> {
-        self.state
-            .lock()
-            .await
-            .leases
-            .values()
-            .find(|slot| slot.lease_key == lease_key)
-            .cloned()
-    }
-
     pub(crate) async fn try_acquire_lease(
         &self,
         path: &str,

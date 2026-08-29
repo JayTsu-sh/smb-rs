@@ -19,7 +19,7 @@
 mod common;
 use common::{make_server_connection, smb_tests_share};
 use serial_test::serial;
-use smb::{FileCreateArgs, RequestLease, RequestLeaseV2};
+use smb::{FileCreateArgs, LeaseBreakAckOutcome, RequestLease, RequestLeaseV2};
 use smb_fscc::FileDispositionInformation;
 use smb_msg::{LeaseFlags, LeaseState};
 use std::time::Duration;
@@ -195,6 +195,10 @@ async fn test_lease_break_notify_fanned_out() -> smb::Result<()> {
         grant.state.handle_caching(),
         "test relies on handle_caching to provoke a break on B's open",
     );
+    let slot = conn
+        .peek_lease_slot("lease_phase_b_break.txt")
+        .await?
+        .expect("lease slot must exist before the conflicting open");
 
     // Client B: independent connection to same server, opens the same path
     // with OverwriteIf + GenericAll — strongly conflicts with A's
@@ -227,6 +231,12 @@ async fn test_lease_break_notify_fanned_out() -> smb::Result<()> {
     assert!(
         !event.new_state.handle_caching(),
         "server must drop handle_caching when another client opens the file",
+    );
+    assert!(event.ack_required, "the conflict must require an ACK");
+    assert_eq!(event.ack_outcome, LeaseBreakAckOutcome::Accepted);
+    assert!(
+        slot.tombstoned.load(std::sync::atomic::Ordering::Acquire),
+        "authoritative cache invalidation must complete before event publication",
     );
 
     // Cleanup: drop B first so A's set_info can mark the file for delete.
@@ -308,8 +318,8 @@ async fn test_lease_slot_inserted_on_create() -> smb::Result<()> {
 ///
 /// Client A opens with HandleCaching; client B opens the same path with
 /// OverwriteIf. Server sends a `LeaseBreakNotify` to A. The per-connection
-/// break-listener spawned during `_negotiate` consumes the event from
-/// `lease_event_tx` and tombstones the matching slot in `lease_table`.
+/// connection event owner tombstones the matching slot in `lease_table`
+/// before acknowledging and publishing the event.
 /// This test polls the slot until tombstoned (or times out) — no event
 /// subscription needed, the test only inspects cache state.
 #[test_log::test(tokio::test(flavor = "current_thread"))]
@@ -354,11 +364,9 @@ async fn test_lease_slot_tombstoned_on_break() -> smb::Result<()> {
         .into_file()
         .expect("Resource must be a file");
 
-    // Poll the slot's tombstoned flag with a bounded wait. The listener
-    // task runs on the same tokio runtime; the event flows
+    // Poll the slot's tombstoned flag with a bounded wait. The event flows
     //   server -> worker -> notify channel -> handle_lease_break
-    //   -> broadcast tx -> listener rx -> apply_lease_break
-    //   -> slot.tombstoned.store(true).
+    //   -> apply_lease_break -> ACK -> public broadcast.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !slot.tombstoned.load(std::sync::atomic::Ordering::Acquire) {
         if std::time::Instant::now() > deadline {

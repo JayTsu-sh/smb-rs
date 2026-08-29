@@ -39,7 +39,7 @@ pub mod test_support {
 pub use client::{Client, ClientConfig, UncPath};
 pub use connection::{Connection, ConnectionConfig};
 pub use error::Error;
-pub use lease::LeaseBreakEvent;
+pub use lease::{LeaseBreakAckOutcome, LeaseBreakEvent};
 pub use resource::{
     Directory, DurableOpenGrant, DurableOpenRequest, File, FileCreateArgs, GetLen, LeaseGrant,
     Pipe, PipeRpcConnection, ReadAt, ReadAtChannel, Resource, ResourceHandle, WriteAt,
