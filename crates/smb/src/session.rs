@@ -669,9 +669,25 @@ impl SessionContext {
         options: ResponseOptions<'_>,
         dependency: crate::runtime::ObjectToken,
     ) -> crate::Result<(CommandSubmission, CommandResponse)> {
+        self.execute_for_with_replay(
+            msg,
+            options,
+            dependency,
+            crate::runtime::ReplayPolicy::NeverReplay,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_for_with_replay(
+        &self,
+        msg: CommandRequest,
+        options: ResponseOptions<'_>,
+        dependency: crate::runtime::ObjectToken,
+        replay: crate::runtime::ReplayPolicy,
+    ) -> crate::Result<(CommandSubmission, CommandResponse)> {
         self.resolve_channel(msg.channel_id)
             .await?
-            .execute_for(msg, options, dependency)
+            .execute_for_with_replay(msg, options, dependency, replay)
             .await
     }
 

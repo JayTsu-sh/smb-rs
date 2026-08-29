@@ -44,7 +44,7 @@ pub(crate) mod wire;
 pub(crate) use engine::{
     GenerationExit, RuntimeConfig, RuntimeError, RuntimeHandle, start_generation,
 };
-pub(crate) use operation::{OperationResult, ResponsePolicy, TypedOperation};
+pub(crate) use operation::{OperationResult, ReplayPolicy, ResponsePolicy, TypedOperation};
 pub(crate) use object_state::{ObjectKind, ObjectToken};
 pub(crate) use recovery::RecoveryPolicy;
 pub(crate) use recovery_driver::{

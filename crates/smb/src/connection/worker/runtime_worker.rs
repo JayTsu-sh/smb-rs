@@ -144,6 +144,22 @@ impl RuntimeWorker {
         options: &ResponseOptions<'_>,
         dependency: ObjectToken,
     ) -> Result<(CommandSubmission, CommandResponse)> {
+        self.execute_for_with_replay(
+            message,
+            options,
+            dependency,
+            crate::runtime::ReplayPolicy::NeverReplay,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_for_with_replay(
+        &self,
+        message: CommandRequest,
+        options: &ResponseOptions<'_>,
+        dependency: ObjectToken,
+        replay: crate::runtime::ReplayPolicy,
+    ) -> Result<(CommandSubmission, CommandResponse)> {
         let command = options
             .cmd
             .unwrap_or_else(|| message.message.content.associated_cmd());
@@ -151,7 +167,8 @@ impl RuntimeWorker {
             .map_err(|error| Error::InvalidArgument(error.to_string()))?;
         let operation = TypedOperation::new(message, policy)
             .map_err(|error| Error::InvalidArgument(error.to_string()))?
-            .with_dependency(dependency);
+            .with_dependency(dependency)
+            .with_replay_policy(replay);
         let timeout = options.timeout.unwrap_or(self.timeout);
         let deadline = self.clock.now().saturating_add(timeout);
         let ticket = self

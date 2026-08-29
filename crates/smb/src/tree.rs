@@ -529,10 +529,26 @@ impl TreeContext {
         options: ResponseOptions<'_>,
         dependency: crate::runtime::ObjectToken,
     ) -> crate::Result<(CommandSubmission, CommandResponse)> {
+        self.execute_for_with_replay(
+            msg,
+            options,
+            dependency,
+            crate::runtime::ReplayPolicy::NeverReplay,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_for_with_replay(
+        &self,
+        msg: CommandRequest,
+        options: ResponseOptions<'_>,
+        dependency: crate::runtime::ObjectToken,
+        replay: crate::runtime::ReplayPolicy,
+    ) -> crate::Result<(CommandSubmission, CommandResponse)> {
         let (message, generation) = self.prepare(msg)?;
         let result = self
             .upstream
-            .execute_for(message, options, dependency)
+            .execute_for_with_replay(message, options, dependency, replay)
             .await?;
         let incoming = &result.1;
         if !incoming.message.header.flags.async_command()

@@ -29,6 +29,29 @@ pub(crate) struct OperationContext {
     pub(crate) replay: ReplayPolicy,
 }
 
+impl OperationContext {
+    pub(crate) fn remaining(&self) -> crate::Result<Option<Duration>> {
+        self.deadline
+            .map(|deadline| {
+                deadline.checked_duration_since(Instant::now()).ok_or_else(|| {
+                    Error::OperationTimeout(TimedOutTask::ReceiveNextMessage, Duration::ZERO)
+                })
+            })
+            .transpose()
+    }
+
+    pub(crate) const fn runtime_replay(&self) -> crate::runtime::ReplayPolicy {
+        match self.replay {
+            ReplayPolicy::Never => crate::runtime::ReplayPolicy::NeverReplay,
+            ReplayPolicy::IfUncommitted => crate::runtime::ReplayPolicy::ReplayIfUncommitted,
+            ReplayPolicy::Idempotent => crate::runtime::ReplayPolicy::IdempotentReplay,
+            ReplayPolicy::DurableReconnectOnly => {
+                crate::runtime::ReplayPolicy::DurableReconnectOnly
+            }
+        }
+    }
+}
+
 type Start<'a, T> = Box<
     dyn FnOnce(OperationContext) -> BoxFuture<'a, crate::Result<T>> + Send + 'a,
 >;
@@ -93,6 +116,22 @@ impl<'a, T: 'a> Future for Operation<'a, T> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.future.is_none() {
+            if self.cancellation.is_cancelled()
+                || self
+                    .external_cancellation
+                    .as_ref()
+                    .is_some_and(CancelToken::is_cancelled)
+            {
+                self.completed = true;
+                return Poll::Ready(Err(Error::Cancelled("domain operation")));
+            }
+            if self.deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+                self.completed = true;
+                return Poll::Ready(Err(Error::OperationTimeout(
+                    TimedOutTask::ReceiveNextMessage,
+                    Duration::ZERO,
+                )));
+            }
             self.started = true;
             let Some(start) = self.start.take() else {
                 self.completed = true;
@@ -193,16 +232,52 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn deadline_and_external_cancel_are_typed_and_terminal() {
-        let never = || Box::pin(std::future::pending()) as BoxFuture<'_, crate::Result<()>>;
-        let deadline = Operation::new(move |_| never()).timeout(Duration::from_secs(5));
+        let deadline = Operation::new(move |_| {
+            Box::pin(std::future::pending()) as BoxFuture<'_, crate::Result<()>>
+        })
+        .timeout(Duration::from_secs(5));
         tokio::pin!(deadline);
         tokio::time::advance(Duration::from_secs(5)).await;
         assert!(matches!(deadline.await, Err(Error::OperationTimeout(..))));
 
+        let starts = Arc::new(AtomicUsize::new(0));
+        let observed = starts.clone();
         let token = CancelToken::new();
-        let cancelled = Operation::new(move |_| never()).cancellation(token.clone());
+        let cancelled = Operation::new(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending()) as BoxFuture<'_, crate::Result<()>>
+        })
+        .cancellation(token.clone());
         token.cancel();
         assert!(matches!(cancelled.await, Err(Error::Cancelled("domain operation"))));
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn public_replay_categories_map_exactly_to_runtime_policy() {
+        let token = CancelToken::new();
+        for (public, runtime) in [
+            (ReplayPolicy::Never, crate::runtime::ReplayPolicy::NeverReplay),
+            (
+                ReplayPolicy::IfUncommitted,
+                crate::runtime::ReplayPolicy::ReplayIfUncommitted,
+            ),
+            (
+                ReplayPolicy::Idempotent,
+                crate::runtime::ReplayPolicy::IdempotentReplay,
+            ),
+            (
+                ReplayPolicy::DurableReconnectOnly,
+                crate::runtime::ReplayPolicy::DurableReconnectOnly,
+            ),
+        ] {
+            let context = OperationContext {
+                deadline: None,
+                cancellation: token.clone(),
+                replay: public,
+            };
+            assert_eq!(context.runtime_replay(), runtime);
+        }
     }
 
     #[tokio::test]

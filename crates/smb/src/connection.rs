@@ -950,11 +950,12 @@ impl ConnectionCore {
             .await
     }
 
-    pub(crate) async fn execute_for(
+    pub(crate) async fn execute_for_with_replay(
         &self,
         mut msg: CommandRequest,
         mut options: ResponseOptions<'_>,
         dependency: crate::runtime::ObjectToken,
+        replay: crate::runtime::ReplayPolicy,
     ) -> crate::Result<(CommandSubmission, CommandResponse)> {
         let timeout = options
             .timeout
@@ -968,7 +969,7 @@ impl ConnectionCore {
         let result = self
             .worker()
             .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?
-            .execute_for(msg, &options, dependency)
+            .execute_for_with_replay(msg, &options, dependency, replay)
             .await?;
         if !result.1.message.header.flags.server_to_redir() {
             return Err(Error::InvalidMessage(

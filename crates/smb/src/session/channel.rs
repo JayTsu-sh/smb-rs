@@ -145,9 +145,25 @@ impl ChannelContext {
         options: ResponseOptions<'_>,
         dependency: crate::runtime::ObjectToken,
     ) -> crate::Result<(CommandSubmission, CommandResponse)> {
+        self.execute_for_with_replay(
+            msg,
+            options,
+            dependency,
+            crate::runtime::ReplayPolicy::NeverReplay,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_for_with_replay(
+        &self,
+        msg: CommandRequest,
+        options: ResponseOptions<'_>,
+        dependency: crate::runtime::ObjectToken,
+        replay: crate::runtime::ReplayPolicy,
+    ) -> crate::Result<(CommandSubmission, CommandResponse)> {
         let result = match self
             .upstream
-            .execute_for(self.prepare(msg).await?, options, dependency)
+            .execute_for_with_replay(self.prepare(msg).await?, options, dependency, replay)
             .await
         {
             Ok(result) => result,

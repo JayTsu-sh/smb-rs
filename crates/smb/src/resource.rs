@@ -1457,9 +1457,23 @@ impl ResourceHandle {
         msg: CommandRequest,
         options: ResponseOptions<'_>,
     ) -> crate::Result<CommandResponse> {
+        self.execute_request_with_replay(
+            msg,
+            options,
+            crate::runtime::ReplayPolicy::NeverReplay,
+        )
+        .await
+    }
+
+    async fn execute_request_with_replay(
+        &self,
+        msg: CommandRequest,
+        options: ResponseOptions<'_>,
+        replay: crate::runtime::ReplayPolicy,
+    ) -> crate::Result<CommandResponse> {
         self.ensure_current().await?;
         self.context
-            .execute_for(msg, options, self.generation.load().object)
+            .execute_for_with_replay(msg, options, self.generation.load().object, replay)
             .await
             .map(|(_, incoming)| incoming)
     }

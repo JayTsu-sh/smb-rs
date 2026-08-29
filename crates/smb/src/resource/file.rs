@@ -3,6 +3,22 @@ use super::*;
 use bytes::Bytes;
 use std::ops::{Deref, DerefMut};
 
+pub(crate) struct FileOperationOptions {
+    pub(crate) timeout: Option<std::time::Duration>,
+    pub(crate) cancellation: Option<tokio_util::sync::CancellationToken>,
+    pub(crate) replay: crate::runtime::ReplayPolicy,
+}
+
+impl Default for FileOperationOptions {
+    fn default() -> Self {
+        Self {
+            timeout: None,
+            cancellation: None,
+            replay: crate::runtime::ReplayPolicy::NeverReplay,
+        }
+    }
+}
+
 /// An opened file on the server.
 ///
 /// # [std::io] Support
@@ -123,15 +139,31 @@ impl File {
         channel: Option<u32>,
         unbuffered: bool,
     ) -> std::io::Result<bytes::Bytes> {
+        self.read_block_bytes_with_options(
+            max_len,
+            pos,
+            channel,
+            unbuffered,
+            FileOperationOptions::default(),
+        )
+        .await
+        .map_err(std::io::Error::other)
+    }
+
+    pub(crate) async fn read_block_bytes_with_options(
+        &self,
+        max_len: u32,
+        pos: u64,
+        channel: Option<u32>,
+        unbuffered: bool,
+        options: FileOperationOptions,
+    ) -> crate::Result<bytes::Bytes> {
         if max_len == 0 {
             return Ok(bytes::Bytes::new());
         }
 
         if !self.access.file_read_data() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "No read permission",
-            ));
+            return Err(Error::MissingPermissions("file read data".into()));
         }
 
         if pos >= self.end_of_file {
@@ -139,17 +171,23 @@ impl File {
         }
 
         let response = self
-            .send_read_request(max_len, pos, channel, unbuffered)
+            .send_read_request_with_options(
+                max_len,
+                pos,
+                channel,
+                unbuffered,
+                options,
+            )
             .await?;
         let content = response
             .message
             .content
             .to_read()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            .map_err(|error| Error::InvalidMessage(error.to_string()))?;
 
         let data_range = content
             .data_range(response.raw.len())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            .map_err(|error| Error::InvalidMessage(error.to_string()))?;
 
         // Zero-copy: slice the immutable frame owner without copying payload.
         Ok(response.raw.slice(data_range.as_range()))
@@ -165,6 +203,25 @@ impl File {
         channel: Option<u32>,
         unbuffered: bool,
     ) -> std::io::Result<crate::command::CommandResponse> {
+        self.send_read_request_with_options(
+            length,
+            pos,
+            channel,
+            unbuffered,
+            FileOperationOptions::default(),
+        )
+        .await
+        .map_err(std::io::Error::other)
+    }
+
+    async fn send_read_request_with_options(
+        &self,
+        length: u32,
+        pos: u64,
+        channel: Option<u32>,
+        unbuffered: bool,
+        operation: FileOperationOptions,
+    ) -> crate::Result<crate::command::CommandResponse> {
         let mut flags = ReadFlags::new();
         if self.handle.conn_info.config.compression_enabled
             && self.handle.conn_info.dialect.supports_compression()
@@ -181,17 +238,23 @@ impl File {
                 flags,
                 length,
                 offset: pos,
-                file_id: self.handle.file_id().await.map_err(std::io::Error::other)?,
+                file_id: self.handle.file_id().await?,
                 minimum_count: 1,
             }
             .into(),
         )
         .with_channel_id(channel);
 
+        let mut options = ResponseOptions::new().with_allow_async(true);
+        if let Some(timeout) = operation.timeout {
+            options = options.with_timeout(timeout);
+        }
+        if let Some(cancellation) = operation.cancellation {
+            options = options.with_cancellation_token(cancellation);
+        }
         self.handle
-            .execute_request(request, ResponseOptions::new().with_allow_async(true))
+            .execute_request_with_replay(request, options, operation.replay)
             .await
-            .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
     /// Write a block of data to an opened file.
@@ -226,15 +289,29 @@ impl File {
         pos: u64,
         channel: Option<u32>,
     ) -> std::io::Result<usize> {
+        self.write_block_zc_with_options(
+            buf,
+            pos,
+            channel,
+            FileOperationOptions::default(),
+        )
+        .await
+        .map_err(std::io::Error::other)
+    }
+
+    pub(crate) async fn write_block_zc_with_options(
+        &self,
+        buf: Bytes,
+        pos: u64,
+        channel: Option<u32>,
+        operation: FileOperationOptions,
+    ) -> crate::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
 
         if !self.access.file_write_data() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "No write permission",
-            ));
+            return Err(Error::MissingPermissions("file write data".into()));
         }
 
         tracing::debug!(
@@ -248,7 +325,7 @@ impl File {
         let outgoing = CommandRequest::new(
             WriteRequest::new(
                 pos,
-                self.handle.file_id().await.map_err(std::io::Error::other)?,
+                self.handle.file_id().await?,
                 WriteFlags::new(),
                 buf.len() as u32,
             )
@@ -257,17 +334,23 @@ impl File {
         .with_additional_data(buf)
         .with_channel_id(channel);
 
+        let mut options = ResponseOptions::new().with_allow_async(true);
+        if let Some(timeout) = operation.timeout {
+            options = options.with_timeout(timeout);
+        }
+        if let Some(cancellation) = operation.cancellation {
+            options = options.with_cancellation_token(cancellation);
+        }
         let response = self
             .handle
-            .execute_request(outgoing, ResponseOptions::new().with_allow_async(true))
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+            .execute_request_with_replay(outgoing, options, operation.replay)
+            .await?;
 
         let content = response
             .message
             .content
             .to_write()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            .map_err(|error| Error::InvalidMessage(error.to_string()))?;
         let actual_written_length = content.count as usize;
         tracing::debug!(
             "Wrote {} bytes to {}.",

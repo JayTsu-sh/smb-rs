@@ -12,7 +12,10 @@ use sspi::{AuthIdentity, Secret, Username};
 
 use crate::{
     client::{Client as LegacyClient, ClientConfig as LegacyClientConfig, UncPath},
-    resource::{File as LegacyFile, FileCreateArgs, Resource as LegacyResource},
+    resource::{
+        File as LegacyFile, FileCreateArgs, Resource as LegacyResource,
+        file::FileOperationOptions,
+    },
     session::Session as LegacySession,
     tree::Tree as LegacyShare,
     Error,
@@ -118,18 +121,49 @@ pub(crate) struct RuntimeFile {
 }
 
 impl RuntimeFile {
-    pub(crate) async fn read_at(&self, offset: u64, max_len: u32) -> crate::Result<Bytes> {
+    pub(crate) async fn read_at(
+        &self,
+        offset: u64,
+        max_len: u32,
+        timeout: Option<std::time::Duration>,
+        cancellation: tokio_util::sync::CancellationToken,
+        replay: crate::runtime::ReplayPolicy,
+    ) -> crate::Result<Bytes> {
         self.inner
-            .read_block_bytes(max_len, offset, None, false)
+            .read_block_bytes_with_options(
+                max_len,
+                offset,
+                None,
+                false,
+                FileOperationOptions {
+                    timeout,
+                    cancellation: Some(cancellation),
+                    replay,
+                },
+            )
             .await
-            .map_err(Into::into)
     }
 
-    pub(crate) async fn write_at(&self, offset: u64, bytes: Bytes) -> crate::Result<usize> {
+    pub(crate) async fn write_at(
+        &self,
+        offset: u64,
+        bytes: Bytes,
+        timeout: Option<std::time::Duration>,
+        cancellation: tokio_util::sync::CancellationToken,
+        replay: crate::runtime::ReplayPolicy,
+    ) -> crate::Result<usize> {
         self.inner
-            .write_block_zc(bytes, offset, None)
+            .write_block_zc_with_options(
+                bytes,
+                offset,
+                None,
+                FileOperationOptions {
+                    timeout,
+                    cancellation: Some(cancellation),
+                    replay,
+                },
+            )
             .await
-            .map_err(Into::into)
     }
 
     pub(crate) async fn delete(&self) -> crate::Result<()> {

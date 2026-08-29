@@ -214,9 +214,8 @@ impl Share {
         options: FileOpenOptions,
     ) -> Operation<'a, File> {
         let path = path.clone();
-        Operation::new(move |context| {
+        Operation::new(move |_context| {
             Box::pin(async move {
-                let _replay = context.replay;
                 let inner = self.inner.open_file(path.as_str(), options.mode).await?;
                 Ok(File { inner })
             })
@@ -244,8 +243,16 @@ impl File {
     pub fn read_at(&self, offset: u64, max_len: u32) -> Operation<'_, Bytes> {
         Operation::new(move |context| {
             Box::pin(async move {
-                let _replay = context.replay;
-                self.inner.read_at(offset, max_len).await
+                let timeout = context.remaining()?;
+                self.inner
+                    .read_at(
+                        offset,
+                        max_len,
+                        timeout,
+                        context.cancellation.clone(),
+                        context.runtime_replay(),
+                    )
+                    .await
             })
         })
     }
@@ -253,8 +260,16 @@ impl File {
     pub fn write_at(&self, offset: u64, bytes: Bytes) -> Operation<'_, usize> {
         Operation::new(move |context| {
             Box::pin(async move {
-                let _replay = context.replay;
-                self.inner.write_at(offset, bytes).await
+                let timeout = context.remaining()?;
+                self.inner
+                    .write_at(
+                        offset,
+                        bytes,
+                        timeout,
+                        context.cancellation.clone(),
+                        context.runtime_replay(),
+                    )
+                    .await
             })
         })
     }
