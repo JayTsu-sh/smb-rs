@@ -371,7 +371,7 @@ impl RecoveryDriver {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 mod tests {
     use super::*;
     use crate::clock::ManualClock;
