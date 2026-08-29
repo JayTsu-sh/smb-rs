@@ -5,13 +5,20 @@ mod registry;
 pub mod worker;
 
 use crate::compression;
+use crate::clock::TokioClock;
 use crate::connection::preauth_hash::PreauthHashState;
 use crate::dialects::DialectImpl;
 use crate::lease::{LeaseBreakEvent, LeaseSlot};
+use crate::runtime::{
+    GenerationBootstrap, GenerationId, GenerationPublication, RandomRecoveryJitter,
+    PreparedGeneration, RecoveryDriver, RecoveryError, RuntimeError,
+};
 pub use crate::runtime::wire::TransformError;
 use crate::{Error, crypto, command::*, session::Session};
 use arc_swap::ArcSwapOption;
 use binrw::prelude::*;
+use futures_core::future::BoxFuture;
+use futures_util::FutureExt;
 pub use config::*;
 use connection_info::{ConnectionInfo, NegotiatedProperties};
 use rand::RngCore;
@@ -24,7 +31,8 @@ use smb_msg::{
 };
 use smb_transport::*;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::sync::Weak;
 use std::time::Instant;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
@@ -47,6 +55,88 @@ pub struct Connection {
 
     server_name: String,
     server_address: SocketAddr,
+}
+
+struct ConnectionRecoveryBootstrap {
+    context: Weak<ConnectionCore>,
+    config: ConnectionConfig,
+    server_name: String,
+    server_address: SocketAddr,
+}
+
+struct ConnectionGenerationPublication {
+    context: Arc<ConnectionCore>,
+    worker: Arc<WorkerImpl>,
+    info: Arc<ConnectionInfo>,
+}
+
+impl GenerationPublication for ConnectionGenerationPublication {
+    fn publish(self: Box<Self>) {
+        self.context.publish_generation(self.worker, self.info);
+    }
+}
+
+impl GenerationBootstrap for ConnectionRecoveryBootstrap {
+    fn bootstrap(
+        &self,
+        generation: GenerationId,
+        _deadline: crate::clock::MonotonicTime,
+    ) -> BoxFuture<'static, Result<PreparedGeneration, RuntimeError>> {
+        let context = self.context.clone();
+        let config = self.config.clone();
+        let server_name = self.server_name.clone();
+        let server_address = self.server_address;
+        async move {
+            let context = context.upgrade().ok_or(RuntimeError::Closed)?;
+            let connection = Connection {
+                context: context.clone(),
+                config: config.clone(),
+                server_name: server_name.clone(),
+                server_address,
+            };
+            let mut transport = make_transport(&config.transport, config.timeout())
+                .map_err(|_| RuntimeError::Transport("recovery-make-transport"))?;
+            let mut address = server_address;
+            if address.port() == 0 {
+                address.set_port(config.port.unwrap_or_else(|| transport.default_port()));
+            }
+            transport
+                .connect(&server_name, address)
+                .await
+                .map_err(|_| RuntimeError::Transport("recovery-connect"))?;
+            let remote_address = transport
+                .remote_address()
+                .map_err(|_| RuntimeError::Transport("recovery-remote-address"))?;
+            let worker = connection
+                ._negotiate_switch_to_smb2(
+                    transport,
+                    config.smb2_only_negotiate,
+                    generation,
+                )
+                .await
+                .map_err(|_| RuntimeError::Wire("recovery-negotiate-switch"))?;
+            let info = match connection._negotiate_smb2(remote_address, &worker).await {
+                Ok(info) => Arc::new(info),
+                Err(_) => {
+                    let _ = worker.stop().await;
+                    return Err(RuntimeError::Wire("recovery-negotiate"));
+                }
+            };
+            if worker.negotaite_complete(&info).await.is_err() {
+                let _ = worker.stop().await;
+                return Err(RuntimeError::Wire("recovery-negotiate-commit"));
+            }
+            Ok(PreparedGeneration::new(
+                worker.runtime_handle(),
+                Box::new(ConnectionGenerationPublication {
+                    context,
+                    worker,
+                    info,
+                }),
+            ))
+        }
+        .boxed()
+    }
 }
 
 impl Connection {
@@ -134,7 +224,7 @@ impl Connection {
             .await?;
 
         tracing::info!("Connected. Negotiating");
-        self._negotiate(transport, self.config.smb2_only_negotiate)
+        self._negotiate(transport, self.config.smb2_only_negotiate, true)
             .await?;
 
         Ok(())
@@ -173,7 +263,7 @@ impl Connection {
         config: ConnectionConfig,
     ) -> crate::Result<Self> {
         let conn = Self::build(server, transport.remote_address()?, client_guid, config)?;
-        conn._negotiate(transport, conn.config.smb2_only_negotiate)
+        conn._negotiate(transport, conn.config.smb2_only_negotiate, false)
             .await?;
         Ok(conn)
     }
@@ -186,6 +276,7 @@ impl Connection {
     /// See also [`Client::close`][`crate::Client::close`].
     #[tracing::instrument(level = "debug", skip_all, fields(server = %self.server_name))]
     pub async fn close(&self) -> crate::Result<()> {
+        self.context.stop_recovery().await;
         match self.context.worker() {
             Some(c) => c.stop().await,
             None => Ok(()),
@@ -198,6 +289,7 @@ impl Connection {
         &self,
         mut transport: Box<dyn SmbTransport>,
         smb2_only_neg: bool,
+        generation: GenerationId,
     ) -> crate::Result<Arc<WorkerImpl>> {
         let mut initial_message_id = 0;
         // Multi-protocol negotiation: Begin with SMB1, expect SMB2.
@@ -242,11 +334,12 @@ impl Connection {
             initial_message_id = 1;
         }
 
-        WorkerImpl::start_at(
+        WorkerImpl::start_generation_at(
             transport,
             self.config.timeout(),
             initial_message_id,
             u32::from(self.config.credits_backlog.unwrap_or(128)),
+            generation,
         )
         .await
     }
@@ -498,6 +591,7 @@ impl Connection {
         &self,
         transport: Box<dyn SmbTransport>,
         smb2_only_neg: bool,
+        recoverable: bool,
     ) -> crate::Result<()> {
         if self.context.conn_info().is_some() {
             return Err(Error::InvalidState("Already negotiated".into()));
@@ -506,14 +600,14 @@ impl Connection {
         let server_address = transport.remote_address()?;
         // Negotiate SMB1, Switch to SMB2
         let worker = self
-            ._negotiate_switch_to_smb2(transport, smb2_only_neg)
+            ._negotiate_switch_to_smb2(transport, smb2_only_neg, GenerationId::new(1))
             .await?;
 
         // Negotiate SMB2
         let info = Arc::new(self._negotiate_smb2(server_address, &worker).await?);
 
         worker.negotaite_complete(&info).await?;
-        self.context.publish_generation(worker, info.clone());
+        self.context.publish_generation(worker.clone(), info.clone());
 
         // Always start the notify task unless the caller explicitly disabled
         // it. `caps.notifications()` is the SMB 3.1.1 ChangeNotify capability
@@ -534,6 +628,15 @@ impl Connection {
             // tombstones matching slots in lease_table so new opens
             // miss the cache after a server-side break.
             self.context.start_lease_break_listener();
+        }
+
+        if recoverable {
+            self.context.start_recovery(
+                worker,
+                self.config.clone(),
+                self.server_name.clone(),
+                self.server_address,
+            )?;
         }
 
         tracing::debug!("Negotiation successful");
@@ -796,6 +899,8 @@ pub(crate) struct ConnectionCore {
 
     generation: ArcSwapOption<ConnectionGeneration>,
 
+    recovery: OnceLock<Arc<RecoveryDriver>>,
+
     /// Cancellation token for stopping notifications.
     stop_notifications: CancellationToken,
 
@@ -872,7 +977,9 @@ impl ConnectionCore {
         mut message: CommandRequest,
     ) -> crate::Result<(CommandSubmission, CommandResponse)> {
         let command = message.message.content.associated_cmd();
-        self.prepare_outgoing(&mut message).await?;
+        // Candidate Connection negotiation must not inherit header policy
+        // from the currently published generation.
+        message.message.header.flags.set_priority_mask(0);
         let result = worker
             .execute_for(
                 message,
@@ -937,6 +1044,7 @@ impl ConnectionCore {
         ConnectionCore {
             client_guid,
             generation: ArcSwapOption::empty(),
+            recovery: OnceLock::new(),
             stop_notifications: Default::default(),
             lease_event_tx,
             registry: ConnectionRegistry::new(),
@@ -1182,6 +1290,71 @@ impl ConnectionCore {
     fn publish_generation(&self, worker: Arc<WorkerImpl>, conn_info: Arc<ConnectionInfo>) {
         self.generation
             .store(Some(Arc::new(ConnectionGeneration { worker, conn_info })));
+    }
+
+    fn start_recovery(
+        self: &Arc<Self>,
+        worker: Arc<WorkerImpl>,
+        config: ConnectionConfig,
+        server_name: String,
+        server_address: SocketAddr,
+    ) -> crate::Result<()> {
+        let clock = Arc::new(TokioClock::new());
+        let bootstrap = Arc::new(ConnectionRecoveryBootstrap {
+            context: Arc::downgrade(self),
+            config: config.clone(),
+            server_name,
+            server_address,
+        });
+        let driver = Arc::new(RecoveryDriver::new(
+            GenerationId::new(1),
+            config.auto_reconnect.runtime_policy(),
+            clock,
+            bootstrap,
+            Arc::new(RandomRecoveryJitter::new(
+                config.auto_reconnect.maximum_jitter,
+            )),
+        ));
+        self.recovery
+            .set(driver.clone())
+            .map_err(|_| Error::InvalidState("Recovery coordinator already started".into()))?;
+        let context = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut current = worker;
+            loop {
+                let exit = current.exited().await;
+                match driver.recover(exit).await {
+                    Ok(_) => {
+                        let Some(context) = context.upgrade() else {
+                            driver.close().await;
+                            break;
+                        };
+                        let Some(replacement) = context.worker() else {
+                            driver.close().await;
+                            break;
+                        };
+                        if !config.disable_notifications
+                            && let Err(error) = context.start_notify().await
+                        {
+                            tracing::warn!(?error, "recovered notification lane failed");
+                        }
+                        current = replacement;
+                    }
+                    Err(RecoveryError::NotRecoverable | RecoveryError::Closed) => break,
+                    Err(error) => {
+                        tracing::warn!(?error, "connection recovery terminated");
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+
+    async fn stop_recovery(&self) {
+        if let Some(driver) = self.recovery.get() {
+            driver.close().await;
+        }
     }
 
     /// Stamp an [`CommandRequest`] with connection-level header policy.
@@ -1457,8 +1630,12 @@ impl Drop for ConnectionCore {
             Some(generation) => generation,
             None => return,
         };
+        let recovery = self.recovery.get().cloned();
 
         tokio::task::spawn(async move {
+            if let Some(recovery) = recovery {
+                recovery.close().await;
+            }
             generation.worker.stop().await.ok();
         });
     }

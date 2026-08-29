@@ -5,6 +5,48 @@ use std::time::Duration;
 use smb_msg::Dialect;
 use smb_transport::config::*;
 
+/// Bounded automatic transport and Connection-generation recovery policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoReconnectConfig {
+    pub enabled: bool,
+    pub max_attempts: u32,
+    pub attempt_timeout: Duration,
+    pub total_timeout: Duration,
+    pub initial_backoff: Duration,
+    pub maximum_backoff: Duration,
+    pub maximum_jitter: Duration,
+}
+
+impl Default for AutoReconnectConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_attempts: 3,
+            attempt_timeout: Duration::from_secs(10),
+            total_timeout: Duration::from_secs(30),
+            initial_backoff: Duration::from_millis(100),
+            maximum_backoff: Duration::from_secs(2),
+            maximum_jitter: Duration::from_millis(100),
+        }
+    }
+}
+
+impl AutoReconnectConfig {
+    pub(crate) fn runtime_policy(self) -> crate::runtime::RecoveryPolicy {
+        if !self.enabled {
+            return crate::runtime::RecoveryPolicy::disabled();
+        }
+        crate::runtime::RecoveryPolicy {
+            max_attempts: self.max_attempts,
+            attempt_timeout: self.attempt_timeout,
+            total_timeout: self.total_timeout,
+            initial_backoff: self.initial_backoff,
+            maximum_backoff: self.maximum_backoff,
+            maximum_jitter: self.maximum_jitter,
+        }
+    }
+}
+
 /// Specifies the encryption mode for the connection.
 /// Use this as part of the [ConnectionConfig] to specify the encryption mode for the connection.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -114,6 +156,9 @@ pub struct ConnectionConfig {
     /// Access the timeout using the [`ConnectionConfig::timeout()`] method.
     pub timeout: Option<Duration>,
 
+    /// Controls automatic recovery after unplanned transport loss.
+    pub auto_reconnect: AutoReconnectConfig,
+
     /// Specifies the minimum and maximum dialects to be used in the connection.
     ///
     /// Note, that if set, the minimum dialect must be less than or equal to the maximum dialect.
@@ -204,6 +249,21 @@ impl ConnectionConfig {
             if default_transaction_size == 0 {
                 return Err(crate::Error::InvalidConfiguration(
                     "Default transaction size cannot be zero".to_string(),
+                ));
+            }
+        }
+        if self.auto_reconnect.enabled {
+            if self.auto_reconnect.max_attempts == 0
+                || self.auto_reconnect.attempt_timeout.is_zero()
+                || self.auto_reconnect.total_timeout.is_zero()
+            {
+                return Err(crate::Error::InvalidConfiguration(
+                    "Enabled auto reconnect requires attempts and non-zero deadlines".to_string(),
+                ));
+            }
+            if self.auto_reconnect.initial_backoff > self.auto_reconnect.maximum_backoff {
+                return Err(crate::Error::InvalidConfiguration(
+                    "Initial reconnect backoff exceeds maximum backoff".to_string(),
                 ));
             }
         }

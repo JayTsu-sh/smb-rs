@@ -7,6 +7,7 @@ use super::recovery::{
 use super::GenerationId;
 use crate::clock::{Clock, MonotonicTime};
 use futures_core::future::BoxFuture;
+use rand::Rng;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -19,7 +20,28 @@ pub(crate) trait GenerationBootstrap: Send + Sync + 'static {
         &self,
         generation: GenerationId,
         deadline: MonotonicTime,
-    ) -> BoxFuture<'static, Result<RuntimeHandle, RuntimeError>>;
+    ) -> BoxFuture<'static, Result<PreparedGeneration, RuntimeError>>;
+}
+
+pub(crate) trait GenerationPublication: Send + 'static {
+    fn publish(self: Box<Self>);
+}
+
+pub(crate) struct PreparedGeneration {
+    runtime: RuntimeHandle,
+    publication: Box<dyn GenerationPublication>,
+}
+
+impl PreparedGeneration {
+    pub(crate) fn new(
+        runtime: RuntimeHandle,
+        publication: Box<dyn GenerationPublication>,
+    ) -> Self {
+        Self {
+            runtime,
+            publication,
+        }
+    }
 }
 
 pub(crate) trait RecoveryJitter: Send + Sync + 'static {
@@ -35,6 +57,28 @@ impl RecoveryJitter for NoRecoveryJitter {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct RandomRecoveryJitter {
+    maximum: Duration,
+}
+
+impl RandomRecoveryJitter {
+    pub(crate) const fn new(maximum: Duration) -> Self {
+        Self { maximum }
+    }
+}
+
+impl RecoveryJitter for RandomRecoveryJitter {
+    fn next(&self, _failed_attempt: u32) -> Duration {
+        let maximum = u64::try_from(self.maximum.as_nanos()).unwrap_or(u64::MAX);
+        if maximum == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_nanos(rand::thread_rng().gen_range(0..=maximum))
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum RecoveryError {
     #[error("generation exit is not recoverable")]
@@ -43,6 +87,8 @@ pub(crate) enum RecoveryError {
     Closed,
     #[error("connection recovery attempts were exhausted")]
     AttemptsExhausted,
+    #[error("generation exit does not match the active generation")]
+    StaleGeneration,
     #[error("generation identity space is exhausted")]
     GenerationExhausted,
     #[error("bootstrap published a mismatched generation")]
@@ -81,6 +127,9 @@ impl RecoveryDriver {
         if !matches!(exit.cause, GenerationExitCause::Transport(_)) {
             return Err(RecoveryError::NotRecoverable);
         }
+        if self.state().await != RecoveryState::Connected(exit.generation) {
+            return Err(RecoveryError::StaleGeneration);
+        }
         let next_generation = exit
             .generation
             .checked_next()
@@ -113,8 +162,9 @@ impl RecoveryDriver {
                         result = self.bootstrap.bootstrap(next_generation, deadline) => result,
                     };
                     match result {
-                        Ok(runtime)
-                            if runtime.connection_object().generation() == next_generation =>
+                        Ok(candidate)
+                            if candidate.runtime.connection_object().generation()
+                                == next_generation =>
                         {
                             let published = self
                                 .reduce(RecoveryEvent::AttemptSucceeded {
@@ -124,12 +174,13 @@ impl RecoveryDriver {
                             if published
                                 == Some(RecoveryEffect::PublishGeneration(next_generation))
                             {
-                                return Ok(runtime);
+                                candidate.publication.publish();
+                                return Ok(candidate.runtime);
                             }
                             return Err(RecoveryError::Closed);
                         }
-                        Ok(runtime) => {
-                            let _ = runtime.close(self.clock.now()).await;
+                        Ok(candidate) => {
+                            let _ = candidate.runtime.close(self.clock.now()).await;
                             return Err(RecoveryError::MismatchedGeneration);
                         }
                         Err(_) => {
@@ -183,12 +234,30 @@ mod tests {
         clock: Arc<ManualClock>,
     }
 
+    struct PendingBootstrap;
+
+    impl GenerationBootstrap for PendingBootstrap {
+        fn bootstrap(
+            &self,
+            _generation: GenerationId,
+            _deadline: MonotonicTime,
+        ) -> BoxFuture<'static, Result<PreparedGeneration, RuntimeError>> {
+            futures_util::future::pending().boxed()
+        }
+    }
+
+    struct NoopPublication;
+
+    impl GenerationPublication for NoopPublication {
+        fn publish(self: Box<Self>) {}
+    }
+
     impl GenerationBootstrap for ScriptedBootstrap {
         fn bootstrap(
             &self,
             generation: GenerationId,
             _deadline: MonotonicTime,
-        ) -> BoxFuture<'static, Result<RuntimeHandle, RuntimeError>> {
+        ) -> BoxFuture<'static, Result<PreparedGeneration, RuntimeError>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let succeeds = self.outcomes.lock().unwrap().pop_front().unwrap_or(false);
             let clock = self.clock.clone();
@@ -198,7 +267,7 @@ mod tests {
                 }
                 let (transport, _) = ScriptedTransport::new();
                 let (runtime, _) = start_generation(transport, clock, config(generation));
-                Ok(runtime)
+                Ok(PreparedGeneration::new(runtime, Box::new(NoopPublication)))
             }
             .boxed()
         }
@@ -319,5 +388,36 @@ mod tests {
             waiting.await.unwrap(),
             Err(RecoveryError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn attempt_deadline_stops_pending_bootstrap_and_stale_exit_is_rejected() {
+        let clock = Arc::new(ManualClock::new());
+        let exit = transport_exit(clock.clone()).await;
+        let driver = Arc::new(RecoveryDriver::new(
+            GenerationId::new(1),
+            RecoveryPolicy {
+                max_attempts: 1,
+                ..policy()
+            },
+            clock.clone(),
+            Arc::new(PendingBootstrap),
+            Arc::new(NoRecoveryJitter),
+        ));
+        let recovery = tokio::spawn({
+            let driver = driver.clone();
+            let exit = exit.clone();
+            async move { driver.recover(exit).await }
+        });
+        tokio::task::yield_now().await;
+        clock.advance(Duration::from_secs(2)).await.unwrap();
+        assert!(matches!(
+            recovery.await.unwrap(),
+            Err(RecoveryError::AttemptsExhausted)
+        ));
+        assert_eq!(
+            driver.recover(exit).await.err(),
+            Some(RecoveryError::StaleGeneration)
+        );
     }
 }

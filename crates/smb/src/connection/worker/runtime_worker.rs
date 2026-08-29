@@ -4,8 +4,9 @@ use crate::connection::preauth_hash::PreauthHashValue;
 use crate::error::TimedOutTask;
 use crate::command::{CommandResponse, CommandRequest, ResponseOptions, CommandSubmission};
 use crate::runtime::{
-    GenerationId, ObjectKind, ObjectToken, OperationResult, RequestKey, ResponsePolicy,
-    RuntimeConfig, RuntimeError, RuntimeHandle, TerminalOutcome, TypedOperation, start_generation,
+    GenerationExit, GenerationId, ObjectKind, ObjectToken, OperationResult, RequestKey,
+    ResponsePolicy, RuntimeConfig, RuntimeError, RuntimeHandle, TerminalOutcome, TypedOperation,
+    start_generation,
 };
 use crate::session::SessionAndChannel;
 use crate::{Error, Result};
@@ -42,14 +43,14 @@ impl RuntimeWorker {
             .map_err(|error| self.map_runtime_error(error))
     }
 
-    pub(crate) async fn start_at(
+    pub(crate) async fn start_generation_at(
         transport: Box<dyn SmbTransport>,
         timeout: Duration,
         initial_message_id: u64,
         target_credits: u32,
+        generation: GenerationId,
     ) -> Result<Arc<Self>> {
         let clock = Arc::new(TokioClock::new());
-        let generation = GenerationId::new(1);
         let config = RuntimeConfig::production(
             generation,
             initial_message_id,
@@ -64,6 +65,14 @@ impl RuntimeWorker {
             generation,
             timeout,
         }))
+    }
+
+    pub(crate) fn runtime_handle(&self) -> RuntimeHandle {
+        self.runtime.clone()
+    }
+
+    pub(crate) async fn exited(&self) -> GenerationExit {
+        self.runtime.exited().await
     }
 
     pub(crate) async fn stop(&self) -> Result<()> {

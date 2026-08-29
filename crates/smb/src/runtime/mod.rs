@@ -27,7 +27,14 @@ mod reducer;
 mod state;
 pub(crate) mod wire;
 
-pub(crate) use engine::{RuntimeConfig, RuntimeError, RuntimeHandle, start_generation};
+pub(crate) use engine::{
+    GenerationExit, RuntimeConfig, RuntimeError, RuntimeHandle, start_generation,
+};
 pub(crate) use operation::{OperationResult, ResponsePolicy, TypedOperation};
 pub(crate) use object_state::{ObjectKind, ObjectToken};
+pub(crate) use recovery::RecoveryPolicy;
+pub(crate) use recovery_driver::{
+    GenerationBootstrap, GenerationPublication, PreparedGeneration, RandomRecoveryJitter,
+    RecoveryDriver, RecoveryError,
+};
 pub(crate) use reducer::{GenerationId, RequestKey, TerminalOutcome};
