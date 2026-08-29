@@ -28,6 +28,11 @@ pub(crate) enum SessionRecoveryState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SessionRecoveryEvent {
+    SessionLost {
+        session: ObjectToken,
+        connection: ObjectToken,
+        now: MonotonicTime,
+    },
     ConnectionReplaced {
         connection: ObjectToken,
         now: MonotonicTime,
@@ -85,6 +90,14 @@ impl SessionRecoveryCoordinator {
                 self.state = SessionRecoveryState::Closed;
                 Some(SessionRecoveryEffect::Closed)
             }
+            (
+                SessionRecoveryState::Active(previous),
+                SessionRecoveryEvent::SessionLost {
+                    session,
+                    connection,
+                    now,
+                },
+            ) if session == previous => self.start(previous, connection, 1, now),
             (
                 SessionRecoveryState::Active(previous),
                 SessionRecoveryEvent::ConnectionReplaced { connection, now },
@@ -311,6 +324,32 @@ mod tests {
         );
         assert!(closed
             .reduce(SessionRecoveryEvent::ConnectionReplaced {
+                connection,
+                now: MonotonicTime::ZERO,
+            })
+            .is_none());
+    }
+
+    #[test]
+    fn session_loss_can_reauthenticate_without_a_connection_generation_change() {
+        let (connection, previous) = objects(1);
+        let mut recovery = SessionRecoveryCoordinator::new(previous, policy());
+
+        assert!(matches!(
+            recovery.reduce(SessionRecoveryEvent::SessionLost {
+                session: previous,
+                connection,
+                now: MonotonicTime::ZERO,
+            }),
+            Some(SessionRecoveryEffect::StartAuthentication {
+                connection: target,
+                attempt: 1,
+                ..
+            }) if target == connection
+        ));
+        assert!(recovery
+            .reduce(SessionRecoveryEvent::SessionLost {
+                session: previous,
                 connection,
                 now: MonotonicTime::ZERO,
             })
