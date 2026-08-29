@@ -55,6 +55,7 @@ arc-swap = "1"
 
 # APIs
 sspi = { version = "0.20.1", features = ["ring"], default-features = false }
+zeroize = "1"
 reqwest = { workspace = true, optional = true }
 
 # Crypto
@@ -80,7 +81,6 @@ serial_test = "3.2"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "test-util"] }
 serde_json = "1"
-zeroize = "1"
 smb-tests = { workspace = true }
 
 [[test]]

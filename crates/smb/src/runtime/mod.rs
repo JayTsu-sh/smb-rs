@@ -31,6 +31,7 @@ mod share_recovery;
 // W4-5 starts with the pure durable/persistent Resource reconnect authority.
 #[allow(dead_code)]
 mod durable_recovery;
+pub(crate) mod domain_bridge;
 // W4-6 starts with the pure asynchronous server-event authority.
 #[allow(dead_code)]
 mod event_authority;
