@@ -286,6 +286,111 @@ impl File {
         })
     }
 
+    pub fn read_at_into<'a>(&'a self, offset: u64, buffer: &'a mut [u8]) -> Operation<'a, usize> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                let timeout = context.remaining()?;
+                let bytes = self
+                    .inner
+                    .read_at(
+                        offset,
+                        u32::try_from(buffer.len())?,
+                        timeout,
+                        context.cancellation.clone(),
+                        context.runtime_replay(),
+                    )
+                    .await?;
+                buffer[..bytes.len()].copy_from_slice(&bytes);
+                Ok(bytes.len())
+            })
+        })
+    }
+
+    pub fn write_at_from<'a>(&'a self, offset: u64, buffer: &'a [u8]) -> Operation<'a, usize> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                let bytes = Bytes::copy_from_slice(buffer);
+                let timeout = context.remaining()?;
+                self.inner
+                    .write_at(
+                        offset,
+                        bytes,
+                        timeout,
+                        context.cancellation.clone(),
+                        context.runtime_replay(),
+                    )
+                    .await
+            })
+        })
+    }
+
+    pub fn read_exact_at(&self, offset: u64, length: u32) -> Operation<'_, Bytes> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                let mut result = bytes::BytesMut::with_capacity(length as usize);
+                while result.len() < length as usize {
+                    let position = offset.checked_add(result.len() as u64).ok_or_else(|| {
+                        Error::InvalidArgument("read range exceeds u64 offsets".into())
+                    })?;
+                    let remaining = length - result.len() as u32;
+                    let bytes = self
+                        .inner
+                        .read_at(
+                            position,
+                            remaining,
+                            context.remaining()?,
+                            context.cancellation.clone(),
+                            context.runtime_replay(),
+                        )
+                        .await?;
+                    if bytes.is_empty() {
+                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                    }
+                    if bytes.len() > remaining as usize {
+                        return Err(Error::InvalidMessage(
+                            "read response exceeded the requested range".into(),
+                        ));
+                    }
+                    result.extend_from_slice(&bytes);
+                }
+                Ok(result.freeze())
+            })
+        })
+    }
+
+    pub fn write_all_at(&self, offset: u64, bytes: Bytes) -> Operation<'_, ()> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                let mut written = 0_usize;
+                while written < bytes.len() {
+                    let position = offset.checked_add(written as u64).ok_or_else(|| {
+                        Error::InvalidArgument("write range exceeds u64 offsets".into())
+                    })?;
+                    let count = self
+                        .inner
+                        .write_at(
+                            position,
+                            bytes.slice(written..),
+                            context.remaining()?,
+                            context.cancellation.clone(),
+                            context.runtime_replay(),
+                        )
+                        .await?;
+                    if count == 0 {
+                        return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+                    }
+                    if count > bytes.len() - written {
+                        return Err(Error::InvalidMessage(
+                            "write response exceeded the submitted payload".into(),
+                        ));
+                    }
+                    written += count;
+                }
+                Ok(())
+            })
+        })
+    }
+
     pub async fn delete(&self) -> crate::Result<()> {
         self.inner.delete().await
     }

@@ -48,6 +48,10 @@ async fn common_and_explicit_session_paths_compile(
         .deadline(Instant::now() + Duration::from_secs(5))
         .replay(ReplayPolicy::Never)
         .await?;
+    let mut caller_buffer = [0_u8; 6];
+    file.read_at_into(0, &mut caller_buffer).await?;
+    file.write_at_from(6, b"-slice").await?;
+    file.write_all_at(12, Bytes::from_static(b"-all")).await?;
     file.close().await?;
 
     let session = client
@@ -58,7 +62,7 @@ async fn common_and_explicit_session_paths_compile(
         .open_file(&path, FileOpenOptions::open_existing())
         .await?;
     let _bytes = file
-        .read_at(0, 6)
+        .read_exact_at(0, 6)
         .timeout(Duration::from_secs(5))
         .replay(ReplayPolicy::Idempotent)
         .await?;
