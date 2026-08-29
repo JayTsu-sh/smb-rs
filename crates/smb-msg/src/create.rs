@@ -666,6 +666,16 @@ pub struct DurableHandleRequestV2 {
     pub create_guid: Guid,
 }
 
+impl DurableHandleRequestV2 {
+    pub fn new(timeout: u32, persistent: bool, create_guid: Guid) -> Self {
+        Self {
+            timeout,
+            flags: DurableHandleV2Flags::new().with_persistent(persistent),
+            create_guid,
+        }
+    }
+}
+
 /// Flags for durable handle v2 requests.
 ///
 /// Reference: MS-SMB2 2.2.13.2.11
@@ -690,6 +700,28 @@ pub struct DurableHandleReconnectV2 {
     create_guid: Guid,
     /// Flags indicating whether a persistent handle is requested
     flags: DurableHandleV2Flags,
+}
+
+impl DurableHandleReconnectV2 {
+    pub fn new(file_id: FileId, create_guid: Guid, persistent: bool) -> Self {
+        Self {
+            file_id,
+            create_guid,
+            flags: DurableHandleV2Flags::new().with_persistent(persistent),
+        }
+    }
+
+    pub const fn file_id(&self) -> FileId {
+        self.file_id
+    }
+
+    pub const fn create_guid(&self) -> Guid {
+        self.create_guid
+    }
+
+    pub fn persistent(&self) -> bool {
+        self.flags.persistent()
+    }
 }
 
 /// Application instance identifier (SMB 3.x dialect family only).

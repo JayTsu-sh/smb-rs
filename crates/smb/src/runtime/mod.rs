@@ -28,6 +28,9 @@ mod session_recovery;
 // W4-4 starts with the pure Share TreeConnect replay authority.
 #[allow(dead_code)]
 mod share_recovery;
+// W4-5 starts with the pure durable/persistent Resource reconnect authority.
+#[allow(dead_code)]
+mod durable_recovery;
 #[allow(dead_code)]
 mod reducer;
 #[allow(dead_code)]
