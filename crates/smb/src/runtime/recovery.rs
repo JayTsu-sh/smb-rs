@@ -16,6 +16,7 @@ pub(crate) struct RecoveryPolicy {
     pub(crate) initial_backoff: Duration,
     pub(crate) maximum_backoff: Duration,
     pub(crate) maximum_jitter: Duration,
+    pub(crate) max_waiting_operations: usize,
 }
 
 impl RecoveryPolicy {
@@ -27,6 +28,7 @@ impl RecoveryPolicy {
             initial_backoff: Duration::ZERO,
             maximum_backoff: Duration::ZERO,
             maximum_jitter: Duration::ZERO,
+            max_waiting_operations: 0,
         }
     }
 
@@ -205,6 +207,7 @@ mod tests {
             initial_backoff: SECOND,
             maximum_backoff: Duration::from_secs(4),
             maximum_jitter: Duration::from_millis(250),
+            max_waiting_operations: 8,
         }
     }
 

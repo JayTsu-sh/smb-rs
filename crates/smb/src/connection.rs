@@ -830,6 +830,10 @@ impl Connection {
         mut msgs: Vec<CommandRequest>,
         dependency: crate::runtime::ObjectToken,
     ) -> crate::Result<Vec<CommandResponse>> {
+        let dependency = self
+            .context
+            .resolve_dependency(dependency, Some(self.config.timeout()), None)
+            .await?;
         // CancelRequest has its own bespoke path inside the single-message
         // `submit` (it reuses an already-allocated message_id and skips
         // owner admission). Bundling it into a compound chain
@@ -931,6 +935,7 @@ impl ConnectionCore {
         parent: crate::runtime::ObjectToken,
         kind: crate::runtime::ObjectKind,
     ) -> crate::Result<crate::runtime::ObjectToken> {
+        let parent = self.resolve_dependency(parent, None, None).await?;
         self.worker()
             .ok_or_else(|| Error::InvalidState("Runtime is uninitialized".into()))?
             .create_object(parent, kind)
@@ -943,6 +948,12 @@ impl ConnectionCore {
         mut options: ResponseOptions<'_>,
         dependency: crate::runtime::ObjectToken,
     ) -> crate::Result<(CommandSubmission, CommandResponse)> {
+        let timeout = options
+            .timeout
+            .or_else(|| self.conn_info().map(|info| info.config.timeout()));
+        let dependency = self
+            .resolve_dependency(dependency, timeout, options.async_cancel.clone())
+            .await?;
         let channel_id = msg.channel_id;
         self.prepare_outgoing(&mut msg).await?;
         options.channel_id = channel_id;
@@ -964,6 +975,8 @@ impl ConnectionCore {
         mut message: CommandRequest,
         dependency: crate::runtime::ObjectToken,
     ) -> crate::Result<CommandSubmission> {
+        let timeout = self.conn_info().map(|info| info.config.timeout());
+        let dependency = self.resolve_dependency(dependency, timeout, None).await?;
         self.prepare_outgoing(&mut message).await?;
         self.worker()
             .ok_or_else(|| Error::InvalidState("Runtime is uninitialized".into()))?
@@ -1307,7 +1320,7 @@ impl ConnectionCore {
             server_address,
         });
         let driver = Arc::new(RecoveryDriver::new(
-            GenerationId::new(1),
+            worker.connection_object(),
             config.auto_reconnect.runtime_policy(),
             clock,
             bootstrap,
@@ -1392,10 +1405,29 @@ impl ConnectionCore {
         &self,
         msg: CommandRequest,
     ) -> crate::Result<CommandSubmission> {
+        let dependency = self.connection_object()?;
+        let timeout = self.conn_info().map(|info| info.config.timeout());
+        let dependency = self.resolve_dependency(dependency, timeout, None).await?;
         self.worker()
             .ok_or(Error::InvalidState("Worker is uninitialized".into()))?
-            .send(msg)
+            .send_for(msg, dependency)
             .await
+    }
+
+    async fn resolve_dependency(
+        &self,
+        dependency: crate::runtime::ObjectToken,
+        timeout: Option<std::time::Duration>,
+        cancellation: Option<CancellationToken>,
+    ) -> crate::Result<crate::runtime::ObjectToken> {
+        let Some(recovery) = self.recovery.get() else {
+            return Ok(dependency);
+        };
+        let deadline = timeout.map(|timeout| recovery.deadline_after(timeout));
+        recovery
+            .resolve_dependency(dependency, deadline, cancellation)
+            .await
+            .map_err(|error| Error::InvalidState(error.to_string()))
     }
 
     async fn start_notify(self: &Arc<Self>) -> crate::Result<()> {

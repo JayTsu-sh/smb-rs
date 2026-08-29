@@ -15,6 +15,7 @@ pub struct AutoReconnectConfig {
     pub initial_backoff: Duration,
     pub maximum_backoff: Duration,
     pub maximum_jitter: Duration,
+    pub max_waiting_operations: usize,
 }
 
 impl Default for AutoReconnectConfig {
@@ -27,6 +28,7 @@ impl Default for AutoReconnectConfig {
             initial_backoff: Duration::from_millis(100),
             maximum_backoff: Duration::from_secs(2),
             maximum_jitter: Duration::from_millis(100),
+            max_waiting_operations: 1024,
         }
     }
 }
@@ -43,6 +45,7 @@ impl AutoReconnectConfig {
             initial_backoff: self.initial_backoff,
             maximum_backoff: self.maximum_backoff,
             maximum_jitter: self.maximum_jitter,
+            max_waiting_operations: self.max_waiting_operations,
         }
     }
 }
@@ -256,6 +259,7 @@ impl ConnectionConfig {
             if self.auto_reconnect.max_attempts == 0
                 || self.auto_reconnect.attempt_timeout.is_zero()
                 || self.auto_reconnect.total_timeout.is_zero()
+                || self.auto_reconnect.max_waiting_operations == 0
             {
                 return Err(crate::Error::InvalidConfiguration(
                     "Enabled auto reconnect requires attempts and non-zero deadlines".to_string(),

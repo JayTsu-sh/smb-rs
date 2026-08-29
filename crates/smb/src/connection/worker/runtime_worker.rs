@@ -83,10 +83,6 @@ impl RuntimeWorker {
             .map_err(|error| self.map_runtime_error(error))
     }
 
-    pub(crate) async fn send(&self, message: CommandRequest) -> Result<CommandSubmission> {
-        self.send_for(message, self.connection_object()).await
-    }
-
     pub(crate) async fn send_for(
         &self,
         message: CommandRequest,

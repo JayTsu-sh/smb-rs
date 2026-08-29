@@ -204,6 +204,29 @@ impl RecoveryQueue {
         }
     }
 
+    pub(crate) fn release_dependency(
+        &mut self,
+        dependency: ObjectToken,
+    ) -> Vec<RecoveryWaitOutcome> {
+        let mut outcomes = Vec::new();
+        self.waits.retain(|wait| {
+            if wait.dependency == dependency {
+                outcomes.push(RecoveryWaitOutcome::Ready(wait.id));
+                false
+            } else {
+                true
+            }
+        });
+        outcomes
+    }
+
+    pub(crate) fn fail_all(&mut self) -> Vec<RecoveryWaitOutcome> {
+        self.waits
+            .drain(..)
+            .map(|wait| RecoveryWaitOutcome::AncestorFailed(wait.id))
+            .collect()
+    }
+
     pub(crate) fn drain_ancestor(
         &mut self,
         registry: &ObjectRegistry,
