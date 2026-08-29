@@ -330,10 +330,9 @@ impl WirePipeline {
     /// **Constraints:**
     /// - No `additional_data` zero-copy bodies (data is whatever each
     ///   member's `PlainRequest` serializes to).
-    /// - Caller must have already populated `header.message_id`,
-    ///   `tree_id`, `session_id`, and `credit_charge` / `credit_request`
-    ///   per member (typically done by `Connection::process_sequence_outgoing`
-    ///   on each message before this call).
+    /// - The runtime owner must have populated `header.message_id` and
+    ///   `credit_charge` / `credit_request`; domain policy supplies tree and
+    ///   session identity before this call.
     /// - Caller is responsible for setting `flags.related_operations` on the
     ///   2nd..Nth members and the `0xFF…FF` sentinel `FileId` on commands that
     ///   want to chain context from a prior Create.

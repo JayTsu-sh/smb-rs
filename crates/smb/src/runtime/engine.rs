@@ -24,6 +24,7 @@ pub(crate) struct RuntimeConfig {
     pub(crate) generation: GenerationId,
     pub(crate) initial_message_id: u64,
     pub(crate) initial_credits: u32,
+    pub(crate) target_credits: u32,
     pub(crate) admission_limits: AdmissionLimits,
     pub(crate) tombstone_drain_timeout: Duration,
     pub(crate) admission_capacity: usize,
@@ -41,12 +42,14 @@ impl RuntimeConfig {
         generation: GenerationId,
         initial_message_id: u64,
         initial_credits: u32,
+        target_credits: u32,
         timeout: Duration,
     ) -> Self {
         Self {
             generation,
             initial_message_id,
             initial_credits,
+            target_credits,
             admission_limits: AdmissionLimits {
                 max_operations: 1024,
                 max_payload_bytes: 256 * 1024 * 1024,
@@ -209,7 +212,6 @@ impl RuntimeHandle {
     pub(crate) async fn submit_operation(
         &self,
         operation: TypedOperation,
-        credit_charge: u16,
         deadline: Option<MonotonicTime>,
     ) -> Result<OperationTicket, RuntimeError> {
         let (acknowledge, acknowledged) = oneshot::channel();
@@ -217,7 +219,6 @@ impl RuntimeHandle {
         self.operations
             .try_send(OperationAdmission {
                 operation,
-                credit_charge,
                 deadline,
                 acknowledge,
                 terminal: Some(terminal),
@@ -238,14 +239,12 @@ impl RuntimeHandle {
     pub(crate) async fn submit_operation_detached(
         &self,
         operation: TypedOperation,
-        credit_charge: u16,
         deadline: Option<MonotonicTime>,
     ) -> Result<OperationSubmission, RuntimeError> {
         let (acknowledge, acknowledged) = oneshot::channel();
         self.operations
             .try_send(OperationAdmission {
                 operation,
-                credit_charge,
                 deadline,
                 acknowledge,
                 terminal: None,
@@ -273,7 +272,7 @@ impl RuntimeHandle {
 
     pub(crate) async fn submit_compound_detached(
         &self,
-        operations: Vec<(TypedOperation, u16)>,
+        operations: Vec<TypedOperation>,
         deadline: Option<MonotonicTime>,
     ) -> Result<Vec<OperationSubmission>, RuntimeError> {
         let (acknowledge, acknowledged) = oneshot::channel();
@@ -397,14 +396,13 @@ struct AdmissionCommand {
 
 struct OperationAdmission {
     operation: TypedOperation,
-    credit_charge: u16,
     deadline: Option<MonotonicTime>,
     acknowledge: oneshot::Sender<Result<OperationSubmission, RuntimeError>>,
     terminal: Option<oneshot::Sender<Result<OperationResult, RuntimeError>>>,
 }
 
 struct CompoundAdmission {
-    operations: Vec<(TypedOperation, u16)>,
+    operations: Vec<TypedOperation>,
     deadline: Option<MonotonicTime>,
     acknowledge: oneshot::Sender<Result<Vec<OperationSubmission>, RuntimeError>>,
 }
@@ -425,6 +423,8 @@ struct RequestAuthority {
     frame_cancellations: HashMap<RequestKey, CancellationToken>,
     deferred_cancellations: HashMap<RequestKey, MonotonicTime>,
     notifications: Option<mpsc::Sender<crate::msg_handler::IncomingMessage>>,
+    large_mtu: bool,
+    target_credits: u32,
 }
 
 enum ControlCommand {
@@ -522,6 +522,7 @@ async fn owner_task(
             config.generation,
             config.initial_message_id,
             config.initial_credits,
+            1,
             config.admission_limits,
             config.tombstone_drain_timeout,
         ),
@@ -532,6 +533,8 @@ async fn owner_task(
         frame_cancellations: HashMap::new(),
         deferred_cancellations: HashMap::new(),
         notifications: None,
+        large_mtu: false,
+        target_credits: config.target_credits,
     };
     let mut send_queue = VecDeque::new();
     let mut close_request = None;
@@ -751,9 +754,20 @@ async fn process_operation_admission(
         return;
     }
     let payload_bytes = command.operation.payload_bytes();
+    let credit_charge = match command.operation.credit_charge(authority.large_mtu) {
+        Ok(charge) => charge,
+        Err(_) => {
+            let error = RuntimeError::Wire("credit-charge");
+            if let Some(terminal) = command.terminal {
+                let _ = terminal.send(Err(error.clone()));
+            }
+            let _ = command.acknowledge.send(Err(error));
+            return;
+        }
+    };
     let effects = authority.state.reduce(OwnerEvent::Admit {
         payload_bytes,
-        credit_charge: command.credit_charge,
+        credit_charge,
         caller_deadline: command.deadline,
     });
     let Some(OwnerEffect::Admitted(plan)) = effects.first() else {
@@ -772,6 +786,8 @@ async fn process_operation_admission(
     let response = command.operation.response_policy().clone();
     let mut outgoing = command.operation.into_outgoing();
     outgoing.message.header.message_id = key.message_id;
+    outgoing.message.header.credit_charge = plan.credit_charge;
+    outgoing.message.header.credit_request = plan.credit_request;
     let retain_raw = outgoing.return_raw_data;
     let frame = match wire.transform_outgoing(outgoing).await {
         Ok(frame) => frame,
@@ -838,8 +854,22 @@ async fn process_compound_admission(
 
     let mut admitted = Vec::with_capacity(command.operations.len());
     let mut outgoing_messages = Vec::with_capacity(command.operations.len());
-    for (operation, credit_charge) in command.operations {
+    for operation in command.operations {
         let payload_bytes = operation.payload_bytes();
+        let credit_charge = match operation.credit_charge(authority.large_mtu) {
+            Ok(charge) => charge,
+            Err(_) => {
+                for (key, _) in &admitted {
+                    authority
+                        .state
+                        .reduce(OwnerEvent::PrepareFailed { key: *key });
+                }
+                let _ = command
+                    .acknowledge
+                    .send(Err(RuntimeError::Wire("credit-charge")));
+                return;
+            }
+        };
         let effects = authority.state.reduce(OwnerEvent::Admit {
             payload_bytes,
             credit_charge,
@@ -862,10 +892,8 @@ async fn process_compound_admission(
         let response = operation.response_policy().clone();
         let mut outgoing = operation.into_outgoing();
         outgoing.message.header.message_id = key.message_id;
-        outgoing.message.header.credit_charge = credit_charge;
-        if outgoing.message.header.credit_request == 0 {
-            outgoing.message.header.credit_request = credit_charge;
-        }
+        outgoing.message.header.credit_charge = plan.credit_charge;
+        outgoing.message.header.credit_request = plan.credit_request;
         admitted.push((key, response));
         outgoing_messages.push(outgoing);
     }
@@ -999,6 +1027,12 @@ async fn handle_control(
             false
         }
         ControlCommand::Negotiated { connection, reply } => {
+            authority.large_mtu = connection.negotiation.caps.large_mtu();
+            authority.state.set_target_credits(if authority.large_mtu {
+                authority.target_credits
+            } else {
+                1
+            });
             let result = wire
                 .negotiated(&connection)
                 .await
@@ -1824,6 +1858,7 @@ mod tests {
             generation: GenerationId::new(1),
             initial_message_id: 10,
             initial_credits: 32,
+            target_credits: 32,
             admission_limits: AdmissionLimits {
                 max_operations: 32,
                 max_payload_bytes: 1024 * 1024,
@@ -2254,7 +2289,7 @@ mod tests {
         let clock = Arc::new(ManualClock::new());
         let (handle, _events) = start_generation(transport, clock.clone(), config());
         let ticket = handle
-            .submit_operation(session_setup_operation(true), 1, None)
+            .submit_operation(session_setup_operation(true), None)
             .await
             .unwrap();
         assert_eq!(ticket.key.message_id, 10);
@@ -2292,7 +2327,7 @@ mod tests {
         let clock = Arc::new(ManualClock::new());
         let (handle, _events) = start_generation(transport, clock.clone(), config());
         let ticket = handle
-            .submit_operation(session_setup_operation(false), 1, None)
+            .submit_operation(session_setup_operation(false), None)
             .await
             .unwrap();
         let key = ticket.key;
@@ -2316,7 +2351,7 @@ mod tests {
         let (handle, mut events) = start_generation(transport, clock.clone(), config());
         let deadline = clock.now().saturating_add(Duration::from_secs(1));
         let ticket = handle
-            .submit_operation(session_setup_operation(false), 1, Some(deadline))
+            .submit_operation(session_setup_operation(false), Some(deadline))
             .await
             .unwrap();
         let key = ticket.key;
@@ -2345,7 +2380,7 @@ mod tests {
         let clock = Arc::new(ManualClock::new());
         let (handle, mut events) = start_generation(transport, clock.clone(), config());
         let submission = handle
-            .submit_operation_detached(session_setup_operation(true), 1, None)
+            .submit_operation_detached(session_setup_operation(true), None)
             .await
             .unwrap();
         let key = submission.key;
@@ -2383,7 +2418,7 @@ mod tests {
             }
         }
         let ticket = handle
-            .submit_operation(session_setup_operation(false), 1, None)
+            .submit_operation(session_setup_operation(false), None)
             .await
             .unwrap();
         let result = ticket.completion().await.unwrap();
@@ -2408,7 +2443,7 @@ mod tests {
         runtime_config.admission_limits.max_operations = 1;
         let (handle, mut events) = start_generation(transport, clock.clone(), runtime_config);
         let first = handle
-            .submit_operation_detached(session_setup_operation(false), 1, None)
+            .submit_operation_detached(session_setup_operation(false), None)
             .await
             .unwrap()
             .key;
@@ -2419,13 +2454,13 @@ mod tests {
         }
         assert!(matches!(
             handle
-                .submit_operation_detached(session_setup_operation(false), 1, None)
+                .submit_operation_detached(session_setup_operation(false), None)
                 .await,
             Err(RuntimeError::Admission(AdmissionError::OperationsExhausted))
         ));
         handle.await_operation(first).await.unwrap();
         let second = handle
-            .submit_operation_detached(session_setup_operation(false), 1, None)
+            .submit_operation_detached(session_setup_operation(false), None)
             .await
             .unwrap()
             .key;
@@ -2445,8 +2480,8 @@ mod tests {
         let submissions = handle
             .submit_compound_detached(
                 vec![
-                    (session_setup_operation(false), 1),
-                    (session_setup_operation(false), 1),
+                    session_setup_operation(false),
+                    session_setup_operation(false),
                 ],
                 None,
             )

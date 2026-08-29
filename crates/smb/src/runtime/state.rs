@@ -27,6 +27,7 @@ pub(crate) struct PreparationPlan {
     pub(crate) key: RequestKey,
     pub(crate) payload_bytes: u64,
     pub(crate) credit_charge: u16,
+    pub(crate) credit_request: u16,
     pub(crate) caller_deadline: Option<MonotonicTime>,
 }
 
@@ -132,6 +133,8 @@ struct OwnedRequest {
     lifecycle: RequestRecord,
     payload_bytes: u64,
     credit_charge: u16,
+    requested_extra_credits: u32,
+    credit_response_seen: bool,
     admission_held: bool,
     payload_held: bool,
     credit_obligation: bool,
@@ -145,6 +148,9 @@ pub(crate) struct GenerationState {
     limits: AdmissionLimits,
     next_message_id: Option<u64>,
     available_credits: u32,
+    total_credits: u32,
+    pending_extra_credits: u32,
+    target_credits: u32,
     admitted_operations: usize,
     retained_payload_bytes: u64,
     requests: HashMap<RequestKey, OwnedRequest>,
@@ -164,10 +170,15 @@ impl GenerationState {
         self.limits.max_operations
     }
 
+    pub(crate) fn set_target_credits(&mut self, target: u32) {
+        self.target_credits = target.max(1);
+    }
+
     pub(crate) fn new(
         generation: GenerationId,
         initial_message_id: u64,
         initial_credits: u32,
+        target_credits: u32,
         limits: AdmissionLimits,
         tombstone_drain_timeout: Duration,
     ) -> Self {
@@ -176,6 +187,9 @@ impl GenerationState {
             limits,
             next_message_id: Some(initial_message_id),
             available_credits: initial_credits,
+            total_credits: initial_credits,
+            pending_extra_credits: 0,
+            target_credits,
             admitted_operations: 0,
             retained_payload_bytes: 0,
             requests: HashMap::new(),
@@ -241,14 +255,26 @@ impl GenerationState {
             return OwnerEffect::AdmissionRejected(AdmissionError::MessageIdExhausted);
         };
         self.next_message_id = message_id.checked_add(u64::from(credit_charge));
+        let projected_total = self
+            .total_credits
+            .saturating_add(self.pending_extra_credits);
+        let requested_extra_credits = self.target_credits.saturating_sub(projected_total);
+        let credit_request = u32::from(credit_charge)
+            .saturating_add(requested_extra_credits)
+            .min(u32::from(u16::MAX)) as u16;
+        let requested_extra_credits = u32::from(credit_request) - u32::from(credit_charge);
         let key = RequestKey::new(self.generation, message_id);
         let plan = PreparationPlan {
             key,
             payload_bytes,
             credit_charge,
+            credit_request,
             caller_deadline,
         };
         self.available_credits -= u32::from(credit_charge);
+        self.pending_extra_credits = self
+            .pending_extra_credits
+            .saturating_add(requested_extra_credits);
         self.admitted_operations += 1;
         self.retained_payload_bytes += payload_bytes;
         self.requests.insert(
@@ -257,6 +283,8 @@ impl GenerationState {
                 lifecycle: RequestRecord::new(key),
                 payload_bytes,
                 credit_charge,
+                requested_extra_credits,
+                credit_response_seen: false,
                 admission_held: true,
                 payload_held: true,
                 credit_obligation: true,
@@ -494,6 +522,21 @@ impl GenerationState {
         }
         let previous_response = request.lifecycle.response();
 
+        if !request.credit_response_seen {
+            self.pending_extra_credits = self
+                .pending_extra_credits
+                .saturating_sub(request.requested_extra_credits);
+            self.total_credits = self
+                .total_credits
+                .saturating_sub(u32::from(request.credit_charge))
+                .saturating_add(u32::from(credit_grant));
+            request.credit_response_seen = true;
+        } else {
+            self.total_credits = self
+                .total_credits
+                .saturating_add(u32::from(credit_grant));
+        }
+
         // Protocol bookkeeping deliberately precedes caller completion.
         request.lifecycle.observe_response_commitment();
         if request.payload_held {
@@ -559,6 +602,9 @@ impl GenerationState {
                 return false;
             };
             self.available_credits = available;
+            self.pending_extra_credits = self
+                .pending_extra_credits
+                .saturating_sub(request.requested_extra_credits);
             request.credit_obligation = false;
         }
         self.release_request_ownership(key);
@@ -654,7 +700,7 @@ mod tests {
     const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
     fn state() -> GenerationState {
-        GenerationState::new(GENERATION, 40, 4, LIMITS, DRAIN_TIMEOUT)
+        GenerationState::new(GENERATION, 40, 4, 4, LIMITS, DRAIN_TIMEOUT)
     }
 
     fn admit(state: &mut GenerationState, payload_bytes: u64, charge: u16) -> RequestKey {
@@ -691,11 +737,42 @@ mod tests {
 
     #[test]
     fn multi_credit_admission_consumes_the_full_message_id_sequence_window() {
-        let mut state = GenerationState::new(GENERATION, 40, 32, LIMITS, DRAIN_TIMEOUT);
+        let mut state = GenerationState::new(GENERATION, 40, 32, 32, LIMITS, DRAIN_TIMEOUT);
         let first = admit(&mut state, 0, 16);
         let second = admit(&mut state, 0, 1);
         assert_eq!(first.message_id, 40);
         assert_eq!(second.message_id, 56);
+    }
+
+    #[test]
+    fn owner_requests_target_credit_window_once_while_grant_is_pending() {
+        let mut state = GenerationState::new(GENERATION, 0, 4, 128, LIMITS, DRAIN_TIMEOUT);
+        let first = state.reduce(OwnerEvent::Admit {
+            payload_bytes: 0,
+            credit_charge: 2,
+            caller_deadline: None,
+        });
+        let second = state.reduce(OwnerEvent::Admit {
+            payload_bytes: 0,
+            credit_charge: 1,
+            caller_deadline: None,
+        });
+        assert!(matches!(
+            first.as_slice(),
+            [OwnerEffect::Admitted(PreparationPlan {
+                credit_charge: 2,
+                credit_request: 126,
+                ..
+            })]
+        ));
+        assert!(matches!(
+            second.as_slice(),
+            [OwnerEffect::Admitted(PreparationPlan {
+                credit_charge: 1,
+                credit_request: 1,
+                ..
+            })]
+        ));
     }
 
     #[test]
@@ -736,6 +813,7 @@ mod tests {
             GENERATION,
             9,
             3,
+            3,
             AdmissionLimits {
                 max_operations: 1,
                 max_payload_bytes: 10,
@@ -762,7 +840,7 @@ mod tests {
 
     #[test]
     fn message_id_max_is_allocated_once_and_never_wraps() {
-        let mut state = GenerationState::new(GENERATION, u64::MAX, 2, LIMITS, DRAIN_TIMEOUT);
+        let mut state = GenerationState::new(GENERATION, u64::MAX, 2, 2, LIMITS, DRAIN_TIMEOUT);
         let key = admit(&mut state, 0, 1);
         assert_eq!(key.message_id, u64::MAX);
         state.reduce(OwnerEvent::Cancel {
@@ -786,6 +864,7 @@ mod tests {
         let mut state = GenerationState::new(
             GENERATION,
             100,
+            64,
             64,
             AdmissionLimits {
                 max_operations: 64,
@@ -936,7 +1015,14 @@ mod tests {
 
     #[test]
     fn credit_overflow_is_typed_and_does_not_advance_response_state() {
-        let mut state = GenerationState::new(GENERATION, 1, u32::MAX, LIMITS, DRAIN_TIMEOUT);
+        let mut state = GenerationState::new(
+            GENERATION,
+            1,
+            u32::MAX,
+            u32::MAX,
+            LIMITS,
+            DRAIN_TIMEOUT,
+        );
         let key = admit(&mut state, 0, 1);
         assert_eq!(
             state.reduce(OwnerEvent::Response {

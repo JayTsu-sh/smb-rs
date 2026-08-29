@@ -41,13 +41,10 @@
 //! - The handle is `Clone` (it just wraps an `mpsc::Sender`). When
 //!   every clone is dropped, the receiver returns `None` and the
 //!   actor task exits gracefully.
-//! - The actor does **not** own the `worker`, `conn_info`,
-//!   `curr_credits`, `curr_msg_id`, `credit_pool`, or
-//!   `lease_event_tx` fields. Those are either write-once
-//!   (`OnceCell`), lock-free (atomics), or already-serialised
-//!   (broadcast / semaphore) — routing them through an actor mailbox
-//!   would add latency to every send/recv without buying any
-//!   serialisation we don't already have.
+//! - The actor does **not** own protocol sequencing, credit accounting,
+//!   pending requests, transport I/O, or notification delivery. Those are
+//!   generation-runtime responsibilities; this temporary actor only owns
+//!   the lease/session maps pending their W3-6 migration.
 
 use std::collections::HashMap;
 use std::sync::Arc;

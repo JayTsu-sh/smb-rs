@@ -31,10 +31,17 @@ impl RuntimeWorker {
         transport: Box<dyn SmbTransport>,
         timeout: Duration,
         initial_message_id: u64,
+        target_credits: u32,
     ) -> Result<Arc<Self>> {
         let clock = Arc::new(TokioClock::new());
         let generation = GenerationId::new(1);
-        let config = RuntimeConfig::production(generation, initial_message_id, 1, timeout);
+        let config = RuntimeConfig::production(
+            generation,
+            initial_message_id,
+            1,
+            target_credits,
+            timeout,
+        );
         let (runtime, _events) = start_generation(transport, clock.clone(), config);
         Ok(Arc::new(Self {
             runtime,
@@ -53,13 +60,11 @@ impl RuntimeWorker {
     }
 
     pub(crate) async fn send(&self, message: OutgoingMessage) -> Result<SendMessageResult> {
-        let credit_charge = message.message.header.credit_charge.max(1);
         let deadline = self.clock.now().saturating_add(self.timeout);
         let submission = self
             .runtime
             .submit_operation_detached(
                 TypedOperation::any_status(message),
-                credit_charge,
                 Some(deadline),
             )
             .await
@@ -141,10 +146,7 @@ impl RuntimeWorker {
     ) -> Result<Vec<SendMessageResult>> {
         let operations = messages
             .into_iter()
-            .map(|message| {
-                let credit_charge = message.message.header.credit_charge.max(1);
-                (TypedOperation::any_status(message), credit_charge)
-            })
+            .map(TypedOperation::any_status)
             .collect();
         self.runtime
             .submit_compound_detached(

@@ -18,17 +18,15 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use smb_dtyp::*;
 use smb_msg::{
-    Command, RequestContent, Response, ResponseContent, negotiate::*, oplock::LeaseBreakAck,
+    RequestContent, Response, ResponseContent, negotiate::*, oplock::LeaseBreakAck,
     smb1::SMB1NegotiateMessage,
 };
 use smb_transport::*;
-use std::cmp::max;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::select;
-use tokio::sync::{OnceCell, Semaphore};
+use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 use worker::WorkerImpl;
 
@@ -62,10 +60,7 @@ impl Connection {
     ) -> crate::Result<Self> {
         config.validate()?;
         Ok(Connection {
-            handler: Arc::new(ConnectionMessageHandler::new(
-                client_guid,
-                config.credits_backlog,
-            )),
+            handler: Arc::new(ConnectionMessageHandler::new(client_guid)),
             config,
             server_name: server_name.to_string(),
             server_address,
@@ -247,7 +242,13 @@ impl Connection {
             initial_message_id = 1;
         }
 
-        WorkerImpl::start_at(transport, self.config.timeout(), initial_message_id).await
+        WorkerImpl::start_at(
+            transport,
+            self.config.timeout(),
+            initial_message_id,
+            u32::from(self.config.credits_backlog.unwrap_or(128)),
+        )
+        .await
     }
 
     /// This method perofrms the SMB2 negotiation.
@@ -697,10 +698,8 @@ impl Connection {
     /// 1. Sets `priority_mask` per the negotiated dialect — matches the
     ///    single-message [`crate::msg_handler::MessageHandler::sendo`]
     ///    path.
-    /// 2. Calls [`ConnectionMessageHandler::process_sequence_outgoing`]
-    ///    to allocate `message_id` + credit_charge / credit_request.
-    ///    Same accounting as a single-shot send, so server-side credit
-    ///    windows stay consistent.
+    /// 2. Submits the entire typed batch atomically; the runtime owner
+    ///    allocates MessageIds and credit charge/request values.
     /// 3. After all members are prepared, hands the whole batch to
     ///    [`crate::connection::worker::WorkerImpl::send_compound`] for
     ///    the single TCP write.
@@ -709,8 +708,8 @@ impl Connection {
     ///    N parts; our compound-aware incoming-side parser routes each
     ///    part by message_id, and these receives just consume the
     ///    pre-routed entries.
-    /// 5. Calls `process_sequence_incoming` on each response to return
-    ///    credits to the pool (mirroring the single-message path).
+    /// 5. The runtime owner applies every response grant before publishing
+    ///    the corresponding typed result.
     ///
     /// The caller owns everything semantic: setting
     /// `flags.related_operations` on members 2..N to chain off the
@@ -737,7 +736,7 @@ impl Connection {
     ) -> crate::Result<Vec<IncomingMessage>> {
         // CancelRequest has its own bespoke path inside the single-message
         // `sendo` (it reuses an already-allocated message_id and skips
-        // `process_sequence_outgoing`). Bundling it into a compound chain
+        // owner admission). Bundling it into a compound chain
         // would either re-allocate its message_id — silently breaking the
         // cancel target — or skip the per-member accounting we run below.
         // Reject up front rather than letting either failure mode bite.
@@ -758,7 +757,6 @@ impl Connection {
         };
         for m in msgs.iter_mut() {
             m.message.header.flags = m.message.header.flags.with_priority_mask(priority_value);
-            self.handler.process_sequence_outgoing(m).await?;
         }
 
         let worker = self
@@ -774,7 +772,6 @@ impl Connection {
             opts.msg_id = r.msg_id;
             opts.allow_async = true;
             let incoming = worker.receive(&opts).await?;
-            self.handler.process_sequence_incoming(&incoming).await?;
             responses.push(incoming);
         }
         Ok(responses)
@@ -805,10 +802,6 @@ pub struct LeaseEviction {
 pub(crate) struct ConnectionMessageHandler {
     client_guid: Guid,
 
-    /// The number of extra credits to be requested by the client
-    /// to enable larger requests/multiple outstanding requests.
-    credits_backlog: u16,
-
     worker: OnceCell<Arc<WorkerImpl>>,
 
     /// Cancellation token for stopping notifications.
@@ -816,14 +809,6 @@ pub(crate) struct ConnectionMessageHandler {
 
     // Negotiation-related state.
     conn_info: OnceCell<Arc<ConnectionInfo>>,
-
-    /// Number of credits available to the client at the moment, for the next requests.
-    curr_credits: Semaphore,
-    /// The current message ID to be used in the next message.
-    curr_msg_id: AtomicU64,
-    /// The number of credits granted to the client by the server, including the being-used ones.
-    /// This field is used ONLY when large MTU is enabled.
-    credit_pool: AtomicU16,
 
     /// Broadcasts [`LeaseBreakEvent`] to any [`crate::Client::subscribe_lease_breaks`]
     /// consumers when the server sends a `LeaseBreakNotify`.
@@ -837,17 +822,13 @@ pub(crate) struct ConnectionMessageHandler {
 }
 
 impl ConnectionMessageHandler {
-    fn new(client_guid: Guid, credits_backlog: Option<u16>) -> ConnectionMessageHandler {
+    fn new(client_guid: Guid) -> ConnectionMessageHandler {
         let (lease_event_tx, _) = tokio::sync::broadcast::channel(LEASE_BREAK_CHANNEL_CAPACITY);
 
         ConnectionMessageHandler {
             client_guid,
             worker: OnceCell::new(),
             conn_info: OnceCell::new(),
-            credits_backlog: credits_backlog.unwrap_or(128),
-            curr_credits: Semaphore::new(1),
-            curr_msg_id: AtomicU64::new(0),
-            credit_pool: AtomicU16::new(1),
             stop_notifications: Default::default(),
             lease_event_tx,
             actor: ConnectionActor::spawn(),
@@ -1087,18 +1068,8 @@ impl ConnectionMessageHandler {
         self.worker.get()
     }
 
-    const SET_CREDIT_CHARGE_CMDS: &'static [Command] = &[
-        Command::Read,
-        Command::Write,
-        Command::Ioctl,
-        Command::QueryDirectory,
-    ];
-
-    const CREDIT_CALC_RATIO: u32 = 65536;
-    const CREDITS_PER_MSG_NO_LARGE_MTU: u32 = 1;
-
-    /// Stamp an [`OutgoingMessage`] with priority, credit charge, and a
-    /// fresh message_id. Callers that need the wire-bytes of a
+    /// Stamp an [`OutgoingMessage`] with connection-level header policy.
+    /// Callers that need the wire-bytes of a
     /// request *before* it goes through [`Self::sendo`] (e.g. the
     /// session-setup driver hashing the final SessionSetup Request
     /// into the SMB 3.1.1 preauth integrity chain) invoke this
@@ -1115,10 +1086,7 @@ impl ConnectionMessageHandler {
         };
         msg.message.header.flags = msg.message.header.flags.with_priority_mask(priority_value);
 
-        let is_cancel = msg.message.content.as_cancel().is_ok();
-        if !is_cancel {
-            self.process_sequence_outgoing(msg).await?;
-        } else if msg.message.header.message_id == 0 {
+        if msg.message.content.as_cancel().is_ok() && msg.message.header.message_id == 0 {
             return Err(Error::InvalidState(
                 "Cancel message must have a valid message ID".into(),
             ));
@@ -1140,96 +1108,6 @@ impl ConnectionMessageHandler {
             .ok_or(Error::InvalidState("Worker is uninitialized".into()))?
             .send(msg)
             .await
-    }
-
-    async fn process_sequence_outgoing(&self, msg: &mut OutgoingMessage) -> crate::Result<()> {
-        if let Some(neg) = self.conn_info.get() {
-            if neg.negotiation.caps.large_mtu() {
-                // Calculate the cost of the message (charge).
-                let cost = if Self::SET_CREDIT_CHARGE_CMDS.contains(&msg.message.header.command) {
-                    let send_payload_size = msg.message.content.req_payload_size();
-                    let expected_response_payload_size = msg.message.content.expected_resp_size();
-                    (1 + (max(send_payload_size, expected_response_payload_size) - 1)
-                        / Self::CREDIT_CALC_RATIO)
-                        .try_into()
-                        .map_err(|_| Error::InvalidState("Credit charge overflow.".to_string()))?
-                } else {
-                    1
-                };
-
-                // First, acquire credits from the semaphore, and forget them.
-                // They may be returned via the response message, at `process_sequence_incoming` below.
-                self.curr_credits.acquire_many(cost as u32).await?.forget();
-
-                let mut request = cost;
-                // Request additional credits if required: if balance < extra, add to request the diff:
-                let current_pool_size = self.credit_pool.load(Ordering::Relaxed);
-                if current_pool_size < self.credits_backlog {
-                    request += self.credits_backlog - current_pool_size;
-                }
-
-                msg.message.header.credit_charge = cost;
-                msg.message.header.credit_request = request;
-                msg.message.header.message_id =
-                    self.curr_msg_id.fetch_add(cost as u64, Ordering::Relaxed);
-
-                return Ok(());
-            } else {
-                debug_assert_eq!(msg.message.header.credit_request, 0);
-                debug_assert_eq!(msg.message.header.credit_charge, 0);
-            }
-        }
-
-        // Default case: logically waiting for single credit per message,
-        // which will make the client wait for next response before allowing next request.
-        self.curr_credits
-            .acquire_many(Self::CREDITS_PER_MSG_NO_LARGE_MTU)
-            .await?
-            .forget();
-        debug_assert!(
-            self.curr_credits.available_permits() == 0,
-            "Expected 0 credits available with no large mtu, got {}",
-            self.curr_credits.available_permits()
-        );
-
-        msg.message.header.message_id = self
-            .curr_msg_id
-            .fetch_add(Self::CREDITS_PER_MSG_NO_LARGE_MTU as u64, Ordering::Relaxed);
-
-        Ok(())
-    }
-
-    async fn process_sequence_incoming(&self, msg: &IncomingMessage) -> crate::Result<()> {
-        if let Some(neg) = self.conn_info.get() {
-            if neg.negotiation.caps.large_mtu() {
-                let granted_credits = msg.message.header.credit_request;
-                let charged_credits = msg.message.header.credit_charge;
-                // Update the pool size - return how many EXTRA credits were granted.
-                // also, handle the case where the server granted less credits than charged.
-                if charged_credits > granted_credits {
-                    self.credit_pool
-                        .fetch_sub(charged_credits - granted_credits, Ordering::Relaxed);
-                } else {
-                    self.credit_pool
-                        .fetch_add(granted_credits - charged_credits, Ordering::Relaxed);
-                }
-
-                // Return the credits to the pool.
-                self.curr_credits.add_permits(granted_credits as usize);
-                return Ok(());
-            }
-        }
-
-        // Default case: return a single credit to the pool.
-        self.curr_credits
-            .add_permits(Self::CREDITS_PER_MSG_NO_LARGE_MTU as usize);
-        debug_assert!(
-            self.curr_credits.available_permits() <= Self::CREDITS_PER_MSG_NO_LARGE_MTU as usize,
-            "Expected at most {} credits available with no large mtu, got {}",
-            Self::CREDITS_PER_MSG_NO_LARGE_MTU,
-            self.curr_credits.available_permits()
-        );
-        Ok(())
     }
 
     async fn start_notify(self: &Arc<Self>) -> crate::Result<()> {
@@ -1314,8 +1192,6 @@ impl MessageHandler for ConnectionMessageHandler {
                 "Expected server-to-redir message".into(),
             ));
         }
-
-        self.process_sequence_incoming(&msg).await?;
 
         // Expected status matching. Error if no match.
         if !options

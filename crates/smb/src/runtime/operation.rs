@@ -7,6 +7,7 @@
 use crate::msg_handler::{IncomingMessage, OutgoingMessage};
 use bytes::Bytes;
 use smb_msg::{Command, Status};
+use std::cmp::max;
 
 use super::reducer::RequestKey;
 
@@ -100,6 +101,30 @@ impl TypedOperation {
             .map_or(0, |payload| payload.len() as u64)
     }
 
+    /// Compute the SMB2 credit charge from protocol intent. The caller does
+    /// not supply accounting data; the generation owner applies negotiated
+    /// Large MTU policy before admission.
+    pub(crate) fn credit_charge(&self, large_mtu: bool) -> Result<u16, OperationContractError> {
+        if !large_mtu {
+            return Ok(1);
+        }
+        const CREDIT_BYTES: u32 = 65_536;
+        let command = self.response.wire_command();
+        let charged = matches!(
+            command,
+            Command::Read | Command::Write | Command::Ioctl | Command::QueryDirectory
+        );
+        if !charged {
+            return Ok(1);
+        }
+        let request = self.outgoing.message.content.req_payload_size();
+        let response = self.outgoing.message.content.expected_resp_size();
+        let units = 1 + (max(request, response).saturating_sub(1) / CREDIT_BYTES);
+        units
+            .try_into()
+            .map_err(|_| OperationContractError::CreditChargeOverflow { command })
+    }
+
     pub(crate) fn into_outgoing(self) -> OutgoingMessage {
         self.outgoing
     }
@@ -152,6 +177,8 @@ pub(crate) enum OperationContractError {
     UnexpectedStatus { command: Command, status: Status },
     #[error("typed operation {command:?} requires at least one accepted status")]
     EmptyStatusPolicy { command: Command },
+    #[error("typed operation {command:?} credit charge overflows SMB2 header")]
+    CreditChargeOverflow { command: Command },
 }
 
 #[cfg(test)]
@@ -209,5 +236,23 @@ mod tests {
                 .response_policy()
                 .accepts_status(Status::AccessDenied)
         );
+    }
+
+    #[test]
+    fn owner_derives_multi_credit_charge_from_operation_shape() {
+        use smb_msg::{ReadRequest, RequestContent};
+
+        let request = ReadRequest {
+            flags: Default::default(),
+            length: 1024 * 1024,
+            offset: 0,
+            file_id: Default::default(),
+            minimum_count: 1,
+        };
+        let operation = TypedOperation::any_status(OutgoingMessage::new(RequestContent::Read(
+            request,
+        )));
+        assert_eq!(operation.credit_charge(false).unwrap(), 1);
+        assert_eq!(operation.credit_charge(true).unwrap(), 16);
     }
 }
