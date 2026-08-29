@@ -210,7 +210,10 @@ impl Connection {
             tracing::debug!("Negotiating multi-protocol: Sending SMB1");
             // 1. Send SMB1 negotiate request
             let msg_bytes: Vec<u8> = SMB1NegotiateMessage::default().try_into()?;
-            let frame = smb_transport::SendFrame::from_iovec(IoVec::from(msg_bytes))?;
+            let frame = smb_transport::SendFrame::from_segments(
+                vec![bytes::Bytes::from(msg_bytes)],
+                1,
+            )?;
             transport.send(&frame).await?;
 
             tracing::debug!("Sent SMB1 negotiate request, Receieving SMB2 response");
@@ -344,14 +347,11 @@ impl Connection {
         );
 
         let preauth_hash = if dialect_impl.preauth_hash_supported() {
-            let mut request_raw = request_status
+            let request_raw = request_status
                 .raw
                 .expect("Preauth hash must be calculated for supported dialect!");
-            request_raw.consolidate();
             PreauthHashState::begin()
-                .next(request_raw.first().ok_or_else(|| {
-                    Error::InvalidState("Preauth hash request data is empty.".to_string())
-                })?)?
+                .next(&request_raw)?
                 .next(&response.raw)?
         } else {
             PreauthHashState::unsupported()

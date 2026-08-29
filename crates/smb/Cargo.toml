@@ -81,6 +81,7 @@ temp-env = { version = "0.3.6", features = ["async_closure"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "test-util"] }
 serde_json = "1"
 zeroize = "1"
+smb-tests = { workspace = true }
 
 [features]
 default = ["sign", "encrypt", "compress", "std-fs-impls", "netbios-transport"]

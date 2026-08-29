@@ -47,7 +47,7 @@ pub use query_dir::*;
 pub use session_setup::*;
 pub use tree_connect::*;
 pub use wire_range::{DecodedFrame, WireRange};
-pub use wire_out::{WireBuilder, WireMessage};
+pub use wire_out::{TransformFrame, WireBuilder, WireMessage};
 
 #[cfg(test)]
 mod test;

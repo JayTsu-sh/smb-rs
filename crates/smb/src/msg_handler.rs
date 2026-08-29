@@ -1,6 +1,5 @@
 use bytes::Bytes;
 use smb_msg::{Command, PlainRequest, PlainResponse, RequestContent, Status};
-use smb_transport::IoVec;
 use std::sync::{Arc, atomic::AtomicU64};
 use tokio_util::sync::CancellationToken;
 
@@ -108,11 +107,11 @@ pub struct SendMessageResult {
     // The message ID for the sent message.
     pub msg_id: u64,
     // If finalized, this is set.
-    pub raw: Option<IoVec>,
+    pub raw: Option<Bytes>,
 }
 
 impl SendMessageResult {
-    pub fn new(msg_id: u64, raw: Option<IoVec>) -> SendMessageResult {
+    pub fn new(msg_id: u64, raw: Option<Bytes>) -> SendMessageResult {
         SendMessageResult { msg_id, raw }
     }
 }

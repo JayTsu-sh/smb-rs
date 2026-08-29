@@ -3,7 +3,7 @@ use crate::connection::worker::Worker;
 use crate::msg_handler::ReceiveOptions;
 use smb_msg::ResponseContent;
 use smb_transport::TransportFrame;
-use smb_transport::{IoVec, SmbTransport, SmbTransportWrite, TransportError};
+use smb_transport::{SendFrame, SmbTransport, SmbTransportWrite, TransportError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
@@ -109,8 +109,7 @@ where
     ///   chain is using the related-operations / `FileId::FULL` chaining
     ///   semantics from MS-SMB2 3.3.5.2.7.2.
     ///
-    /// **Not supported in the minimal compound path** (will error):
-    /// - per-member encryption,
+    /// **Not supported in the compound path** (will error):
     /// - per-member `additional_data` (zero-copy write tails),
     /// - empty input.
     pub async fn send_compound(
@@ -252,7 +251,7 @@ where
     /// to send a message to the server.
     pub async fn outgoing_data_callback(
         self: &Arc<Self>,
-        message: Option<IoVec>,
+        message: Option<SendFrame>,
         wtransport: &mut dyn SmbTransportWrite,
     ) -> crate::Result<()> {
         let message = match message {
@@ -267,8 +266,7 @@ where
                 }
             }
         };
-        let frame = smb_transport::SendFrame::from_iovec(message)?;
-        wtransport.send(&frame).await?;
+        wtransport.send(&message).await?;
 
         Ok(())
     }
@@ -328,17 +326,19 @@ where
 
         tracing::trace!("Message with ID {id} is passed to the worker for sending",);
 
-        // If raw data is requested (e.g. for preauth hash), consolidate into a single
-        // Bytes buffer before sending. This avoids cloning the entire IoVec (which would
-        // deep-copy all Owned Vec<u8> buffers). Instead, we get a single contiguous copy
-        // and the original IoVec is moved to the send channel without cloning.
+        // Preauth callers require exact contiguous wire bytes. The common
+        // single-segment case clones only the immutable Bytes owner; segmented
+        // messages use one explicit compatibility copy.
         let raw_bytes = if return_raw_data {
-            let total = message.total_size();
-            let mut buf = Vec::with_capacity(total);
-            for chunk in message.iter() {
-                buf.extend_from_slice(chunk);
+            if let [only] = message.segments() {
+                Some(only.clone())
+            } else {
+                let mut buf = Vec::with_capacity(message.total_len());
+                for chunk in message.segments() {
+                    buf.extend_from_slice(chunk);
+                }
+                Some(bytes::Bytes::from(buf))
             }
-            Some(IoVec::from(buf))
         } else {
             None
         };

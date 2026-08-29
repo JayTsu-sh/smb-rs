@@ -1,8 +1,6 @@
 use crate::ConnectionConfig;
-use crate::msg_handler::OutgoingMessage;
+use crate::msg_handler::{OutgoingMessage, Protection};
 use crate::{Connection, Error, FileCreateArgs, Pipe, Resource, Session, Tree};
-use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
 use smb_fscc::{ChainedItemList, FileBasicInformation, SetFileInfo, SetFileInfoClass};
 use smb_msg::{
     AdditionalInfo, CloseRequest, CreateRequest, FileId, ImpersonationLevel, NetworkInterfaceInfo,
@@ -14,7 +12,9 @@ use smb_transport::TransportConfig;
 use smb_transport::utils::TransportUtils;
 use sspi::{AuthIdentity, Secret};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::{collections::HashMap, str::FromStr};
+use tokio::sync::{Mutex, RwLock};
 
 use super::{config::ClientConfig, unc_path::UncPath};
 
@@ -755,22 +755,8 @@ impl Client {
         let tree_id = tree.tree_id();
         let session = self.get_session(path).await?;
         let session_id = session.session_id();
-        // Refuse to send a compound chain on a session that requires
-        // encryption — the current minimal compound transformer rejects
-        // per-member `encrypt = true` (see Transformer::transform_outgoing_compound),
-        // so silently falling through here would either leak the chain in
-        // plaintext (on a permissive server) or fail at the transformer
-        // with a less obvious error. Bail loudly with the same intent as
-        // ChannelMessageHandler::sendo, which prefers encryption over
-        // signing on such sessions.
-        if session.should_encrypt().await? {
-            return Err(Error::UnsupportedOperation(
-                "compound_set_basic_info: session requires encryption, but the compound \
-                 path does not yet support per-member encryption"
-                    .to_string(),
-            ));
-        }
-        let signed = !session.allow_unsigned().await?;
+        let encrypt = session.should_encrypt().await?;
+        let signed = !encrypt && !session.allow_unsigned().await?;
         let conn = self.get_connection(path.server()).await?;
         let rel = path.path().unwrap_or("");
 
@@ -784,6 +770,13 @@ impl Client {
             m.message.header.tree_id = Some(tree_id);
             m.message.header.session_id = session_id;
             m.message.header.flags.set_signed(signed);
+            m.security = Some(if encrypt {
+                Protection::Encrypt
+            } else if signed {
+                Protection::SignWithChannel
+            } else {
+                Protection::None
+            });
             if related {
                 m.message.header.flags.set_related_operations(true);
             }

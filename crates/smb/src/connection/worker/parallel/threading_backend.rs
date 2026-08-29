@@ -1,5 +1,5 @@
 use crate::error::*;
-use smb_transport::{IoVec, SmbTransport, SmbTransportRead, SmbTransportWrite, TransportError};
+use smb_transport::{SendFrame, SmbTransport, SmbTransportRead, SmbTransportWrite, TransportError};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -64,7 +64,7 @@ impl ThreadingBackend {
     fn loop_send(
         &self,
         mut wtransport: Box<dyn SmbTransportWrite>,
-        send_channel: mpsc::Receiver<Option<IoVec>>,
+        send_channel: mpsc::Receiver<Option<SendFrame>>,
     ) {
         loop {
             match self.loop_send_next(send_channel.recv(), wtransport.as_mut()) {
@@ -89,7 +89,7 @@ impl ThreadingBackend {
     #[inline]
     fn loop_send_next(
         &self,
-        message: Result<Option<IoVec>, mpsc::RecvError>,
+        message: Result<Option<SendFrame>, mpsc::RecvError>,
         wtransport: &mut dyn SmbTransportWrite,
     ) -> crate::Result<()> {
         self.worker.outgoing_data_callback(message?, wtransport)
@@ -97,7 +97,7 @@ impl ThreadingBackend {
 }
 
 impl MultiWorkerBackend for ThreadingBackend {
-    type SendMessage = Option<IoVec>;
+    type SendMessage = Option<SendFrame>;
 
     type AwaitingNotifier = std::sync::mpsc::Sender<crate::Result<IncomingMessage>>;
     type AwaitingWaiter = std::sync::mpsc::Receiver<crate::Result<IncomingMessage>>;
@@ -169,7 +169,7 @@ impl MultiWorkerBackend for ThreadingBackend {
         Ok(())
     }
 
-    fn wrap_msg_to_send(msg: IoVec) -> Self::SendMessage {
+    fn wrap_msg_to_send(msg: SendFrame) -> Self::SendMessage {
         Some(msg)
     }
 

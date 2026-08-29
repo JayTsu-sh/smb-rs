@@ -216,6 +216,29 @@ pub struct WireMessage {
     total_len: usize,
 }
 
+/// Immutable contiguous owner produced by compression and/or encryption.
+/// Construction consumes the transform arena; callers cannot regain mutable
+/// access after protection completes.
+#[derive(Clone, Debug)]
+pub struct TransformFrame(Bytes);
+
+impl TransformFrame {
+    pub fn from_vec(bytes: Vec<u8>) -> Result<Self> {
+        if bytes.is_empty() {
+            return Err(invalid("transform frame cannot be empty"));
+        }
+        Ok(Self(Bytes::from(bytes)))
+    }
+
+    pub fn as_bytes(&self) -> &Bytes {
+        &self.0
+    }
+
+    pub fn into_bytes(self) -> Bytes {
+        self.0
+    }
+}
+
 impl WireMessage {
     pub fn total_len(&self) -> usize {
         self.total_len
@@ -229,6 +252,27 @@ impl WireMessage {
         std::iter::once(self.metadata.as_ref()).chain(self.payloads.iter().map(Bytes::as_ref))
     }
 
+    /// Consume all segment owners into a single transform input arena. This is
+    /// the only payload-copying transition and is unreachable for plain send.
+    pub fn into_contiguous(self, prefix: usize) -> Result<Vec<u8>> {
+        let capacity = prefix
+            .checked_add(self.total_len)
+            .ok_or_else(|| invalid("transform arena length overflow"))?;
+        let mut contiguous = Vec::with_capacity(capacity);
+        contiguous.resize(prefix, 0);
+        contiguous.extend_from_slice(&self.metadata);
+        for payload in self.payloads {
+            contiguous.extend_from_slice(&payload);
+        }
+        Ok(contiguous)
+    }
+
+    pub fn into_segments(self) -> Vec<Bytes> {
+        std::iter::once(self.metadata)
+            .chain(self.payloads)
+            .collect()
+    }
+
     pub fn member_count(&self) -> usize {
         self.member_ranges.len().max(1)
     }
@@ -239,12 +283,6 @@ impl WireMessage {
         } else {
             self.member_ranges.get(index).cloned()
         }
-    }
-
-    /// Temporary stateless W2 adapter into the existing connection path.
-    #[doc(hidden)]
-    pub fn into_parts(self) -> (Bytes, Vec<Bytes>) {
-        (self.metadata, self.payloads)
     }
 }
 
@@ -485,5 +523,34 @@ mod tests {
         assert_eq!(segments[2].as_ptr(), second_pointer);
         assert_eq!(segments[1], b"first");
         assert_eq!(segments[2], b"second");
+    }
+
+    #[test]
+    fn transform_transition_consumes_segments_into_one_prefixed_owner() {
+        let payload = Bytes::from_static(b"payload");
+        let mut requests = [write_request(payload.len() as u32)];
+        let mut builder = WireBuilder::encode(&mut requests, 2).unwrap();
+        builder.attach_payload(payload).unwrap();
+        builder.finalize_offsets().unwrap();
+        builder.finish_unsigned().unwrap();
+
+        let message = builder.seal().unwrap();
+        let golden = message
+            .segments()
+            .flat_map(|segment| segment.iter().copied())
+            .collect::<Vec<_>>();
+        let contiguous = message.into_contiguous(7).unwrap();
+        assert_eq!(&contiguous[..7], &[0; 7]);
+        assert_eq!(&contiguous[7..], golden);
+    }
+
+    #[test]
+    fn transform_frame_freezes_the_final_arena_without_copy() {
+        let arena = vec![1, 2, 3, 4];
+        let pointer = arena.as_ptr();
+        let frame = TransformFrame::from_vec(arena).unwrap();
+        assert_eq!(frame.as_bytes().as_ptr(), pointer);
+        assert_eq!(frame.as_bytes().as_ref(), &[1, 2, 3, 4]);
+        assert!(TransformFrame::from_vec(Vec::new()).is_err());
     }
 }

@@ -4,7 +4,7 @@ use crate::{compression::*, msg_handler::*};
 use binrw::prelude::*;
 use bytes::Bytes;
 use smb_msg::*;
-use smb_transport::IoVec;
+use smb_transport::SendFrame;
 use std::sync::Arc;
 use std::{collections::HashMap, io::Cursor};
 use tokio::sync::{Mutex, RwLock};
@@ -325,12 +325,9 @@ impl Transformer {
     ///   that member's byte slice (header with signature=0 + body), then written
     ///   back into the header. All members must have the same `signed` flag on
     ///   the first member (used as the chain-wide policy).
-    /// - The resulting [`IoVec`] is the concatenation of each member's bytes
-    ///   in order, ready for the transport to write.
+    /// - The resulting immutable [`SendFrame`] is ready for transport.
     ///
-    /// **Constraints for the current minimal implementation:**
-    /// - No encryption.
-    /// - No compression.
+    /// **Constraints:**
     /// - No `additional_data` zero-copy bodies (data is whatever each
     ///   member's `PlainRequest` serializes to).
     /// - Caller must have already populated `header.message_id`,
@@ -341,23 +338,18 @@ impl Transformer {
     ///   2nd..Nth members and the `0xFF…FF` sentinel `FileId` on commands that
     ///   want to chain context from a prior Create.
     ///
-    /// Returns `Err(InvalidArgument)` for an empty `msgs` slice or any
-    /// member that requests encryption / additional_data.
+    /// Returns `Err(InvalidArgument)` for an empty chain, inconsistent
+    /// protection policy, or any member with `additional_data`.
     pub async fn transform_outgoing_compound(
         &self,
         mut msgs: Vec<OutgoingMessage>,
-    ) -> crate::Result<IoVec> {
+    ) -> crate::Result<SendFrame> {
         if msgs.is_empty() {
             return Err(crate::Error::InvalidArgument(
                 "compound chain requires at least one message".to_string(),
             ));
         }
         for (i, m) in msgs.iter().enumerate() {
-            if matches!(m.security, Some(Protection::Encrypt)) {
-                return Err(crate::Error::InvalidArgument(format!(
-                    "compound member {i}: encryption is not supported in the current minimal compound path",
-                )));
-            }
             if m.additional_data.is_some() {
                 return Err(crate::Error::InvalidArgument(format!(
                     "compound member {i}: additional_data is not supported in compound mode",
@@ -381,7 +373,16 @@ impl Transformer {
         // need a real signature, unsigned ones must carry the all-zero
         // sentinel). Catching this here yields a clearer error than the
         // server-side STATUS_ACCESS_DENIED that would otherwise come back.
-        let should_sign = msgs[0].message.header.flags.signed();
+        let should_encrypt = matches!(msgs[0].security, Some(Protection::Encrypt));
+        if msgs
+            .iter()
+            .any(|message| matches!(message.security, Some(Protection::Encrypt)) != should_encrypt)
+        {
+            return Err(crate::Error::InvalidArgument(
+                "compound chain has inconsistent encryption policy".to_string(),
+            ));
+        }
+        let should_sign = !should_encrypt && msgs[0].message.header.flags.signed();
         if msgs
             .iter()
             .any(|m| m.message.header.flags.signed() != should_sign)
@@ -424,14 +425,13 @@ impl Transformer {
             builder.finish_unsigned()?;
         }
 
-        let wire = builder.seal()?;
-        let (metadata, payloads) = wire.into_parts();
-        debug_assert!(payloads.is_empty());
-        Ok(IoVec::from(smb_transport::IoVecBuf::from(metadata)))
+        let session_id = msgs[0].message.header.session_id;
+        self.protect_wire(builder.seal()?, should_encrypt, session_id)
+            .await
     }
 
     /// Transforms an outgoing message to a raw SMB message.
-    pub async fn transform_outgoing(&self, mut msg: OutgoingMessage) -> crate::Result<IoVec> {
+    pub async fn transform_outgoing(&self, mut msg: OutgoingMessage) -> crate::Result<SendFrame> {
         // Single source of truth for what to do with this message: the
         // sealed `Protection` enum. Callers that haven't been migrated
         // off the legacy `encrypt: bool` / `flags.signed()` hint fields
@@ -519,14 +519,9 @@ impl Transformer {
         }
 
         let wire = builder.seal()?;
-        let (metadata, payloads) = wire.into_parts();
-        let mut outgoing_data = IoVec::from(smb_transport::IoVecBuf::from(metadata));
-        for payload in payloads {
-            outgoing_data.add_bytes(payload);
-        }
 
         if let Some(session_key) = setup_session_key {
-            if let Some(signed_request) = outgoing_data.first() {
+            if let Some(signed_request) = wire.segments().next() {
                 let mut hash = self.preauth_hash.lock().await;
                 *hash = hash.clone().next(signed_request)?;
             }
@@ -537,43 +532,32 @@ impl Transformer {
                 .insert(session_id, response_signer);
         }
 
-        // 2. Compress
-        const COMPRESSION_THRESHOLD: usize = 1024;
-        outgoing_data = {
-            if outgoing_data.total_size() > COMPRESSION_THRESHOLD {
-                let rconfig = self.config.read().await;
-                if let Some(compress) = &rconfig.compress {
-                    // Build a vector of the entire data. In the future, this may be optimized to avoid copying.
-                    // currently, there's not chained compression, and copy will occur anyway.
-                    outgoing_data.consolidate();
-                    let compressed =
-                        compress.0.compress(outgoing_data.first().ok_or_else(|| {
-                            crate::Error::InvalidState(
-                                "Outgoing data is empty after consolidation.".to_string(),
-                            )
-                        })?)?;
+        self.protect_wire(wire, should_encrypt, session_id).await
+    }
 
-                    let mut compressed_result = IoVec::default();
-                    let write_compressed =
-                        compressed_result.add_owned(Vec::with_capacity(compressed.total_size()));
-                    compressed.write(&mut Cursor::new(write_compressed))?;
-                    compressed_result
-                } else {
-                    outgoing_data
-                }
-            } else {
-                outgoing_data
-            }
+    /// Consume one sealed plain wire owner and return the sole immutable frame
+    /// handed to the backend. Ordinary and compound messages must share this
+    /// protection order so transform composition cannot diverge again.
+    async fn protect_wire(
+        &self,
+        wire: smb_msg::WireMessage,
+        should_encrypt: bool,
+        session_id: u64,
+    ) -> crate::Result<SendFrame> {
+        const COMPRESSION_THRESHOLD: usize = 1024;
+        let compressor = if wire.total_len() > COMPRESSION_THRESHOLD {
+            self.config
+                .read()
+                .await
+                .compress
+                .as_ref()
+                .map(|pair| pair.0.clone())
+        } else {
+            None
         };
 
-        // 3. Encrypt
-        if should_encrypt {
-            debug_assert!(should_encrypt && !should_sign);
-
-            // AEAD encrypt runs *outside* the sessions read lock:
-            // get_encryptor returns an owned clone, then we release
-            // the inner borrow before the (CPU-bound) encrypt step.
-            let encryptor =
+        let encryptor = if should_encrypt {
+            Some(
                 self.get_encryptor(session_id)
                     .await?
                     .ok_or(crate::Error::TranformFailed(TransformError {
@@ -581,17 +565,56 @@ impl Transformer {
                         phase: TransformPhase::EncryptDecrypt,
                         session_id: Some(session_id),
                         why: "Message is required to be encrypted, but no encryptor is set up!",
-                        msg_id: Some(msg.message.header.message_id),
-                    }))?;
-            let encrypted_header = encryptor.encrypt_message(&mut outgoing_data, session_id)?;
+                        msg_id: None,
+                    }))?,
+            )
+        } else {
+            None
+        };
 
-            let write_encryption_header =
-                outgoing_data.insert_owned(0, Vec::with_capacity(EncryptedHeader::STRUCTURE_SIZE));
+        Self::protect_wire_with(wire, compressor, encryptor, session_id)
+    }
 
-            encrypted_header.write(&mut Cursor::new(write_encryption_header))?;
+    fn protect_wire_with(
+        wire: smb_msg::WireMessage,
+        compressor: Option<Compressor>,
+        encryptor: Option<MessageEncryptor>,
+        session_id: u64,
+    ) -> crate::Result<SendFrame> {
+        let should_encrypt = encryptor.is_some();
+
+        if compressor.is_none() && !should_encrypt {
+            return SendFrame::from_segments(wire.into_segments(), usize::MAX).map_err(Into::into);
         }
 
-        Ok(outgoing_data)
+        let encryption_prefix = if should_encrypt {
+            EncryptedHeader::STRUCTURE_SIZE
+        } else {
+            0
+        };
+
+        // Compression consumes the plain owner. Its serialized output is
+        // written directly after any reserved encryption header, avoiding a
+        // second transformed frame owner.
+        let mut transformed = if let Some(compressor) = compressor {
+            let plain = wire.into_contiguous(0)?;
+            compressor.compress_transform(&plain, encryption_prefix)?
+        } else {
+            wire.into_contiguous(encryption_prefix)?
+        };
+
+        if let Some(encryptor) = encryptor {
+            let encrypted_header = encryptor.encrypt_message(
+                &mut transformed[EncryptedHeader::STRUCTURE_SIZE..],
+                session_id,
+            )?;
+            encrypted_header.write(&mut Cursor::new(
+                &mut transformed[..EncryptedHeader::STRUCTURE_SIZE],
+            ))?;
+        }
+
+        let transformed = smb_msg::TransformFrame::from_vec(transformed)?;
+        SendFrame::from_segments(vec![transformed.into_bytes()], 1).map_err(Into::into)
     }
 
     /// Transforms an incoming message buffer to one or more [`IncomingMessage`]s,
@@ -959,7 +982,7 @@ mod wire_builder_tests {
     use super::*;
 
     #[tokio::test]
-    async fn bytes_write_keeps_payload_identity_through_legacy_adapter() {
+    async fn plain_bytes_write_keeps_payload_identity_through_sealed_frame() {
         let payload = Bytes::from_static(b"identity-preserved");
         let pointer = payload.as_ptr();
         let outgoing = OutgoingMessage::new(
@@ -972,7 +995,116 @@ mod wire_builder_tests {
             .await
             .unwrap();
 
-        assert_eq!(wire.len(), 2);
-        assert_eq!(wire[1].as_ptr(), pointer);
+        assert_eq!(wire.segments().len(), 2);
+        assert_eq!(wire.segments()[1].as_ptr(), pointer);
+    }
+
+    #[test]
+    #[cfg(feature = "encrypt_aes128gcm")]
+    fn encrypted_compound_uses_one_transform_owner_and_preserves_chain() {
+        let session_id = 7;
+        let mut requests = [
+            PlainRequest::new(LogoffRequest {}.into()),
+            PlainRequest::new(LogoffRequest {}.into()),
+            PlainRequest::new(LogoffRequest {}.into()),
+        ];
+        for (index, request) in requests.iter_mut().enumerate() {
+            request.header.session_id = session_id;
+            request.header.message_id = index as u64;
+        }
+        let mut builder = WireBuilder::encode(&mut requests, 1).unwrap();
+        builder.finalize_offsets().unwrap();
+        builder.finish_unsigned().unwrap();
+
+        let key = [0x42; 16];
+        let encryptor = MessageEncryptor::new(
+            crate::crypto::make_encrypting_algo(EncryptionCipher::Aes128Gcm, &key).unwrap(),
+        );
+        let frame = Transformer::protect_wire_with(
+            builder.seal().unwrap(),
+            None,
+            Some(encryptor),
+            session_id,
+        )
+        .unwrap();
+        assert_eq!(frame.segments().len(), 1);
+
+        let mut cursor = Cursor::new(frame.segments()[0].as_ref());
+        let encrypted_header = EncryptedHeader::read_le(&mut cursor).unwrap();
+        let mut encrypted_payload = frame.segments()[0][cursor.position() as usize..].to_vec();
+        let decryptor =
+            crate::crypto::make_encrypting_algo(EncryptionCipher::Aes128Gcm, &key).unwrap();
+        decryptor
+            .decrypt(
+                &mut encrypted_payload,
+                &encrypted_header.aead_bytes(),
+                &encrypted_header.nonce,
+                encrypted_header.signature,
+            )
+            .unwrap();
+
+        let mut offset = 0;
+        for index in 0..3 {
+            let header = Header::read(&mut Cursor::new(&encrypted_payload[offset..])).unwrap();
+            assert_eq!(header.message_id, index as u64);
+            if index < 2 {
+                assert!(header.next_command > 0);
+                assert_eq!(header.next_command % 8, 0);
+                offset += header.next_command as usize;
+            } else {
+                assert_eq!(header.next_command, 0);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "encrypt_aes128gcm", feature = "compress_lz4"))]
+    fn compression_is_serialized_inside_the_final_encrypted_owner() {
+        let session_id = 11;
+        let payload = Bytes::from(vec![0x5a; 4096]);
+        let mut request = PlainRequest::new(
+            WriteRequest::new(0, FileId::EMPTY, WriteFlags::new(), payload.len() as u32).into(),
+        );
+        request.header.session_id = session_id;
+        let mut builder = WireBuilder::encode(std::iter::once(&mut request), 2).unwrap();
+        builder.attach_payload(payload).unwrap();
+        builder.finalize_offsets().unwrap();
+        builder.finish_unsigned().unwrap();
+        let wire = builder.seal().unwrap();
+        let original_size = wire.total_len();
+
+        let caps = Arc::new(CompressionCapabilities {
+            flags: CompressionCapsFlags::new(),
+            compression_algorithms: vec![CompressionAlgorithm::LZ4],
+        });
+        let key = [0x24; 16];
+        let frame = Transformer::protect_wire_with(
+            wire,
+            Some(Compressor::new(&caps)),
+            Some(MessageEncryptor::new(
+                crate::crypto::make_encrypting_algo(EncryptionCipher::Aes128Gcm, &key).unwrap(),
+            )),
+            session_id,
+        )
+        .unwrap();
+
+        let mut cursor = Cursor::new(frame.segments()[0].as_ref());
+        let header = EncryptedHeader::read_le(&mut cursor).unwrap();
+        let mut payload = frame.segments()[0][cursor.position() as usize..].to_vec();
+        crate::crypto::make_encrypting_algo(EncryptionCipher::Aes128Gcm, &key)
+            .unwrap()
+            .decrypt(
+                &mut payload,
+                &header.aead_bytes(),
+                &header.nonce,
+                header.signature,
+            )
+            .unwrap();
+
+        assert_eq!(&payload[..4], b"\xfcSMB");
+        assert_eq!(
+            u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize,
+            original_size,
+        );
     }
 }

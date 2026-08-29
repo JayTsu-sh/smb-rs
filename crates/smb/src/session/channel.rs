@@ -65,11 +65,8 @@ impl Channel {
     /// Mirrors the check used inside [`ChannelMessageHandler::sendo`]: when
     /// `should_encrypt()` is `true`, the single-message path sets
     /// `msg.encrypt = true` instead of merely signing. Callers that build
-    /// SMB2 compound chains directly (e.g. P2.b) must inspect this *before*
-    /// going through the worker, because the compound transformer does not
-    /// yet support per-member encryption and would otherwise leak the
-    /// compound's headers/body in cleartext on an encryption-required
-    /// session.
+    /// SMB2 compound chains directly must use this to select whole-chain
+    /// encryption instead of per-member signing.
     ///
     /// Errors with `InvalidState` when the underlying session has not
     /// reached the Ready state, matching `SessionInfo::should_encrypt`.

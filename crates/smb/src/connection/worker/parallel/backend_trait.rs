@@ -1,4 +1,4 @@
-use smb_transport::{IoVec, SmbTransport};
+use smb_transport::{SendFrame, SmbTransport};
 use std::{sync::Arc, time::Duration};
 
 use crate::msg_handler::IncomingMessage;
@@ -23,7 +23,7 @@ pub trait MultiWorkerBackend {
         Self::AwaitingNotifier: std::fmt::Debug;
     async fn stop(&self) -> crate::Result<()>;
 
-    fn wrap_msg_to_send(msg: IoVec) -> Self::SendMessage;
+    fn wrap_msg_to_send(msg: SendFrame) -> Self::SendMessage;
     fn make_notifier_awaiter_pair() -> (Self::AwaitingNotifier, Self::AwaitingWaiter);
     fn make_send_channel_pair() -> (Self::ChannelSender, Self::ChannelReceiver);
 

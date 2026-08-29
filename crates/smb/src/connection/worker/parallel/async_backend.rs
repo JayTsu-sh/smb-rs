@@ -1,12 +1,12 @@
 use crate::clock::{Clock, TokioClock};
 use crate::error::*;
 use crate::msg_handler::IncomingMessage;
-use smb_transport::{IoVec, SmbTransport, SmbTransportRead, SmbTransportWrite, TransportError};
+use smb_transport::{SendFrame, SmbTransport, SmbTransportRead, SmbTransportWrite, TransportError};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::select;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::{select};
 use tokio_util::sync::CancellationToken;
 
 use super::backend_trait::MultiWorkerBackend;
@@ -60,7 +60,7 @@ impl AsyncBackend {
     async fn loop_send(
         self: Arc<Self>,
         mut wtransport: Box<dyn SmbTransportWrite>,
-        mut send_channel: mpsc::Receiver<IoVec>,
+        mut send_channel: mpsc::Receiver<SendFrame>,
         worker: Arc<ParallelWorker<Self>>,
     ) {
         tracing::debug!("Starting worker loop.");
@@ -115,7 +115,7 @@ impl AsyncBackend {
     async fn handle_next_send(
         &self,
         wtransport: &mut dyn SmbTransportWrite,
-        send_channel: &mut mpsc::Receiver<IoVec>,
+        send_channel: &mut mpsc::Receiver<SendFrame>,
         worker: &Arc<ParallelWorker<Self>>,
     ) -> crate::Result<()> {
         select! {
@@ -132,7 +132,7 @@ impl AsyncBackend {
 }
 
 impl MultiWorkerBackend for AsyncBackend {
-    type SendMessage = IoVec;
+    type SendMessage = SendFrame;
 
     type AwaitingNotifier = oneshot::Sender<crate::Result<IncomingMessage>>;
     type AwaitingWaiter = oneshot::Receiver<crate::Result<IncomingMessage>>;
@@ -181,7 +181,7 @@ impl MultiWorkerBackend for AsyncBackend {
         loop_handles.1.await?;
         Ok(())
     }
-    fn wrap_msg_to_send(msg: IoVec) -> Self::SendMessage {
+    fn wrap_msg_to_send(msg: SendFrame) -> Self::SendMessage {
         msg
     }
 

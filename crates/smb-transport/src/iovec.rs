@@ -91,24 +91,6 @@ impl IoVec {
             .collect()
     }
 
-    /// Consolidates all buffers into a single owned buffer,
-    /// and puts it in the IoVec, replacing all previous buffers.
-    pub fn consolidate(&mut self) -> &mut Vec<u8> {
-        // Fast path: single owned buffer — no allocation or copy needed.
-        if self.0.len() == 1 && matches!(self.0[0], IoVecBuf::Owned(_)) {
-            match &mut self.0[0] {
-                IoVecBuf::Owned(v) => return v,
-                _ => unreachable!(),
-            }
-        }
-
-        let mut consolidated = Vec::with_capacity(self.total_size());
-        for buf in self.0.iter() {
-            consolidated.extend_from_slice(buf);
-        }
-        self.0.clear();
-        self.add_owned(consolidated)
-    }
 }
 
 impl From<Vec<IoVecBuf>> for IoVec {
