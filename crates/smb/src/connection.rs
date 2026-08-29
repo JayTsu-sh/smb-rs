@@ -10,6 +10,7 @@ use crate::dialects::DialectImpl;
 use crate::lease::{LeaseBreakEvent, LeaseSlot};
 pub use crate::runtime::wire::TransformError;
 use crate::{Error, crypto, command::*, session::Session};
+use arc_swap::ArcSwapOption;
 use binrw::prelude::*;
 pub use config::*;
 use connection_info::{ConnectionInfo, NegotiatedProperties};
@@ -26,7 +27,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::select;
-use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 use worker::WorkerImpl;
 
@@ -106,7 +106,7 @@ impl Connection {
             .bind(
                 identity,
                 &self.context,
-                self.context.conn_info.get().ok_or_else(|| {
+                &self.context.conn_info().ok_or_else(|| {
                     Error::InvalidState("Connection info not available.".to_string())
                 })?,
             )
@@ -255,12 +255,8 @@ impl Connection {
     async fn _negotiate_smb2(
         &self,
         server_address: std::net::SocketAddr,
+        worker: &Arc<WorkerImpl>,
     ) -> crate::Result<ConnectionInfo> {
-        // Confirm that we're not already negotiated.
-        if self.context.conn_info.get().is_some() {
-            return Err(Error::InvalidState("Already negotiated".into()));
-        }
-
         tracing::debug!("Negotiating SMB2");
 
         // List possible versions to run with.
@@ -287,7 +283,8 @@ impl Connection {
         // Send SMB2 negotiate request
         let (request_status, response) = self
             .context
-            .execute_with_submission(
+            .execute_with_worker(
+                worker,
                 CommandRequest::new(
                     self._make_smb2_neg_request(
                         dialects,
@@ -502,7 +499,7 @@ impl Connection {
         transport: Box<dyn SmbTransport>,
         smb2_only_neg: bool,
     ) -> crate::Result<()> {
-        if self.context.conn_info.get().is_some() {
+        if self.context.conn_info().is_some() {
             return Err(Error::InvalidState("Already negotiated".into()));
         }
 
@@ -512,20 +509,11 @@ impl Connection {
             ._negotiate_switch_to_smb2(transport, smb2_only_neg)
             .await?;
 
-        self.context
-            .worker
-            .set(worker)
-            .map_err(|_| Error::InvalidState("Worker already set.".to_string()))?;
-
         // Negotiate SMB2
-        let info = Arc::new(self._negotiate_smb2(server_address).await?);
+        let info = Arc::new(self._negotiate_smb2(server_address, &worker).await?);
 
-        self.context
-            .worker
-            .get()
-            .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?
-            .negotaite_complete(&info)
-            .await?;
+        worker.negotaite_complete(&info).await?;
+        self.context.publish_generation(worker, info.clone());
 
         // Always start the notify task unless the caller explicitly disabled
         // it. `caps.notifications()` is the SMB 3.1.1 ChangeNotify capability
@@ -548,11 +536,6 @@ impl Connection {
             self.context.start_lease_break_listener();
         }
 
-        self.context
-            .conn_info
-            .set(info)
-            .map_err(|_| Error::InvalidState("Connection info already set.".to_string()))?;
-
         tracing::debug!("Negotiation successful");
         Ok(())
     }
@@ -571,13 +554,14 @@ impl Connection {
     /// * Use the [`ConnectionConfig`] to configure authentication options.
     #[tracing::instrument(level = "debug", skip_all, fields(server = %self.server_name, user = %identity.username.account_name()))]
     pub async fn authenticate(&self, identity: sspi::AuthIdentity) -> crate::Result<Session> {
+        let conn_info = self
+            .context
+            .conn_info()
+            .ok_or_else(|| Error::InvalidState("Connection not negotiated.".to_string()))?;
         let session = Session::create(
             identity,
             &self.context,
-            self.context
-                .conn_info
-                .get()
-                .ok_or_else(|| Error::InvalidState("Connection not negotiated.".to_string()))?,
+            &conn_info,
         )
         .await?;
         let session_context = Arc::downgrade(&session.context);
@@ -605,13 +589,14 @@ impl Connection {
     where
         G: crate::session::gss::GssState + 'static,
     {
+        let conn_info = self
+            .context
+            .conn_info()
+            .ok_or_else(|| Error::InvalidState("Connection not negotiated.".to_string()))?;
         let session = Session::create_with_gss(
             gss,
             &self.context,
-            self.context
-                .conn_info
-                .get()
-                .ok_or_else(|| Error::InvalidState("Connection not negotiated.".to_string()))?,
+            &conn_info,
         )
         .await?;
         let session_context = Arc::downgrade(&session.context);
@@ -624,8 +609,8 @@ impl Connection {
 
     /// Returns the connection information, if the connection has been negotiated.
     /// Otherwise, returns `None`.
-    pub fn conn_info(&self) -> Option<&Arc<ConnectionInfo>> {
-        self.context.conn_info.get()
+    pub fn conn_info(&self) -> Option<Arc<ConnectionInfo>> {
+        self.context.conn_info()
     }
 
     /// Subscribe to lease-break notifications received on this connection.
@@ -756,7 +741,7 @@ impl Connection {
                 )));
             }
         }
-        let priority_value = match self.context.conn_info.get() {
+        let priority_value = match self.context.conn_info() {
             Some(neg_info) => match neg_info.negotiation.dialect_rev {
                 Dialect::Smb0311 => 1,
                 _ => 0,
@@ -769,8 +754,7 @@ impl Connection {
 
         let worker = self
             .context
-            .worker
-            .get()
+            .worker()
             .ok_or(Error::InvalidState("Worker is uninitialized".into()))?;
         let send_results = worker.send_compound_for(msgs, dependency).await?;
 
@@ -810,13 +794,10 @@ pub struct LeaseEviction {
 pub(crate) struct ConnectionCore {
     client_guid: Guid,
 
-    worker: OnceCell<Arc<WorkerImpl>>,
+    generation: ArcSwapOption<ConnectionGeneration>,
 
     /// Cancellation token for stopping notifications.
     stop_notifications: CancellationToken,
-
-    // Negotiation-related state.
-    conn_info: OnceCell<Arc<ConnectionInfo>>,
 
     /// Broadcasts [`LeaseBreakEvent`] to any [`crate::Client::subscribe_lease_breaks`]
     /// consumers when the server sends a `LeaseBreakNotify`.
@@ -827,11 +808,15 @@ pub(crate) struct ConnectionCore {
     registry: ConnectionRegistry,
 }
 
+struct ConnectionGeneration {
+    worker: Arc<WorkerImpl>,
+    conn_info: Arc<ConnectionInfo>,
+}
+
 impl ConnectionCore {
     pub(crate) fn connection_object(&self) -> crate::Result<crate::runtime::ObjectToken> {
         Ok(self
-            .worker
-            .get()
+            .worker()
             .ok_or_else(|| Error::InvalidState("Runtime is uninitialized".into()))?
             .connection_object())
     }
@@ -841,19 +826,9 @@ impl ConnectionCore {
         parent: crate::runtime::ObjectToken,
         kind: crate::runtime::ObjectKind,
     ) -> crate::Result<crate::runtime::ObjectToken> {
-        self.worker
-            .get()
+        self.worker()
             .ok_or_else(|| Error::InvalidState("Runtime is uninitialized".into()))?
             .create_object(parent, kind)
-            .await
-    }
-
-    pub(crate) async fn execute(
-        &self,
-        msg: CommandRequest,
-        options: ResponseOptions<'_>,
-    ) -> crate::Result<(CommandSubmission, CommandResponse)> {
-        self.execute_for(msg, options, self.connection_object()?)
             .await
     }
 
@@ -867,8 +842,7 @@ impl ConnectionCore {
         self.prepare_outgoing(&mut msg).await?;
         options.channel_id = channel_id;
         let result = self
-            .worker
-            .get()
+            .worker()
             .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?
             .execute_for(msg, &options, dependency)
             .await?;
@@ -886,20 +860,32 @@ impl ConnectionCore {
         dependency: crate::runtime::ObjectToken,
     ) -> crate::Result<CommandSubmission> {
         self.prepare_outgoing(&mut message).await?;
-        self.worker
-            .get()
+        self.worker()
             .ok_or_else(|| Error::InvalidState("Runtime is uninitialized".into()))?
             .send_for(message, dependency)
             .await
     }
 
-    pub(crate) async fn execute_with_submission(
+    async fn execute_with_worker(
         &self,
-        message: CommandRequest,
+        worker: &Arc<WorkerImpl>,
+        mut message: CommandRequest,
     ) -> crate::Result<(CommandSubmission, CommandResponse)> {
         let command = message.message.content.associated_cmd();
-        self.execute(message, ResponseOptions::new().with_cmd(Some(command)))
-            .await
+        self.prepare_outgoing(&mut message).await?;
+        let result = worker
+            .execute_for(
+                message,
+                &ResponseOptions::new().with_cmd(Some(command)),
+                worker.connection_object(),
+            )
+            .await?;
+        if !result.1.message.header.flags.server_to_redir() {
+            return Err(Error::InvalidMessage(
+                "Expected server-to-redir message".into(),
+            ));
+        }
+        Ok(result)
     }
 
     pub(crate) async fn receive(
@@ -907,8 +893,7 @@ impl ConnectionCore {
         options: ResponseOptions<'_>,
     ) -> crate::Result<CommandResponse> {
         Self::validate_incoming(
-            self.worker
-                .get()
+            self.worker()
                 .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?
                 .receive(&options)
                 .await?,
@@ -951,8 +936,7 @@ impl ConnectionCore {
 
         ConnectionCore {
             client_guid,
-            worker: OnceCell::new(),
-            conn_info: OnceCell::new(),
+            generation: ArcSwapOption::empty(),
             stop_notifications: Default::default(),
             lease_event_tx,
             registry: ConnectionRegistry::new(),
@@ -1183,8 +1167,21 @@ impl ConnectionCore {
         self.lease_event_tx.subscribe()
     }
 
-    pub fn worker(&self) -> Option<&Arc<WorkerImpl>> {
-        self.worker.get()
+    pub fn worker(&self) -> Option<Arc<WorkerImpl>> {
+        self.generation
+            .load_full()
+            .map(|generation| generation.worker.clone())
+    }
+
+    fn conn_info(&self) -> Option<Arc<ConnectionInfo>> {
+        self.generation
+            .load_full()
+            .map(|generation| generation.conn_info.clone())
+    }
+
+    fn publish_generation(&self, worker: Arc<WorkerImpl>, conn_info: Arc<ConnectionInfo>) {
+        self.generation
+            .store(Some(Arc::new(ConnectionGeneration { worker, conn_info })));
     }
 
     /// Stamp an [`CommandRequest`] with connection-level header policy.
@@ -1196,7 +1193,7 @@ impl ConnectionCore {
     /// message off — bypassing `submit` so the sequencing logic does
     /// not run twice.
     pub(crate) async fn prepare_outgoing(&self, msg: &mut CommandRequest) -> crate::Result<()> {
-        let priority_value = match self.conn_info.get() {
+        let priority_value = match self.conn_info() {
             Some(neg_info) => match neg_info.negotiation.dialect_rev {
                 Dialect::Smb0311 => 1,
                 _ => 0,
@@ -1222,8 +1219,7 @@ impl ConnectionCore {
         &self,
         msg: CommandRequest,
     ) -> crate::Result<CommandSubmission> {
-        self.worker
-            .get()
+        self.worker()
             .ok_or(Error::InvalidState("Worker is uninitialized".into()))?
             .send(msg)
             .await
@@ -1231,8 +1227,7 @@ impl ConnectionCore {
 
     async fn start_notify(self: &Arc<Self>) -> crate::Result<()> {
         let worker = self
-            .worker
-            .get()
+            .worker()
             .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?;
         let worker = worker.clone();
         const CHANNEL_BUFFER_SIZE: usize = 10;
@@ -1458,13 +1453,13 @@ impl Drop for ConnectionCore {
     fn drop(&mut self) {
         self.stop_notify();
 
-        let worker = match self.worker.take() {
-            Some(worker) => worker,
+        let generation = match self.generation.swap(None) {
+            Some(generation) => generation,
             None => return,
         };
 
         tokio::task::spawn(async move {
-            worker.stop().await.ok();
+            generation.worker.stop().await.ok();
         });
     }
 }
