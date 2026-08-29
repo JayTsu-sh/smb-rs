@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serial_test::serial;
 mod common;
 use common::{TestConstants, make_server_connection};
-use smb::{Client, Connection, File, FileCreateArgs, Session, Tree};
+use smb::{FileCreateArgs, client::Client, connection::Connection, resource::File, session::Session, tree::Tree};
 use smb_fscc::{FileBasicInformation, FileDispositionInformation};
 
 async fn _close_tests_helper()

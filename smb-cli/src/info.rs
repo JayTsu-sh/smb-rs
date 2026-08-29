@@ -1,7 +1,7 @@
 use crate::Cli;
 use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
-use smb::{Client, FileAccessMask, FileBasicInformation, QueryQuotaInfo, UncPath, resource::*};
+use smb::{FileAccessMask, FileBasicInformation, QueryQuotaInfo, UncPath, client::Client, resource::*};
 use std::collections::VecDeque;
 use std::fmt::Display;
 use std::{error::Error, sync::Arc};

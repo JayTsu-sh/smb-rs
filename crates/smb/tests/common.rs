@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use smb::*;
+use smb::client::{Client, ClientConfig};
 use std::env::var;
 use std::fs;
 use std::sync::OnceLock;

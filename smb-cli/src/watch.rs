@@ -1,6 +1,6 @@
 use crate::Cli;
 use clap::Parser;
-use smb::{Client, DirAccessMask, NotifyFilter, UncPath, resource::*};
+use smb::{DirAccessMask, NotifyFilter, UncPath, client::Client, resource::*};
 use std::error::Error;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;

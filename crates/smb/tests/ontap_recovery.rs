@@ -6,7 +6,7 @@ use common::{
     default_connection_config, make_server_connection, smb_test_identity, smb_tests_server,
     smb_tests_share,
 };
-use smb::{Connection, DurableOpenRequest, FileCreateArgs, UncPath, WriteAt};
+use smb::{DurableOpenRequest, FileCreateArgs, UncPath, WriteAt, connection::Connection};
 use smb_dtyp::Guid;
 use std::net::SocketAddr;
 use std::sync::Arc;

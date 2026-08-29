@@ -1,7 +1,7 @@
 use crate::{Cli, path::*};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use smb::{Client, CreateOptions, FileAccessMask, FileAttributes, resource::*};
+use smb::{CreateOptions, FileAccessMask, FileAttributes, client::Client, resource::*};
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;

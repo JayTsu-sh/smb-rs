@@ -12,7 +12,7 @@ use smb_msg::{
     tree_connect::{TreeConnectRequest, TreeDisconnectRequest},
 };
 
-use crate::{Error, Resource, command::Protection, session::SessionContext};
+use crate::{Error, command::Protection, resource::Resource, session::SessionContext};
 mod dfs_tree;
 mod ipc_tree;
 use crate::command::{CommandRequest, CommandResponse, CommandSubmission, ResponseOptions};

@@ -1,6 +1,12 @@
 use crate::ConnectionConfig;
 use crate::command::{CommandRequest, Protection};
-use crate::{Connection, Error, FileCreateArgs, Pipe, Resource, Session, Tree};
+use crate::{
+    Error, FileCreateArgs,
+    connection::Connection,
+    resource::{Pipe, Resource},
+    session::Session,
+    tree::Tree,
+};
 use smb_fscc::{ChainedItemList, FileBasicInformation, SetFileInfo, SetFileInfoClass};
 use smb_msg::{
     AdditionalInfo, CloseRequest, CreateRequest, FileId, ImpersonationLevel, NetworkInterfaceInfo,

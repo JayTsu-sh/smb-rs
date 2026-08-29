@@ -3,6 +3,7 @@ use std::str::FromStr;
 use super::Cli;
 use clap::{Parser, Subcommand};
 use smb::*;
+use smb::{client::Client, resource::Resource};
 
 #[derive(Parser, Debug)]
 pub struct SecurityCmd {

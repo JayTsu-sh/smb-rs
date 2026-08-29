@@ -1,5 +1,5 @@
 use serial_test::serial;
-use smb::{ConnectionConfig, Directory, FileCreateArgs, connection::EncryptionMode};
+use smb::{ConnectionConfig, FileCreateArgs, connection::EncryptionMode, resource::Directory};
 use smb_fscc::*;
 use smb_msg::NotifyFilter;
 use std::sync::Arc;

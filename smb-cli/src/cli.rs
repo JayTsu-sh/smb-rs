@@ -3,7 +3,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use smb::connection::MultiChannelConfig;
 use smb::transport::config::*;
 use smb::{
-    ClientConfig, ConnectionConfig,
+    ConnectionConfig,
+    client::ClientConfig,
     connection::{AuthMethodsConfig, EncryptionMode},
 };
 use smb::{Dialect, Guid};

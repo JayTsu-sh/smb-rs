@@ -28,7 +28,7 @@ use conformance::transcripts::{
 use conformance::{
     MockGss, ScriptedGssStep, ScriptedTransport, assert_signed_final_session_setup,
 };
-use smb::{Connection, ConnectionConfig};
+use smb::{ConnectionConfig, connection::Connection};
 use smb_dtyp::Guid;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -4,7 +4,7 @@ mod common;
 
 use common::{make_server_connection, smb_tests_share};
 use futures_util::StreamExt;
-use smb::{Directory, FileCreateArgs};
+use smb::{FileCreateArgs, resource::Directory};
 use smb_fscc::{
     DirAccessMask, FileDispositionInformation, FileRenameInformation, NotifyAction,
 };

@@ -38,17 +38,20 @@ pub mod test_support {
     pub use smb_transport::test_support::{ScriptedTransport, ScriptedTransportControl};
 }
 
-pub use client::{Client, ClientConfig, UncPath};
-pub use connection::{Connection, ConnectionConfig};
+pub use client::UncPath;
+pub use connection::ConnectionConfig;
+pub use domain::{
+    Credentials, Directory, File, FileOpenOptions, Pipe, Resource, Session, Share, SharePath,
+    ShareTarget,
+};
 pub use error::Error;
+pub use facade::{Client, ClientConfig};
 pub use lease::{LeaseBreakAckOutcome, LeaseBreakEvent, OplockBreakEvent};
 pub use resource::{
-    Directory, DurableOpenGrant, DurableOpenRequest, File, FileCreateArgs, GetLen, LeaseGrant,
-    Pipe, PipeRpcConnection, ReadAt, ReadAtChannel, Resource, ResourceHandle, WriteAt,
-    WriteAtChannel,
+    DurableOpenGrant, DurableOpenRequest, FileCreateArgs, GetLen, LeaseGrant, PipeRpcConnection,
+    ReadAt, ReadAtChannel, ResourceHandle, WriteAt, WriteAtChannel,
 };
-pub use session::Session;
-pub use tree::{DfsRootTreeRef, Tree};
+pub use tree::DfsRootTreeRef;
 
 pub use smb_dtyp::*;
 pub use smb_fscc::*;
