@@ -270,3 +270,30 @@ async fn domain_spine_roundtrips_without_protocol_escape_hatches() -> smb::Resul
     session.close().await?;
     client.close().await
 }
+
+#[cfg(feature = "real-server-tests")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[ignore = "requires a real server exposing the standard IPC service pipes"]
+async fn domain_named_pipe_open_cancel_and_close() -> smb::Result<()> {
+    let client = Client::new(ClientConfig::default());
+    let server = common::smb_tests_server();
+    let session = client
+        .authenticate(&server, common::smb_test_credentials())
+        .await?;
+    let ipc = session.connect_share("IPC$").await?;
+    let pipe = ipc.open_pipe(&PipeName::new("srvsvc")?).await?;
+
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    assert!(matches!(
+        pipe.transact(Bytes::from_static(b"not-admitted"), 4096)
+            .cancellation(cancel)
+            .await,
+        Err(Error::Cancelled("domain operation"))
+    ));
+    assert_eq!(pipe.close().await?, CloseOutcome::Confirmed);
+    assert_eq!(pipe.close().await?, CloseOutcome::AlreadyClosed);
+    ipc.close().await?;
+    session.close().await?;
+    client.close().await
+}
