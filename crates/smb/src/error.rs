@@ -110,6 +110,13 @@ pub enum Error {
         capacity: usize,
     },
 
+    #[error("transfer failed at offset {offset} after {transferred} bytes: {source}")]
+    TransferFailed {
+        offset: u64,
+        transferred: u64,
+        source: Box<Error>,
+    },
+
     #[error("Invalid state: {0}")]
     InvalidState(String),
     #[error("Unable to transform message: {0}")]

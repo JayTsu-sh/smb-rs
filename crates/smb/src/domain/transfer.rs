@@ -256,10 +256,15 @@ where
             let read = read_chunk.clone();
             let token = cancellation.clone();
             pending.push(async move {
-                let bytes = read(offset, chunk_length, token).await?;
+                let bytes = read(offset, chunk_length, token)
+                    .await
+                    .map_err(|error| (offset, error))?;
                 if bytes.len() != chunk_length as usize {
-                    return Err(Error::InvalidMessage(
-                        "transfer read completed with a short byte count".into(),
+                    return Err((
+                        offset,
+                        Error::InvalidMessage(
+                            "transfer read completed with a short byte count".into(),
+                        ),
                     ));
                 }
                 Ok((offset, bytes))
@@ -268,11 +273,21 @@ where
 
         if let Some(bytes) = ready.remove(&next_write) {
             let expected = u32::try_from(bytes.len())?;
-            let written = write_chunk(next_write, bytes, cancellation.clone()).await?;
+            let written = write_chunk(next_write, bytes, cancellation.clone())
+                .await
+                .map_err(|source| Error::TransferFailed {
+                    offset: next_write,
+                    transferred,
+                    source: Box::new(source),
+                })?;
             if written != expected {
-                return Err(Error::InvalidMessage(
-                    "transfer write completed with a short byte count".into(),
-                ));
+                return Err(Error::TransferFailed {
+                    offset: next_write,
+                    transferred,
+                    source: Box::new(Error::InvalidMessage(
+                        "transfer write completed with a short byte count".into(),
+                    )),
+                });
             }
             let offset = next_write;
             next_write += u64::from(written);
@@ -289,7 +304,11 @@ where
 
         match pending.next().await {
             Some(result) => {
-                let (offset, bytes) = result?;
+                let (offset, bytes) = result.map_err(|(offset, source)| Error::TransferFailed {
+                    offset,
+                    transferred,
+                    source: Box::new(source),
+                })?;
                 ready.insert(offset, bytes);
             }
             None if ready.is_empty() => break,
@@ -397,7 +416,11 @@ mod tests {
                 write,
             )
             .await,
-            Err(Error::InvalidMessage(_))
+            Err(Error::TransferFailed {
+                offset: 0,
+                transferred: 0,
+                ..
+            })
         ));
 
         let (progress, _) = broadcast::channel(1);
@@ -492,7 +515,50 @@ mod tests {
         cancellation.cancel();
         assert!(matches!(
             running.await.unwrap(),
-            Err(Error::Cancelled("transfer chunk"))
+            Err(Error::TransferFailed {
+                source,
+                ..
+            }) if matches!(*source, Error::Cancelled("transfer chunk"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn partial_failure_reports_exact_committed_prefix_and_offset() {
+        let read = |offset, length, _| {
+            async move {
+                if offset == 4 {
+                    Err(Error::InvalidState("injected read failure".into()))
+                } else {
+                    Ok(Bytes::from(vec![0_u8; length as usize]))
+                }
+            }
+            .boxed()
+        };
+        let write = |_, bytes: Bytes, _| async move { Ok(bytes.len() as u32) }.boxed();
+        let (progress, mut receiver) = broadcast::channel(4);
+        assert!(matches!(
+            run_transfer(
+                8,
+                TransferOptions::default().concurrency(1).chunk_size(4),
+                CancelToken::new(),
+                progress,
+                read,
+                write,
+            )
+            .await,
+            Err(Error::TransferFailed {
+                offset: 4,
+                transferred: 4,
+                ..
+            })
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Ok(TransferProgress::ChunkCompleted {
+                offset: 0,
+                transferred: 4,
+                ..
+            })
         ));
     }
 
