@@ -1451,21 +1451,18 @@ impl ConnectionMessageHandler {
 
     /// Construct and send a `LeaseBreakAck` for the given notification.
     ///
-    /// Fire-and-forget (`has_response = false`): the server's
-    /// `LeaseBreakResponse` is purely informational, and waiting for it
-    /// would block the notify task. If it arrives later, the worker's
-    /// response router drops it as unmatched.
-    ///
-    /// The ack is sent through any active session on this connection so
-    /// it gets signed under the session key — sending unsigned via the
-    /// bare connection handler triggers STATUS_NETWORK_NAME_DELETED on
-    /// Samba-based servers. Lease identity is in the lease_key, not the
-    /// session, so the choice of session doesn't matter.
+    /// MS-SMB2 requires the acknowledgement to use the SessionId and TreeId
+    /// of the open that owns the lease. Route through the handler retained in
+    /// that lease slot so the normal handler chain stamps both identifiers and
+    /// applies the tree's signing/encryption policy.
     async fn send_lease_break_ack(&self, notify: &smb_msg::LeaseBreakNotify) {
-        let session_handler = match self.actor.any_live_session().await {
-            Ok(h) => h,
+        let slot = match self
+            .actor
+            .find_lease_by_key(notify.lease_key.as_u128())
+            .await
+        {
+            Ok(slot) => slot,
             Err(_) => {
-                // Connection actor has shut down — best-effort path.
                 tracing::warn!(
                     lease_key = ?notify.lease_key,
                     "Cannot send LeaseBreakAck: connection actor stopped",
@@ -1474,10 +1471,10 @@ impl ConnectionMessageHandler {
             }
         };
 
-        let Some(h) = session_handler else {
+        let Some(slot) = slot else {
             tracing::warn!(
                 lease_key = ?notify.lease_key,
-                "Cannot send LeaseBreakAck: no active session on this connection",
+                "Cannot send LeaseBreakAck: matching lease open is not cached",
             );
             return;
         };
@@ -1486,17 +1483,16 @@ impl ConnectionMessageHandler {
             lease_key: notify.lease_key,
             lease_state: notify.new_lease_state,
         };
-        // Fire-and-forget: caller intentionally never invokes recvo on
-        // this message. The wire-protocol response (if any) is ignored
-        // by the worker's response router as an unmatched msg_id; there
-        // is no per-message field telling the worker not to allocate a
-        // response slot.
-        let out = OutgoingMessage::new(RequestContent::LeaseBreakAck(ack));
-        match h.sendo(out).await {
-            Ok(r) => tracing::debug!(
+        match slot
+            .proto
+            .handler
+            .send_recv(RequestContent::LeaseBreakAck(ack))
+            .await
+        {
+            Ok(_) => tracing::debug!(
                 lease_key = ?notify.lease_key,
-                msg_id = r.msg_id,
-                "LeaseBreakAck sent (fire-and-forget)",
+                tree_id = slot.tree_id,
+                "LeaseBreakAck accepted",
             ),
             Err(e) => tracing::warn!(
                 lease_key = ?notify.lease_key,

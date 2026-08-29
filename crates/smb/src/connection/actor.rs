@@ -95,6 +95,12 @@ pub(crate) enum ConnectionCommand {
         path: String,
         reply: oneshot::Sender<Option<Arc<LeaseSlot>>>,
     },
+    /// Find the open that owns a server-supplied lease key. Lease-break
+    /// acknowledgements must travel through that open's exact tree/session.
+    FindLeaseByKey {
+        lease_key: u128,
+        reply: oneshot::Sender<Option<Arc<LeaseSlot>>>,
+    },
     /// Atomically look up `path` and call `LeaseSlot::try_acquire_for_reuse`
     /// inside the actor's single-owner state. Replaces the old
     /// `lease_table.lock()` critical section that wrapped both
@@ -141,11 +147,6 @@ pub(crate) enum ConnectionCommand {
         session_id: u64,
         handler: Weak<ChannelMessageHandler>,
         reply: oneshot::Sender<()>,
-    },
-    /// Pick any live session — used by `send_lease_break_ack` when it
-    /// just needs a signed channel and any active session will do.
-    AnyLiveSession {
-        reply: oneshot::Sender<Option<Arc<ChannelMessageHandler>>>,
     },
     /// Look up the channel handler for a specific `session_id` and try
     /// to upgrade its weak reference. Used by `notify()` to route a
@@ -219,6 +220,14 @@ impl ConnectionActor {
             }
             ConnectionCommand::PeekLease { path, reply } => {
                 let _ = reply.send(self.lease_table.get(&path).cloned());
+            }
+            ConnectionCommand::FindLeaseByKey { lease_key, reply } => {
+                let slot = self
+                    .lease_table
+                    .values()
+                    .find(|slot| slot.lease_key == lease_key)
+                    .cloned();
+                let _ = reply.send(slot);
             }
             ConnectionCommand::TryAcquireLease {
                 path,
@@ -335,10 +344,6 @@ impl ConnectionActor {
                 self.sessions.insert(session_id, handler);
                 let _ = reply.send(());
             }
-            ConnectionCommand::AnyLiveSession { reply } => {
-                let result = self.sessions.values().find_map(|w| w.upgrade());
-                let _ = reply.send(result);
-            }
             ConnectionCommand::GetSession { session_id, reply } => {
                 let result = match self.sessions.get(&session_id) {
                     None => Ok(None),
@@ -385,6 +390,14 @@ impl ConnectionActorHandle {
 
     pub(crate) async fn peek_lease(&self, path: String) -> crate::Result<Option<Arc<LeaseSlot>>> {
         self.dispatch(|reply| ConnectionCommand::PeekLease { path, reply })
+            .await
+    }
+
+    pub(crate) async fn find_lease_by_key(
+        &self,
+        lease_key: u128,
+    ) -> crate::Result<Option<Arc<LeaseSlot>>> {
+        self.dispatch(|reply| ConnectionCommand::FindLeaseByKey { lease_key, reply })
             .await
     }
 
@@ -445,13 +458,6 @@ impl ConnectionActorHandle {
             reply,
         })
         .await
-    }
-
-    pub(crate) async fn any_live_session(
-        &self,
-    ) -> crate::Result<Option<Arc<ChannelMessageHandler>>> {
-        self.dispatch(|reply| ConnectionCommand::AnyLiveSession { reply })
-            .await
     }
 
     /// Look up `session_id` and upgrade its weak handler reference.
