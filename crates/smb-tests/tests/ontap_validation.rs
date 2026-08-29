@@ -71,6 +71,26 @@ fn preflight_and_runtime_identity_are_cryptographically_bound_without_cleartext(
 }
 
 #[test]
+fn manifest_contains_traceability_metadata_without_target_or_identity() {
+    let path = temp_manifest("metadata");
+    let plan = fixture();
+    let target_id = plan.anonymous_target_id("appliance.example.test");
+    let metadata = smb_tests::ontap::RunMetadata::new(
+        "a".repeat(40),
+        "rustc-test".into(),
+        "runner-test".into(),
+        target_id,
+    )
+    .unwrap();
+    RunManifest::create_with_metadata(&path, plan, metadata).unwrap();
+    let json = fs::read_to_string(&path).unwrap();
+    assert!(json.contains("created_unix_seconds"));
+    assert!(!json.contains("appliance.example.test"));
+    assert!(!json.contains("test-user"));
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn inventory_is_the_only_cleanup_authority_and_cleanup_is_reversed() {
     let plan = fixture();
     let mut inventory = Inventory::new(&plan);

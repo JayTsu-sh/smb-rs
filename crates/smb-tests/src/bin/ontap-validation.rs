@@ -1,8 +1,11 @@
 use rand::RngCore;
-use smb_tests::ontap::{ApplyAuthorization, Plan, ProvisioningRun, RunManifest, SshOntapAdapter};
+use smb_tests::ontap::{
+    ApplyAuthorization, Plan, ProvisioningRun, RunManifest, RunMetadata, SshOntapAdapter,
+};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use zeroize::Zeroizing;
 
 fn main() {
@@ -40,7 +43,13 @@ fn run() -> Result<(), String> {
             )?;
             let preflight = adapter.preflight(&plan)?;
             let plan = plan.bind_preflight(&preflight.state_hash)?;
-            let manifest = RunManifest::create(&manifest_path, plan)?;
+            let metadata = RunMetadata::new(
+                command_output("git", &["rev-parse", "HEAD"])?,
+                command_output("rustc", &["--version"])?,
+                env!("CARGO_PKG_VERSION").into(),
+                plan.anonymous_target_id(target.as_str()),
+            )?;
+            let manifest = RunManifest::create_with_metadata(&manifest_path, plan, metadata)?;
             println!("dry-run plan hash: {}", manifest.plan().hash());
             println!("ONTAP capability: {}", preflight.ontap_version);
             println!("{}", manifest.plan().render_redacted());
@@ -136,6 +145,19 @@ fn random_run_id() -> String {
     let mut bytes = [0_u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     hex::encode(bytes)
+}
+
+fn command_output(program: &str, arguments: &[&str]) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(arguments)
+        .output()
+        .map_err(|error| format!("start {program}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("{program} exited with {}", output.status));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|error| format!("decode {program} output: {error}"))
+        .map(|value| value.trim().to_owned())
 }
 
 fn usage() -> String {

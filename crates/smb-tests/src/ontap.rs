@@ -7,6 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const PREFIX: &str = "smbrs";
 
@@ -78,6 +79,12 @@ impl Plan {
             [self.run_id.as_bytes(), b":", identity.as_bytes()].concat(),
         ));
         digest == self.test_identity_digest
+    }
+
+    pub fn anonymous_target_id(&self, target: &str) -> String {
+        hex::encode(Sha256::digest(
+            [self.run_id.as_bytes(), b":target:", target.as_bytes()].concat(),
+        ))
     }
 
     pub fn bind_preflight(mut self, state_hash: &str) -> Result<Self, String> {
@@ -340,6 +347,7 @@ impl Inventory {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunManifest {
     schema_version: u32,
+    metadata: RunMetadata,
     plan: Plan,
     inventory: Inventory,
     mutations: Vec<Mutation>,
@@ -349,12 +357,21 @@ pub struct RunManifest {
 
 impl RunManifest {
     pub fn create(path: impl AsRef<Path>, plan: Plan) -> Result<Self, String> {
+        Self::create_with_metadata(path, plan, RunMetadata::test_fixture())
+    }
+
+    pub fn create_with_metadata(
+        path: impl AsRef<Path>,
+        plan: Plan,
+        metadata: RunMetadata,
+    ) -> Result<Self, String> {
         let path = path.as_ref();
         if path.exists() {
             return Err(format!("manifest already exists: {}", path.display()));
         }
         let manifest = Self {
             schema_version: 1,
+            metadata,
             inventory: Inventory::new(&plan),
             mutations: Vec::new(),
             plan,
@@ -376,6 +393,7 @@ impl RunManifest {
             ));
         }
         manifest.inventory.validate(&manifest.plan)?;
+        manifest.metadata.validate()?;
         manifest.path = path.to_owned();
         Ok(manifest)
     }
@@ -386,6 +404,10 @@ impl RunManifest {
 
     pub fn plan(&self) -> &Plan {
         &self.plan
+    }
+
+    pub fn metadata(&self) -> &RunMetadata {
+        &self.metadata
     }
 
     pub fn state(&self, kind: ResourceKind) -> Option<Lifecycle> {
@@ -479,6 +501,74 @@ impl RunManifest {
             let _ = fs::remove_file(&temporary);
         }
         result
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunMetadata {
+    pub code_commit: String,
+    pub toolchain: String,
+    pub runner_version: String,
+    pub anonymous_target_id: String,
+    pub created_unix_seconds: u64,
+}
+
+impl RunMetadata {
+    pub fn new(
+        code_commit: String,
+        toolchain: String,
+        runner_version: String,
+        anonymous_target_id: String,
+    ) -> Result<Self, String> {
+        let metadata = Self {
+            code_commit,
+            toolchain,
+            runner_version,
+            anonymous_target_id,
+            created_unix_seconds: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?
+                .as_secs(),
+        };
+        metadata.validate()?;
+        Ok(metadata)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.code_commit.len() != 40
+            || !self
+                .code_commit
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("metadata code commit must be a 40-digit Git object ID".into());
+        }
+        if self.anonymous_target_id.len() != 64
+            || !self
+                .anonymous_target_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("metadata target ID must be a SHA-256 digest".into());
+        }
+        if self.toolchain.is_empty()
+            || self.runner_version.is_empty()
+            || self.toolchain.chars().any(char::is_control)
+            || self.runner_version.chars().any(char::is_control)
+        {
+            return Err("metadata tool versions are empty or invalid".into());
+        }
+        Ok(())
+    }
+
+    fn test_fixture() -> Self {
+        Self {
+            code_commit: "0".repeat(40),
+            toolchain: "test-toolchain".into(),
+            runner_version: env!("CARGO_PKG_VERSION").into(),
+            anonymous_target_id: "0".repeat(64),
+            created_unix_seconds: 0,
+        }
     }
 }
 
