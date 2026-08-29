@@ -306,6 +306,16 @@ fn map_runtime_error_value(error: RuntimeError, timeout: std::time::Duration) ->
     }
 }
 
+impl fmt::Debug for RuntimeWorker {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeWorker")
+            .field("generation", &self.generation)
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod public_error_mapping_tests {
     use super::*;
@@ -335,15 +345,5 @@ mod public_error_mapping_tests {
             map_runtime_error_value(RuntimeError::OwnerTerminated, timeout),
             Error::RuntimeTerminated
         ));
-    }
-}
-
-impl fmt::Debug for RuntimeWorker {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("RuntimeWorker")
-            .field("generation", &self.generation)
-            .field("timeout", &self.timeout)
-            .finish_non_exhaustive()
     }
 }
