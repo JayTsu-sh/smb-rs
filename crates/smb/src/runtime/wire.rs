@@ -1,6 +1,6 @@
 use crate::connection::preauth_hash::{PreauthHashState, PreauthHashValue};
 use crate::session::{MessageDecryptor, MessageEncryptor, MessageSigner, SessionAndChannel};
-use crate::{compression::*, msg_handler::*};
+use crate::{compression::*, command::*};
 use binrw::prelude::*;
 use bytes::Bytes;
 use smb_msg::*;
@@ -341,7 +341,7 @@ impl WirePipeline {
     /// protection policy, or any member with `additional_data`.
     pub async fn transform_outgoing_compound(
         &self,
-        mut msgs: Vec<OutgoingMessage>,
+        mut msgs: Vec<CommandRequest>,
     ) -> crate::Result<SendFrame> {
         if msgs.is_empty() {
             return Err(crate::Error::InvalidArgument(
@@ -430,7 +430,7 @@ impl WirePipeline {
     }
 
     /// Transforms an outgoing message to a raw SMB message.
-    pub async fn transform_outgoing(&self, mut msg: OutgoingMessage) -> crate::Result<SendFrame> {
+    pub async fn transform_outgoing(&self, mut msg: CommandRequest) -> crate::Result<SendFrame> {
         // Single source of truth for what to do with this message: the
         // sealed `Protection` enum. Callers that haven't been migrated
         // off the legacy `encrypt: bool` / `flags.signed()` hint fields
@@ -616,7 +616,7 @@ impl WirePipeline {
         SendFrame::from_segments(vec![transformed.into_bytes()], 1).map_err(Into::into)
     }
 
-    /// Transforms an incoming message buffer to one or more [`IncomingMessage`]s,
+    /// Transforms an incoming message buffer to one or more [`CommandResponse`]s,
     /// supporting SMB2 compound responses.
     ///
     /// SMB2 compound responses chain multiple commands' responses into a single
@@ -636,7 +636,7 @@ impl WirePipeline {
     /// non-compound case). Member order matches the on-wire order, which the
     /// server is required to preserve relative to the request chain (MS-SMB2
     /// 3.3.5.2.7).
-    pub async fn transform_incoming_all(&self, data: Bytes) -> crate::Result<Vec<IncomingMessage>> {
+    pub async fn transform_incoming_all(&self, data: Bytes) -> crate::Result<Vec<CommandResponse>> {
         let (message, data) = Response::decode_frame(data)?.into_parts();
         let mut form = MessageForm::default();
 
@@ -695,7 +695,7 @@ impl WirePipeline {
 
         // 3. Walk the compound chain (or return single).
         //    `next_command == 0` means this is the last (or only) member.
-        let mut out: Vec<IncomingMessage> = Vec::new();
+        let mut out: Vec<CommandResponse> = Vec::new();
         let mut current = plain;
         let mut remaining = raw;
         loop {
@@ -733,7 +733,7 @@ impl WirePipeline {
                     msg_id: Some(current.header.message_id),
                 }));
             }
-            out.push(IncomingMessage::new(current, this_slice, member_form));
+            out.push(CommandResponse::new(current, this_slice, member_form));
 
             if next_offset == 0 {
                 break;
@@ -889,7 +889,7 @@ mod wire_builder_tests {
     async fn plain_bytes_write_keeps_payload_identity_through_sealed_frame() {
         let payload = Bytes::from_static(b"identity-preserved");
         let pointer = payload.as_ptr();
-        let outgoing = OutgoingMessage::new(
+        let outgoing = CommandRequest::new(
             WriteRequest::new(0, FileId::EMPTY, WriteFlags::new(), payload.len() as u32).into(),
         )
         .with_additional_data(payload);

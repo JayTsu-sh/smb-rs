@@ -1,13 +1,13 @@
-use crate::msg_handler::Protection;
+use crate::command::Protection;
 
 use super::*;
 
-pub(crate) type ChannelUpstream = Arc<ConnectionMessageHandler>;
+pub(crate) type ChannelUpstream = Arc<ConnectionCore>;
 
 pub struct Channel {
     channel_id: u32,
 
-    pub(crate) handler: Arc<ChannelMessageHandler>,
+    pub(crate) context: Arc<ChannelContext>,
     pub(crate) conn_info: Arc<ConnectionInfo>,
 }
 
@@ -24,10 +24,10 @@ impl Channel {
                 .ok_or_else(|| Error::InvalidState("Channel not set in setup result".into()))?;
             (session.id(), channel.id())
         };
-        let handler = ChannelMessageHandler::new(session_id, channel_id, upstream, setup_result);
+        let context = ChannelContext::new(session_id, channel_id, upstream, setup_result);
         Ok(Self {
             channel_id,
-            handler,
+            context,
             conn_info: conn_info.clone(),
         })
     }
@@ -38,7 +38,7 @@ impl Channel {
     /// so it is unique-per-connection, and may be seen on the wire as well.
     #[inline]
     pub fn session_id(&self) -> u64 {
-        self.handler.session_id()
+        self.context.session_id()
     }
 
     #[inline]
@@ -48,13 +48,13 @@ impl Channel {
 
     /// Returns `true` when the session permits unsigned messages.
     ///
-    /// Mirrors the check used inside [`ChannelMessageHandler::sendo`]: a
+    /// Mirrors the check used inside [`ChannelContext::submit`]: a
     /// session enforces signing iff `allow_unsigned()` is `false` after
     /// it reaches `is_ready()`. Exposed publicly for callers that build
     /// SMB2 compound chains (P2.b) and need to set the `signed` flag on
     /// each chained header before going through the worker directly.
     pub async fn allow_unsigned(&self) -> crate::Result<bool> {
-        let session = self.handler.session_state.session.read().await;
+        let session = self.context.session_state.session.read().await;
         session.allow_unsigned()
     }
 
@@ -62,7 +62,7 @@ impl Channel {
     /// encrypted (either the session flags carry `encrypt_data` or the
     /// connection config forces it).
     ///
-    /// Mirrors the check used inside [`ChannelMessageHandler::sendo`]: when
+    /// Mirrors the check used inside [`ChannelContext::submit`]: when
     /// `should_encrypt()` is `true`, the single-message path sets
     /// `msg.encrypt = true` instead of merely signing. Callers that build
     /// SMB2 compound chains directly must use this to select whole-chain
@@ -71,16 +71,16 @@ impl Channel {
     /// Errors with `InvalidState` when the underlying session has not
     /// reached the Ready state, matching `SessionInfo::should_encrypt`.
     pub async fn should_encrypt(&self) -> crate::Result<bool> {
-        let session = self.handler.session_state.session.read().await;
+        let session = self.context.session_state.session.read().await;
         session.should_encrypt()
     }
 }
 
-/// Message handler a specific channel.
+/// Message context a specific channel.
 ///
 /// This only makes sense, since sessions are not actually able to send data
 /// as "themselves", but rather, through a channel.
-pub struct ChannelMessageHandler {
+pub struct ChannelContext {
     session_id: u64,
     channel_id: u32,
     upstream: ChannelUpstream,
@@ -88,14 +88,55 @@ pub struct ChannelMessageHandler {
     session_state: Arc<SessionAndChannel>,
 }
 
-impl ChannelMessageHandler {
+impl ChannelContext {
+    async fn prepare(&self, mut msg: CommandRequest) -> crate::Result<CommandRequest> {
+        if msg.security.is_none() {
+            let session = self.session_state.session.read().await;
+            if session.is_invalid() {
+                return Err(Error::InvalidState("Session is invalid".to_string()));
+            }
+            if session.is_ready() || session.is_setting_up() {
+                msg.security = Some(if session.is_ready() && session.should_encrypt()? {
+                    Protection::Encrypt
+                } else if !session.allow_unsigned()? {
+                    Protection::SignWithChannel
+                } else {
+                    Protection::None
+                });
+            } else {
+                msg.security = Some(Protection::None);
+            }
+        }
+        if matches!(
+            msg.security,
+            Some(Protection::SignWithChannel) | Some(Protection::SnapshotKdfSign { .. })
+        ) {
+            msg.message.header.flags.set_signed(true);
+        }
+        msg.message.header.session_id = self.session_id;
+        Ok(msg)
+    }
+
+    pub(crate) async fn execute(
+        &self,
+        msg: CommandRequest,
+        options: ResponseOptions<'_>,
+    ) -> crate::Result<(CommandSubmission, CommandResponse)> {
+        let result = self
+            .upstream
+            .execute(self.prepare(msg).await?, options)
+            .await?;
+        self._verify_incoming(&result.1).await?;
+        Ok(result)
+    }
+
     fn new(
         session_id: u64,
         channel_id: u32,
         upstream: &ChannelUpstream,
         setup_result: &Arc<SessionAndChannel>,
-    ) -> Arc<ChannelMessageHandler> {
-        Arc::new(ChannelMessageHandler {
+    ) -> Arc<ChannelContext> {
+        Arc::new(ChannelContext {
             session_id,
             channel_id,
             upstream: upstream.clone(),
@@ -118,7 +159,7 @@ impl ChannelMessageHandler {
 
     /// (Internal)
     ///
-    /// Verifies an [`IncomingMessage`] for the current session.
+    /// Verifies an [`CommandResponse`] for the current session.
     /// This is trustworthy only since we trust the [`WirePipeline`][crate::runtime::wire::WirePipeline] implementation
     /// to provide the correct IDs and verify signatures and encryption.
     ///
@@ -126,7 +167,7 @@ impl ChannelMessageHandler {
     /// * `incoming` - The incoming message to verify.
     /// # Returns
     /// An empty [`crate::Result`] if the message is valid, or an error if the message is invalid.
-    async fn _verify_incoming(&self, incoming: &IncomingMessage) -> crate::Result<()> {
+    async fn _verify_incoming(&self, incoming: &CommandResponse) -> crate::Result<()> {
         // allow unsigned messages only if the session is anonymous or guest.
         // this is enforced against configuration when setting up the session.
         let (unsigned_allowed, encryption_required) = {
@@ -165,19 +206,19 @@ impl ChannelMessageHandler {
 
     /// **Insecure! Insecure! Insecure!**
     ///
-    /// Same as [`ChannelMessageHandler::recvo`], but possible skips security validation.
+    /// Same as [`ChannelContext::await_response`], but possible skips security validation.
     /// # Arguments
     /// * `options` - The options for receiving the message.
     /// * `skip_security_validation` - Whether to skip security validation of the incoming message.
     ///   This shall only be used when authentication is still being set up.
     /// # Returns
-    /// An [`IncomingMessage`] if the message is valid, or an error if the message is invalid.
+    /// An [`CommandResponse`] if the message is valid, or an error if the message is invalid.
     pub(crate) async fn recvo_internal(
         &self,
-        options: ReceiveOptions<'_>,
+        options: ResponseOptions<'_>,
         skip_security_validation: bool,
-    ) -> crate::Result<IncomingMessage> {
-        let incoming = self.upstream.recvo(options).await?;
+    ) -> crate::Result<CommandResponse> {
+        let incoming = self.upstream.await_response(options).await?;
 
         if !skip_security_validation {
             self._verify_incoming(&incoming).await?;
@@ -219,56 +260,12 @@ impl ChannelMessageHandler {
     }
 }
 
-impl MessageHandler for ChannelMessageHandler {
-    async fn sendo(&self, mut msg: OutgoingMessage) -> crate::Result<SendMessageResult> {
-        // If the caller already sealed a [`Protection`] decision
-        // (e.g. tree.sendo stamping Protection::Encrypt for an
-        // encrypt-data share, or the session-setup driver attaching
-        // SnapshotKdfSign), honor it as-is. Otherwise translate
-        // session state into a matching variant once, here.
-        if msg.security.is_none() {
-            let session = self.session_state.session.read().await;
-            if session.is_invalid() {
-                return Err(Error::InvalidState("Session is invalid".to_string()));
-            }
-
-            if session.is_ready() || session.is_setting_up() {
-                if session.is_ready() && session.should_encrypt()? {
-                    msg.security = Some(Protection::Encrypt);
-                } else if !session.allow_unsigned()? {
-                    msg.security = Some(Protection::SignWithChannel);
-                } else {
-                    msg.security = Some(Protection::None);
-                }
-            } else {
-                msg.security = Some(Protection::None);
-            }
-        }
-
-        // Mirror the chosen signing Protection onto `header.flags.signed`
-        // so the worker (which still inspects the wire-protocol flag on
-        // its own bookkeeping path) sees consistent state. Encryption
-        // has no equivalent flag to mirror.
-        if matches!(
-            msg.security,
-            Some(Protection::SignWithChannel) | Some(Protection::SnapshotKdfSign { .. })
-        ) {
-            msg.message.header.flags.set_signed(true);
-        }
-
-        msg.message.header.session_id = self.session_id;
-        self.upstream.sendo(msg).await
+impl ChannelContext {
+    pub(crate) async fn submit(&self, msg: CommandRequest) -> crate::Result<CommandSubmission> {
+        self.upstream.submit(self.prepare(msg).await?).await
     }
 
-    async fn recvo(&self, options: ReceiveOptions<'_>) -> crate::Result<IncomingMessage> {
-        let incoming = self.upstream.recvo(options).await?;
-
-        self._verify_incoming(&incoming).await?;
-
-        Ok(incoming)
-    }
-
-    async fn notify(&self, msg: IncomingMessage) -> crate::Result<()> {
+    pub(crate) async fn notify(&self, msg: CommandResponse) -> crate::Result<()> {
         self._verify_incoming(&msg).await?;
 
         match &msg.message.content {
@@ -280,7 +277,7 @@ impl MessageHandler for ChannelMessageHandler {
             }
             _ => {
                 tracing::warn!(
-                    "Received unexpected message in session handler: {:?}",
+                    "Received unexpected message in session context: {:?}",
                     msg.message.content
                 );
                 Ok(())

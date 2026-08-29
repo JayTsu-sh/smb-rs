@@ -41,7 +41,7 @@ where
     last_setup_response: Option<SessionSetupResponse>,
     flags: Option<SessionFlags>,
 
-    handler: Option<ChannelMessageHandler>,
+    context: Option<ChannelContext>,
 
     result: Option<Arc<SessionAndChannel>>,
 
@@ -102,7 +102,7 @@ where
             last_setup_response: None,
             flags: None,
             result: None,
-            handler: None,
+            context: None,
             authenticator,
             upstream,
             conn_info,
@@ -236,9 +236,9 @@ where
     /// only per-flavour delta is whether the `binding` flag in
     /// `SessionSetupRequest.flags` is set — true for channel binds,
     /// false for new sessions.
-    fn make_request(&self, buffer: Vec<u8>) -> OutgoingMessage {
+    fn make_request(&self, buffer: Vec<u8>) -> CommandRequest {
         let has_dfs = self.conn_info.negotiation.caps.dfs();
-        let mut msg = OutgoingMessage::new(
+        let mut msg = CommandRequest::new(
             SessionSetupRequest::new(
                 buffer,
                 SessionSecurityMode::new().with_signing_enabled(true),
@@ -358,8 +358,8 @@ where
         let session_id = session.read().await.id();
         let session = Arc::new(SessionAndChannel::new(session_id, session));
 
-        let setup_handler = ChannelMessageHandler::make_for_setup(&session, self.upstream).await?;
-        self.handler = Some(setup_handler);
+        let setup_handler = ChannelContext::make_for_setup(&session, self.upstream).await?;
+        self.context = Some(setup_handler);
 
         self.upstream
             .worker()
@@ -376,7 +376,7 @@ where
         &mut self,
         for_msg_id: u64,
         is_final_request: bool,
-    ) -> crate::Result<IncomingMessage> {
+    ) -> crate::Result<CommandResponse> {
         let is_auth_done = self.authenticator.is_authenticated()?;
 
         let expected_status = if is_final_request {
@@ -385,7 +385,7 @@ where
             &[Status::MoreProcessingRequired]
         };
 
-        let roptions = ReceiveOptions::new()
+        let roptions = ResponseOptions::new()
             .with_status(expected_status)
             .with_msg_id_filter(for_msg_id);
 
@@ -394,17 +394,17 @@ where
             None => false,
         };
         let skip_security_validation = !is_auth_done && !channel_set_up;
-        let result = if let Some(handler) = &self.handler {
+        let result = if let Some(context) = &self.context {
             tracing::trace!(
-                "setup loop: receiving with channel handler; skip_security_validation={skip_security_validation}"
+                "setup loop: receiving with channel context; skip_security_validation={skip_security_validation}"
             );
-            handler
+            context
                 .recvo_internal(roptions, skip_security_validation)
                 .await
         } else {
             assert!(skip_security_validation);
-            tracing::trace!("setup loop: receiving with upstream handler");
-            self.upstream.recvo(roptions).await
+            tracing::trace!("setup loop: receiving with upstream context");
+            self.upstream.await_response(roptions).await
         };
 
         // Upgrade generic transport / channel-layer errors to
@@ -414,7 +414,7 @@ where
         // signed or encrypted" strings.
         //
         // The `InvalidMessage` string match targets the rejection in
-        // `ChannelMessageHandler::_verify_incoming`: on the final
+        // `ChannelContext::_verify_incoming`: on the final
         // SessionSetup Response that arrived unsigned, the channel
         // verifies *before* `_setup_loop` reaches its own sanity
         // check, so we re-tag the error here. (Long-term S5/S7 will
@@ -439,7 +439,7 @@ where
         &mut self,
         buf: Vec<u8>,
         is_final_request: bool,
-    ) -> crate::Result<SendMessageResult> {
+    ) -> crate::Result<CommandSubmission> {
         let request = self.make_request(buf);
 
         if is_final_request {
@@ -454,14 +454,14 @@ where
     /// `WirePipeline::transform_outgoing` (S4-T2); the driver is hands-off.
     async fn send_intermediate_setup_request(
         &mut self,
-        request: OutgoingMessage,
-    ) -> crate::Result<SendMessageResult> {
-        if let Some(handler) = self.handler.as_ref() {
-            tracing::trace!("setup loop: sending intermediate with channel handler");
-            handler.sendo(request).await
+        request: CommandRequest,
+    ) -> crate::Result<CommandSubmission> {
+        if let Some(context) = self.context.as_ref() {
+            tracing::trace!("setup loop: sending intermediate with channel context");
+            context.submit(request).await
         } else {
-            tracing::trace!("setup loop: sending intermediate with upstream handler");
-            self.upstream.sendo(request).await
+            tracing::trace!("setup loop: sending intermediate with upstream context");
+            self.upstream.submit(request).await
         }
     }
 
@@ -478,8 +478,8 @@ where
     /// signs in place — all in one pass.
     async fn send_final_setup_request(
         &mut self,
-        mut request: OutgoingMessage,
-    ) -> crate::Result<SendMessageResult> {
+        mut request: CommandRequest,
+    ) -> crate::Result<CommandSubmission> {
         self.upstream.prepare_outgoing(&mut request).await?;
 
         let session_id = self
@@ -491,7 +491,7 @@ where
             .session_id;
         request.message.header.session_id = session_id;
 
-        request.security = Some(crate::msg_handler::Protection::SnapshotKdfSign {
+        request.security = Some(crate::command::Protection::SnapshotKdfSign {
             session_key: self.session_key()?,
         });
         let request = request.into_signed();

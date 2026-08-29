@@ -15,7 +15,7 @@
 //! runs (e.g. before `delete` or `rename`).
 
 use crate::connection::connection_info::ConnectionInfo;
-use crate::tree::TreeMessageHandler;
+use crate::tree::TreeContext;
 use smb_dtyp::Guid;
 use smb_fscc::FileAccessMask;
 use smb_msg::{CreateDisposition, FileId, LeaseState, ShareType};
@@ -68,14 +68,14 @@ pub struct LeaseBreakEvent {
     pub received_at: Instant,
 }
 
-/// Internal handler/conn-info prototype captured at slot-insert time so a
+/// Internal context/conn-info prototype captured at slot-insert time so a
 /// later cache hit can construct a fresh [`crate::ResourceHandle`] sharing
 /// the same FileId without re-issuing Create. Held inside [`LeaseSlot`]
 /// behind an `Arc` so cloning is cheap and stable across hits.
 pub(crate) struct ResourceProto {
-    /// Shared handler chain — `Arc`-backed under the hood, so cloning into
+    /// Shared context chain — `Arc`-backed under the hood, so cloning into
     /// a new ResourceHandle on hit is just a refcount bump.
-    pub handler: Arc<TreeMessageHandler>,
+    pub context: Arc<TreeContext>,
     /// Snapshot of the connection's negotiated info at create time; the
     /// same instance every resulting ResourceHandle reads from. Cheap to
     /// clone (Arc).
@@ -132,7 +132,7 @@ pub(crate) struct ResourceProto {
 /// Three locks may be held concurrently across this type and the
 /// per-connection `lease_table`:
 ///
-/// 1. `ConnectionMessageHandler::lease_table` (outer; `Mutex<HashMap<…>>`).
+/// 1. `ConnectionCore::lease_table` (outer; `Mutex<HashMap<…>>`).
 /// 2. `LeaseSlot::granted_state` (`RwLock<LeaseState>`).
 /// 3. `LeaseSlot::last_used` (`RwLock<Instant>`).
 ///
@@ -185,7 +185,7 @@ pub struct LeaseSlot {
     pub last_used: RwLock<Instant>,
     /// Reconstruction snapshot (Phase C.3): everything a cache hit needs
     /// to materialize a fresh `ResourceHandle` without sending Create on
-    /// the wire. `pub(crate)` because it references internal handler
+    /// the wire. `pub(crate)` because it references internal context
     /// types; external callers don't need direct access.
     pub(crate) proto: Arc<ResourceProto>,
 }

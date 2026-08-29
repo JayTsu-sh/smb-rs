@@ -12,18 +12,14 @@ use smb_msg::{
     tree_connect::{TreeConnectRequest, TreeDisconnectRequest},
 };
 
-use crate::{
-    Error, Resource,
-    msg_handler::{MessageHandler, MessageHandlerExt, Protection},
-    session::SessionMessageHandler,
-};
+use crate::{Error, Resource, command::Protection, session::SessionContext};
 mod dfs_tree;
 mod ipc_tree;
-use crate::msg_handler::OutgoingMessage;
+use crate::command::CommandRequest;
 pub use dfs_tree::*;
 pub use ipc_tree::*;
 
-type Upstream = Arc<SessionMessageHandler>;
+type Upstream = Arc<SessionContext>;
 
 #[derive(Debug, Clone)]
 pub struct TreeConnectInfo {
@@ -35,13 +31,13 @@ pub struct TreeConnectInfo {
 ///
 /// A Tree is the SMB protocol's representation of a connected share on the server.
 pub struct Tree {
-    handler: Arc<TreeMessageHandler>,
+    context: Arc<TreeContext>,
     conn_info: Arc<ConnectionInfo>,
 }
 
 impl Tree {
     pub(crate) fn requires_encryption(&self) -> crate::Result<bool> {
-        Ok(self.handler.info()?.share_flags.encrypt_data())
+        Ok(self.context.info()?.share_flags.encrypt_data())
     }
 
     pub(crate) async fn connect(
@@ -101,12 +97,7 @@ impl Tree {
         };
 
         let t = Tree {
-            handler: TreeMessageHandler::new(
-                upstream,
-                tree_id,
-                name.to_string(),
-                tree_connect_info,
-            ),
+            context: TreeContext::new(upstream, tree_id, name.to_string(), tree_connect_info),
             conn_info: conn_info.clone(),
         };
 
@@ -127,10 +118,10 @@ impl Tree {
     ///     That is, assuming it is NOT prefixed with "\\". This is rquired for a proper DFS referral file open. ("DFS normalization", MS-SMB2 2.2.13 + 3.3.5.9)
     #[tracing::instrument(level = "debug", skip_all, fields(file_name = %file_name))]
     pub async fn create(&self, file_name: &str, args: &FileCreateArgs) -> crate::Result<Resource> {
-        let info = self.handler.info()?;
+        let info = self.context.info()?;
         Resource::create(
             file_name,
-            &self.handler,
+            &self.context,
             args,
             &self.conn_info,
             info.share_type,
@@ -196,7 +187,7 @@ impl Tree {
     }
 
     pub fn is_dfs_root(&self) -> crate::Result<bool> {
-        let info = self.handler.info()?;
+        let info = self.context.info()?;
         Ok(info.share_flags.dfs_root() && info.share_flags.dfs())
     }
 
@@ -204,18 +195,18 @@ impl Tree {
     /// Used by the lease cache (Phase C) so cache hits can match opens
     /// against the same tree the original Create was issued on.
     pub fn tree_id(&self) -> u32 {
-        self.handler
+        self.context
             .tree_id
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Borrow the tree's underlying `Upstream` handler reference.
+    /// Borrow the tree's underlying `Upstream` context reference.
     /// Phase C uses this from [`crate::resource::Resource::build_lease_proto`]
     /// so the lease cache can construct a `ResourceMessageHandle` against
     /// the same tree the Create was issued on. `pub(crate)` because the
-    /// Crate-private because the per-connection handler type is internal.
-    pub(crate) fn handler_ref(&self) -> &Arc<TreeMessageHandler> {
-        &self.handler
+    /// Crate-private because the per-connection context type is internal.
+    pub(crate) fn context_ref(&self) -> &Arc<TreeContext> {
+        &self.context
     }
 
     pub fn as_dfs_tree(&self) -> crate::Result<DfsRootTreeRef<'_>> {
@@ -226,7 +217,7 @@ impl Tree {
     }
 
     pub fn as_ipc_tree(&self) -> crate::Result<IpcTreeRef<'_>> {
-        let info = self.handler.info()?;
+        let info = self.context.info()?;
         if info.share_type != ShareType::Pipe {
             return Err(Error::InvalidState(format!(
                 "Tree is not IPC tree ({:?})",
@@ -242,7 +233,7 @@ impl Tree {
     /// After calling this method, none of the resources held open by the tree are accessible.
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn disconnect(&self) -> crate::Result<()> {
-        self.handler.disconnect().await?;
+        self.context.disconnect().await?;
         Ok(())
     }
 
@@ -254,7 +245,7 @@ impl Tree {
     ) -> crate::Result<T::Response> {
         const NO_INPUT_IN_RESPONSE: u32 = 0;
         let response = self
-            .handler
+            .context
             .send_recv(RequestContent::Ioctl(IoctlRequest {
                 ctl_code: T::FSCTL_CODE as u32,
                 file_id: FileId::FULL,
@@ -272,7 +263,7 @@ impl Tree {
     }
 }
 
-pub(crate) struct TreeMessageHandler {
+pub(crate) struct TreeContext {
     tree_id: AtomicU32,
 
     upstream: Upstream,
@@ -281,7 +272,7 @@ pub(crate) struct TreeMessageHandler {
     info: TreeConnectInfo,
 }
 
-impl TreeMessageHandler {
+impl TreeContext {
     const INVALID_TREE_ID: u32 = u32::MAX;
 
     pub fn new(
@@ -289,8 +280,8 @@ impl TreeMessageHandler {
         tree_id: u32,
         tree_name: String,
         info: TreeConnectInfo,
-    ) -> Arc<TreeMessageHandler> {
-        Arc::new(TreeMessageHandler {
+    ) -> Arc<TreeContext> {
+        Arc::new(TreeContext {
             tree_id: AtomicU32::new(tree_id),
             upstream: upstream.clone(),
             info,
@@ -298,16 +289,89 @@ impl TreeMessageHandler {
         })
     }
 
+    fn prepare(&self, mut msg: CommandRequest) -> CommandRequest {
+        if !msg.message.header.flags.async_command() {
+            msg.message.header.tree_id = self.tree_id.load(Ordering::Relaxed).into();
+            if self.info.share_flags.encrypt_data() && msg.security.is_none() {
+                msg.security = Some(Protection::Encrypt);
+            }
+        }
+        msg
+    }
+
+    pub(crate) async fn execute(
+        &self,
+        msg: CommandRequest,
+        options: crate::command::ResponseOptions<'_>,
+    ) -> crate::Result<(
+        crate::command::CommandSubmission,
+        crate::command::CommandResponse,
+    )> {
+        let result = self.upstream.execute(self.prepare(msg), options).await?;
+        let incoming = &result.1;
+        if !incoming.message.header.flags.async_command()
+            && incoming.message.header.tree_id.unwrap_or_default()
+                != self.tree_id.load(Ordering::Relaxed)
+        {
+            return Err(Error::InvalidMessage(
+                "Received message for different tree, or tree disconnecting.".to_string(),
+            ));
+        }
+        if !incoming.form.encrypted && self.info()?.share_flags.encrypt_data() {
+            return Err(Error::InvalidMessage(
+                "Received unencrypted message on encrypted share".to_string(),
+            ));
+        }
+        Ok(result)
+    }
+
+    pub(crate) async fn send_recv(
+        &self,
+        content: RequestContent,
+    ) -> crate::Result<crate::command::CommandResponse> {
+        self.execute_request(
+            CommandRequest::new(content),
+            crate::command::ResponseOptions::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_content(
+        &self,
+        content: RequestContent,
+        options: crate::command::ResponseOptions<'_>,
+    ) -> crate::Result<crate::command::CommandResponse> {
+        self.execute_request(CommandRequest::new(content), options)
+            .await
+    }
+
+    pub(crate) async fn execute_request(
+        &self,
+        message: CommandRequest,
+        options: crate::command::ResponseOptions<'_>,
+    ) -> crate::Result<crate::command::CommandResponse> {
+        self.execute(message, options)
+            .await
+            .map(|(_, incoming)| incoming)
+    }
+
+    pub(crate) async fn submit(
+        &self,
+        message: CommandRequest,
+    ) -> crate::Result<crate::command::CommandSubmission> {
+        self.upstream.submit(self.prepare(message)).await
+    }
+
     async fn _disconnect(upstream: Upstream, tree_id: u32, encrypt: bool) -> crate::Result<()> {
         // send and receive tree disconnect request & response.
         let request_content: RequestContent = TreeDisconnectRequest::default().into();
-        let mut message = OutgoingMessage::new(request_content);
+        let mut message = CommandRequest::new(request_content);
         if encrypt {
             message.security = Some(Protection::Encrypt);
         }
         message.message.header.tree_id = Some(tree_id);
 
-        let _response = upstream.sendo_recv(message).await?;
+        let _response = upstream.execute_request_default(message).await?;
 
         Ok(())
     }
@@ -331,51 +395,7 @@ impl TreeMessageHandler {
     }
 }
 
-impl MessageHandler for TreeMessageHandler {
-    async fn sendo(
-        &self,
-        mut msg: crate::msg_handler::OutgoingMessage,
-    ) -> crate::Result<crate::msg_handler::SendMessageResult> {
-        if !msg.message.header.flags.async_command() {
-            msg.message.header.tree_id = self.tree_id.load(Ordering::Relaxed).into();
-            // Share-level encrypt_data forces Encrypt; only set when the
-            // caller hasn't already sealed a Protection decision (e.g.
-            // the session-setup driver's SnapshotKdfSign).
-            if self.info.share_flags.encrypt_data() && msg.security.is_none() {
-                msg.security = Some(Protection::Encrypt);
-            }
-        }
-
-        self.upstream.sendo(msg).await
-    }
-
-    async fn recvo(
-        &self,
-        options: crate::msg_handler::ReceiveOptions<'_>,
-    ) -> crate::Result<crate::msg_handler::IncomingMessage> {
-        let msg = self.upstream.recvo(options).await?;
-
-        if !msg.message.header.flags.async_command()
-            && msg.message.header.tree_id.unwrap_or_default()
-                != self.tree_id.load(Ordering::Relaxed)
-        {
-            return Err(Error::InvalidMessage(
-                "Received message for different tree, or tree disconnecting.".to_string(),
-            ));
-        }
-
-        // Make sure encryption is enforced if the share requires it.
-        if !msg.form.encrypted && self.info()?.share_flags.encrypt_data() {
-            return Err(Error::InvalidMessage(
-                "Received unencrypted message on encrypted share".to_string(),
-            ));
-        }
-
-        Ok(msg)
-    }
-}
-
-impl Drop for TreeMessageHandler {
+impl Drop for TreeContext {
     fn drop(&mut self) {
         let tree_id = self.tree_id.load(Ordering::Relaxed);
         if tree_id == Self::INVALID_TREE_ID {

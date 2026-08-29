@@ -53,7 +53,7 @@
         "crate::connection::preauth_hash",
         "crate::crypto",
         "crate::error",
-        "crate::msg_handler",
+        "crate::command",
         "crate::session",
         "crate::Error",
         "crate::Result"

@@ -8,16 +8,13 @@ use crate::connection::connection_info::ConnectionInfo;
 use crate::connection::preauth_hash::PreauthHashValue;
 use crate::{
     Error,
-    connection::ConnectionMessageHandler,
+    connection::ConnectionCore,
     crypto::KeyToDerive,
-    msg_handler::{
-        IncomingMessage, MessageHandler, MessageHandlerExt, OutgoingMessage, ReceiveOptions,
-        SendMessageResult,
-    },
+    command::{CommandResponse, CommandRequest, ResponseOptions, CommandSubmission},
     tree::Tree,
 };
 use arc_swap::ArcSwapOption;
-use smb_msg::{Notification, ResponseContent, Status, session_setup::*};
+use smb_msg::{Notification, RequestContent, ResponseContent, Status, session_setup::*};
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -56,8 +53,8 @@ pub struct Session {
     alt_channels: RwLock<HashMap<u32, Channel>>,
     channel_counter: AtomicU32,
 
-    // Message handler for this session.
-    session_handler: Arc<SessionMessageHandler>,
+    // Message context for this session.
+    session_context: Arc<SessionContext>,
 }
 
 impl Session {
@@ -115,10 +112,10 @@ impl Session {
     {
         let primary_channel = Self::_common_setup(setup_result).await?;
 
-        let handler = Arc::new(SessionMessageHandler::new(primary_channel.handler.clone()));
+        let context = Arc::new(SessionContext::new(primary_channel.context.clone()));
 
         Ok(Session {
-            session_handler: handler,
+            session_context: context,
             primary_channel,
             alt_channels: Default::default(),
             channel_counter: AtomicU32::new(PRIMARY_CHANNEL_ID + 1),
@@ -131,7 +128,7 @@ impl Session {
     pub(crate) async fn bind(
         &self,
         identity: sspi::AuthIdentity,
-        handler: &Arc<ConnectionMessageHandler>,
+        context: &Arc<ConnectionCore>,
         conn_info: &Arc<ConnectionInfo>,
     ) -> crate::Result<u32> {
         if self.conn_info.negotiation.dialect_rev != conn_info.negotiation.dialect_rev {
@@ -146,7 +143,7 @@ impl Session {
         }
 
         {
-            let session = self.handler.session_state().session.read().await;
+            let session = self.context.session_state().session.read().await;
             if !session.is_ready() {
                 return Err(Error::InvalidState(
                     "Cannot bind session that is not ready.".to_string(),
@@ -165,27 +162,27 @@ impl Session {
 
         let setup_result = SessionSetup::new(
             identity,
-            handler,
+            context,
             conn_info,
             new_channel_id,
-            Some(self.handler.session_state()),
+            Some(self.context.session_state()),
             SetupKind::Bind,
         )
         .await?;
 
         let channel = Self::_common_setup(setup_result).await?;
-        let channel_handler = channel.handler.clone();
+        let channel_context = channel.context.clone();
 
         self.alt_channels
             .write()
             .await
             .insert(new_channel_id, channel);
 
-        self.session_handler
-            .channel_handlers
+        self.session_context
+            .channel_contexts
             .write()
             .await
-            .insert(new_channel_id, channel_handler);
+            .insert(new_channel_id, channel_context);
 
         Ok(new_channel_id)
     }
@@ -220,7 +217,7 @@ impl Session {
     #[tracing::instrument(level = "debug", skip_all, fields(session_id = self.session_id(), share = %name))]
     pub async fn tree_connect(&self, name: &UncPath) -> crate::Result<Tree> {
         let name = name.clone().with_no_path().to_string();
-        let tree = Tree::connect(&name, &self.session_handler, &self.conn_info).await?;
+        let tree = Tree::connect(&name, &self.session_context, &self.conn_info).await?;
         Ok(tree)
     }
 
@@ -230,7 +227,7 @@ impl Session {
     /// and any [`Tree`] objects and their resources will be unusable.
     #[tracing::instrument(level = "debug", skip_all, fields(session_id = self.session_id()))]
     pub async fn logoff(&self) -> crate::Result<()> {
-        self.session_handler.logoff().await
+        self.session_context.logoff().await
     }
 }
 
@@ -298,26 +295,26 @@ impl SessionAndChannel {
     }
 }
 
-pub(crate) struct SessionMessageHandler {
+pub(crate) struct SessionContext {
     session_id: u64,
-    // this is used to speed up access to the primary channel handler.
+    // this is used to speed up access to the primary channel context.
     primary_channel_id: u32,
-    primary_channel: Arc<ChannelMessageHandler>,
+    primary_channel: Arc<ChannelContext>,
 
-    channel_handlers: RwLock<HashMap<u32, Arc<ChannelMessageHandler>>>,
+    channel_contexts: RwLock<HashMap<u32, Arc<ChannelContext>>>,
 
     dropping: AtomicBool,
 }
 
-impl SessionMessageHandler {
-    pub fn new(primary_channel: Arc<ChannelMessageHandler>) -> Self {
+impl SessionContext {
+    pub fn new(primary_channel: Arc<ChannelContext>) -> Self {
         let session_id = primary_channel.session_id();
         let primary_channel_id = primary_channel.channel_id();
         Self {
             session_id,
             primary_channel_id,
             primary_channel: primary_channel.clone(),
-            channel_handlers: RwLock::new(HashMap::from([(primary_channel_id, primary_channel)])),
+            channel_contexts: RwLock::new(HashMap::from([(primary_channel_id, primary_channel)])),
             dropping: AtomicBool::new(false),
         }
     }
@@ -354,6 +351,50 @@ impl SessionMessageHandler {
         Ok(())
     }
 
+    async fn resolve_channel(&self, channel_id: Option<u32>) -> crate::Result<Arc<ChannelContext>> {
+        match channel_id {
+            None => Ok(self.primary_channel.clone()),
+            Some(id) if id == self.primary_channel_id => Ok(self.primary_channel.clone()),
+            Some(id) => self
+                .channel_contexts
+                .read()
+                .await
+                .get(&id)
+                .cloned()
+                .ok_or(Error::ChannelNotFound(self.session_id, id)),
+        }
+    }
+
+    pub(crate) async fn execute(
+        &self,
+        msg: CommandRequest,
+        options: ResponseOptions<'_>,
+    ) -> crate::Result<(CommandSubmission, CommandResponse)> {
+        self.resolve_channel(msg.channel_id)
+            .await?
+            .execute(msg, options)
+            .await
+    }
+
+    pub(crate) async fn send_recv(
+        &self,
+        content: RequestContent,
+    ) -> crate::Result<CommandResponse> {
+        self.execute(CommandRequest::new(content), ResponseOptions::new())
+            .await
+            .map(|(_, incoming)| incoming)
+    }
+
+    pub(crate) async fn execute_request_default(
+        &self,
+        message: CommandRequest,
+    ) -> crate::Result<CommandResponse> {
+        let command = message.message.content.associated_cmd();
+        self.execute(message, ResponseOptions::new().with_cmd(Some(command)))
+            .await
+            .map(|(_, incoming)| incoming)
+    }
+
     /// Logs off the session and invalidates it.
     ///
     /// # Notes
@@ -364,64 +405,15 @@ impl SessionMessageHandler {
             tracing::error!("Failed to logoff: {e}");
         });
     }
+}
 
-    #[inline]
-    async fn _with_channel<T: WithChannel>(
-        &self,
-        channel_id: Option<u32>,
-        t: T,
-    ) -> crate::Result<T::Result> {
-        let channel_id = match channel_id {
-            None => return t.work(&self.primary_channel).await,
-            Some(id) if id == self.primary_channel_id => {
-                return t.work(&self.primary_channel).await;
-            }
-            Some(id) => id,
-        };
-
-        let handlers = self.channel_handlers.read().await;
-        if let Some(handler) = handlers.get(&channel_id) {
-            t.work(handler).await
-        } else {
-            Err(Error::ChannelNotFound(self.session_id, channel_id))
-        }
+impl SessionContext {
+    pub(crate) async fn submit(&self, msg: CommandRequest) -> crate::Result<CommandSubmission> {
+        self.resolve_channel(msg.channel_id).await?.submit(msg).await
     }
 }
 
-impl MessageHandler for SessionMessageHandler {
-    async fn sendo(&self, msg: OutgoingMessage) -> crate::Result<SendMessageResult> {
-        self._with_channel(msg.channel_id, SendoWithChannel(msg))
-            .await
-    }
-
-    async fn recvo(&self, options: ReceiveOptions<'_>) -> crate::Result<IncomingMessage> {
-        self._with_channel(options.channel_id, RecvoWithChannel(options))
-            .await
-    }
-}
-
-trait WithChannel {
-    type Result;
-    async fn work(self, href: &Arc<ChannelMessageHandler>) -> crate::Result<Self::Result>;
-}
-
-struct SendoWithChannel(OutgoingMessage);
-impl WithChannel for SendoWithChannel {
-    type Result = SendMessageResult;
-    async fn work(self, href: &Arc<ChannelMessageHandler>) -> crate::Result<Self::Result> {
-        href.sendo(self.0).await
-    }
-}
-
-struct RecvoWithChannel<'a>(ReceiveOptions<'a>);
-impl WithChannel for RecvoWithChannel<'_> {
-    type Result = IncomingMessage;
-    async fn work(self, href: &Arc<ChannelMessageHandler>) -> crate::Result<Self::Result> {
-        href.recvo(self.0).await
-    }
-}
-
-impl Drop for SessionMessageHandler {
+impl Drop for SessionContext {
     fn drop(&mut self) {
         if self
             .dropping
@@ -435,12 +427,12 @@ impl Drop for SessionMessageHandler {
         let primary_channel = self.primary_channel.clone();
 
         tokio::task::spawn(async move {
-            let temp_handler = SessionMessageHandler {
+            let temp_handler = SessionContext {
                 session_id,
                 dropping: AtomicBool::new(false),
                 primary_channel_id,
                 primary_channel,
-                channel_handlers: Default::default(),
+                channel_contexts: Default::default(),
             };
             temp_handler.logoff_async().await;
         });

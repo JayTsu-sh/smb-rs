@@ -15,14 +15,14 @@ use tokio::sync::Mutex;
 
 use super::LeaseEviction;
 use crate::lease::LeaseSlot;
-use crate::session::ChannelMessageHandler;
+use crate::session::ChannelContext;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SessionGone;
 
 #[derive(Default)]
 struct RegistryState {
-    sessions: HashMap<u64, Weak<ChannelMessageHandler>>,
+    sessions: HashMap<u64, Weak<ChannelContext>>,
     leases: HashMap<String, Arc<LeaseSlot>>,
 }
 
@@ -37,7 +37,11 @@ impl ConnectionRegistry {
     }
 
     pub(crate) async fn insert_lease(&self, slot: Arc<LeaseSlot>) -> Option<Arc<LeaseSlot>> {
-        self.state.lock().await.leases.insert(slot.path.clone(), slot)
+        self.state
+            .lock()
+            .await
+            .leases
+            .insert(slot.path.clone(), slot)
     }
 
     pub(crate) async fn lease_slot_count(&self) -> usize {
@@ -72,11 +76,7 @@ impl ConnectionRegistry {
             .get(path)
             .cloned()
             .filter(|slot| {
-                slot.try_acquire_for_reuse(
-                    requested_access,
-                    requested_disposition,
-                    wants_directory,
-                )
+                slot.try_acquire_for_reuse(requested_access, requested_disposition, wants_directory)
             })
     }
 
@@ -145,21 +145,17 @@ impl ConnectionRegistry {
             .collect()
     }
 
-    pub(crate) async fn insert_session(
-        &self,
-        session_id: u64,
-        handler: Weak<ChannelMessageHandler>,
-    ) {
-        self.state.lock().await.sessions.insert(session_id, handler);
+    pub(crate) async fn insert_session(&self, session_id: u64, context: Weak<ChannelContext>) {
+        self.state.lock().await.sessions.insert(session_id, context);
     }
 
     pub(crate) async fn get_session(
         &self,
         session_id: u64,
-    ) -> Result<Option<Arc<ChannelMessageHandler>>, SessionGone> {
+    ) -> Result<Option<Arc<ChannelContext>>, SessionGone> {
         match self.state.lock().await.sessions.get(&session_id) {
             None => Ok(None),
-            Some(handler) => handler.upgrade().map(Some).ok_or(SessionGone),
+            Some(context) => context.upgrade().map(Some).ok_or(SessionGone),
         }
     }
 }

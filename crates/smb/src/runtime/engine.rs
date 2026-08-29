@@ -199,7 +199,7 @@ impl RuntimeHandle {
 
     pub(crate) fn install_notifications(
         &self,
-        sender: mpsc::Sender<crate::msg_handler::IncomingMessage>,
+        sender: mpsc::Sender<crate::command::CommandResponse>,
     ) -> Result<(), RuntimeError> {
         self.control
             .try_send(ControlCommand::InstallNotifications { sender })
@@ -418,18 +418,18 @@ struct RequestAuthority {
     state: GenerationState,
     terminals: HashMap<RequestKey, oneshot::Sender<Result<TerminalOutcome, RuntimeError>>>,
     operation_pending: HashMap<RequestKey, OperationPending>,
-    early_responses: HashMap<RequestKey, crate::msg_handler::IncomingMessage>,
+    early_responses: HashMap<RequestKey, crate::command::CommandResponse>,
     frame_members: HashMap<RequestKey, Arc<[RequestKey]>>,
     frame_cancellations: HashMap<RequestKey, CancellationToken>,
     deferred_cancellations: HashMap<RequestKey, MonotonicTime>,
-    notifications: Option<mpsc::Sender<crate::msg_handler::IncomingMessage>>,
+    notifications: Option<mpsc::Sender<crate::command::CommandResponse>>,
     large_mtu: bool,
     target_credits: u32,
 }
 
 enum ControlCommand {
     InstallNotifications {
-        sender: mpsc::Sender<crate::msg_handler::IncomingMessage>,
+        sender: mpsc::Sender<crate::command::CommandResponse>,
     },
     PreauthSnapshot {
         reply: oneshot::Sender<Result<Option<PreauthHashValue>, RuntimeError>>,
@@ -1336,7 +1336,7 @@ fn apply_owner_effects(
 }
 
 fn process_decoded_response(
-    message: crate::msg_handler::IncomingMessage,
+    message: crate::command::CommandResponse,
     authority: &mut RequestAuthority,
     fatal: &mut Option<RuntimeError>,
 ) {
@@ -1956,7 +1956,7 @@ mod tests {
     }
 
     fn session_setup_operation(return_raw: bool) -> TypedOperation {
-        let mut outgoing = crate::msg_handler::OutgoingMessage::new(
+        let mut outgoing = crate::command::CommandRequest::new(
             smb_msg::RequestContent::SessionSetup(smb_msg::SessionSetupRequest::new(
                 vec![9, 8, 7],
                 smb_msg::SessionSecurityMode::new(),
@@ -1965,7 +1965,7 @@ mod tests {
             )),
         )
         .with_return_raw_data(return_raw);
-        outgoing.security = Some(crate::msg_handler::Protection::None);
+        outgoing.security = Some(crate::command::Protection::None);
         TypedOperation::new(
             outgoing,
             ResponsePolicy::one_of(

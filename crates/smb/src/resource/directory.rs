@@ -1,12 +1,12 @@
 use super::ResourceHandle;
 use crate::Error;
-use crate::msg_handler::{MessageHandlerExt, ReceiveOptions};
-use std::sync::Arc;
-use tokio::sync::{Mutex, MutexGuard, mpsc};
+use crate::command::ResponseOptions;
 use smb_fscc::*;
 use smb_msg::*;
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{Mutex, MutexGuard, mpsc};
 
 /// A directory resource on the server.
 /// This is used to query the directory for its contents,
@@ -209,7 +209,7 @@ impl Directory {
         self._watch_options(
             filter,
             recursive,
-            ReceiveOptions::new().with_timeout(timeout),
+            ResponseOptions::new().with_timeout(timeout),
         )
         .await
         .into()
@@ -252,7 +252,7 @@ impl Directory {
         let (sender, receiver) = tokio::sync::mpsc::channel(1024);
         let (watch_tx, mut watch_rx) = tokio::sync::mpsc::channel(1024);
 
-        let receive_options = ReceiveOptions::default()
+        let receive_options = ResponseOptions::default()
             .with_timeout(Duration::MAX)
             .with_async_msg_ids(Default::default());
 
@@ -364,7 +364,7 @@ impl Directory {
 
     /// (Internal) Watches the directory for changes, with an optional timeout.
     ///
-    /// This method accepts the `ReceiveOptions` struct, allowing more fine-tuned control over the receive operation.
+    /// This method accepts the `ResponseOptions` struct, allowing more fine-tuned control over the receive operation.
     /// It uses:
     /// * `timeout` - to set the timeout for the receive operation.
     /// * `async_msg_ids` - to allow async notifications.
@@ -373,7 +373,7 @@ impl Directory {
         &self,
         filter: NotifyFilter,
         recursive: bool,
-        options: ReceiveOptions<'_>,
+        options: ResponseOptions<'_>,
     ) -> DirectoryWatchResult {
         if !self.access.list_directory() {
             return DirectoryWatchResult::Error(Error::MissingPermissions(
@@ -389,8 +389,8 @@ impl Directory {
 
         let response = self
             .handle
-            .handler
-            .send_recvo(
+            .context
+            .execute_content(
                 ChangeNotifyRequest {
                     file_id,
                     flags: NotifyFlags::new().with_watch_tree(recursive),
@@ -398,7 +398,7 @@ impl Directory {
                     output_buffer_length,
                 }
                 .into(),
-                ReceiveOptions {
+                ResponseOptions {
                     allow_async: true,
                     async_cancel: options.async_cancel,
                     async_msg_ids: options.async_msg_ids,

@@ -4,7 +4,7 @@
 //! send/receive pairing. Message identity, credit accounting, wire sealing,
 //! response correlation, and terminal publication remain runtime concerns.
 
-use crate::msg_handler::{IncomingMessage, OutgoingMessage};
+use crate::command::{CommandResponse, CommandRequest};
 use bytes::Bytes;
 use smb_msg::{Command, Status};
 use std::cmp::max;
@@ -66,12 +66,12 @@ impl ResponsePolicy {
 #[derive(Debug)]
 pub(crate) struct TypedOperation {
     response: ResponsePolicy,
-    outgoing: OutgoingMessage,
+    outgoing: CommandRequest,
 }
 
 impl TypedOperation {
     pub(crate) fn new(
-        outgoing: OutgoingMessage,
+        outgoing: CommandRequest,
         response: ResponsePolicy,
     ) -> Result<Self, OperationContractError> {
         let actual = outgoing.message.content.associated_cmd();
@@ -82,7 +82,7 @@ impl TypedOperation {
         Ok(Self { response, outgoing })
     }
 
-    pub(crate) fn any_status(outgoing: OutgoingMessage) -> Self {
+    pub(crate) fn any_status(outgoing: CommandRequest) -> Self {
         let command = outgoing.message.content.associated_cmd();
         Self {
             response: ResponsePolicy::any(command),
@@ -125,7 +125,7 @@ impl TypedOperation {
             .map_err(|_| OperationContractError::CreditChargeOverflow { command })
     }
 
-    pub(crate) fn into_outgoing(self) -> OutgoingMessage {
+    pub(crate) fn into_outgoing(self) -> CommandRequest {
         self.outgoing
     }
 
@@ -153,12 +153,12 @@ impl TypedOperation {
 #[derive(Debug)]
 pub(crate) struct OperationResult {
     pub(crate) key: RequestKey,
-    pub(crate) response: IncomingMessage,
+    pub(crate) response: CommandResponse,
     pub(crate) request_raw: Option<Bytes>,
 }
 
 impl OperationResult {
-    pub(crate) fn into_incoming(self) -> IncomingMessage {
+    pub(crate) fn into_incoming(self) -> CommandResponse {
         self.response
     }
 }
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn constructor_rejects_a_command_mismatch() {
-        let outgoing = OutgoingMessage::new(RequestContent::Cancel(CancelRequest::default()));
+        let outgoing = CommandRequest::new(RequestContent::Cancel(CancelRequest::default()));
         let error = TypedOperation::new(
             outgoing,
             ResponsePolicy::one_of(Command::Negotiate, [Status::Success]).unwrap(),
@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn any_status_policy_supports_every_request_command_without_a_second_seam() {
-        let operation = TypedOperation::any_status(OutgoingMessage::new(RequestContent::Cancel(
+        let operation = TypedOperation::any_status(CommandRequest::new(RequestContent::Cancel(
             CancelRequest::default(),
         )));
         assert_eq!(operation.response_policy().wire_command(), Command::Cancel);
@@ -249,7 +249,7 @@ mod tests {
             file_id: Default::default(),
             minimum_count: 1,
         };
-        let operation = TypedOperation::any_status(OutgoingMessage::new(RequestContent::Read(
+        let operation = TypedOperation::any_status(CommandRequest::new(RequestContent::Read(
             request,
         )));
         assert_eq!(operation.credit_charge(false).unwrap(), 1);

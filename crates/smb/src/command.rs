@@ -4,7 +4,7 @@ use std::sync::{Arc, atomic::AtomicU64};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
-pub struct OutgoingMessage {
+pub struct CommandRequest {
     pub message: PlainRequest,
 
     pub return_raw_data: bool,
@@ -16,7 +16,7 @@ pub struct OutgoingMessage {
     pub channel_id: Option<u32>,
 
     /// Internal: explicit, sealed-at-construction safety policy.
-    /// Producers stamp this directly (`tree.sendo` for share-level
+    /// Producers stamp this directly (`tree.submit` for share-level
     /// encrypt_data; session-setup driver for `SnapshotKdfSign`); the
     /// channel layer fills in the default for any message that
     /// arrives with `None` based on session state. Once set, the
@@ -27,10 +27,10 @@ pub struct OutgoingMessage {
     pub(crate) security: Option<Protection>,
 }
 
-/// Explicit security treatment for an [`OutgoingMessage`].
+/// Explicit security treatment for an [`CommandRequest`].
 ///
 /// Sealed at construction by the caller (or, for legacy paths,
-/// inferred by `ChannelMessageHandler::sendo` from session state and
+/// inferred by `ChannelContext::submit` from session state and
 /// stamped into the message before it leaves the channel layer), so
 /// the wire pipeline can dispatch purely on this enum without
 /// inspecting other mutable state.
@@ -60,9 +60,9 @@ pub enum Protection {
     Encrypt,
 }
 
-impl OutgoingMessage {
-    pub fn new(content: RequestContent) -> OutgoingMessage {
-        OutgoingMessage {
+impl CommandRequest {
+    pub fn new(content: RequestContent) -> CommandRequest {
+        CommandRequest {
             message: PlainRequest::new(content),
             return_raw_data: false,
             additional_data: None,
@@ -88,8 +88,8 @@ impl OutgoingMessage {
 
     /// Internal: stamp `header.flags.signed = true` on a message that
     /// the session-setup driver is about to hand to
-    /// [`ConnectionMessageHandler::dispatch_outgoing`] directly
-    /// (bypassing [`ConnectionMessageHandler::sendo`]). This is the
+    /// [`ConnectionCore::dispatch_outgoing`] directly
+    /// (bypassing [`ConnectionCore::submit`]). This is the
     /// final SessionSetup Request path, where the driver has manually
     /// run `prepare_outgoing` and installed a channel SigningKey via
     /// `make_channel`; the wire pipeline's signing path keys off
@@ -103,21 +103,21 @@ impl OutgoingMessage {
 }
 
 #[derive(Debug)]
-pub struct SendMessageResult {
+pub struct CommandSubmission {
     // The message ID for the sent message.
     pub msg_id: u64,
     // If finalized, this is set.
     pub raw: Option<Bytes>,
 }
 
-impl SendMessageResult {
-    pub fn new(msg_id: u64, raw: Option<Bytes>) -> SendMessageResult {
-        SendMessageResult { msg_id, raw }
+impl CommandSubmission {
+    pub fn new(msg_id: u64, raw: Option<Bytes>) -> CommandSubmission {
+        CommandSubmission { msg_id, raw }
     }
 }
 
 #[derive(Debug)]
-pub struct IncomingMessage {
+pub struct CommandResponse {
     pub message: PlainResponse,
     /// The raw message bytes received from the server, after applying transformations
     /// (e.g. decryption, decompression). Stored as `Bytes` for zero-copy slicing.
@@ -129,9 +129,9 @@ pub struct IncomingMessage {
     pub source_channel_id: Option<u32>,
 }
 
-impl IncomingMessage {
-    pub fn new(message: PlainResponse, raw: Bytes, form: MessageForm) -> IncomingMessage {
-        IncomingMessage {
+impl CommandResponse {
+    pub fn new(message: PlainResponse, raw: Bytes, form: MessageForm) -> CommandResponse {
+        CommandResponse {
             message,
             raw,
             form,
@@ -185,14 +185,14 @@ impl Default for AsyncMessageIds {
 /// Use a builder pattern to set the options:
 /// ```
 /// use smb_msg::*;
-/// use smb::msg_handler::ReceiveOptions;
+/// use smb::command::ResponseOptions;
 ///
-/// let options = ReceiveOptions::new()
+/// let options = ResponseOptions::new()
 ///    .with_status(&[Status::Success])
 ///    .with_cmd(Some(Command::Negotiate));
 /// ```
 #[derive(Debug, Clone)]
-pub struct ReceiveOptions<'a> {
+pub struct ResponseOptions<'a> {
     /// The expected status(es) of the received message.
     /// If the received message has a different status, an error will be returned.
     pub status: &'a [Status],
@@ -231,7 +231,7 @@ pub struct ReceiveOptions<'a> {
     pub timeout: Option<std::time::Duration>,
 }
 
-impl<'a> ReceiveOptions<'a> {
+impl<'a> ResponseOptions<'a> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -272,9 +272,9 @@ impl<'a> ReceiveOptions<'a> {
     }
 }
 
-impl<'a> Default for ReceiveOptions<'a> {
+impl<'a> Default for ResponseOptions<'a> {
     fn default() -> Self {
-        ReceiveOptions {
+        ResponseOptions {
             status: &[Status::Success],
             cmd: None,
             msg_id: 0,
@@ -286,135 +286,3 @@ impl<'a> Default for ReceiveOptions<'a> {
         }
     }
 }
-
-/// Chain-of-responsibility pattern trait for handling SMB messages
-/// outgoing from the client or incoming from the server.
-///
-/// Implementers provide the three core operations (`sendo`, `recvo`,
-/// `notify`). The eight `send*` / `recv*` / `*_recv*` composition
-/// helpers that wrap them live on [`MessageHandlerExt`], a sibling
-/// trait with a blanket impl — callers get the same `arc.send_recv(msg)`
-/// syntax as before, as long as `MessageHandlerExt` is in scope.
-#[allow(async_fn_in_trait)]
-pub trait MessageHandler {
-    /// Send a message to the server, returning the result.
-    /// This must be implemented. Each handler in the chain must call the next handler,
-    /// after possibly modifying the message.
-    async fn sendo(&self, msg: OutgoingMessage) -> crate::Result<SendMessageResult>;
-
-    /// Receive a message from the server, returning the result.
-    /// This must be implemented, and must call the next handler in the chain,
-    /// if there is one, using the provided `ReceiveOptions`.
-    async fn recvo(&self, options: ReceiveOptions) -> crate::Result<IncomingMessage>;
-
-    /// Called when a server-to-client message is received.
-    ///
-    /// # Arguments
-    /// * `msg` - The message received from the server.
-    ///
-    /// # Returns
-    /// A result indicating whether the message was handled successfully.
-    ///
-    /// # Notes
-    /// * This method should generally be implemented by handlers, if there's a chance they are related
-    ///   to any supported notification messages.
-    /// * Unless the handler finishes handling the message fully, it should call the next handler in the chain.
-    /// * Default implementation does nothing.
-    async fn notify(&self, msg: IncomingMessage) -> crate::Result<()> {
-        tracing::debug!("Received notification message: {msg:?}");
-        Ok(())
-    }
-}
-
-/// Composition helpers built on top of [`MessageHandler::sendo`] /
-/// [`MessageHandler::recvo`]. Split off from the core trait so
-/// implementers' surface stays at three methods; callers automatically
-/// pick up the eight helpers via the blanket impl below.
-///
-/// Common shapes:
-/// - `send*`: send a request content.
-/// - `recv*`: receive a response.
-/// - `send*_recv*` / `sendo*_recv*` / `sendor_*`: combined send + recv.
-/// - the `o` suffix means "with low-level options"
-///   (`OutgoingMessage` / `ReceiveOptions` instead of `RequestContent` /
-///   default options).
-/// - the `or` infix means "also return the send result", not just the
-///   incoming response.
-#[allow(async_fn_in_trait)]
-pub trait MessageHandlerExt: MessageHandler {
-    #[inline]
-    async fn send(&self, msg: RequestContent) -> crate::Result<SendMessageResult> {
-        self.sendo(OutgoingMessage::new(msg)).await
-    }
-
-    #[inline]
-    async fn recv(&self, cmd: Command) -> crate::Result<IncomingMessage> {
-        self.recvo(ReceiveOptions::new().with_cmd(Some(cmd))).await
-    }
-
-    #[inline]
-    async fn sendor_recvo(
-        &self,
-        msg: OutgoingMessage,
-        mut options: ReceiveOptions<'_>,
-    ) -> crate::Result<(SendMessageResult, IncomingMessage)> {
-        let channel_id = msg.channel_id;
-        // Send the message and wait for the matching response.
-        let send_result = self.sendo(msg).await?;
-
-        options.msg_id = send_result.msg_id;
-        options.channel_id = channel_id;
-
-        let in_result = self.recvo(options).await?;
-        Ok((send_result, in_result))
-    }
-
-    #[inline]
-    async fn sendo_recvo(
-        &self,
-        msg: OutgoingMessage,
-        options: ReceiveOptions<'_>,
-    ) -> crate::Result<IncomingMessage> {
-        self.sendor_recvo(msg, options).await.map(|(_, r)| r)
-    }
-
-    #[inline]
-    async fn send_recvo(
-        &self,
-        msg: RequestContent,
-        options: ReceiveOptions<'_>,
-    ) -> crate::Result<IncomingMessage> {
-        self.sendo_recvo(OutgoingMessage::new(msg), options).await
-    }
-
-    #[inline]
-    async fn sendo_recv(&self, msg: OutgoingMessage) -> crate::Result<IncomingMessage> {
-        let cmd = msg.message.content.associated_cmd();
-        let options = ReceiveOptions::new().with_cmd(Some(cmd));
-        self.sendo_recvo(msg, options).await
-    }
-
-    #[inline]
-    async fn send_recv(&self, msg: RequestContent) -> crate::Result<IncomingMessage> {
-        self.sendo_recv(OutgoingMessage::new(msg)).await
-    }
-
-    #[inline]
-    async fn sendor_recv(
-        &self,
-        msg: OutgoingMessage,
-    ) -> crate::Result<(SendMessageResult, IncomingMessage)> {
-        self.sendor_recvo(msg, ReceiveOptions::new()).await
-    }
-}
-
-// Blanket impl: every MessageHandler automatically gets the helpers.
-impl<T: MessageHandler + ?Sized> MessageHandlerExt for T {}
-
-// Note: prior versions of this module defined a `HandlerReference<T>`
-// wrapper that was structurally `Arc<T>` + a `weak()` method. Since
-// the crate has no `dyn MessageHandler` callsites (every Upstream is
-// a concrete `MessageHandler` impl), the wrapper added no
-// polymorphism — it only saved one method call (`.weak()` vs
-// `Arc::downgrade(&_)`). Callers now use `Arc<T>` directly and rely
-// on `Arc::deref` to reach trait methods. See refactor-notes §17.

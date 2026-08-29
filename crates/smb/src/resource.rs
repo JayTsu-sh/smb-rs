@@ -12,11 +12,10 @@ use crate::{
     Error,
     connection::connection_info::ConnectionInfo,
     lease::{LeaseSlot, ResourceProto, SlotReleaseAction},
-    msg_handler::{
-        AsyncMessageIds, IncomingMessage, MessageHandler, MessageHandlerExt, OutgoingMessage,
-        ReceiveOptions, SendMessageResult,
+    command::{
+        AsyncMessageIds, CommandResponse, CommandRequest, ResponseOptions, CommandSubmission,
     },
-    tree::TreeMessageHandler,
+    tree::TreeContext,
 };
 
 pub mod directory;
@@ -29,7 +28,7 @@ pub use file::*;
 pub use file_util::*;
 pub use pipe::*;
 
-type Upstream = Arc<TreeMessageHandler>;
+type Upstream = Arc<TreeContext>;
 
 #[derive(Default)]
 pub struct FileCreateArgs {
@@ -159,7 +158,7 @@ impl Resource {
             OplockLevel::None
         };
 
-        let mut msg = OutgoingMessage::new(
+        let mut msg = CommandRequest::new(
             CreateRequest {
                 requested_oplock_level,
                 impersonation_level: ImpersonationLevel::Impersonation,
@@ -177,7 +176,7 @@ impl Resource {
         msg.message.header.flags.set_dfs_operation(is_dfs);
 
         let response = upstream
-            .sendo_recvo(msg, ReceiveOptions::new().with_allow_async(true))
+            .execute_request(msg, ResponseOptions::new().with_allow_async(true))
             .await?;
 
         let response = response.message.content.to_create()?;
@@ -225,7 +224,7 @@ impl Resource {
         // [`Resource::attach_lease_slot`] after this function returns.
         let handle = ResourceHandle {
             name: name.to_string(),
-            handler: upstream.clone(),
+            context: upstream.clone(),
             open: AtomicBool::new(true),
             _file_id: response.file_id,
             created: response.creation_time.date_time(),
@@ -302,7 +301,7 @@ impl Resource {
 
     /// Phase C.3: materialize a cache-hit resource from an existing
     /// `LeaseSlot`. Skips the wire `Create` entirely — the returned
-    /// resource reuses the slot's `FileId`, handler chain, and creation
+    /// resource reuses the slot's `FileId`, context chain, and creation
     /// metadata. The slot's refcount is *not* incremented here; the
     /// caller (`Client::_create_file`) must have already called
     /// [`LeaseSlot::try_acquire_for_reuse`] which performs the bump
@@ -328,7 +327,7 @@ impl Resource {
 
         let handle = ResourceHandle {
             name: slot.path.clone(),
-            handler: proto.handler.clone(),
+            context: proto.context.clone(),
             open: AtomicBool::new(true),
             _file_id: slot.file_id,
             created: proto.created,
@@ -387,7 +386,7 @@ impl Resource {
         let is_dir = matches!(self, Resource::Directory(_));
         let epoch_at_grant = h.lease_granted.map(|g| g.epoch).unwrap_or(0);
         Some(Arc::new(ResourceProto {
-            handler: upstream.clone(),
+            context: upstream.clone(),
             conn_info: h.conn_info.clone(),
             created: h.created,
             modified: h.modified,
@@ -514,7 +513,7 @@ impl LeaseGrant {
 /// Holds the common information for an opened SMB resource.
 pub struct ResourceHandle {
     name: String,
-    handler: Arc<TreeMessageHandler>,
+    context: Arc<TreeContext>,
 
     // Whether the resource is open or not.
     // TODO: Consider using RwLock here on FileId instead of AtomicBool+FileId.
@@ -640,9 +639,9 @@ impl ResourceHandle {
 
         let info_type = req.info_type;
         let result = self
-            .send_recvo(
+            .execute_content(
                 req.into(),
-                ReceiveOptions::new().with_status(&[
+                ResponseOptions::new().with_status(&[
                     Status::Success,
                     Status::BufferOverflow,
                     Status::BufferTooSmall,
@@ -689,7 +688,7 @@ impl ResourceHandle {
                         required: None,
                         provided: buffer_length as usize,
                     }),
-                    _ => unreachable!(), // already filtered by send_recvo
+                    _ => unreachable!(), // already filtered by execute_content
                 }
             }
             Err(e) => Err(e),
@@ -946,8 +945,8 @@ impl ResourceHandle {
         flags: IoctlRequestFlags,
     ) -> crate::Result<IoctlResponse> {
         let result = self
-            .handler
-            .send_recvo(
+            .context
+            .execute_content(
                 RequestContent::Ioctl(IoctlRequest {
                     ctl_code,
                     file_id: self.file_id()?,
@@ -956,7 +955,7 @@ impl ResourceHandle {
                     flags,
                     buffer: req_data,
                 }),
-                ReceiveOptions::new().with_allow_async(true),
+                ResponseOptions::new().with_allow_async(true),
             )
             .await?
             .message
@@ -1074,12 +1073,9 @@ impl ResourceHandle {
     /// Sends a close request to the server for the given file ID.
     /// This should be called properly after taking out the file id (handle) from the resource instance,
     /// to avoid Use-after-free errors.
-    async fn send_close(
-        file_id: FileId,
-        handler: &Arc<TreeMessageHandler>,
-    ) -> crate::Result<()> {
+    async fn send_close(file_id: FileId, context: &Arc<TreeContext>) -> crate::Result<()> {
         tracing::trace!("Send close to file with ID: {file_id:?}");
-        let response = handler.send_recv(CloseRequest { file_id }.into()).await?;
+        let response = context.send_recv(CloseRequest { file_id }.into()).await?;
         tracing::debug!("Close response received for file ID: {file_id:?}, {response:?}");
         Ok(())
     }
@@ -1087,14 +1083,14 @@ impl ResourceHandle {
     /// Phase C.5: pub(crate) entry point so the lease-eviction path in
     /// [`crate::Client::flush_eviction`] can send the deferred wire
     /// `Close` against a slot whose owning [`ResourceHandle`] is already
-    /// gone (refcount was zero at evict time). The handler is pulled
+    /// gone (refcount was zero at evict time). The context is pulled
     /// from `LeaseSlot::proto`, so the close goes through the same
     /// tree+session as the original Create.
     pub(crate) async fn send_close_external(
         file_id: FileId,
-        handler: &Arc<TreeMessageHandler>,
+        context: &Arc<TreeContext>,
     ) -> crate::Result<()> {
-        Self::send_close(file_id, handler).await
+        Self::send_close(file_id, context).await
     }
 
     /// Closes the resource.
@@ -1148,7 +1144,7 @@ impl ResourceHandle {
         }
 
         tracing::debug!(file_id = ?self._file_id, "Closing handle");
-        Self::send_close(self._file_id, &self.handler).await?;
+        Self::send_close(self._file_id, &self.context).await?;
 
         tracing::debug!("Closed");
 
@@ -1159,40 +1155,40 @@ impl ResourceHandle {
     async fn send_receive(
         &self,
         msg: RequestContent,
-    ) -> crate::Result<crate::msg_handler::IncomingMessage> {
-        self.handler.send_recv(msg).await
+    ) -> crate::Result<crate::command::CommandResponse> {
+        self.context.send_recv(msg).await
     }
 
     #[inline]
-    async fn send_recvo(
+    async fn execute_content(
         &self,
         msg: RequestContent,
-        options: ReceiveOptions<'_>,
-    ) -> crate::Result<IncomingMessage> {
-        self.handler
-            .sendo_recvo(OutgoingMessage::new(msg), options)
+        options: ResponseOptions<'_>,
+    ) -> crate::Result<CommandResponse> {
+        self.context
+            .execute_request(CommandRequest::new(msg), options)
             .await
     }
 
     #[inline]
-    async fn sendo_recvo(
+    async fn execute_request(
         &self,
-        msg: OutgoingMessage,
-        options: ReceiveOptions<'_>,
-    ) -> crate::Result<IncomingMessage> {
-        self.handler.sendo_recvo(msg, options).await
+        msg: CommandRequest,
+        options: ResponseOptions<'_>,
+    ) -> crate::Result<CommandResponse> {
+        self.context.execute_request(msg, options).await
     }
 
     #[inline]
-    pub async fn send_cancel(&self, msg_ids: &AsyncMessageIds) -> crate::Result<SendMessageResult> {
-        let mut outgoing_message = OutgoingMessage::new(CancelRequest {}.into());
+    pub async fn send_cancel(&self, msg_ids: &AsyncMessageIds) -> crate::Result<CommandSubmission> {
+        let mut outgoing_message = CommandRequest::new(CancelRequest {}.into());
         outgoing_message.message.header.message_id = msg_ids.msg_id.load(Ordering::Relaxed);
         outgoing_message
             .message
             .header
             .to_async(msg_ids.async_id.load(Ordering::Relaxed));
 
-        self.handler.sendo(outgoing_message).await
+        self.context.submit(outgoing_message).await
     }
 
     /// Returns whether current resource is opened from the same tree as the other resource.
@@ -1202,7 +1198,7 @@ impl ResourceHandle {
     /// * Even if a resource is positioned in the same tree, if the tree was accessed using different
     ///   share connections, this will return false!
     pub fn same_tree(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.handler, &other.handler)
+        Arc::ptr_eq(&self.context, &other.context)
     }
 }
 
@@ -1239,11 +1235,11 @@ impl Drop for ResourceHandle {
         }
 
         let file_id = self._file_id;
-        let handler = self.handler.clone();
+        let context = self.context.clone();
         tracing::debug!("Spawning task to close file with ID: {file_id:?}");
         tokio::task::spawn(async move {
             if file_id != FileId::EMPTY {
-                if let Err(e) = Self::send_close(file_id, &handler).await {
+                if let Err(e) = Self::send_close(file_id, &context).await {
                     tracing::error!("Error closing file: {e}");
                 }
             }

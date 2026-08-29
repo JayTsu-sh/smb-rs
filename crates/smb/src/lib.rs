@@ -10,7 +10,7 @@ pub mod dialects;
 pub mod docs;
 pub mod error;
 pub mod lease;
-pub mod msg_handler;
+pub mod command;
 pub mod resource;
 pub(crate) mod runtime;
 #[cfg(feature = "test-support")]

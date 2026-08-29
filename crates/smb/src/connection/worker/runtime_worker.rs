@@ -2,10 +2,10 @@ use crate::clock::{Clock, TokioClock};
 use crate::connection::connection_info::ConnectionInfo;
 use crate::connection::preauth_hash::PreauthHashValue;
 use crate::error::TimedOutTask;
-use crate::msg_handler::{IncomingMessage, OutgoingMessage, ReceiveOptions, SendMessageResult};
+use crate::command::{CommandResponse, CommandRequest, ResponseOptions, CommandSubmission};
 use crate::runtime::{
-    GenerationId, OperationResult, RequestKey, RuntimeConfig, RuntimeError, RuntimeHandle,
-    TerminalOutcome, TypedOperation, start_generation,
+    GenerationId, OperationResult, RequestKey, ResponsePolicy, RuntimeConfig, RuntimeError,
+    RuntimeHandle, TerminalOutcome, TypedOperation, start_generation,
 };
 use crate::session::SessionAndChannel;
 use crate::{Error, Result};
@@ -59,7 +59,7 @@ impl RuntimeWorker {
             .map_err(|error| self.map_runtime_error(error))
     }
 
-    pub(crate) async fn send(&self, message: OutgoingMessage) -> Result<SendMessageResult> {
+    pub(crate) async fn send(&self, message: CommandRequest) -> Result<CommandSubmission> {
         let deadline = self.clock.now().saturating_add(self.timeout);
         let submission = self
             .runtime
@@ -69,13 +69,56 @@ impl RuntimeWorker {
             )
             .await
             .map_err(|error| self.map_runtime_error(error))?;
-        Ok(SendMessageResult::new(
+        Ok(CommandSubmission::new(
             submission.key.message_id,
             submission.request_raw,
         ))
     }
 
-    pub(crate) async fn receive(&self, options: &ReceiveOptions<'_>) -> Result<IncomingMessage> {
+    pub(crate) async fn execute(
+        &self,
+        message: CommandRequest,
+        options: &ResponseOptions<'_>,
+    ) -> Result<(CommandSubmission, CommandResponse)> {
+        let command = options
+            .cmd
+            .unwrap_or_else(|| message.message.content.associated_cmd());
+        let policy = ResponsePolicy::one_of(command, options.status.iter().copied())
+            .map_err(|error| Error::InvalidArgument(error.to_string()))?;
+        let operation = TypedOperation::new(message, policy)
+            .map_err(|error| Error::InvalidArgument(error.to_string()))?;
+        let timeout = options.timeout.unwrap_or(self.timeout);
+        let deadline = self.clock.now().saturating_add(timeout);
+        let ticket = self
+            .runtime
+            .submit_operation(operation, Some(deadline))
+            .await
+            .map_err(|error| self.map_runtime_error(error))?;
+        let key = ticket.key;
+        let completion = ticket.completion();
+        tokio::pin!(completion);
+        let result = if let Some(cancellation) = &options.async_cancel {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    self.runtime
+                        .cancel(key, self.clock.now())
+                        .map_err(|error| self.map_runtime_error(error))?;
+                    return Err(Error::Cancelled("runtime operation"));
+                }
+                result = &mut completion => result,
+            }
+        } else {
+            completion.await
+        }
+        .map_err(|error| self.map_runtime_error(error))?;
+        Ok((
+            CommandSubmission::new(result.key.message_id, result.request_raw),
+            result.response,
+        ))
+    }
+
+    pub(crate) async fn receive(&self, options: &ResponseOptions<'_>) -> Result<CommandResponse> {
         if options.msg_id == u64::MAX {
             return Err(Error::InvalidArgument(
                 "Message ID -1 is not valid for receive()".to_string(),
@@ -133,7 +176,7 @@ impl RuntimeWorker {
 
     pub(crate) fn start_notify_channel(
         self: &Arc<Self>,
-        sender: tokio::sync::mpsc::Sender<IncomingMessage>,
+        sender: tokio::sync::mpsc::Sender<CommandResponse>,
     ) -> Result<()> {
         self.runtime
             .install_notifications(sender)
@@ -142,8 +185,8 @@ impl RuntimeWorker {
 
     pub(crate) async fn send_compound(
         self: &Arc<Self>,
-        messages: Vec<OutgoingMessage>,
-    ) -> Result<Vec<SendMessageResult>> {
+        messages: Vec<CommandRequest>,
+    ) -> Result<Vec<CommandSubmission>> {
         let operations = messages
             .into_iter()
             .map(TypedOperation::any_status)
@@ -158,7 +201,7 @@ impl RuntimeWorker {
                 submissions
                     .into_iter()
                     .map(|submission| {
-                        SendMessageResult::new(submission.key.message_id, submission.request_raw)
+                        CommandSubmission::new(submission.key.message_id, submission.request_raw)
                     })
                     .collect()
             })

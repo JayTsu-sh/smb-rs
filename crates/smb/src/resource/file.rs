@@ -164,7 +164,7 @@ impl File {
         pos: u64,
         channel: Option<u32>,
         unbuffered: bool,
-    ) -> std::io::Result<crate::msg_handler::IncomingMessage> {
+    ) -> std::io::Result<crate::command::CommandResponse> {
         let mut flags = ReadFlags::new();
         if self.handle.conn_info.config.compression_enabled
             && self.handle.conn_info.dialect.supports_compression()
@@ -176,7 +176,7 @@ impl File {
             flags.set_read_unbuffered(true);
         }
 
-        let request = OutgoingMessage::new(
+        let request = CommandRequest::new(
             ReadRequest {
                 flags,
                 length,
@@ -189,7 +189,7 @@ impl File {
         .with_channel_id(channel);
 
         self.handle
-            .sendo_recvo(request, ReceiveOptions::new().with_allow_async(true))
+            .execute_request(request, ResponseOptions::new().with_allow_async(true))
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))
     }
@@ -245,7 +245,7 @@ impl File {
         );
 
         // Bytes provides zero-copy clone via internal reference counting.
-        let outgoing = OutgoingMessage::new(
+        let outgoing = CommandRequest::new(
             WriteRequest::new(
                 pos,
                 self.handle.file_id().map_err(std::io::Error::other)?,
@@ -259,7 +259,7 @@ impl File {
 
         let response = self
             .handle
-            .sendo_recvo(outgoing, ReceiveOptions::new().with_allow_async(true))
+            .execute_request(outgoing, ResponseOptions::new().with_allow_async(true))
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
@@ -282,12 +282,12 @@ impl File {
     pub async fn flush(&self) -> std::io::Result<()> {
         let _response = self
             .handle
-            .send_recvo(
+            .execute_content(
                 FlushRequest {
                     file_id: self.handle.file_id().map_err(std::io::Error::other)?,
                 }
                 .into(),
-                ReceiveOptions::new().with_allow_async(true),
+                ResponseOptions::new().with_allow_async(true),
             )
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;

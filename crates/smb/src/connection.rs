@@ -1,7 +1,7 @@
-mod registry;
 pub mod config;
 pub mod connection_info;
 pub mod preauth_hash;
+mod registry;
 pub mod worker;
 
 use crate::compression;
@@ -9,13 +9,13 @@ use crate::connection::preauth_hash::PreauthHashState;
 use crate::dialects::DialectImpl;
 use crate::lease::{LeaseBreakEvent, LeaseSlot};
 pub use crate::runtime::wire::TransformError;
-use crate::{Error, crypto, msg_handler::*, session::Session};
-use registry::ConnectionRegistry;
+use crate::{Error, crypto, command::*, session::Session};
 use binrw::prelude::*;
 pub use config::*;
 use connection_info::{ConnectionInfo, NegotiatedProperties};
 use rand::RngCore;
 use rand::rngs::OsRng;
+use registry::ConnectionRegistry;
 use smb_dtyp::*;
 use smb_msg::{
     RequestContent, Response, ResponseContent, negotiate::*, oplock::LeaseBreakAck,
@@ -42,7 +42,7 @@ const LEASE_BREAK_CHANNEL_CAPACITY: usize = 64;
 /// Each SMB connection has a single matching transport (e.g. TCP connection).
 /// Usually, most use cases require a single connection per server-client communication.
 pub struct Connection {
-    handler: Arc<ConnectionMessageHandler>,
+    context: Arc<ConnectionCore>,
     config: ConnectionConfig,
 
     server_name: String,
@@ -60,7 +60,7 @@ impl Connection {
     ) -> crate::Result<Self> {
         config.validate()?;
         Ok(Connection {
-            handler: Arc::new(ConnectionMessageHandler::new(client_guid)),
+            context: Arc::new(ConnectionCore::new(client_guid)),
             config,
             server_name: server_name.to_string(),
             server_address,
@@ -105,8 +105,8 @@ impl Connection {
         primary_session
             .bind(
                 identity,
-                &self.handler,
-                self.handler.conn_info.get().ok_or_else(|| {
+                &self.context,
+                self.context.conn_info.get().ok_or_else(|| {
                     Error::InvalidState("Connection info not available.".to_string())
                 })?,
             )
@@ -116,7 +116,7 @@ impl Connection {
     /// Connects to the specified server, if it is not already connected, and negotiates the connection.
     #[tracing::instrument(level = "debug", skip_all, fields(server = %self.server_name))]
     pub async fn connect(&self) -> crate::Result<()> {
-        if self.handler.worker().is_some() {
+        if self.context.worker().is_some() {
             return Err(Error::InvalidState("Already connected".into()));
         }
 
@@ -186,7 +186,7 @@ impl Connection {
     /// See also [`Client::close`][`crate::Client::close`].
     #[tracing::instrument(level = "debug", skip_all, fields(server = %self.server_name))]
     pub async fn close(&self) -> crate::Result<()> {
-        match self.handler.worker() {
+        match self.context.worker() {
             Some(c) => c.stop().await,
             None => Ok(()),
         }
@@ -257,7 +257,7 @@ impl Connection {
         server_address: std::net::SocketAddr,
     ) -> crate::Result<ConnectionInfo> {
         // Confirm that we're not already negotiated.
-        if self.handler.conn_info.get().is_some() {
+        if self.context.conn_info.get().is_some() {
             return Err(Error::InvalidState("Already negotiated".into()));
         }
 
@@ -286,9 +286,9 @@ impl Connection {
 
         // Send SMB2 negotiate request
         let (request_status, response) = self
-            .handler
-            .sendor_recv(
-                OutgoingMessage::new(
+            .context
+            .execute_with_submission(
+                CommandRequest::new(
                     self._make_smb2_neg_request(
                         dialects,
                         crypto::SIGNING_ALGOS.to_vec(),
@@ -362,7 +362,7 @@ impl Connection {
             config: self.config.clone(),
             server_name: self.server_name.clone(),
             preauth_hash,
-            client_guid: self.handler.client_guid,
+            client_guid: self.context.client_guid,
             server_address,
         })
     }
@@ -375,7 +375,7 @@ impl Connection {
         encrypting_algorithms: Vec<EncryptionCipher>,
         compression_algorithms: Vec<CompressionAlgorithm>,
     ) -> NegotiateRequest {
-        let client_guid = self.handler.client_guid;
+        let client_guid = self.context.client_guid;
         let client_netname = self
             .config
             .client_name
@@ -502,7 +502,7 @@ impl Connection {
         transport: Box<dyn SmbTransport>,
         smb2_only_neg: bool,
     ) -> crate::Result<()> {
-        if self.handler.conn_info.get().is_some() {
+        if self.context.conn_info.get().is_some() {
             return Err(Error::InvalidState("Already negotiated".into()));
         }
 
@@ -512,7 +512,7 @@ impl Connection {
             ._negotiate_switch_to_smb2(transport, smb2_only_neg)
             .await?;
 
-        self.handler
+        self.context
             .worker
             .set(worker)
             .map_err(|_| Error::InvalidState("Worker already set.".to_string()))?;
@@ -520,7 +520,7 @@ impl Connection {
         // Negotiate SMB2
         let info = Arc::new(self._negotiate_smb2(server_address).await?);
 
-        self.handler
+        self.context
             .worker
             .get()
             .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?
@@ -538,17 +538,17 @@ impl Connection {
                 "Starting Notification job (server notifications cap={}).",
                 info.negotiation.caps.notifications()
             );
-            self.handler.start_notify().await?;
+            self.context.start_notify().await?;
             tracing::debug!("Notification job started.");
 
             // Phase C.2: the break-listener consumes the per-connection
             // lease_event_tx broadcast (fed by handle_lease_break) and
             // tombstones matching slots in lease_table so new opens
             // miss the cache after a server-side break.
-            self.handler.start_lease_break_listener();
+            self.context.start_lease_break_listener();
         }
 
-        self.handler
+        self.context
             .conn_info
             .set(info)
             .map_err(|_| Error::InvalidState("Connection info already set.".to_string()))?;
@@ -573,17 +573,17 @@ impl Connection {
     pub async fn authenticate(&self, identity: sspi::AuthIdentity) -> crate::Result<Session> {
         let session = Session::create(
             identity,
-            &self.handler,
-            self.handler
+            &self.context,
+            self.context
                 .conn_info
                 .get()
                 .ok_or_else(|| Error::InvalidState("Connection not negotiated.".to_string()))?,
         )
         .await?;
-        let session_handler = Arc::downgrade(&session.handler);
-        self.handler
+        let session_context = Arc::downgrade(&session.context);
+        self.context
             .registry
-            .insert_session(session.session_id(), session_handler)
+            .insert_session(session.session_id(), session_context)
             .await;
         Ok(session)
     }
@@ -598,7 +598,7 @@ impl Connection {
     /// must produce a known sequence of bytes.
     ///
     /// Behaviour, error semantics, and bookkeeping (session table,
-    /// handler weak ref) are identical to [`Self::authenticate`].
+    /// context weak ref) are identical to [`Self::authenticate`].
     #[cfg(feature = "test-support")]
     #[tracing::instrument(level = "debug", skip_all, fields(server = %self.server_name))]
     pub async fn authenticate_with_gss<G>(&self, gss: G) -> crate::Result<Session>
@@ -607,17 +607,17 @@ impl Connection {
     {
         let session = Session::create_with_gss(
             gss,
-            &self.handler,
-            self.handler
+            &self.context,
+            self.context
                 .conn_info
                 .get()
                 .ok_or_else(|| Error::InvalidState("Connection not negotiated.".to_string()))?,
         )
         .await?;
-        let session_handler = Arc::downgrade(&session.handler);
-        self.handler
+        let session_context = Arc::downgrade(&session.context);
+        self.context
             .registry
-            .insert_session(session.session_id(), session_handler)
+            .insert_session(session.session_id(), session_context)
             .await;
         Ok(session)
     }
@@ -625,34 +625,34 @@ impl Connection {
     /// Returns the connection information, if the connection has been negotiated.
     /// Otherwise, returns `None`.
     pub fn conn_info(&self) -> Option<&Arc<ConnectionInfo>> {
-        self.handler.conn_info.get()
+        self.context.conn_info.get()
     }
 
     /// Subscribe to lease-break notifications received on this connection.
-    /// See [`ConnectionMessageHandler::subscribe_lease_breaks`] for semantics.
+    /// See [`ConnectionCore::subscribe_lease_breaks`] for semantics.
     pub fn subscribe_lease_breaks(&self) -> tokio::sync::broadcast::Receiver<LeaseBreakEvent> {
-        self.handler.subscribe_lease_breaks()
+        self.context.subscribe_lease_breaks()
     }
 
     /// Install a [`crate::lease::LeaseSlot`] into this connection's
-    /// lease cache. See [`ConnectionMessageHandler::insert_lease_slot`].
+    /// lease cache. See [`ConnectionCore::insert_lease_slot`].
     pub async fn insert_lease_slot(&self, slot: Arc<LeaseSlot>) -> crate::Result<()> {
-        self.handler.insert_lease_slot(slot).await
+        self.context.insert_lease_slot(slot).await
     }
 
     /// Return the current number of cached lease slots.
     pub async fn lease_slot_count(&self) -> crate::Result<usize> {
-        self.handler.lease_slot_count().await
+        self.context.lease_slot_count().await
     }
 
     /// Look up a cached lease slot by path; `None` when absent.
     pub async fn peek_lease_slot(&self, path: &str) -> crate::Result<Option<Arc<LeaseSlot>>> {
-        self.handler.peek_lease_slot(path).await
+        self.context.peek_lease_slot(path).await
     }
 
     /// Atomic cache-hit acquire: peek a slot and bump its refcount inside
     /// the `lease_table` lock. See
-    /// [`ConnectionMessageHandler::try_acquire_lease`] for semantics and
+    /// [`ConnectionCore::try_acquire_lease`] for semantics and
     /// the rationale around lock ordering vs eviction.
     pub async fn try_acquire_lease(
         &self,
@@ -661,7 +661,7 @@ impl Connection {
         requested_disposition: smb_msg::CreateDisposition,
         wants_directory: bool,
     ) -> crate::Result<Option<Arc<LeaseSlot>>> {
-        self.handler
+        self.context
             .try_acquire_lease(
                 path,
                 requested_access,
@@ -672,10 +672,10 @@ impl Connection {
     }
 
     /// Phase C.5: tombstone a lease slot and remove it from the table.
-    /// See [`ConnectionMessageHandler::take_lease_for_evict`] for the
+    /// See [`ConnectionCore::take_lease_for_evict`] for the
     /// race-free contract.
     pub async fn take_lease_for_evict(&self, path: &str) -> crate::Result<Option<LeaseEviction>> {
-        self.handler.take_lease_for_evict(path).await
+        self.context.take_lease_for_evict(path).await
     }
 
     /// Phase C.5: scan the connection's lease table and tombstone any
@@ -688,16 +688,15 @@ impl Connection {
         &self,
         older_than: std::time::Duration,
     ) -> crate::Result<Vec<LeaseEviction>> {
-        self.handler.sweep_idle_leases(older_than).await
+        self.context.sweep_idle_leases(older_than).await
     }
 
     /// Send an SMB2 compound chain through this connection's worker and
     /// receive each member's response.
     ///
     /// For each message in `msgs` (in order) this:
-    /// 1. Sets `priority_mask` per the negotiated dialect — matches the
-    ///    single-message [`crate::msg_handler::MessageHandler::sendo`]
-    ///    path.
+    /// 1. Sets `priority_mask` per the negotiated dialect, matching the
+    ///    single-command execution path.
     /// 2. Submits the entire typed batch atomically; the runtime owner
     ///    allocates MessageIds and credit charge/request values.
     /// 3. After all members are prepared, hands the whole batch to
@@ -732,10 +731,10 @@ impl Connection {
     /// twice, which defeats the point of the single-write path.
     pub async fn send_compound(
         &self,
-        mut msgs: Vec<OutgoingMessage>,
-    ) -> crate::Result<Vec<IncomingMessage>> {
+        mut msgs: Vec<CommandRequest>,
+    ) -> crate::Result<Vec<CommandResponse>> {
         // CancelRequest has its own bespoke path inside the single-message
-        // `sendo` (it reuses an already-allocated message_id and skips
+        // `submit` (it reuses an already-allocated message_id and skips
         // owner admission). Bundling it into a compound chain
         // would either re-allocate its message_id — silently breaking the
         // cancel target — or skip the per-member accounting we run below.
@@ -748,7 +747,7 @@ impl Connection {
                 )));
             }
         }
-        let priority_value = match self.handler.conn_info.get() {
+        let priority_value = match self.context.conn_info.get() {
             Some(neg_info) => match neg_info.negotiation.dialect_rev {
                 Dialect::Smb0311 => 1,
                 _ => 0,
@@ -760,7 +759,7 @@ impl Connection {
         }
 
         let worker = self
-            .handler
+            .context
             .worker
             .get()
             .ok_or(Error::InvalidState("Worker is uninitialized".into()))?;
@@ -768,7 +767,7 @@ impl Connection {
 
         let mut responses = Vec::with_capacity(send_results.len());
         for r in send_results {
-            let mut opts = ReceiveOptions::new();
+            let mut opts = ResponseOptions::new();
             opts.msg_id = r.msg_id;
             opts.allow_async = true;
             let incoming = worker.receive(&opts).await?;
@@ -792,14 +791,14 @@ pub struct LeaseEviction {
     /// `true` when this eviction owns the wire `Close`: at removal time
     /// the slot had zero live handles, so no `release_one` path will
     /// fire it. The caller must send `CloseRequest` against
-    /// `slot.file_id` through `slot.proto.handler`. `false` when at
+    /// `slot.file_id` through `slot.proto.context`. `false` when at
     /// least one live handle was present; that handle's
     /// `release_one` -> `CloseAndEvict` path will own the wire Close.
     pub needs_wire_close: bool,
 }
 
-/// This struct is the internal message handler for the SMB client.
-pub(crate) struct ConnectionMessageHandler {
+/// This struct is the internal message context for the SMB client.
+pub(crate) struct ConnectionCore {
     client_guid: Guid,
 
     worker: OnceCell<Arc<WorkerImpl>>,
@@ -819,11 +818,86 @@ pub(crate) struct ConnectionMessageHandler {
     registry: ConnectionRegistry,
 }
 
-impl ConnectionMessageHandler {
-    fn new(client_guid: Guid) -> ConnectionMessageHandler {
+impl ConnectionCore {
+    pub(crate) async fn execute(
+        &self,
+        mut msg: CommandRequest,
+        mut options: ResponseOptions<'_>,
+    ) -> crate::Result<(CommandSubmission, CommandResponse)> {
+        let channel_id = msg.channel_id;
+        self.prepare_outgoing(&mut msg).await?;
+        options.channel_id = channel_id;
+        let result = self
+            .worker
+            .get()
+            .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?
+            .execute(msg, &options)
+            .await?;
+        if !result.1.message.header.flags.server_to_redir() {
+            return Err(Error::InvalidMessage(
+                "Expected server-to-redir message".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    pub(crate) async fn execute_with_submission(
+        &self,
+        message: CommandRequest,
+    ) -> crate::Result<(CommandSubmission, CommandResponse)> {
+        let command = message.message.content.associated_cmd();
+        self.execute(message, ResponseOptions::new().with_cmd(Some(command)))
+            .await
+    }
+
+    pub(crate) async fn receive(
+        &self,
+        options: ResponseOptions<'_>,
+    ) -> crate::Result<CommandResponse> {
+        Self::validate_incoming(
+            self.worker
+                .get()
+                .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?
+                .receive(&options)
+                .await?,
+            &options,
+        )
+    }
+
+    fn validate_incoming(
+        msg: CommandResponse,
+        options: &ResponseOptions<'_>,
+    ) -> crate::Result<CommandResponse> {
+        if let Some(cmd) = options.cmd
+            && msg.message.header.command != cmd
+        {
+            return Err(Error::UnexpectedMessageCommand(msg.message.header.command));
+        }
+        if !msg.message.header.flags.server_to_redir() {
+            return Err(Error::InvalidMessage(
+                "Expected server-to-redir message".into(),
+            ));
+        }
+        if !options
+            .status
+            .iter()
+            .any(|status| msg.message.header.status == *status as u32)
+        {
+            if let ResponseContent::Error(error) = msg.message.content {
+                return Err(Error::ReceivedErrorMessage(
+                    msg.message.header.status,
+                    error,
+                ));
+            }
+            return Err(Error::UnexpectedMessageStatus(msg.message.header.status));
+        }
+        Ok(msg)
+    }
+
+    fn new(client_guid: Guid) -> ConnectionCore {
         let (lease_event_tx, _) = tokio::sync::broadcast::channel(LEASE_BREAK_CHANNEL_CAPACITY);
 
-        ConnectionMessageHandler {
+        ConnectionCore {
             client_guid,
             worker: OnceCell::new(),
             conn_info: OnceCell::new(),
@@ -859,11 +933,11 @@ impl ConnectionMessageHandler {
             );
             if live == 0 && prev.file_id != smb_msg::FileId::EMPTY {
                 let file_id = prev.file_id;
-                let handler = prev.proto.handler.clone();
-                // The spawned task captures the `handler` chain
-                // (TreeMessageHandler -> SessionMessageHandler)
+                let context = prev.proto.context.clone();
+                // The spawned task captures the `context` chain
+                // (TreeContext -> SessionContext)
                 // by Arc clone, but NOT this
-                // ConnectionMessageHandler itself. If the Connection
+                // ConnectionCore itself. If the Connection
                 // races into Drop before the spawn runs, its
                 // `worker.stop()` (in Connection::Drop) will complete
                 // first and send_close_external will see a stopped
@@ -871,10 +945,10 @@ impl ConnectionMessageHandler {
                 // which the session-disconnect garbage-collects anyway.
                 // The spawn does *not* extend the Connection's lifetime;
                 // tying it to Connection would require Arc'ing the
-                // handler chain back up, which we explicitly avoid.
+                // context chain back up, which we explicitly avoid.
                 tokio::spawn(async move {
                     if let Err(e) =
-                        crate::resource::ResourceHandle::send_close_external(file_id, &handler)
+                        crate::resource::ResourceHandle::send_close_external(file_id, &context)
                             .await
                     {
                         tracing::warn!(
@@ -920,7 +994,8 @@ impl ConnectionMessageHandler {
         requested_disposition: smb_msg::CreateDisposition,
         wants_directory: bool,
     ) -> crate::Result<Option<Arc<LeaseSlot>>> {
-        Ok(self.registry
+        Ok(self
+            .registry
             .try_acquire_lease(
                 path,
                 requested_access,
@@ -1056,15 +1131,15 @@ impl ConnectionMessageHandler {
         self.worker.get()
     }
 
-    /// Stamp an [`OutgoingMessage`] with connection-level header policy.
+    /// Stamp an [`CommandRequest`] with connection-level header policy.
     /// Callers that need the wire-bytes of a
-    /// request *before* it goes through [`Self::sendo`] (e.g. the
+    /// request *before* it goes through [`Self::submit`] (e.g. the
     /// session-setup driver hashing the final SessionSetup Request
     /// into the SMB 3.1.1 preauth integrity chain) invoke this
     /// directly, then call [`Self::dispatch_outgoing`] to hand the
-    /// message off — bypassing `sendo` so the sequencing logic does
+    /// message off — bypassing `submit` so the sequencing logic does
     /// not run twice.
-    pub(crate) async fn prepare_outgoing(&self, msg: &mut OutgoingMessage) -> crate::Result<()> {
+    pub(crate) async fn prepare_outgoing(&self, msg: &mut CommandRequest) -> crate::Result<()> {
         let priority_value = match self.conn_info.get() {
             Some(neg_info) => match neg_info.negotiation.dialect_rev {
                 Dialect::Smb0311 => 1,
@@ -1082,15 +1157,15 @@ impl ConnectionMessageHandler {
         Ok(())
     }
 
-    /// Hand a fully-prepared [`OutgoingMessage`] to the worker for
+    /// Hand a fully-prepared [`CommandRequest`] to the worker for
     /// transformation (sign/compress/encrypt) and transmission.
     /// Callers must have invoked [`Self::prepare_outgoing`] first.
-    /// [`Self::sendo`] is the public, all-in-one entry point that
+    /// [`Self::submit`] is the public, all-in-one entry point that
     /// combines both.
     pub(crate) async fn dispatch_outgoing(
         &self,
-        msg: OutgoingMessage,
-    ) -> crate::Result<SendMessageResult> {
+        msg: CommandRequest,
+    ) -> crate::Result<CommandSubmission> {
         self.worker
             .get()
             .ok_or(Error::InvalidState("Worker is uninitialized".into()))?
@@ -1122,7 +1197,7 @@ impl ConnectionMessageHandler {
             loop {
                 select! {
                     _ = stop_notification.cancelled() => {
-                        tracing::info!("Notification handler cancelled.");
+                        tracing::info!("Notification context cancelled.");
                         break;
                     }
                     next = rx.recv() => {
@@ -1134,7 +1209,7 @@ impl ConnectionMessageHandler {
                             }
                             None => {
                                 tracing::debug!(
-                                    "Notification channel closed; exiting handler."
+                                    "Notification channel closed; exiting context."
                                 );
                                 break;
                             }
@@ -1142,64 +1217,31 @@ impl ConnectionMessageHandler {
                     }
                 }
             }
-            tracing::info!("Notification handler thread stopped.");
+            tracing::info!("Notification context thread stopped.");
         });
         Ok(())
     }
 
     pub fn stop_notify(&self) {
         self.stop_notifications.cancel();
-        tracing::info!("Notification handler stopped.");
+        tracing::info!("Notification context stopped.");
     }
 }
 
-impl MessageHandler for ConnectionMessageHandler {
-    async fn sendo(&self, mut msg: OutgoingMessage) -> crate::Result<SendMessageResult> {
+impl ConnectionCore {
+    pub(crate) async fn submit(&self, mut msg: CommandRequest) -> crate::Result<CommandSubmission> {
         self.prepare_outgoing(&mut msg).await?;
         self.dispatch_outgoing(msg).await
     }
 
-    async fn recvo(&self, options: ReceiveOptions<'_>) -> crate::Result<IncomingMessage> {
-        let msg = self
-            .worker
-            .get()
-            .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?
-            .receive(&options)
-            .await?;
-
-        // Command matching (if needed).
-        if let Some(cmd) = options.cmd {
-            if msg.message.header.command != cmd {
-                return Err(Error::UnexpectedMessageCommand(msg.message.header.command));
-            }
-        }
-
-        // Direction matching.
-        if !msg.message.header.flags.server_to_redir() {
-            return Err(Error::InvalidMessage(
-                "Expected server-to-redir message".into(),
-            ));
-        }
-
-        // Expected status matching. Error if no match.
-        if !options
-            .status
-            .iter()
-            .any(|s| msg.message.header.status == *s as u32)
-        {
-            if let ResponseContent::Error(error_res) = msg.message.content {
-                return Err(Error::ReceivedErrorMessage(
-                    msg.message.header.status,
-                    error_res,
-                ));
-            }
-            return Err(Error::UnexpectedMessageStatus(msg.message.header.status));
-        }
-
-        Ok(msg)
+    pub(crate) async fn await_response(
+        &self,
+        options: ResponseOptions<'_>,
+    ) -> crate::Result<CommandResponse> {
+        self.receive(options).await
     }
 
-    async fn notify(&self, msg: IncomingMessage) -> crate::Result<()> {
+    async fn notify(&self, msg: CommandResponse) -> crate::Result<()> {
         // Intercept LeaseBreakNotify *before* the session-id sanity check
         // because the server sends lease breaks with `session_id = 0` per
         // MS-SMB2 2.2.23.2 — the notification is keyed on lease_key, not
@@ -1218,8 +1260,12 @@ impl MessageHandler for ConnectionMessageHandler {
         // that distinguishes unknown session_id (warn and drop) from a
         // known-but-dropped session (raise InvalidState to surface the
         // ordering bug to callers).
-        let session = match self.registry.get_session(msg.message.header.session_id).await {
-            Ok(Some(handler)) => handler,
+        let session = match self
+            .registry
+            .get_session(msg.message.header.session_id)
+            .await
+        {
+            Ok(Some(context)) => context,
             Ok(None) => {
                 tracing::warn!(
                     "Received notification for unknown session ID {}: {msg:?}",
@@ -1240,7 +1286,7 @@ impl MessageHandler for ConnectionMessageHandler {
     }
 }
 
-impl ConnectionMessageHandler {
+impl ConnectionCore {
     /// Process an incoming `LeaseBreakNotify`. Called from [`Self::notify`]
     /// before any session forwarding so that:
     ///
@@ -1255,7 +1301,7 @@ impl ConnectionMessageHandler {
     /// connection-wide notify loop must keep draining notifications even
     /// if a single ack fails. Phase C will surface ack failures back to
     /// the affected handle through the broadcast event.
-    async fn handle_lease_break(&self, msg: IncomingMessage) -> crate::Result<()> {
+    async fn handle_lease_break(&self, msg: CommandResponse) -> crate::Result<()> {
         let notify = match msg.message.content {
             ResponseContent::LeaseBreakNotify(n) => n,
             // SAFETY: caller (`Self::notify`) just matched the variant.
@@ -1311,8 +1357,8 @@ impl ConnectionMessageHandler {
     /// Construct and send a `LeaseBreakAck` for the given notification.
     ///
     /// MS-SMB2 requires the acknowledgement to use the SessionId and TreeId
-    /// of the open that owns the lease. Route through the handler retained in
-    /// that lease slot so the normal handler chain stamps both identifiers and
+    /// of the open that owns the lease. Route through the context retained in
+    /// that lease slot so the normal context chain stamps both identifiers and
     /// applies the tree's signing/encryption policy.
     async fn send_lease_break_ack(&self, notify: &smb_msg::LeaseBreakNotify) {
         let slot = self
@@ -1334,7 +1380,7 @@ impl ConnectionMessageHandler {
         };
         match slot
             .proto
-            .handler
+            .context
             .send_recv(RequestContent::LeaseBreakAck(ack))
             .await
         {
@@ -1352,7 +1398,7 @@ impl ConnectionMessageHandler {
     }
 }
 
-impl Drop for ConnectionMessageHandler {
+impl Drop for ConnectionCore {
     fn drop(&mut self) {
         self.stop_notify();
 

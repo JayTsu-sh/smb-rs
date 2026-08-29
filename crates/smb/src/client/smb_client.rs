@@ -1,5 +1,5 @@
 use crate::ConnectionConfig;
-use crate::msg_handler::{OutgoingMessage, Protection};
+use crate::command::{CommandRequest, Protection};
 use crate::{Connection, Error, FileCreateArgs, Pipe, Resource, Session, Tree};
 use smb_fscc::{ChainedItemList, FileBasicInformation, SetFileInfo, SetFileInfoClass};
 use smb_msg::{
@@ -455,7 +455,7 @@ impl Client {
         let grant = resource.handle().and_then(|h| h.lease_granted());
         if let Some(grant) = grant {
             if let Some(proto) =
-                resource.build_lease_proto(tree.handler_ref(), effective_args.desired_access)
+                resource.build_lease_proto(tree.context_ref(), effective_args.desired_access)
             {
                 let slot = std::sync::Arc::new(crate::lease::LeaseSlot::new_with_proto(
                     rel.clone(),
@@ -784,7 +784,7 @@ impl Client {
         // chain (Create); `related = true` for the SetInfo and Close that
         // depend on Create's returned FileId.
         let make_member = |req: RequestContent, related: bool| {
-            let mut m = OutgoingMessage::new(req);
+            let mut m = CommandRequest::new(req);
             m.message.header.tree_id = Some(tree_id);
             m.message.header.session_id = session_id;
             m.message.header.flags.set_signed(signed);
@@ -910,12 +910,12 @@ impl Client {
             return;
         }
         let file_id = eviction.slot.file_id;
-        let handler = eviction.slot.proto.handler.clone();
+        let context = eviction.slot.proto.context.clone();
         if file_id == smb_msg::FileId::EMPTY {
             return;
         }
         if let Err(e) =
-            crate::resource::ResourceHandle::send_close_external(file_id, &handler).await
+            crate::resource::ResourceHandle::send_close_external(file_id, &context).await
         {
             tracing::warn!(
                 path = label,

@@ -1,6 +1,6 @@
 use std::ops::Deref;
 
-use crate::msg_handler::{MessageHandlerExt, ReceiveOptions};
+use crate::command::ResponseOptions;
 use smb_msg::{FileId, FsctlCodes, IoctlReqData, IoctlRequest, IoctlRequestFlags, dfsc::*};
 
 use super::Tree;
@@ -25,8 +25,8 @@ impl<'a> DfsRootTreeRef<'a> {
     /// See [MS-DFSC](<https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dfsc/04657125-a7d5-4c62-9bec-85af601fa14c>) for more information.
     pub async fn dfs_get_referrals(&self, path: &str) -> crate::Result<RespGetDfsReferral> {
         let res = self
-            .handler
-            .send_recvo(
+            .context
+            .execute_content(
                 IoctlRequest {
                     ctl_code: FsctlCodes::DfsGetReferrals as u32,
                     file_id: FileId::FULL,
@@ -39,7 +39,7 @@ impl<'a> DfsRootTreeRef<'a> {
                     }),
                 }
                 .into(),
-                ReceiveOptions::new().with_allow_async(true),
+                ResponseOptions::new().with_allow_async(true),
             )
             .await?;
         let res = res
