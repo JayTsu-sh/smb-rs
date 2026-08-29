@@ -10,6 +10,7 @@ use smb_msg::{Command, Status};
 use std::cmp::max;
 
 use super::reducer::RequestKey;
+use super::ObjectToken;
 
 /// Response contract sealed at operation construction. `AnyStatus` exists for
 /// the temporary send/receive facade: the owner still validates command,
@@ -67,6 +68,7 @@ impl ResponsePolicy {
 pub(crate) struct TypedOperation {
     response: ResponsePolicy,
     outgoing: CommandRequest,
+    dependency: Option<ObjectToken>,
 }
 
 impl TypedOperation {
@@ -79,7 +81,11 @@ impl TypedOperation {
         if actual != expected {
             return Err(OperationContractError::CommandMismatch { expected, actual });
         }
-        Ok(Self { response, outgoing })
+        Ok(Self {
+            response,
+            outgoing,
+            dependency: None,
+        })
     }
 
     pub(crate) fn any_status(outgoing: CommandRequest) -> Self {
@@ -87,7 +93,17 @@ impl TypedOperation {
         Self {
             response: ResponsePolicy::any(command),
             outgoing,
+            dependency: None,
         }
+    }
+
+    pub(crate) fn with_dependency(mut self, dependency: ObjectToken) -> Self {
+        self.dependency = Some(dependency);
+        self
+    }
+
+    pub(crate) const fn dependency(&self) -> Option<ObjectToken> {
+        self.dependency
     }
 
     pub(crate) fn response_policy(&self) -> &ResponsePolicy {

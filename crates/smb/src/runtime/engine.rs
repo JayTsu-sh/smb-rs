@@ -1,4 +1,5 @@
 use super::operation::{OperationResult, OperationSubmission, ResponsePolicy, TypedOperation};
+use super::object_state::{ObjectError, ObjectKind, ObjectRegistry, ObjectToken};
 use super::reducer::{GenerationId, ReduceEffect, RequestKey, TerminalOutcome};
 use super::state::{
     AdmissionError, AdmissionLimits, GenerationState, OwnerEffect, OwnerEvent, RequestProgress,
@@ -91,6 +92,8 @@ pub(crate) enum RuntimeError {
     UnknownRequest(RequestKey),
     #[error("generation runtime request {0} already has a waiter")]
     AlreadyAwaited(RequestKey),
+    #[error("generation object admission failed: {0:?}")]
+    Object(ObjectError),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -149,9 +152,35 @@ pub(crate) struct RuntimeHandle {
     compounds: mpsc::Sender<CompoundAdmission>,
     control: mpsc::Sender<ControlCommand>,
     owner_finished: CancellationToken,
+    connection_object: ObjectToken,
 }
 
 impl RuntimeHandle {
+    pub(crate) const fn connection_object(&self) -> ObjectToken {
+        self.connection_object
+    }
+
+    pub(crate) async fn create_object(
+        &self,
+        parent: ObjectToken,
+        kind: ObjectKind,
+    ) -> Result<ObjectToken, RuntimeError> {
+        let (reply, result) = oneshot::channel();
+        self.control
+            .send(ControlCommand::CreateObject { parent, kind, reply })
+            .await
+            .map_err(|_| RuntimeError::Closed)?;
+        result.await.unwrap_or(Err(RuntimeError::OwnerTerminated))
+    }
+
+    pub(crate) async fn lose_object_generation(&self) -> Result<usize, RuntimeError> {
+        let (reply, result) = oneshot::channel();
+        self.control
+            .send(ControlCommand::LoseObjectGeneration { reply })
+            .await
+            .map_err(|_| RuntimeError::Closed)?;
+        result.await.unwrap_or(Err(RuntimeError::OwnerTerminated))
+    }
     pub(crate) async fn negotiated(
         &self,
         connection: Arc<ConnectionInfo>,
@@ -361,12 +390,14 @@ pub(crate) fn start_generation(
     let (control_tx, control_rx) = mpsc::channel(config.control_capacity.max(1));
     let (event_tx, event_rx) = mpsc::channel(config.event_capacity.max(1));
     let owner_finished = CancellationToken::new();
+    let connection_object = ObjectRegistry::new(config.generation).connection();
     let handle = RuntimeHandle {
         admission: admission_tx,
         operations: operation_tx,
         compounds: compound_tx,
         control: control_tx,
         owner_finished: owner_finished.clone(),
+        connection_object,
     };
     tokio::spawn(async move {
         owner_task(
@@ -416,6 +447,7 @@ struct OperationPending {
 
 struct RequestAuthority {
     state: GenerationState,
+    objects: ObjectRegistry,
     terminals: HashMap<RequestKey, oneshot::Sender<Result<TerminalOutcome, RuntimeError>>>,
     operation_pending: HashMap<RequestKey, OperationPending>,
     early_responses: HashMap<RequestKey, crate::command::CommandResponse>,
@@ -428,6 +460,14 @@ struct RequestAuthority {
 }
 
 enum ControlCommand {
+    CreateObject {
+        parent: ObjectToken,
+        kind: ObjectKind,
+        reply: oneshot::Sender<Result<ObjectToken, RuntimeError>>,
+    },
+    LoseObjectGeneration {
+        reply: oneshot::Sender<Result<usize, RuntimeError>>,
+    },
     InstallNotifications {
         sender: mpsc::Sender<crate::command::CommandResponse>,
     },
@@ -526,6 +566,7 @@ async fn owner_task(
             config.admission_limits,
             config.tombstone_drain_timeout,
         ),
+        objects: ObjectRegistry::new(config.generation),
         terminals: HashMap::new(),
         operation_pending: HashMap::new(),
         early_responses: HashMap::new(),
@@ -789,6 +830,16 @@ async fn process_operation_admission(
     send_queue: &mut VecDeque<WriteCommand>,
     fatal: &mut Option<RuntimeError>,
 ) -> Option<OperationAdmission> {
+    if let Some(dependency) = command.operation.dependency()
+        && let Err(error) = authority.objects.validate_active(dependency)
+    {
+        let error = RuntimeError::Object(error);
+        if let Some(terminal) = command.terminal {
+            let _ = terminal.send(Err(error.clone()));
+        }
+        let _ = command.acknowledge.send(Err(error));
+        return None;
+    }
     if authority.operation_pending.len() >= authority.state.operation_limit() {
         let error = RuntimeError::Admission(AdmissionError::OperationsExhausted);
         if let Some(terminal) = command.terminal {
@@ -886,6 +937,17 @@ async fn process_compound_admission(
         let _ = command
             .acknowledge
             .send(Err(RuntimeError::Wire("empty-compound")));
+        return None;
+    }
+    if let Some(error) = command
+        .operations
+        .iter()
+        .filter_map(TypedOperation::dependency)
+        .find_map(|dependency| authority.objects.validate_active(dependency).err())
+    {
+        let _ = command
+            .acknowledge
+            .send(Err(RuntimeError::Object(error)));
         return None;
     }
     if authority
@@ -1071,6 +1133,23 @@ async fn handle_control(
     close_request: &mut Option<CloseRequest>,
 ) -> bool {
     match command {
+        ControlCommand::CreateObject {
+            parent,
+            kind,
+            reply,
+        } => {
+            let result = authority
+                .objects
+                .create_child(parent, kind)
+                .map_err(RuntimeError::Object);
+            let _ = reply.send(result);
+            false
+        }
+        ControlCommand::LoseObjectGeneration { reply } => {
+            let revoked = authority.objects.lose_generation().len();
+            let _ = reply.send(Ok(revoked));
+            false
+        }
         ControlCommand::InstallNotifications { sender } => {
             authority.notifications = Some(sender);
             false
@@ -2436,6 +2515,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report.unresolved_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn stale_object_chain_is_rejected_before_wire_admission() {
+        let (transport, control) = ScriptedTransport::new();
+        let clock = Arc::new(ManualClock::new());
+        let (handle, _events) = start_generation(transport, clock.clone(), config());
+        let session = handle
+            .create_object(handle.connection_object(), ObjectKind::Session)
+            .await
+            .unwrap();
+        let share = handle
+            .create_object(session, ObjectKind::Share)
+            .await
+            .unwrap();
+        let resource = handle
+            .create_object(share, ObjectKind::Resource)
+            .await
+            .unwrap();
+        assert_eq!(handle.lose_object_generation().await.unwrap(), 4);
+
+        let operation = session_setup_operation(false).with_dependency(resource);
+        assert!(matches!(
+            handle.submit_operation(operation, None).await,
+            Err(RuntimeError::Object(ObjectError::ParentNotActive))
+        ));
+        assert!(control.captured_client_frames().is_empty());
+
+        handle
+            .close(clock.now().saturating_add(Duration::from_secs(1)))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

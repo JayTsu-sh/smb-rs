@@ -11,6 +11,10 @@ mod engine;
 // Activated by W3-5 as the bootstrap path is cut over incrementally.
 #[allow(dead_code)]
 mod operation;
+// W4-1 lands the complete hierarchy reducer before each domain object is cut
+// over; the allowance is removed when the final object kind is wired.
+#[allow(dead_code)]
+mod object_state;
 #[allow(dead_code)]
 mod reducer;
 #[allow(dead_code)]
@@ -19,4 +23,5 @@ pub(crate) mod wire;
 
 pub(crate) use engine::{RuntimeConfig, RuntimeError, RuntimeHandle, start_generation};
 pub(crate) use operation::{OperationResult, ResponsePolicy, TypedOperation};
+pub(crate) use object_state::ObjectToken;
 pub(crate) use reducer::{GenerationId, RequestKey, TerminalOutcome};
