@@ -7,7 +7,7 @@ use smb::{
     SecurityOpenOptions, SecuritySelection, TransferOptions, TransferProgress,
 };
 use smb::{
-    Client, ClientConfig, CloseOutcome, Credentials, Directory, DirectoryOpenOptions, File,
+    Client, CloseOutcome, Credentials, Directory, DirectoryOpenOptions, File,
     FileCursor, FileOpenOptions, IoCapabilities, ObjectGeneration, Pipe, PipeName, PreviousVersion,
     ReplayPolicy, Session, Share, SharePath, ShareTarget, Transfer, TransferEvents,
 };
@@ -70,7 +70,7 @@ fn public_spine_types_are_send_sync_and_domain_named() {
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore = "requires an isolated writable real-server share"]
 async fn domain_resource_open_and_metadata() -> smb::Result<()> {
-    let client = Client::new(ClientConfig::default());
+    let client = Client::new();
     let share = client
         .connect_share(
             &ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?,
@@ -116,7 +116,7 @@ async fn domain_resource_open_and_metadata() -> smb::Result<()> {
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore = "requires an isolated writable real-server share"]
 async fn domain_security_query_and_idempotent_set() -> smb::Result<()> {
-    let client = Client::new(ClientConfig::default());
+    let client = Client::new();
     let share = client
         .connect_share(
             &ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?,
@@ -165,7 +165,7 @@ async fn common_and_explicit_session_paths_compile(
     target: ShareTarget,
     credentials: Credentials,
 ) -> smb::Result<()> {
-    let client = Client::new(ClientConfig::default());
+    let client = Client::new();
     let share = client.connect_share(&target, credentials).await?;
     let path = SharePath::new("domain-spine.bin")?;
     let directory_path = SharePath::new("domain-directory")?;
@@ -219,7 +219,7 @@ async fn common_and_explicit_session_paths_compile(
 #[ignore = "requires an explicitly provisioned writable real-server share"]
 async fn domain_spine_roundtrips_without_protocol_escape_hatches() -> smb::Result<()> {
     let target = ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?;
-    let client = Client::new(ClientConfig::default());
+    let client = Client::new();
     let share = client
         .connect_share(&target, common::smb_test_credentials())
         .await?;
@@ -390,7 +390,7 @@ async fn domain_spine_roundtrips_without_protocol_escape_hatches() -> smb::Resul
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore = "requires a real server exposing the standard IPC service pipes"]
 async fn domain_named_pipe_open_cancel_and_close() -> smb::Result<()> {
-    let client = Client::new(ClientConfig::default());
+    let client = Client::new();
     let server = common::smb_tests_server();
     let session = client
         .authenticate(&server, common::smb_test_credentials())
@@ -418,7 +418,7 @@ async fn domain_named_pipe_open_cancel_and_close() -> smb::Result<()> {
 #[ignore = "requires an isolated writable real-server share"]
 async fn domain_directory_query_only() -> smb::Result<()> {
     let target = ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?;
-    let client = Client::new(ClientConfig::default());
+    let client = Client::new();
     let share = client
         .connect_share(&target, common::smb_test_credentials())
         .await?;
@@ -438,7 +438,7 @@ async fn domain_directory_query_only() -> smb::Result<()> {
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore = "requires a manifest-owned ONTAP Snapshot between prepare and verify"]
 async fn previous_versions_prepare_version_a() -> smb::Result<()> {
-    let client = Client::new(ClientConfig::default());
+    let client = Client::new();
     let share = client
         .connect_share(
             &ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?,
@@ -459,7 +459,7 @@ async fn previous_versions_prepare_version_a() -> smb::Result<()> {
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore = "requires the manifest-owned ONTAP Snapshot created after prepare"]
 async fn previous_versions_read_snapshot_and_active_version() -> smb::Result<()> {
-    let client = Client::new(ClientConfig::default());
+    let client = Client::new();
     let share = client
         .connect_share(
             &ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?,
@@ -499,7 +499,7 @@ async fn previous_version_no_longer_opens_after_snapshot_delete() -> smb::Result
     let version = PreviousVersion::from_gmt_token(
         std::fs::read_to_string(token_path).map_err(std::io::Error::other)?,
     )?;
-    let stale_client = Client::new(ClientConfig::default());
+    let stale_client = Client::new();
     let stale_share = stale_client
         .connect_share(
             &ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?,
@@ -518,7 +518,7 @@ async fn previous_version_no_longer_opens_after_snapshot_delete() -> smb::Result
     // Some servers close the session when a deleted timewarp token is used.
     // Verify the active namespace through a fresh, independently authenticated
     // session so the two assertions cannot mask one another.
-    let client = Client::new(ClientConfig::default());
+    let client = Client::new();
     let share = client
         .connect_share(
             &ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?,
@@ -539,7 +539,7 @@ async fn previous_version_no_longer_opens_after_snapshot_delete() -> smb::Result
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore = "requires a manifest-owned continuously available share"]
 async fn persistent_handle_is_granted_on_ca_share() -> smb::Result<()> {
-    let client = Client::new(ClientConfig::default());
+    let client = Client::new();
     let share = client
         .connect_share(
             &ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?,
@@ -566,7 +566,7 @@ async fn persistent_handle_is_granted_on_ca_share() -> smb::Result<()> {
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore = "requires exact management closure of the test CIFS session"]
 async fn automatic_reconnect_replaces_share_and_revokes_ordinary_file() -> smb::Result<()> {
-    let client = Client::new(ClientConfig::default());
+    let client = Client::new();
     let target = ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?;
     let session = client
         .authenticate(target.server(), common::smb_test_credentials())
@@ -612,7 +612,7 @@ async fn automatic_reconnect_replaces_share_and_revokes_ordinary_file() -> smb::
 #[ignore = "requires an isolated writable real-server share"]
 async fn domain_batch_and_concurrent_transfer() -> smb::Result<()> {
     let target = ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?;
-    let client = Client::new(ClientConfig::default());
+    let client = Client::new();
     let share = client
         .connect_share(&target, common::smb_test_credentials())
         .await?;

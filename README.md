@@ -33,11 +33,11 @@ You are welcome to see the project's roadmap in the [GitHub Project](https://git
 Check out the `Client` struct, exported from the `smb` crate, to initiate a connection to an SMB server:
 
 ```rust,no_run
-use smb::{Client, ClientConfig, Credentials, FileOpenOptions, SharePath, ShareTarget};
+use smb::{Client, Credentials, FileOpenOptions, SharePath, ShareTarget};
 
 #[tokio::main]
 async fn main() -> smb::Result<()> {
-    let client = Client::new(ClientConfig::default());
+    let client = Client::new();
     let target = ShareTarget::new("server", "share")?;
     let share = client
         .connect_share(&target, Credentials::ntlm("username", "password"))

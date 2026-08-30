@@ -10,12 +10,12 @@ object hierarchy follows the lifetime of remote objects:
 ```rust,no_run
 use bytes::Bytes;
 use smb::{
-    Client, ClientConfig, Credentials, FileOpenOptions, SharePath, ShareTarget,
+    Client, Credentials, FileOpenOptions, SharePath, ShareTarget,
 };
 
 #[tokio::main]
 async fn main() -> smb::Result<()> {
-    let client = Client::new(ClientConfig::default());
+    let client = Client::new();
     let target = ShareTarget::new("server", "share")?;
     let share = client
         .connect_share(&target, Credentials::ntlm("username", "password"))

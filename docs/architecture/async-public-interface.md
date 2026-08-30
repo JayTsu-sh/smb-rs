@@ -22,7 +22,7 @@ appear in normal public use.
 Common use connects directly to a share:
 
 ```rust,ignore
-let client = Client::new(config);
+let client = Client::new();
 let share = client.connect_share(target, credentials).await?;
 ```
 
@@ -207,7 +207,7 @@ cancellation, and copy budgets.
 The crate root exports only facade/domain essentials:
 
 ```text
-Client, ClientConfig, Credentials, CredentialProvider,
+Client, Credentials, CredentialProvider,
 ShareTarget, SharePath, Session, Share,
 File, Directory, Pipe, typed open options,
 Operation, Error, Result, Deadline, CancelToken,

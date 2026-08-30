@@ -5,7 +5,7 @@ mod common;
 use bytes::Bytes;
 use futures_util::{StreamExt, future::try_join_all, stream::FuturesUnordered};
 use serde_json::json;
-use smb::{Client, ClientConfig, File, FileOpenOptions, IoCapabilities, SharePath, ShareTarget};
+use smb::{Client, File, FileOpenOptions, IoCapabilities, SharePath, ShareTarget};
 use std::time::{Duration, Instant};
 
 const MINIMUM_BYTES_PER_SAMPLE: usize = 16 * 1024 * 1024;
@@ -194,7 +194,7 @@ async fn run_sample(
     let mut streams = Vec::with_capacity(shape.connections);
     let mut negotiated_capabilities = None;
     for connection in 0..shape.connections {
-        let client = Client::new(ClientConfig::default());
+        let client = Client::new();
         let share = client
             .connect_share(
                 &ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?,

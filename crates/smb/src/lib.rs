@@ -74,7 +74,7 @@ pub use domain::{
     TransferEvents, TransferOptions, TransferProgress, TransferReport,
 };
 pub use error::Error;
-pub use facade::{Client, ClientConfig, RemoteShare, ShareKind};
+pub use facade::{Client, RemoteShare, ShareKind};
 
 /// Explicit protocol-value namespace for extension and diagnostic code.
 /// Normal facade/domain callers do not need these wire-level types.

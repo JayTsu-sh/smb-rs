@@ -89,6 +89,12 @@ fn removed_dead_features_cannot_return() {
         "deleted command-line application returned"
     );
 
+    let facade = read("crates/smb/src/facade/mod.rs");
+    assert!(
+        !facade.contains("pub struct ClientConfig"),
+        "empty public ClientConfig returned"
+    );
+
     for path in [
         "crates/smb-transport/src/quic.rs",
         "crates/smb-transport/src/quic",

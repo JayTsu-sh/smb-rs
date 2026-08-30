@@ -6,11 +6,6 @@ use crate::domain::{
     Credentials, DomainClient, Operation, PipeName, RpcPipeConnection, Session, Share, ShareTarget,
 };
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ClientConfig {
-    _private: (),
-}
-
 /// Root handle for the domain-first async API.
 #[derive(Clone)]
 pub struct Client {
@@ -57,7 +52,7 @@ impl RemoteShare {
 }
 
 impl Client {
-    pub fn new(_config: ClientConfig) -> Self {
+    pub fn new() -> Self {
         Self {
             domain: DomainClient::new(),
         }
@@ -142,5 +137,11 @@ impl Client {
 
     pub async fn close(&self) -> crate::Result<()> {
         self.domain.close().await
+    }
+}
+
+impl Default for Client {
+    fn default() -> Self {
+        Self::new()
     }
 }
