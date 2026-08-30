@@ -181,7 +181,7 @@ async fn run_sample(
             std::process::id()
         ))?;
         let file = share.open_file(&path, FileOpenOptions::overwrite()).await?;
-        let chunk_size = bytes_per_connection.min(CHUNK_SIZE);
+        let chunk_size = chunk_size(bytes_per_connection, shape.inflight_per_connection)?;
         let pattern = Bytes::from(vec![(connection as u8).wrapping_mul(37); chunk_size]);
         streams.push(Stream {
             client,
@@ -215,6 +215,16 @@ async fn run_sample(
     };
     let mib = (bytes_per_connection * shape.connections) as f64 / (1024.0 * 1024.0);
     Ok((mib / write_seconds, mib / read_seconds))
+}
+
+fn chunk_size(bytes_per_connection: usize, inflight: usize) -> smb::Result<usize> {
+    let chunk_size = CHUNK_SIZE.min(bytes_per_connection / inflight.max(1));
+    if chunk_size == 0 || bytes_per_connection % chunk_size != 0 {
+        return Err(smb::Error::InvalidArgument(
+            "payload cannot be divided into the requested in-flight window".into(),
+        ));
+    }
+    Ok(chunk_size)
 }
 
 async fn cleanup_streams(streams: Vec<Stream>) -> smb::Result<()> {
@@ -354,4 +364,11 @@ fn statistics_use_nearest_rank_p95_and_population_cv() {
     assert_eq!(actual.median, 10.0);
     assert_eq!(actual.p95, 12.0);
     assert!((actual.cv - 0.141_421_356).abs() < 0.000_001);
+}
+
+#[test]
+fn chunk_size_preserves_real_inflight_requests_for_small_payloads() {
+    assert_eq!(chunk_size(64 * 1024, 16).unwrap(), 4 * 1024);
+    assert_eq!(chunk_size(1024 * 1024, 16).unwrap(), 64 * 1024);
+    assert_eq!(chunk_size(1024 * 1024 * 1024, 16).unwrap(), CHUNK_SIZE);
 }
