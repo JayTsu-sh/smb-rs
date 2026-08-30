@@ -442,16 +442,7 @@ impl OntapAdapter for SshOntapAdapter {
     }
 
     fn delete_volume(&mut self, plan: &Plan, role: VolumeRole) -> Result<(), String> {
-        self.run(&[
-            "volume",
-            "delete",
-            &plan.svm,
-            "-volume",
-            plan.volume_name(role),
-            "-foreground",
-            "true",
-        ])
-        .map(drop)
+        self.run(&volume_delete_arguments(plan, role)).map(drop)
     }
     fn create_snapshot(&mut self, plan: &Plan) -> Result<(), String> {
         self.run(&[
@@ -486,6 +477,19 @@ impl OntapAdapter for SshOntapAdapter {
         ])
         .map(drop)
     }
+}
+
+fn volume_delete_arguments(plan: &Plan, role: VolumeRole) -> Vec<&str> {
+    vec![
+        "volume",
+        "delete",
+        "-vserver",
+        &plan.svm,
+        "-volume",
+        plan.volume_name(role),
+        "-foreground",
+        "true",
+    ]
 }
 
 fn ontap_token(value: &str) -> Result<String, String> {
@@ -602,5 +606,25 @@ mod tests {
             normalize_preflight(&[second])
         );
         assert_eq!(normalize_preflight(&[first]), "NetApp Release stable");
+    }
+
+    #[test]
+    fn volume_delete_has_exactly_one_vserver_option() {
+        let plan = Plan::new(
+            "0123456789abcdef0123456789abcdef",
+            "svm",
+            "aggregate",
+            "DOMAIN\\user",
+        )
+        .unwrap();
+        let arguments = volume_delete_arguments(&plan, VolumeRole::Performance);
+        assert_eq!(
+            arguments
+                .iter()
+                .filter(|argument| **argument == "-vserver")
+                .count(),
+            1
+        );
+        assert_eq!(arguments[3], "svm");
     }
 }
