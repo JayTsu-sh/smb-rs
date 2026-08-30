@@ -9,6 +9,7 @@ use smb::{Client, ClientConfig, File, FileOpenOptions, SharePath, ShareTarget};
 use std::time::{Duration, Instant};
 
 const CHUNK_SIZE: usize = 1024 * 1024;
+const MINIMUM_BYTES_PER_SAMPLE: usize = 16 * 1024 * 1024;
 const DEFAULT_BYTES_PER_CONNECTION: usize = 1024 * 1024 * 1024;
 const MEASURED_SAMPLES: usize = 5;
 const MAX_CV: f64 = 0.10;
@@ -69,12 +70,14 @@ async fn plain_or_encrypted_concurrency_matrix() -> smb::Result<()> {
     }
     let mode = PerformanceMode::from_env()?;
     let bytes_per_connection = payload_from_env()?;
+    let repetitions =
+        MINIMUM_BYTES_PER_SAMPLE.saturating_add(bytes_per_connection - 1) / bytes_per_connection;
 
     for shape in selected_shapes()? {
         let mut writes = Vec::with_capacity(MEASURED_SAMPLES);
         let mut reads = Vec::with_capacity(MEASURED_SAMPLES);
         for sample in 0..=MEASURED_SAMPLES {
-            let measured = run_sample(shape, bytes_per_connection, sample).await?;
+            let measured = run_sample(shape, bytes_per_connection, repetitions, sample).await?;
             if sample != 0 {
                 writes.push(measured.0);
                 reads.push(measured.1);
@@ -92,6 +95,7 @@ async fn plain_or_encrypted_concurrency_matrix() -> smb::Result<()> {
                 "connections": shape.connections,
                 "inflight_per_connection": shape.inflight_per_connection,
                 "bytes_per_connection": bytes_per_connection,
+                "repetitions_per_sample": repetitions,
                 "measured_samples": MEASURED_SAMPLES,
                 "write_mib_s": { "median": write.median, "p95": write.p95, "cv": write.cv },
                 "read_mib_s": { "median": read.median, "p95": read.p95, "cv": read.cv },
@@ -165,6 +169,7 @@ fn payload_from_env() -> smb::Result<usize> {
 async fn run_sample(
     shape: Shape,
     bytes_per_connection: usize,
+    repetitions: usize,
     sample: usize,
 ) -> smb::Result<(f64, f64)> {
     let mut streams = Vec::with_capacity(shape.connections);
@@ -192,17 +197,21 @@ async fn run_sample(
 
     let transfer = async {
         let started = Instant::now();
-        try_join_all(streams.iter().map(|stream| {
-            write_windowed(stream, bytes_per_connection, shape.inflight_per_connection)
-        }))
-        .await?;
+        for _ in 0..repetitions {
+            try_join_all(streams.iter().map(|stream| {
+                write_windowed(stream, bytes_per_connection, shape.inflight_per_connection)
+            }))
+            .await?;
+        }
         let write_seconds = started.elapsed().as_secs_f64();
 
         let started = Instant::now();
-        try_join_all(streams.iter().map(|stream| {
-            read_windowed(stream, bytes_per_connection, shape.inflight_per_connection)
-        }))
-        .await?;
+        for _ in 0..repetitions {
+            try_join_all(streams.iter().map(|stream| {
+                read_windowed(stream, bytes_per_connection, shape.inflight_per_connection)
+            }))
+            .await?;
+        }
         smb::Result::Ok((write_seconds, started.elapsed().as_secs_f64()))
     }
     .await;
@@ -213,7 +222,7 @@ async fn run_sample(
         (Err(error), _) => return Err(error),
         (Ok(_), Err(error)) => return Err(error),
     };
-    let mib = (bytes_per_connection * shape.connections) as f64 / (1024.0 * 1024.0);
+    let mib = (bytes_per_connection * shape.connections * repetitions) as f64 / (1024.0 * 1024.0);
     Ok((mib / write_seconds, mib / read_seconds))
 }
 
