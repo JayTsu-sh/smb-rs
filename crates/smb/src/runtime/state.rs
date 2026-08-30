@@ -83,6 +83,9 @@ pub(crate) enum OwnerEvent {
         event: ResponseEvent,
         credit_grant: u16,
     },
+    RecoveryHint {
+        key: RequestKey,
+    },
     AdvanceTime {
         now: MonotonicTime,
     },
@@ -216,6 +219,7 @@ impl GenerationState {
                 event,
                 credit_grant,
             } => self.response(key, event, credit_grant),
+            OwnerEvent::RecoveryHint { key } => self.recovery_hint(key),
             OwnerEvent::AdvanceTime { now } => self.advance_time(now),
             OwnerEvent::Disconnect => self.disconnect(),
         }
@@ -583,6 +587,21 @@ impl GenerationState {
             }
         }
         effects
+    }
+
+    fn recovery_hint(&mut self, key: RequestKey) -> Vec<OwnerEffect> {
+        if key.generation != self.generation {
+            return vec![OwnerEffect::Request {
+                key,
+                effect: ReduceEffect::IgnoredForeignGeneration,
+            }];
+        }
+        let Some(request) = self.requests.get_mut(&key) else {
+            return vec![OwnerEffect::UnknownRequest(key)];
+        };
+        let effect = request.lifecycle.reduce(RequestEvent::RecoveryHint { key });
+        self.release_request_ownership(key);
+        vec![OwnerEffect::Request { key, effect }]
     }
 
     fn rollback(&mut self, key: RequestKey) -> bool {
@@ -1331,6 +1350,44 @@ mod tests {
         assert_eq!(
             state.terminal_outcome(second),
             Some(TerminalOutcome::GenerationLost)
+        );
+    }
+
+    #[test]
+    fn recovery_hint_is_not_a_response_and_grants_no_credits() {
+        let mut state = state();
+        let initial_credits = state.available_credits();
+        let key = admit(&mut state, 128, 1);
+        state.reduce(OwnerEvent::Request {
+            key,
+            event: RequestProgress::WriteComplete,
+        });
+        let after_admission = state.available_credits();
+
+        let effects = state.reduce(OwnerEvent::RecoveryHint { key });
+
+        assert_eq!(after_admission, initial_credits - 1);
+        assert_eq!(state.available_credits(), after_admission);
+        assert_eq!(
+            state.terminal_outcome(key),
+            Some(TerminalOutcome::SessionInvalidated)
+        );
+        assert_eq!(
+            state.request(key).unwrap().response(),
+            ResponseProgress::None
+        );
+        assert_eq!(state.admitted_operations(), 0);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            OwnerEffect::Request {
+                effect: ReduceEffect::Publish(TerminalOutcome::SessionInvalidated),
+                ..
+            }
+        )));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, OwnerEffect::CreditGrantApplied { .. }))
         );
     }
 }

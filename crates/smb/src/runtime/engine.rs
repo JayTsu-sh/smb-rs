@@ -1642,6 +1642,16 @@ fn process_decoded_response(
         *fatal = Some(RuntimeError::Wire("invalid-recovery-hint"));
         return;
     }
+    if message.form.unauthenticated_recovery_hint {
+        let effects = authority.state.reduce(OwnerEvent::RecoveryHint { key });
+        apply_owner_effects(effects, &mut authority.terminals);
+        complete_operation(
+            &mut authority.operation_pending,
+            key,
+            Err(RuntimeError::Terminal(TerminalOutcome::SessionInvalidated)),
+        );
+        return;
+    }
     if message.message.header.command != pending.response.wire_command()
         || (!session_invalidated && !pending.response.accepts_status(status))
     {
@@ -1654,7 +1664,7 @@ fn process_decoded_response(
         // An invalidated server session cannot authenticate this response.
         // It may trigger recovery, but none of its mutable accounting fields
         // are trusted.
-        credit_grant: trusted_credit_grant(&message),
+        credit_grant: message.message.header.credit_request,
     });
     let publishes_response = effects.iter().any(|effect| {
         matches!(
@@ -1682,14 +1692,6 @@ fn process_decoded_response(
         .is_some_and(|pending| pending.draining)
     {
         authority.operation_pending.remove(&key);
-    }
-}
-
-fn trusted_credit_grant(message: &crate::command::CommandResponse) -> u16 {
-    if message.form.unauthenticated_recovery_hint {
-        0
-    } else {
-        message.message.header.credit_request
     }
 }
 

@@ -301,6 +301,7 @@ fn map_runtime_error_value(error: RuntimeError, timeout: std::time::Duration) ->
             Error::OperationTimeout(TimedOutTask::ReceiveNextMessage, timeout)
         }
         RuntimeError::Terminal(TerminalOutcome::OutcomeUnknown) => Error::OutcomeUnknown,
+        RuntimeError::Terminal(TerminalOutcome::SessionInvalidated) => Error::SessionInvalidated,
         RuntimeError::AdmissionBackpressure => Error::Backpressure("admission"),
         RuntimeError::ControlBackpressure => Error::Backpressure("control"),
         RuntimeError::EventBackpressure => Error::Backpressure("event"),

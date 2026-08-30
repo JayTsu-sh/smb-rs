@@ -187,6 +187,17 @@ fn requested_oplock_level(create_args: &FileCreateArgs) -> OplockLevel {
     }
 }
 
+fn validate_create_parent_epoch(
+    captured: crate::runtime::ObjectToken,
+    current: crate::runtime::ObjectToken,
+) -> crate::Result<()> {
+    if captured == current {
+        Ok(())
+    } else {
+        Err(Error::StaleObject)
+    }
+}
+
 /// A resource opened by a create request.
 pub enum Resource {
     File(File),
@@ -277,9 +288,18 @@ impl Resource {
         // Make sure to set DFS if required.
         msg.message.header.flags.set_dfs_operation(is_dfs);
 
+        let share = upstream.current_share_object().await?;
         let response = upstream
-            .execute_request(msg, ResponseOptions::new().with_allow_async(true))
-            .await?;
+            .execute_for_with_replay(
+                msg,
+                ResponseOptions::new().with_allow_async(true),
+                share,
+                crate::runtime::ReplayPolicy::NeverReplay,
+            )
+            .await?
+            .1;
+
+        validate_create_parent_epoch(share, upstream.current_share_object().await?)?;
 
         let response = response.message.content.to_create()?;
         tracing::debug!("Created file '{}', ({:?})", name, response.file_id);
@@ -346,7 +366,6 @@ impl Resource {
         // defaults to None; if a lease was granted and the higher-level
         // client opts in, [`Client::_create_file`] will attach a slot via
         // [`Resource::attach_lease_slot`] after this function returns.
-        let share = upstream.current_share_object().await?;
         let object = upstream.create_resource_object_for(share).await?;
         let oplock_slot = if matches!(
             response.oplock_level,
@@ -1737,5 +1756,6 @@ mod tests {
             .unwrap();
         assert_eq!(share.generation(), replacement_share.generation());
         assert!(!resource.belongs_to(replacement_share));
+        assert!(super::validate_create_parent_epoch(share, replacement_share).is_err());
     }
 }

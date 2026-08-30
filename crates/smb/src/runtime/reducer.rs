@@ -61,6 +61,7 @@ pub(crate) enum ResponseProgress {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TerminalOutcome {
     Response,
+    SessionInvalidated,
     Cancelled,
     TimedOut,
     OutcomeUnknown,
@@ -81,6 +82,7 @@ pub(crate) enum RequestEvent {
     WriteComplete,
     AsyncPending { key: RequestKey, async_id: u64 },
     FinalResponse { key: RequestKey },
+    RecoveryHint { key: RequestKey },
     Cancel,
     Deadline,
     Disconnect,
@@ -199,6 +201,16 @@ impl RequestRecord {
                 self.response = ResponseProgress::Final;
                 self.tombstone = false;
                 self.publish_once(TerminalOutcome::Response)
+            }
+            RequestEvent::RecoveryHint { key } => {
+                if key.generation != self.key.generation {
+                    return ReduceEffect::IgnoredForeignGeneration;
+                }
+                if key != self.key {
+                    return ReduceEffect::BookkeepingOnly;
+                }
+                self.tombstone = false;
+                self.publish_once(TerminalOutcome::SessionInvalidated)
             }
             RequestEvent::Cancel => self.finish_without_response(TerminalOutcome::Cancelled),
             RequestEvent::Deadline => self.finish_without_response(TerminalOutcome::TimedOut),
