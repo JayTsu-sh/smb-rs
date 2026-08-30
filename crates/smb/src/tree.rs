@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use smb_msg::{FileId, FsctlRequest, IoctlRequest, IoctlRequestFlags};
 
-use crate::FileCreateArgs;
 use crate::connection::connection_info::ConnectionInfo;
+use crate::resource::FileCreateArgs;
 use smb_fscc::{FileAccessMask, FileAttributes};
 use smb_msg::{
     CreateOptions, RequestContent, ShareFlags, ShareType, TreeCapabilities,

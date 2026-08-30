@@ -3,7 +3,7 @@ use std::{num::TryFromIntError, sync::PoisonError};
 use smb_transport::TransportError;
 use thiserror::Error;
 
-use crate::{UncPath, connection::TransformError};
+use crate::{client::UncPath, connection::TransformError};
 use smb_msg::{Command, ErrorResponse, Status};
 use tokio::sync::AcquireError;
 

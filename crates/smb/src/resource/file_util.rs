@@ -144,9 +144,7 @@ mod impls {
     }
 }
 
-#[cfg(feature = "std-fs-impls")]
-pub use impls::*;
-
+#[allow(dead_code)]
 mod copy {
     use super::*;
 
@@ -423,5 +421,3 @@ mod copy {
         Ok(())
     }
 }
-
-pub use copy::*;

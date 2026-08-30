@@ -25,7 +25,6 @@ pub mod pipe;
 
 pub use directory::*;
 pub use file::*;
-pub use file_util::*;
 pub use pipe::*;
 
 type Upstream = Arc<TreeContext>;

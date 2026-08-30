@@ -3,22 +3,22 @@
 //! This module contains the session setup logic, as well as the session message handling,
 //! including encryption and signing of messages.
 
-use crate::UncPath;
+use crate::client::UncPath;
 use crate::connection::connection_info::ConnectionInfo;
 use crate::connection::preauth_hash::PreauthHashValue;
 use crate::{
     Error,
+    command::{CommandRequest, CommandResponse, CommandSubmission, ResponseOptions},
     connection::ConnectionCore,
     crypto::KeyToDerive,
-    command::{CommandResponse, CommandRequest, ResponseOptions, CommandSubmission},
     tree::Tree,
 };
 use arc_swap::ArcSwapOption;
 use smb_msg::{Notification, RequestContent, ResponseContent, Status, session_setup::*};
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 
 mod authenticator;
@@ -26,8 +26,8 @@ mod channel;
 mod credential;
 mod encryptor_decryptor;
 pub(crate) mod gss;
-mod setup;
 pub(crate) mod recovery_attempt;
+mod setup;
 mod signer;
 #[cfg(feature = "kerberos")]
 mod sspi_network_client;
@@ -39,9 +39,9 @@ pub use encryptor_decryptor::{MessageDecryptor, MessageEncryptor};
 pub use signer::MessageSigner;
 pub use state::{ChannelInfo, SessionInfo};
 
-use setup::*;
 use credential::{SharedCredentialProvider, StaticCredentialProvider};
 use recovery_attempt::run_bounded_attempt;
+use setup::*;
 
 /// Channel id assigned to a session's primary channel.
 ///
@@ -147,12 +147,22 @@ impl Session {
 
     pub async fn allow_unsigned(&self) -> crate::Result<bool> {
         let primary = self.session_context.primary_channel();
-        primary.session_state().session.read().await.allow_unsigned()
+        primary
+            .session_state()
+            .session
+            .read()
+            .await
+            .allow_unsigned()
     }
 
     pub async fn should_encrypt(&self) -> crate::Result<bool> {
         let primary = self.session_context.primary_channel();
-        primary.session_state().session.read().await.should_encrypt()
+        primary
+            .session_state()
+            .session
+            .read()
+            .await
+            .should_encrypt()
     }
 
     pub(crate) fn recovery_context(&self) -> Arc<SessionContext> {
@@ -357,8 +367,7 @@ struct RecoveryFlag<'a>(&'a AtomicBool);
 
 impl Drop for RecoveryFlag<'_> {
     fn drop(&mut self) {
-        self.0
-            .store(false, std::sync::atomic::Ordering::Release);
+        self.0.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -418,10 +427,7 @@ impl SessionContext {
         self.primary_channel().session_state().object()
     }
 
-    pub(crate) async fn register_share(
-        &self,
-        share: std::sync::Weak<crate::tree::TreeContext>,
-    ) {
+    pub(crate) async fn register_share(&self, share: std::sync::Weak<crate::tree::TreeContext>) {
         self.shares.lock().await.push(share);
     }
 
@@ -436,10 +442,15 @@ impl SessionContext {
         let shares = {
             let mut shares = self.shares.lock().await;
             shares.retain(|share| share.strong_count() != 0);
-            shares.iter().filter_map(std::sync::Weak::upgrade).collect::<Vec<_>>()
+            shares
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .collect::<Vec<_>>()
         };
         let results = futures_util::future::join_all(
-            shares.into_iter().map(|share| async move { share.reconnect().await }),
+            shares
+                .into_iter()
+                .map(|share| async move { share.reconnect().await }),
         )
         .await;
         for result in results {
@@ -456,9 +467,7 @@ impl SessionContext {
     ) -> crate::Result<()> {
         let primary = self.primary_channel();
         let expected_session_id = primary.session_id();
-        let connection = primary
-            .upstream()
-            .connection_object()?;
+        let connection = primary.upstream().connection_object()?;
         if !self.recovering.load(std::sync::atomic::Ordering::Acquire)
             && primary.session_state().object()?.generation() == connection.generation()
         {
@@ -473,7 +482,10 @@ impl SessionContext {
             let context = self.clone();
             async move {
                 let _permit = permit;
-                context.reauthenticate(expected_session_id).await.map(|_| ())
+                context
+                    .reauthenticate(expected_session_id)
+                    .await
+                    .map(|_| ())
             }
         });
         tokio::pin!(recovery);
@@ -514,9 +526,9 @@ impl SessionContext {
         let previous_state = previous_channel.session_state().clone();
         let previous_object = previous_state.object()?;
         let upstream = previous_channel.upstream();
-        let worker = upstream
-            .worker()
-            .ok_or_else(|| Error::InvalidState("Worker is unavailable for reauthentication".into()))?;
+        let worker = upstream.worker().ok_or_else(|| {
+            Error::InvalidState("Worker is unavailable for reauthentication".into())
+        })?;
         let connection = worker.connection_object();
         let same_generation = previous_object.generation() == connection.generation();
 
@@ -572,9 +584,7 @@ impl SessionContext {
             }));
         };
         if same_generation {
-            let replacement = worker
-                .publish_object_replacement(previous_object)
-                .await?;
+            let replacement = worker.publish_object_replacement(previous_object).await?;
             setup_result.set_object(replacement)?;
         }
         let channel = Channel::new(&upstream, &conn_info, &setup_result).await?;
@@ -637,13 +647,17 @@ impl SessionContext {
         match channel_id {
             None => Ok(primary),
             Some(id) if id == primary.channel_id() => Ok(primary),
-            Some(id) => self
-                .channel_contexts
-                .read()
-                .await
-                .get(&id)
-                .cloned()
-                .ok_or(Error::ChannelNotFound(self.primary_channel().session_id(), id)),
+            Some(id) => {
+                self.channel_contexts
+                    .read()
+                    .await
+                    .get(&id)
+                    .cloned()
+                    .ok_or(Error::ChannelNotFound(
+                        self.primary_channel().session_id(),
+                        id,
+                    ))
+            }
         }
     }
 
@@ -653,7 +667,9 @@ impl SessionContext {
         options: ResponseOptions<'_>,
     ) -> crate::Result<(CommandSubmission, CommandResponse)> {
         self.wait_for_reauthentication(
-            options.timeout.or_else(|| Some(self.conn_info().config.timeout())),
+            options
+                .timeout
+                .or_else(|| Some(self.conn_info().config.timeout())),
             options.async_cancel.clone(),
         )
         .await?;
@@ -757,8 +773,7 @@ impl SessionContext {
     }
 }
 
-impl SessionContext {
-}
+impl SessionContext {}
 
 impl Drop for SessionContext {
     fn drop(&mut self) {

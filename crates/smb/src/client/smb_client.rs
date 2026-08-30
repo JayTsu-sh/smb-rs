@@ -1,8 +1,9 @@
-use crate::ConnectionConfig;
 use crate::command::{CommandRequest, Protection};
+use crate::connection::ConnectionConfig;
 use crate::{
-    Error, FileCreateArgs,
+    Error,
     connection::Connection,
+    resource::FileCreateArgs,
     resource::{Pipe, Resource},
     session::Session,
     tree::Tree,
@@ -685,7 +686,7 @@ impl Client {
     pub async fn subscribe_lease_breaks(
         &self,
         server: &str,
-    ) -> crate::Result<tokio::sync::broadcast::Receiver<crate::LeaseBreakEvent>> {
+    ) -> crate::Result<tokio::sync::broadcast::Receiver<crate::lease::LeaseBreakEvent>> {
         let conn = self.get_connection(server).await?;
         Ok(conn.subscribe_lease_breaks())
     }
@@ -693,7 +694,7 @@ impl Client {
     pub async fn subscribe_oplock_breaks(
         &self,
         server: &str,
-    ) -> crate::Result<tokio::sync::broadcast::Receiver<crate::OplockBreakEvent>> {
+    ) -> crate::Result<tokio::sync::broadcast::Receiver<crate::lease::OplockBreakEvent>> {
         let conn = self.get_connection(server).await?;
         Ok(conn.subscribe_oplock_breaks())
     }
@@ -932,13 +933,12 @@ impl Client {
         if file_id == smb_msg::FileId::EMPTY {
             return;
         }
-        if let Err(e) =
-            crate::resource::ResourceHandle::send_close_external(
-                file_id,
-                &context,
-                eviction.slot.proto.object,
-            )
-            .await
+        if let Err(e) = crate::resource::ResourceHandle::send_close_external(
+            file_id,
+            &context,
+            eviction.slot.proto.object,
+        )
+        .await
         {
             tracing::warn!(
                 path = label,

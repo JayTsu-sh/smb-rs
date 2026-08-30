@@ -1,24 +1,31 @@
 #![doc = include_str!("../docs/index.md")]
 #![forbid(unsafe_code)]
 
-pub mod client;
+#[allow(dead_code)]
+pub(crate) mod client;
 mod clock;
-pub mod command;
+#[allow(dead_code)]
+pub(crate) mod command;
 pub mod compression;
-pub mod connection;
+#[allow(dead_code)]
+pub(crate) mod connection;
 pub mod crypto;
 pub mod dialects;
 pub mod docs;
 pub mod domain;
 pub mod error;
 pub mod facade;
-pub mod lease;
-pub mod resource;
+#[allow(dead_code)]
+pub(crate) mod lease;
+#[allow(dead_code)]
+pub(crate) mod resource;
 pub(crate) mod runtime;
 #[cfg(feature = "test-support")]
 mod scenario;
-pub mod session;
-pub mod tree;
+#[allow(dead_code)]
+pub(crate) mod session;
+#[allow(dead_code)]
+pub(crate) mod tree;
 
 /// Test-only API surface.
 ///
@@ -30,6 +37,7 @@ pub mod tree;
 #[cfg(feature = "test-support")]
 pub mod test_support {
     pub use crate::clock::{Clock, ManualClock, ManualClockError, MonotonicTime, TokioClock};
+    pub use crate::connection::{Connection, ConnectionConfig};
     pub use crate::scenario::{
         LifecycleScenario, ScenarioError, ScenarioEvent, ScenarioReport, ScenarioTaskError,
         TerminalOutcome, TerminalProbe,
@@ -38,8 +46,6 @@ pub mod test_support {
     pub use smb_transport::test_support::{ScriptedTransport, ScriptedTransportControl};
 }
 
-pub use client::UncPath;
-pub use connection::ConnectionConfig;
 pub use domain::{
     Batch, BatchCommand, BatchOutcome, BatchRef, BatchResult, CancelToken, CloseOutcome,
     Credentials, Deadline, Directory, DirectoryEntries, DirectoryEntry, DirectoryEvent,
@@ -51,12 +57,6 @@ pub use domain::{
 };
 pub use error::Error;
 pub use facade::{Client, ClientConfig, RemoteShare, ShareKind};
-pub use lease::{LeaseBreakAckOutcome, LeaseBreakEvent, OplockBreakEvent};
-pub use resource::{
-    DurableOpenGrant, DurableOpenRequest, FileCreateArgs, GetLen, LeaseGrant, PipeRpcConnection,
-    ReadAt, ReadAtChannel, ResourceHandle, WriteAt, WriteAtChannel,
-};
-pub use tree::DfsRootTreeRef;
 
 /// Explicit protocol-value namespace for extension and diagnostic code.
 /// Normal facade/domain callers do not need these wire-level types.

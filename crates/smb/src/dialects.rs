@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use crate::{
-    ConnectionConfig, Error,
+    Error,
+    connection::ConnectionConfig,
     connection::{connection_info::NegotiatedProperties, preauth_hash},
     crypto,
 };

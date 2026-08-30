@@ -34,10 +34,8 @@ use conformance::transcripts::{
     negotiate_response_windows_dc, session_setup_response_final,
     session_setup_response_intermediate,
 };
-use conformance::{
-    MockGss, ScriptedGssStep, ScriptedTransport, assert_signed_final_session_setup,
-};
-use smb::{ConnectionConfig, connection::Connection};
+use conformance::{MockGss, ScriptedGssStep, ScriptedTransport, assert_signed_final_session_setup};
+use smb::test_support::{Connection, ConnectionConfig};
 use smb_dtyp::Guid;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

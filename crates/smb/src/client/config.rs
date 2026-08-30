@@ -1,7 +1,7 @@
 use smb_dtyp::Guid;
 use smb_msg::LeaseState;
 
-use crate::ConnectionConfig;
+use crate::connection::ConnectionConfig;
 
 /// Configuration for the SMB client.
 #[derive(Debug, Clone, PartialEq, Eq)]
