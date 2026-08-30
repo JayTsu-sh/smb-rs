@@ -276,6 +276,7 @@ impl Connection {
     /// See also [`Client::close`][`crate::Client::close`].
     #[tracing::instrument(level = "debug", skip_all, fields(server = %self.server_name))]
     pub async fn close(&self) -> crate::Result<()> {
+        self.context.stop_notify();
         self.context.stop_recovery().await;
         match self.context.generation_runtime() {
             Some(c) => c.stop().await,
@@ -909,6 +910,8 @@ pub(crate) struct ConnectionCore {
 
     recovery: OnceLock<Arc<RecoveryDriver>>,
 
+    tasks: std::sync::Mutex<ConnectionTasks>,
+
     /// Cancellation token for stopping notifications.
     stop_notifications: CancellationToken,
 
@@ -925,6 +928,12 @@ pub(crate) struct ConnectionCore {
 struct ConnectionGeneration {
     generation_runtime: Arc<GenerationRuntime>,
     conn_info: Arc<ConnectionInfo>,
+}
+
+#[derive(Default)]
+struct ConnectionTasks {
+    recovery: Option<tokio::task::JoinHandle<()>>,
+    notifications: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl ConnectionCore {
@@ -1067,6 +1076,7 @@ impl ConnectionCore {
             client_guid,
             generation: ArcSwapOption::empty(),
             recovery: OnceLock::new(),
+            tasks: std::sync::Mutex::new(ConnectionTasks::default()),
             stop_notifications: Default::default(),
             lease_event_tx,
             oplock_event_tx,
@@ -1101,33 +1111,21 @@ impl ConnectionCore {
             if live == 0 && prev.file_id != smb_msg::FileId::EMPTY {
                 let file_id = prev.file_id;
                 let context = prev.proto.context.clone();
-                // The spawned task captures the `context` chain
-                // (TreeContext -> SessionContext)
-                // by Arc clone, but NOT this
-                // ConnectionCore itself. If the Connection
-                // races into Drop before the spawn runs, its
-                // `generation_runtime.stop()` (in Connection::Drop) will complete
-                // first and send_close_external will see a stopped
-                // generation_runtime — at worst we lose this displaced FileId,
-                // which the session-disconnect garbage-collects anyway.
-                // The spawn does *not* extend the Connection's lifetime;
-                // tying it to Connection would require Arc'ing the
-                // context chain back up, which we explicitly avoid.
-                tokio::spawn(async move {
-                    if let Err(e) = crate::resource::ResourceHandle::send_close_external(
-                        file_id,
-                        &context,
-                        prev.proto.object,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            file_id = ?file_id,
-                            error = ?e,
-                            "Displaced-slot wire Close failed (FileId leaked until session end)",
-                        );
-                    }
-                });
+                // Close synchronously within the caller's owned operation;
+                // detached cleanup tasks are forbidden.
+                if let Err(e) = crate::resource::ResourceHandle::send_close_external(
+                    file_id,
+                    &context,
+                    prev.proto.object,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        file_id = ?file_id,
+                        error = ?e,
+                        "Displaced-slot wire Close failed (FileId leaked until session end)",
+                    );
+                }
             }
         }
         Ok(())
@@ -1310,7 +1308,7 @@ impl ConnectionCore {
             .set(driver.clone())
             .map_err(|_| Error::InvalidState("Recovery coordinator already started".into()))?;
         let context = Arc::downgrade(self);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut current = generation_runtime;
             loop {
                 let exit = current.exited().await;
@@ -1340,12 +1338,31 @@ impl ConnectionCore {
                 }
             }
         });
+        self.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recovery = Some(task);
         Ok(())
     }
 
     async fn stop_recovery(&self) {
         if let Some(driver) = self.recovery.get() {
             driver.close().await;
+        }
+        let tasks = {
+            let mut tasks = self
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let recovery = tasks.recovery.take();
+            let notifications = std::mem::take(&mut tasks.notifications);
+            (recovery, notifications)
+        };
+        if let Some(recovery) = tasks.0 {
+            let _ = recovery.await;
+        }
+        for notification in tasks.1 {
+            let _ = notification.await;
         }
     }
 
@@ -1457,7 +1474,7 @@ impl ConnectionCore {
         generation_runtime.start_notify_channel(tx)?;
         let stop_notification = self.stop_notifications.clone();
         let self_clone = self.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             // Race the cancellation token against each `rx.recv()` so that
             // (a) we keep draining notifications as they arrive and
             // (b) we exit promptly when the connection is shutting down.
@@ -1492,6 +1509,11 @@ impl ConnectionCore {
             }
             tracing::info!("Notification context thread stopped.");
         });
+        self.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .notifications
+            .push(task);
         Ok(())
     }
 
