@@ -510,6 +510,46 @@ async fn persistent_handle_is_granted_on_ca_share() -> smb::Result<()> {
 
 #[cfg(feature = "real-server-tests")]
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[ignore = "requires exact management closure of the test CIFS session"]
+async fn automatic_reconnect_replaces_share_and_revokes_ordinary_file() -> smb::Result<()> {
+    let client = Client::new(ClientConfig::default());
+    let target = ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?;
+    let share = client
+        .connect_share(&target, common::smb_test_credentials())
+        .await?;
+    let stale_path = SharePath::new(format!("w6-stale-{}.bin", std::process::id()))?;
+    let stale = share
+        .open_file(&stale_path, FileOpenOptions::overwrite())
+        .await?;
+    stale
+        .write_all_at(0, Bytes::from_static(b"ordinary"))
+        .await?;
+
+    common::close_exact_ontap_session(target.share()).map_err(Error::InvalidState)?;
+
+    let recovered_path = SharePath::new(format!("w6-recovered-{}.bin", std::process::id()))?;
+    let recovered = share
+        .open_file(&recovered_path, FileOpenOptions::overwrite())
+        .timeout(Duration::from_secs(30))
+        .await?;
+    recovered
+        .write_all_at(0, Bytes::from_static(b"new-generation"))
+        .await?;
+    assert!(
+        stale
+            .read_at(0, 8)
+            .timeout(Duration::from_secs(5))
+            .await
+            .is_err()
+    );
+    recovered.delete().await?;
+    recovered.close().await?;
+    share.close().await?;
+    client.close().await
+}
+
+#[cfg(feature = "real-server-tests")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore = "requires an isolated writable real-server share"]
 async fn domain_batch_and_concurrent_transfer() -> smb::Result<()> {
     let target = ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?;

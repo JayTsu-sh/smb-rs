@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 use std::env::var;
 use std::fs;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use zeroize::Zeroizing;
 
@@ -8,6 +10,9 @@ static SERVER_FROM_FD: OnceLock<Zeroizing<String>> = OnceLock::new();
 static USER_FROM_FD: OnceLock<Zeroizing<String>> = OnceLock::new();
 static PASSWORD_FROM_FD: OnceLock<Zeroizing<String>> = OnceLock::new();
 static SHARE_FROM_FD: OnceLock<Zeroizing<String>> = OnceLock::new();
+static MANAGEMENT_TARGET_FROM_FD: OnceLock<Zeroizing<String>> = OnceLock::new();
+static MANAGEMENT_USER_FROM_FD: OnceLock<Zeroizing<String>> = OnceLock::new();
+static MANAGEMENT_PASSWORD_FROM_FD: OnceLock<Zeroizing<String>> = OnceLock::new();
 
 pub struct TestEnv;
 
@@ -64,6 +69,123 @@ pub fn smb_test_credentials() -> smb::Credentials {
         .or_else(|| from_secret_fd(TestEnv::PASSWORD_FD, &PASSWORD_FROM_FD))
         .unwrap_or_else(|| TestEnv::DEFAULT_PASSWORD.to_string());
     smb::Credentials::ntlm(user, password)
+}
+
+pub fn smb_test_username() -> String {
+    var(TestEnv::USER)
+        .ok()
+        .or_else(|| from_secret_fd(TestEnv::USER_FD, &USER_FROM_FD))
+        .unwrap_or_else(|| TestEnv::DEFAULT_USER.to_string())
+}
+
+pub fn close_exact_ontap_session(share: &str) -> Result<(), String> {
+    let svm = var("SMB_ONTAP_TEST_SVM").map_err(|_| "missing SMB_ONTAP_TEST_SVM")?;
+    let username = smb_test_username();
+    let output = management_command(&[
+        "vserver",
+        "cifs",
+        "session",
+        "show",
+        "-vserver",
+        &svm,
+        "-share-names",
+        share,
+        "-instance",
+    ])?;
+    let mut connection_id = None;
+    let mut session_id = None;
+    let mut matches_share = false;
+    let mut matches_user = false;
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("Connection ID:") {
+            connection_id = Some(value.trim().to_owned());
+        } else if let Some(value) = line.strip_prefix("Session ID:") {
+            session_id = Some(value.trim().to_owned());
+        } else if let Some(value) = line.strip_prefix("Shares:") {
+            matches_share = value.split(',').any(|value| value.trim() == share);
+        } else if let Some(value) = line.strip_prefix("Windows User:") {
+            let value = value.trim();
+            matches_user = value == username || value.ends_with(&format!("\\{username}"));
+        }
+    }
+    if !matches_share || !matches_user {
+        return Err("management preflight found no exact test-share session".into());
+    }
+    let connection_id = connection_id.ok_or("management preflight omitted connection ID")?;
+    let session_id = session_id.ok_or("management preflight omitted session ID")?;
+    management_command(&[
+        "vserver",
+        "cifs",
+        "session",
+        "close",
+        "-vserver",
+        &svm,
+        "-connection-id",
+        &connection_id,
+        "-session-id",
+        &session_id,
+    ])
+    .map(drop)
+}
+
+fn management_command(arguments: &[&str]) -> Result<String, String> {
+    let descriptor = |name: &str| {
+        var(name)
+            .map_err(|_| format!("missing {name}"))?
+            .parse::<i32>()
+            .map_err(|_| format!("invalid {name}"))
+    };
+    let target = from_secret_fd("SMB_ONTAP_MANAGEMENT_TARGET_FD", &MANAGEMENT_TARGET_FROM_FD)
+        .ok_or("missing management target")?;
+    let user = from_secret_fd("SMB_ONTAP_MANAGEMENT_USER_FD", &MANAGEMENT_USER_FROM_FD)
+        .ok_or("missing management user")?;
+    let password = from_secret_fd(
+        "SMB_ONTAP_MANAGEMENT_PASSWORD_FD",
+        &MANAGEMENT_PASSWORD_FROM_FD,
+    )
+    .ok_or("missing management password")?;
+    let _ = descriptor("SMB_ONTAP_MANAGEMENT_PASSWORD_FD")?;
+    if arguments.iter().any(|value| {
+        value.is_empty()
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'_' | b'-' | b'.' | b'/' | b'\\' | b':' | b'@' | b',')
+            })
+    }) {
+        return Err("management command contains an invalid token".into());
+    }
+    let remote = arguments.join(" ");
+    let mut child = Command::new("sshpass")
+        .arg("-d0")
+        .arg("ssh")
+        .args(["-o", "BatchMode=no", "-o", "PasswordAuthentication=yes"])
+        .args([
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=10",
+        ])
+        .arg(format!("{user}@{target}"))
+        .arg(remote)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("start management command: {error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("management password pipe unavailable")?
+        .write_all(format!("{password}\n").as_bytes())
+        .map_err(|error| format!("write management password: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("wait management command: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("management command failed: {}", output.status));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn from_secret_fd(name: &str, cache: &'static OnceLock<Zeroizing<String>>) -> Option<String> {
