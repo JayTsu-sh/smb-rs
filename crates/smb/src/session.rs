@@ -766,49 +766,13 @@ impl SessionContext {
             .await
             .map(|(_, incoming)| incoming)
     }
-
-    /// Logs off the session and invalidates it.
-    ///
-    /// # Notes
-    /// This method waits for the logoff response to be received from the server.
-    /// It is used when dropping the session.
-    async fn logoff_async(self: Arc<Self>) {
-        self.logoff().await.unwrap_or_else(|e| {
-            tracing::error!("Failed to logoff: {e}");
-        });
-    }
 }
 
 impl SessionContext {}
 
 impl Drop for SessionContext {
     fn drop(&mut self) {
-        if self
-            .dropping
-            .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            return;
-        }
-
-        let generation = self.generation();
-        let primary_channel = generation.primary_channel.clone();
-        let conn_info = generation.conn_info.clone();
-
-        tokio::task::spawn(async move {
-            let temp_handler = SessionContext {
-                dropping: AtomicBool::new(false),
-                generation: arc_swap::ArcSwap::from_pointee(SessionGeneration {
-                    primary_channel,
-                    conn_info,
-                }),
-                channel_contexts: Default::default(),
-                credential_provider: None,
-                recovery: tokio::sync::Mutex::new(()),
-                recovery_slots: Arc::new(tokio::sync::Semaphore::new(1)),
-                recovering: AtomicBool::new(false),
-                shares: tokio::sync::Mutex::new(Vec::new()),
-            };
-            Arc::new(temp_handler).logoff_async().await;
-        });
+        self.dropping
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }

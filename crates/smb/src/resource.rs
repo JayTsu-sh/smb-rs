@@ -1551,23 +1551,13 @@ impl Drop for ResourceHandle {
                         file_id = ?file_id,
                         "Drop: lease slot evicted; scheduling wire Close",
                     );
-                    // Fall through to the legacy spawn-Close branch below.
+                    // The slot is no longer retained. Explicit close remains
+                    // the only path that performs wire I/O.
                 }
             }
         }
 
-        let generation = self.generation.load_full();
-        let file_id = generation.file_id;
-        let context = self.context.clone();
-        let object = generation.object;
-        tracing::debug!("Spawning task to close file with ID: {file_id:?}");
-        tokio::task::spawn(async move {
-            if file_id != FileId::EMPTY {
-                if let Err(e) = Self::send_close(file_id, &context, object).await {
-                    tracing::error!("Error closing file: {e}");
-                }
-            }
-        });
+        tracing::debug!("Dropped an open resource; wire cleanup requires explicit async close");
     }
 }
 

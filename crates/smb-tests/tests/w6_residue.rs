@@ -74,3 +74,34 @@ fn removed_dead_features_cannot_return() {
         );
     }
 }
+
+#[test]
+fn drop_implementations_cannot_spawn_unowned_cleanup_tasks() {
+    for path in [
+        "crates/smb/src/connection.rs",
+        "crates/smb/src/session.rs",
+        "crates/smb/src/tree.rs",
+        "crates/smb/src/resource.rs",
+    ] {
+        let source = read(path);
+        let syntax =
+            syn::parse_file(&source).unwrap_or_else(|error| panic!("parse {path}: {error}"));
+        for item in syntax.items {
+            let syn::Item::Impl(item) = item else {
+                continue;
+            };
+            let is_drop = item
+                .trait_
+                .as_ref()
+                .and_then(|(_, path, _)| path.segments.last())
+                .is_some_and(|segment| segment.ident == "Drop");
+            if is_drop {
+                let rendered = quote::quote!(#item).to_string();
+                assert!(
+                    !rendered.contains("tokio ::") && !rendered.contains("spawn"),
+                    "Drop must not start unowned async cleanup in {path}"
+                );
+            }
+        }
+    }
+}

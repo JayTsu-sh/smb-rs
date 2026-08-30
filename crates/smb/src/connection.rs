@@ -1747,19 +1747,7 @@ impl ConnectionCore {
 impl Drop for ConnectionCore {
     fn drop(&mut self) {
         self.stop_notify();
-
-        let generation = match self.generation.swap(None) {
-            Some(generation) => generation,
-            None => return,
-        };
-        let recovery = self.recovery.get().cloned();
-
-        tokio::task::spawn(async move {
-            if let Some(recovery) = recovery {
-                recovery.close().await;
-            }
-            generation.generation_runtime.stop().await.ok();
-        });
+        self.generation.store(None);
     }
 }
 

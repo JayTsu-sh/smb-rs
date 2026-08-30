@@ -675,24 +675,6 @@ impl TreeContext {
 
 impl Drop for TreeContext {
     fn drop(&mut self) {
-        if self.closed.load(Ordering::Acquire) {
-            // Already dropped
-            return;
-        }
-
-        let generation = self.generation();
-        let upstream = self.upstream.clone();
-        let tree_name = self.tree_name.clone();
-        let tree_id = generation.tree_id;
-        let encrypt = generation.info.share_flags.encrypt_data();
-        let object = generation.object;
-        tokio::task::spawn(async move {
-            Self::_disconnect(upstream, tree_id, encrypt, object)
-                .await
-                .map_err(|e| {
-                    tracing::warn!("Failed to disconnect from tree {}: {e}", tree_name);
-                })
-                .ok();
-        });
+        self.closed.store(true, Ordering::Release);
     }
 }
