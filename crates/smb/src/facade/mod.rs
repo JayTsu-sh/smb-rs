@@ -58,23 +58,34 @@ impl Client {
         }
     }
 
-    pub async fn authenticate(
-        &self,
-        server: &str,
+    pub fn authenticate<'a>(
+        &'a self,
+        server: &'a str,
         credentials: Credentials,
-    ) -> crate::Result<Session> {
-        self.domain.authenticate(server, credentials).await
+    ) -> Operation<'a, Session> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                self.domain.authenticate(server, credentials).await
+            })
+        })
     }
 
-    pub async fn connect_share(
-        &self,
-        target: &ShareTarget,
+    pub fn connect_share<'a>(
+        &'a self,
+        target: &'a ShareTarget,
         credentials: Credentials,
-    ) -> crate::Result<Share> {
-        self.authenticate(target.server(), credentials)
-            .await?
-            .connect_share(target.share())
-            .await
+    ) -> Operation<'a, Share> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                self.domain
+                    .authenticate(target.server(), credentials)
+                    .await?
+                    .connect_share(target.share())
+                    .await
+            })
+        })
     }
 
     /// Lazily enumerate the server's shares through the typed SRVSVC
@@ -135,8 +146,13 @@ impl Client {
         })
     }
 
-    pub async fn close(&self) -> crate::Result<()> {
-        self.domain.close().await
+    pub fn close(&self) -> Operation<'_, ()> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                self.domain.close().await
+            })
+        })
     }
 }
 

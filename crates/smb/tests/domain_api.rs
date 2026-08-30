@@ -8,7 +8,7 @@ use smb::{
 };
 use smb::{
     Client, CloseOutcome, Credentials, Directory, DirectoryOpenOptions, File, FileCursor,
-    FileOpenOptions, IoCapabilities, ObjectGeneration, Pipe, PipeName, PreviousVersion,
+    FileOpenOptions, IoCapabilities, ObjectGeneration, Operation, Pipe, PipeName, PreviousVersion,
     ReplayPolicy, Session, Share, SharePath, ShareTarget, Transfer, TransferEvents,
 };
 use std::time::{Duration, Instant};
@@ -21,6 +21,40 @@ fn assert_send_sync<T: Send + Sync>() {}
 fn assert_clone<T: Clone>() {}
 fn assert_send<T: Send>() {}
 fn assert_cursor<T: AsyncRead + AsyncWrite + AsyncSeek + Unpin + Send>() {}
+fn assert_lazy<T>(operation: Operation<'_, T>) {
+    drop(operation);
+}
+
+fn session_connect_is_lazy<'a>(session: &'a Session, name: &'a str) -> Operation<'a, Share> {
+    session.connect_share(name)
+}
+
+fn session_close_is_lazy(session: &Session) -> Operation<'_, ()> {
+    session.close()
+}
+
+fn share_close_is_lazy(share: &Share) -> Operation<'_, ()> {
+    share.close()
+}
+
+fn file_delete_is_lazy(file: &File) -> Operation<'_, ()> {
+    file.delete()
+}
+
+#[test]
+fn public_spine_defers_async_work_to_lazy_operations() {
+    let client = Client::new();
+    let target = ShareTarget::new("server", "share").unwrap();
+
+    assert_lazy(client.authenticate("server", Credentials::ntlm("user", "secret")));
+    assert_lazy(client.connect_share(&target, Credentials::ntlm("user", "secret")));
+    assert_lazy(client.close());
+
+    let _ = session_connect_is_lazy;
+    let _ = session_close_is_lazy;
+    let _ = share_close_is_lazy;
+    let _ = file_delete_is_lazy;
+}
 
 #[test]
 fn previous_version_tokens_are_validated_at_the_domain_boundary() {

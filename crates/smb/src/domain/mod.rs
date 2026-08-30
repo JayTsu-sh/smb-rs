@@ -343,16 +343,26 @@ impl Session {
         })
     }
 
-    pub async fn connect_share(&self, name: &str) -> crate::Result<Share> {
-        let inner = self.inner.connect_share(name).await?;
-        Ok(Share {
-            inner: Arc::new(inner),
-            _session: self.inner.clone(),
+    pub fn connect_share<'a>(&'a self, name: &'a str) -> Operation<'a, Share> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                let inner = self.inner.connect_share(name).await?;
+                Ok(Share {
+                    inner: Arc::new(inner),
+                    _session: self.inner.clone(),
+                })
+            })
         })
     }
 
-    pub async fn close(&self) -> crate::Result<()> {
-        self.inner.close().await
+    pub fn close(&self) -> Operation<'_, ()> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                self.inner.close().await
+            })
+        })
     }
 }
 
@@ -537,8 +547,13 @@ impl Share {
         })
     }
 
-    pub async fn close(&self) -> crate::Result<()> {
-        self.inner.close().await
+    pub fn close(&self) -> Operation<'_, ()> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                self.inner.close().await
+            })
+        })
     }
 }
 
@@ -930,8 +945,18 @@ impl File {
         })
     }
 
-    pub async fn delete(&self) -> crate::Result<()> {
-        self.inner.delete().await
+    pub fn delete(&self) -> Operation<'_, ()> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                if context.replay != ReplayPolicy::Never {
+                    return Err(Error::UnsupportedOperation(
+                        "file delete permits only ReplayPolicy::Never".into(),
+                    ));
+                }
+                self.inner.delete().await
+            })
+        })
     }
 
     pub fn rename<'a>(&'a self, destination: &'a SharePath) -> Operation<'a, ()> {
