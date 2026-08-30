@@ -106,7 +106,13 @@ impl File {
         let response = self
             .send_read_request(buf.len() as u32, pos, channel, unbuffered)
             .await?;
-        if response.message.header.status().map_err(std::io::Error::other)? == Status::EndOfFile {
+        if response
+            .message
+            .header
+            .status()
+            .map_err(std::io::Error::other)?
+            == Status::EndOfFile
+        {
             return Ok(0);
         }
         let content = response
@@ -173,13 +179,7 @@ impl File {
         }
 
         let response = self
-            .send_read_request_with_options(
-                max_len,
-                pos,
-                channel,
-                unbuffered,
-                options,
-            )
+            .send_read_request_with_options(max_len, pos, channel, unbuffered, options)
             .await?;
         if response.message.header.status()? == Status::EndOfFile {
             return Ok(bytes::Bytes::new());
@@ -297,14 +297,9 @@ impl File {
         pos: u64,
         channel: Option<u32>,
     ) -> std::io::Result<usize> {
-        self.write_block_zc_with_options(
-            buf,
-            pos,
-            channel,
-            FileOperationOptions::default(),
-        )
-        .await
-        .map_err(std::io::Error::other)
+        self.write_block_zc_with_options(buf, pos, channel, FileOperationOptions::default())
+            .await
+            .map_err(std::io::Error::other)
     }
 
     pub(crate) async fn write_block_zc_with_options(

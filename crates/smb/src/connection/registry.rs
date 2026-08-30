@@ -170,7 +170,9 @@ impl ConnectionRegistry {
 
     pub(crate) async fn recoverable_sessions(&self) -> Vec<Arc<SessionContext>> {
         let mut state = self.state.lock().await;
-        state.sessions.retain(|_, context| context.strong_count() != 0);
+        state
+            .sessions
+            .retain(|_, context| context.strong_count() != 0);
         state.sessions.values().filter_map(Weak::upgrade).collect()
     }
 

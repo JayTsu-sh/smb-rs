@@ -88,10 +88,7 @@ impl DurableRecoveryCoordinator {
         }
     }
 
-    pub(crate) fn reduce(
-        &mut self,
-        event: DurableRecoveryEvent,
-    ) -> Option<DurableRecoveryEffect> {
+    pub(crate) fn reduce(&mut self, event: DurableRecoveryEvent) -> Option<DurableRecoveryEffect> {
         match (self.state, event) {
             (DurableRecoveryState::Closed | DurableRecoveryState::Revoked(_), _) => None,
             (_, DurableRecoveryEvent::Close) => {
@@ -191,13 +188,15 @@ impl DurableRecoveryCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::object_state::{ObjectKind, ObjectRegistry};
     use crate::runtime::GenerationId;
+    use crate::runtime::object_state::{ObjectKind, ObjectRegistry};
 
     fn objects(generation: u64) -> (ObjectToken, ObjectToken) {
         let mut objects = ObjectRegistry::new(GenerationId::new(generation));
         let connection = objects.connection();
-        let session = objects.create_child(connection, ObjectKind::Session).unwrap();
+        let session = objects
+            .create_child(connection, ObjectKind::Session)
+            .unwrap();
         let share = objects.create_child(session, ObjectKind::Share).unwrap();
         let resource = objects.create_child(share, ObjectKind::Resource).unwrap();
         (share, resource)
@@ -259,31 +258,36 @@ mod tests {
             now: MonotonicTime::ZERO,
         });
         let mut wrong_guid = identity(20);
-        wrong_guid.create_guid =
-            Guid::parse_uuid("00000000-0000-0000-0000-000000000008").unwrap();
-        assert!(recovery
-            .reduce(DurableRecoveryEvent::AttemptSucceeded {
-                share,
-                resource: replacement,
-                identity: wrong_guid,
-            })
-            .is_none());
+        wrong_guid.create_guid = Guid::parse_uuid("00000000-0000-0000-0000-000000000008").unwrap();
+        assert!(
+            recovery
+                .reduce(DurableRecoveryEvent::AttemptSucceeded {
+                    share,
+                    resource: replacement,
+                    identity: wrong_guid,
+                })
+                .is_none()
+        );
         let mut wrong_persistence = identity(20);
         wrong_persistence.persistent = true;
-        assert!(recovery
-            .reduce(DurableRecoveryEvent::AttemptSucceeded {
-                share,
-                resource: replacement,
-                identity: wrong_persistence,
-            })
-            .is_none());
-        assert!(recovery
-            .reduce(DurableRecoveryEvent::AttemptSucceeded {
-                share,
-                resource: foreign,
-                identity: identity(20),
-            })
-            .is_none());
+        assert!(
+            recovery
+                .reduce(DurableRecoveryEvent::AttemptSucceeded {
+                    share,
+                    resource: replacement,
+                    identity: wrong_persistence,
+                })
+                .is_none()
+        );
+        assert!(
+            recovery
+                .reduce(DurableRecoveryEvent::AttemptSucceeded {
+                    share,
+                    resource: foreign,
+                    identity: identity(20),
+                })
+                .is_none()
+        );
     }
 
     #[test]
@@ -318,11 +322,13 @@ mod tests {
             recovery.reduce(DurableRecoveryEvent::Close),
             Some(DurableRecoveryEffect::Closed)
         );
-        assert!(recovery
-            .reduce(DurableRecoveryEvent::AttemptFailed {
-                share: third,
-                now: MonotonicTime::ZERO,
-            })
-            .is_none());
+        assert!(
+            recovery
+                .reduce(DurableRecoveryEvent::AttemptFailed {
+                    share: third,
+                    now: MonotonicTime::ZERO,
+                })
+                .is_none()
+        );
     }
 }

@@ -532,9 +532,7 @@ impl GenerationState {
                 .saturating_add(u32::from(credit_grant));
             request.credit_response_seen = true;
         } else {
-            self.total_credits = self
-                .total_credits
-                .saturating_add(u32::from(credit_grant));
+            self.total_credits = self.total_credits.saturating_add(u32::from(credit_grant));
         }
 
         // Protocol bookkeeping deliberately precedes caller completion.
@@ -1015,14 +1013,8 @@ mod tests {
 
     #[test]
     fn credit_overflow_is_typed_and_does_not_advance_response_state() {
-        let mut state = GenerationState::new(
-            GENERATION,
-            1,
-            u32::MAX,
-            u32::MAX,
-            LIMITS,
-            DRAIN_TIMEOUT,
-        );
+        let mut state =
+            GenerationState::new(GENERATION, 1, u32::MAX, u32::MAX, LIMITS, DRAIN_TIMEOUT);
         let key = admit(&mut state, 0, 1);
         assert_eq!(
             state.reduce(OwnerEvent::Response {

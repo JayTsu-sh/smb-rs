@@ -4,13 +4,13 @@
 //! send/receive pairing. Message identity, credit accounting, wire sealing,
 //! response correlation, and terminal publication remain runtime concerns.
 
-use crate::command::{CommandResponse, CommandRequest};
+use crate::command::{CommandRequest, CommandResponse};
 use bytes::Bytes;
 use smb_msg::{Command, Status};
 use std::cmp::max;
 
-use super::reducer::RequestKey;
 use super::ObjectToken;
+use super::reducer::RequestKey;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum ReplayPolicy {
@@ -355,9 +355,8 @@ mod tests {
             file_id: Default::default(),
             minimum_count: 1,
         };
-        let operation = TypedOperation::any_status(CommandRequest::new(RequestContent::Read(
-            request,
-        )));
+        let operation =
+            TypedOperation::any_status(CommandRequest::new(RequestContent::Read(request)));
         assert_eq!(operation.credit_charge(false).unwrap(), 1);
         assert_eq!(operation.credit_charge(true).unwrap(), 16);
     }

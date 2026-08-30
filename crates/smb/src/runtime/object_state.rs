@@ -6,8 +6,8 @@
 
 use super::GenerationId;
 use crate::clock::MonotonicTime;
-use std::collections::VecDeque;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ObjectToken {
@@ -157,10 +157,7 @@ impl RecoveryQueue {
         Some(RecoveryWaitOutcome::Cancelled(id))
     }
 
-    pub(crate) fn advance_time(
-        &mut self,
-        now: MonotonicTime,
-    ) -> Vec<RecoveryWaitOutcome> {
+    pub(crate) fn advance_time(&mut self, now: MonotonicTime) -> Vec<RecoveryWaitOutcome> {
         let mut outcomes = Vec::new();
         self.waits.retain(|wait| {
             if wait.deadline.is_some_and(|deadline| deadline <= now) {
@@ -173,10 +170,7 @@ impl RecoveryQueue {
         outcomes
     }
 
-    pub(crate) fn release_ready(
-        &mut self,
-        registry: &ObjectRegistry,
-    ) -> Vec<RecoveryWaitOutcome> {
+    pub(crate) fn release_ready(&mut self, registry: &ObjectRegistry) -> Vec<RecoveryWaitOutcome> {
         let mut outcomes = Vec::new();
         self.waits.retain(|wait| {
             if registry.validate_active(wait.dependency).is_ok() {
@@ -329,8 +323,15 @@ impl ObjectRegistry {
         if record.phase != ObjectPhase::Recovering {
             return Err(ObjectError::ParentNotActive);
         }
-        let epoch = record.token.epoch.checked_add(1).ok_or(ObjectError::IdExhausted)?;
-        let replacement = ObjectToken { epoch, ..record.token };
+        let epoch = record
+            .token
+            .epoch
+            .checked_add(1)
+            .ok_or(ObjectError::IdExhausted)?;
+        let replacement = ObjectToken {
+            epoch,
+            ..record.token
+        };
         let previous = record.token;
         record.token = replacement;
         record.phase = ObjectPhase::Active;
@@ -376,10 +377,7 @@ impl ObjectRegistry {
         Ok(effects)
     }
 
-    pub(crate) fn begin_close(
-        &mut self,
-        token: ObjectToken,
-    ) -> Result<CloseDecision, ObjectError> {
+    pub(crate) fn begin_close(&mut self, token: ObjectToken) -> Result<CloseDecision, ObjectError> {
         let record = self.record_mut(token)?;
         match record.phase {
             ObjectPhase::Active | ObjectPhase::Recovering => {
@@ -446,7 +444,10 @@ impl ObjectRegistry {
     }
 
     fn is_descendant(&self, candidate: ObjectToken, ancestor: ObjectToken) -> bool {
-        let mut parent = self.records.get(&candidate.id).and_then(|record| record.parent);
+        let mut parent = self
+            .records
+            .get(&candidate.id)
+            .and_then(|record| record.parent);
         while let Some(token) = parent {
             if token == ancestor {
                 return true;
@@ -471,7 +472,10 @@ impl ObjectRegistry {
         if token.generation != self.generation {
             return Err(ObjectError::ForeignGeneration);
         }
-        let record = self.records.get_mut(&token.id).ok_or(ObjectError::Unknown)?;
+        let record = self
+            .records
+            .get_mut(&token.id)
+            .ok_or(ObjectError::Unknown)?;
         if record.token != token {
             return Err(ObjectError::Stale);
         }
@@ -486,7 +490,9 @@ mod tests {
     fn hierarchy() -> (ObjectRegistry, [ObjectToken; 4]) {
         let mut registry = ObjectRegistry::new(GenerationId::new(7));
         let connection = registry.connection();
-        let session = registry.create_child(connection, ObjectKind::Session).unwrap();
+        let session = registry
+            .create_child(connection, ObjectKind::Session)
+            .unwrap();
         let share = registry.create_child(session, ObjectKind::Share).unwrap();
         let resource = registry.create_child(share, ObjectKind::Resource).unwrap();
         (registry, [connection, session, share, resource])
@@ -514,7 +520,10 @@ mod tests {
         );
         assert_eq!(
             registry.complete_close(session).unwrap(),
-            vec![ObjectEffect::Revoked(share), ObjectEffect::Revoked(resource)]
+            vec![
+                ObjectEffect::Revoked(share),
+                ObjectEffect::Revoked(resource)
+            ]
         );
         assert!(registry.complete_close(session).unwrap().is_empty());
     }
@@ -561,7 +570,10 @@ mod tests {
 
         assert_eq!(
             revoked,
-            vec![ObjectEffect::Revoked(share), ObjectEffect::Revoked(resource)]
+            vec![
+                ObjectEffect::Revoked(share),
+                ObjectEffect::Revoked(resource)
+            ]
         );
         assert_eq!(registry.validate_active(replacement), Ok(()));
         assert_eq!(
@@ -595,10 +607,7 @@ mod tests {
         let first = queue.enqueue(session, None).unwrap();
         let second = queue.enqueue(share, None).unwrap();
         let third = queue.enqueue(resource, None).unwrap();
-        assert_eq!(
-            queue.enqueue(resource, None),
-            Err(RecoveryQueueError::Full)
-        );
+        assert_eq!(queue.enqueue(resource, None), Err(RecoveryQueueError::Full));
 
         let replacement = registry.publish_replacement(session).unwrap();
         queue.publish_replacement(replacement);

@@ -254,15 +254,21 @@ impl ShareWaitQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::object_state::{ObjectKind, ObjectRegistry};
     use crate::runtime::GenerationId;
+    use crate::runtime::object_state::{ObjectKind, ObjectRegistry};
 
     fn objects(generation: u64) -> (ObjectToken, ObjectToken, ObjectToken) {
         let mut objects = ObjectRegistry::new(GenerationId::new(generation));
         let connection = objects.connection();
-        let session = objects.create_child(connection, ObjectKind::Session).unwrap();
+        let session = objects
+            .create_child(connection, ObjectKind::Session)
+            .unwrap();
         let share = objects.create_child(session, ObjectKind::Share).unwrap();
-        (session, share, objects.create_child(share, ObjectKind::Resource).unwrap())
+        (
+            session,
+            share,
+            objects.create_child(share, ObjectKind::Resource).unwrap(),
+        )
     }
 
     fn policy() -> ShareRecoveryPolicy {
@@ -306,12 +312,14 @@ mod tests {
             session: second,
             now: MonotonicTime::ZERO,
         });
-        assert!(recovery
-            .reduce(ShareRecoveryEvent::SessionReplaced {
-                session: second,
-                now: MonotonicTime::ZERO,
-            })
-            .is_none());
+        assert!(
+            recovery
+                .reduce(ShareRecoveryEvent::SessionReplaced {
+                    session: second,
+                    now: MonotonicTime::ZERO,
+                })
+                .is_none()
+        );
         assert!(matches!(
             recovery.reduce(ShareRecoveryEvent::SessionReplaced {
                 session: third,
@@ -323,12 +331,14 @@ mod tests {
                 ..
             }) if session == third
         ));
-        assert!(recovery
-            .reduce(ShareRecoveryEvent::AttemptSucceeded {
-                session: second,
-                share: second_share,
-            })
-            .is_none());
+        assert!(
+            recovery
+                .reduce(ShareRecoveryEvent::AttemptSucceeded {
+                    session: second,
+                    share: second_share,
+                })
+                .is_none()
+        );
         assert!(matches!(
             recovery.reduce(ShareRecoveryEvent::AttemptSucceeded {
                 session: third,
@@ -366,12 +376,14 @@ mod tests {
             closed.reduce(ShareRecoveryEvent::Close),
             Some(ShareRecoveryEffect::Closed)
         );
-        assert!(closed
-            .reduce(ShareRecoveryEvent::SessionReplaced {
-                session,
-                now: MonotonicTime::ZERO,
-            })
-            .is_none());
+        assert!(
+            closed
+                .reduce(ShareRecoveryEvent::SessionReplaced {
+                    session,
+                    now: MonotonicTime::ZERO,
+                })
+                .is_none()
+        );
     }
 
     #[test]
@@ -416,9 +428,6 @@ mod tests {
             queue.advance_time(MonotonicTime::ZERO),
             vec![ShareWaitOutcome::TimedOut(timed)]
         );
-        assert_eq!(
-            queue.fail(),
-            vec![ShareWaitOutcome::RecoveryFailed(failed)]
-        );
+        assert_eq!(queue.fail(), vec![ShareWaitOutcome::RecoveryFailed(failed)]);
     }
 }

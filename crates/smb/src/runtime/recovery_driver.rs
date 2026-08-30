@@ -1,5 +1,6 @@
 //! Async coordinator that applies the pure recovery reducer.
 
+use super::GenerationId;
 use super::engine::{GenerationExit, GenerationExitCause, RuntimeError, RuntimeHandle};
 use super::object_state::{
     ObjectEffect, ObjectToken, RecoveryQueue, RecoveryQueueError, RecoveryWaitId,
@@ -8,7 +9,6 @@ use super::object_state::{
 use super::recovery::{
     RecoveryCoordinator, RecoveryEffect, RecoveryEvent, RecoveryPolicy, RecoveryState,
 };
-use super::GenerationId;
 use crate::clock::{Clock, MonotonicTime};
 use futures_core::future::BoxFuture;
 use rand::Rng;
@@ -38,10 +38,7 @@ pub(crate) struct PreparedGeneration {
 }
 
 impl PreparedGeneration {
-    pub(crate) fn new(
-        runtime: RuntimeHandle,
-        publication: Box<dyn GenerationPublication>,
-    ) -> Self {
+    pub(crate) fn new(runtime: RuntimeHandle, publication: Box<dyn GenerationPublication>) -> Self {
         Self {
             runtime,
             publication,
@@ -205,8 +202,7 @@ impl RecoveryDriver {
                                     generation: next_generation,
                                 })
                                 .await;
-                            if published
-                                == Some(RecoveryEffect::PublishGeneration(next_generation))
+                            if published == Some(RecoveryEffect::PublishGeneration(next_generation))
                             {
                                 candidate.publication.publish();
                                 self.finish_recovery(candidate.runtime.connection_object())
@@ -267,25 +263,25 @@ impl RecoveryDriver {
         deadline: Option<MonotonicTime>,
         cancellation: Option<CancellationToken>,
     ) -> Result<ObjectToken, RecoveryError> {
-        let (id, completion) = {
-            let mut admissions = self.admissions.lock().await;
-            if !admissions.recovering {
-                return Ok(dependency);
-            }
-            if dependency != admissions.active_connection {
-                return Err(RecoveryError::DependencyNotConnection);
-            }
-            let id = admissions
-                .queue
-                .enqueue(dependency, deadline)
-                .map_err(|error| match error {
-                    RecoveryQueueError::Full => RecoveryError::QueueFull,
-                    RecoveryQueueError::IdExhausted => RecoveryError::WaitFailed,
-                })?;
-            let (reply, completion) = oneshot::channel();
-            admissions.completions.insert(id, reply);
-            (id, completion)
-        };
+        let (id, completion) =
+            {
+                let mut admissions = self.admissions.lock().await;
+                if !admissions.recovering {
+                    return Ok(dependency);
+                }
+                if dependency != admissions.active_connection {
+                    return Err(RecoveryError::DependencyNotConnection);
+                }
+                let id = admissions.queue.enqueue(dependency, deadline).map_err(
+                    |error| match error {
+                        RecoveryQueueError::Full => RecoveryError::QueueFull,
+                        RecoveryQueueError::IdExhausted => RecoveryError::WaitFailed,
+                    },
+                )?;
+                let (reply, completion) = oneshot::channel();
+                admissions.completions.insert(id, reply);
+                (id, completion)
+            };
 
         let deadline_wait = async {
             match deadline {
@@ -326,12 +322,12 @@ impl RecoveryDriver {
     async fn finish_recovery(&self, replacement: ObjectToken) {
         let mut admissions = self.admissions.lock().await;
         let previous = admissions.active_connection;
-        admissions.queue.publish_replacement(
-            ObjectEffect::ReplacementPublished {
+        admissions
+            .queue
+            .publish_replacement(ObjectEffect::ReplacementPublished {
                 previous,
                 replacement,
-            },
-        );
+            });
         admissions.active_connection = replacement;
         admissions.recovering = false;
         let outcomes = admissions.queue.release_dependency(replacement);
@@ -514,9 +510,15 @@ mod tests {
         );
 
         let recovered = driver.recover(exit).await.unwrap();
-        assert_eq!(recovered.connection_object().generation(), GenerationId::new(2));
+        assert_eq!(
+            recovered.connection_object().generation(),
+            GenerationId::new(2)
+        );
         assert_eq!(bootstrap.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(driver.state().await, RecoveryState::Connected(GenerationId::new(2)));
+        assert_eq!(
+            driver.state().await,
+            RecoveryState::Connected(GenerationId::new(2))
+        );
         recovered.close(clock.now()).await.unwrap();
     }
 
@@ -566,10 +568,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
         closing_driver.close().await;
-        assert!(matches!(
-            waiting.await.unwrap(),
-            Err(RecoveryError::Closed)
-        ));
+        assert!(matches!(waiting.await.unwrap(), Err(RecoveryError::Closed)));
     }
 
     #[tokio::test]
@@ -718,6 +717,9 @@ mod tests {
         clock.advance(Duration::from_secs(1)).await.unwrap();
         assert_eq!(timed.await.unwrap(), Err(RecoveryError::WaitTimedOut));
         driver.close().await;
-        assert!(matches!(recovery.await.unwrap(), Err(RecoveryError::Closed)));
+        assert!(matches!(
+            recovery.await.unwrap(),
+            Err(RecoveryError::Closed)
+        ));
     }
 }

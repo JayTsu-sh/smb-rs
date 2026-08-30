@@ -119,11 +119,7 @@ impl OplockSlot {
         self.generation.load().object
     }
 
-    pub(crate) fn replace(
-        &self,
-        file_id: FileId,
-        object: crate::runtime::ObjectToken,
-    ) {
+    pub(crate) fn replace(&self, file_id: FileId, object: crate::runtime::ObjectToken) {
         self.generation
             .store(Arc::new(OplockGeneration { file_id, object }));
     }

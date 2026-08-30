@@ -66,8 +66,12 @@ pub(crate) enum RecoveryEvent {
         generation: GenerationId,
         now: MonotonicTime,
     },
-    Wake { now: MonotonicTime },
-    AttemptSucceeded { generation: GenerationId },
+    Wake {
+        now: MonotonicTime,
+    },
+    AttemptSucceeded {
+        generation: GenerationId,
+    },
     AttemptFailed {
         now: MonotonicTime,
         jitter: Duration,
@@ -77,8 +81,14 @@ pub(crate) enum RecoveryEvent {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RecoveryEffect {
-    ScheduleAttempt { attempt: u32, at: MonotonicTime },
-    StartAttempt { attempt: u32, deadline: MonotonicTime },
+    ScheduleAttempt {
+        attempt: u32,
+        at: MonotonicTime,
+    },
+    StartAttempt {
+        attempt: u32,
+        deadline: MonotonicTime,
+    },
     PublishGeneration(GenerationId),
     RecoveryFailed,
     Closed,
@@ -141,10 +151,7 @@ impl RecoveryCoordinator {
                     Some(RecoveryEffect::StartAttempt { attempt, deadline })
                 }
             }
-            (
-                RecoveryState::Connecting { .. },
-                RecoveryEvent::AttemptSucceeded { generation },
-            ) => {
+            (RecoveryState::Connecting { .. }, RecoveryEvent::AttemptSucceeded { generation }) => {
                 self.state = RecoveryState::Connected(generation);
                 Some(RecoveryEffect::PublishGeneration(generation))
             }
@@ -223,22 +230,34 @@ mod tests {
                 generation: GenerationId::new(1),
                 now: at(0),
             }),
-            Some(RecoveryEffect::ScheduleAttempt { attempt: 1, at: at(0) })
+            Some(RecoveryEffect::ScheduleAttempt {
+                attempt: 1,
+                at: at(0)
+            })
         );
         assert_eq!(
             recovery.reduce(RecoveryEvent::Wake { now: at(0) }),
-            Some(RecoveryEffect::StartAttempt { attempt: 1, deadline: at(1) })
+            Some(RecoveryEffect::StartAttempt {
+                attempt: 1,
+                deadline: at(1)
+            })
         );
         assert_eq!(
             recovery.reduce(RecoveryEvent::AttemptFailed {
                 now: at(1),
                 jitter: Duration::ZERO,
             }),
-            Some(RecoveryEffect::ScheduleAttempt { attempt: 2, at: at(2) })
+            Some(RecoveryEffect::ScheduleAttempt {
+                attempt: 2,
+                at: at(2)
+            })
         );
         assert_eq!(
             recovery.reduce(RecoveryEvent::Wake { now: at(2) }),
-            Some(RecoveryEffect::StartAttempt { attempt: 2, deadline: at(3) })
+            Some(RecoveryEffect::StartAttempt {
+                attempt: 2,
+                deadline: at(3)
+            })
         );
         assert_eq!(
             recovery.reduce(RecoveryEvent::AttemptSucceeded {
@@ -246,19 +265,24 @@ mod tests {
             }),
             Some(RecoveryEffect::PublishGeneration(GenerationId::new(2)))
         );
-        assert!(recovery
-            .reduce(RecoveryEvent::AttemptSucceeded {
-                generation: GenerationId::new(3),
-            })
-            .is_none());
+        assert!(
+            recovery
+                .reduce(RecoveryEvent::AttemptSucceeded {
+                    generation: GenerationId::new(3),
+                })
+                .is_none()
+        );
     }
 
     #[test]
     fn total_deadline_and_attempt_limit_are_terminal() {
-        let mut deadline = RecoveryCoordinator::new(GenerationId::new(1), RecoveryPolicy {
-            total_timeout: SECOND,
-            ..policy()
-        });
+        let mut deadline = RecoveryCoordinator::new(
+            GenerationId::new(1),
+            RecoveryPolicy {
+                total_timeout: SECOND,
+                ..policy()
+            },
+        );
         deadline.reduce(RecoveryEvent::TransportLost {
             generation: GenerationId::new(1),
             now: at(0),
@@ -268,10 +292,13 @@ mod tests {
             Some(RecoveryEffect::RecoveryFailed)
         );
 
-        let mut attempts = RecoveryCoordinator::new(GenerationId::new(1), RecoveryPolicy {
-            max_attempts: 1,
-            ..policy()
-        });
+        let mut attempts = RecoveryCoordinator::new(
+            GenerationId::new(1),
+            RecoveryPolicy {
+                max_attempts: 1,
+                ..policy()
+            },
+        );
         attempts.reduce(RecoveryEvent::TransportLost {
             generation: GenerationId::new(1),
             now: at(0),
@@ -293,19 +320,26 @@ mod tests {
             generation: GenerationId::new(1),
             now: at(0),
         });
-        assert!(recovery
-            .reduce(RecoveryEvent::TransportLost {
-                generation: GenerationId::new(1),
-                now: at(0),
-            })
-            .is_none());
-        assert_eq!(recovery.reduce(RecoveryEvent::Close), Some(RecoveryEffect::Closed));
-        assert!(recovery.reduce(RecoveryEvent::Wake { now: at(10) }).is_none());
-
-        let mut disabled = RecoveryCoordinator::new(
-            GenerationId::new(1),
-            RecoveryPolicy::disabled(),
+        assert!(
+            recovery
+                .reduce(RecoveryEvent::TransportLost {
+                    generation: GenerationId::new(1),
+                    now: at(0),
+                })
+                .is_none()
         );
+        assert_eq!(
+            recovery.reduce(RecoveryEvent::Close),
+            Some(RecoveryEffect::Closed)
+        );
+        assert!(
+            recovery
+                .reduce(RecoveryEvent::Wake { now: at(10) })
+                .is_none()
+        );
+
+        let mut disabled =
+            RecoveryCoordinator::new(GenerationId::new(1), RecoveryPolicy::disabled());
         assert_eq!(
             disabled.reduce(RecoveryEvent::TransportLost {
                 generation: GenerationId::new(1),

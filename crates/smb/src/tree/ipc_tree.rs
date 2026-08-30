@@ -15,13 +15,7 @@ impl<'a> IpcTreeRef<'a> {
     }
 
     pub async fn query_network_interfaces(&self) -> crate::Result<Vec<NetworkInterfaceInfo>> {
-        if !self
-            .tree
-            .connection_info()
-            .config
-            .multichannel
-            .is_enabled()
-        {
+        if !self.tree.connection_info().config.multichannel.is_enabled() {
             // Server might decline + this is irrelevant!
             return Err(Error::InvalidState(
                 "Network interfaces can only be queried when multi-channel is enabled".to_string(),

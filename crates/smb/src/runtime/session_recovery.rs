@@ -187,10 +187,7 @@ impl SessionRecoveryCoordinator {
         self.state
     }
 
-    pub(crate) fn reduce(
-        &mut self,
-        event: SessionRecoveryEvent,
-    ) -> Option<SessionRecoveryEffect> {
+    pub(crate) fn reduce(&mut self, event: SessionRecoveryEvent) -> Option<SessionRecoveryEffect> {
         match (self.state, event) {
             (SessionRecoveryState::Closed | SessionRecoveryState::Revoked(_), _) => None,
             (_, SessionRecoveryEvent::Close) => {
@@ -287,8 +284,8 @@ impl SessionRecoveryCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::object_state::{ObjectKind, ObjectRegistry};
     use crate::runtime::GenerationId;
+    use crate::runtime::object_state::{ObjectKind, ObjectRegistry};
 
     fn objects(generation: u64) -> (ObjectToken, ObjectToken) {
         let mut objects = ObjectRegistry::new(GenerationId::new(generation));
@@ -319,12 +316,14 @@ mod tests {
             }),
             Some(SessionRecoveryEffect::StartAuthentication { attempt: 1, .. })
         ));
-        assert!(recovery
-            .reduce(SessionRecoveryEvent::AttemptSucceeded {
-                connection,
-                session: previous,
-            })
-            .is_none());
+        assert!(
+            recovery
+                .reduce(SessionRecoveryEvent::AttemptSucceeded {
+                    connection,
+                    session: previous,
+                })
+                .is_none()
+        );
         assert_eq!(
             recovery.reduce(SessionRecoveryEvent::AttemptSucceeded {
                 connection,
@@ -349,18 +348,22 @@ mod tests {
             now: MonotonicTime::ZERO,
         });
 
-        assert!(recovery
-            .reduce(SessionRecoveryEvent::ConnectionReplaced {
-                connection,
-                now: MonotonicTime::ZERO,
-            })
-            .is_none());
-        assert!(recovery
-            .reduce(SessionRecoveryEvent::AttemptFailed {
-                connection: stale_connection,
-                now: MonotonicTime::ZERO,
-            })
-            .is_none());
+        assert!(
+            recovery
+                .reduce(SessionRecoveryEvent::ConnectionReplaced {
+                    connection,
+                    now: MonotonicTime::ZERO,
+                })
+                .is_none()
+        );
+        assert!(
+            recovery
+                .reduce(SessionRecoveryEvent::AttemptFailed {
+                    connection: stale_connection,
+                    now: MonotonicTime::ZERO,
+                })
+                .is_none()
+        );
     }
 
     #[test]
@@ -385,12 +388,14 @@ mod tests {
                 ..
             }) if connection == third
         ));
-        assert!(recovery
-            .reduce(SessionRecoveryEvent::AttemptSucceeded {
-                connection: second,
-                session: second_session,
-            })
-            .is_none());
+        assert!(
+            recovery
+                .reduce(SessionRecoveryEvent::AttemptSucceeded {
+                    connection: second,
+                    session: second_session,
+                })
+                .is_none()
+        );
         assert!(matches!(
             recovery.reduce(SessionRecoveryEvent::AttemptSucceeded {
                 connection: third,
@@ -429,12 +434,14 @@ mod tests {
             closed.reduce(SessionRecoveryEvent::Close),
             Some(SessionRecoveryEffect::Closed)
         );
-        assert!(closed
-            .reduce(SessionRecoveryEvent::ConnectionReplaced {
-                connection,
-                now: MonotonicTime::ZERO,
-            })
-            .is_none());
+        assert!(
+            closed
+                .reduce(SessionRecoveryEvent::ConnectionReplaced {
+                    connection,
+                    now: MonotonicTime::ZERO,
+                })
+                .is_none()
+        );
     }
 
     #[test]
@@ -454,13 +461,15 @@ mod tests {
                 ..
             }) if target == connection
         ));
-        assert!(recovery
-            .reduce(SessionRecoveryEvent::SessionLost {
-                session: previous,
-                connection,
-                now: MonotonicTime::ZERO,
-            })
-            .is_none());
+        assert!(
+            recovery
+                .reduce(SessionRecoveryEvent::SessionLost {
+                    session: previous,
+                    connection,
+                    now: MonotonicTime::ZERO,
+                })
+                .is_none()
+        );
     }
 
     #[test]

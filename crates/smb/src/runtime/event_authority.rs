@@ -34,22 +34,10 @@ enum BreakState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EventInput {
-    Receive {
-        key: BreakKey,
-        ack_required: bool,
-    },
-    Invalidated {
-        key: BreakKey,
-        now: MonotonicTime,
-    },
-    AckCompleted {
-        key: BreakKey,
-        accepted: bool,
-    },
-    AckDeadline {
-        key: BreakKey,
-        now: MonotonicTime,
-    },
+    Receive { key: BreakKey, ack_required: bool },
+    Invalidated { key: BreakKey, now: MonotonicTime },
+    AckCompleted { key: BreakKey, accepted: bool },
+    AckDeadline { key: BreakKey, now: MonotonicTime },
     ReplaceGeneration(GenerationId),
     Close,
 }
@@ -231,12 +219,14 @@ mod tests {
             key: first,
             ack_required: true,
         });
-        assert!(events
-            .reduce(EventInput::Receive {
-                key: first,
-                ack_required: true,
-            })
-            .is_empty());
+        assert!(
+            events
+                .reduce(EventInput::Receive {
+                    key: first,
+                    ack_required: true,
+                })
+                .is_empty()
+        );
         assert_eq!(
             events.reduce(EventInput::Receive {
                 key: second,
@@ -265,12 +255,14 @@ mod tests {
             key: old,
             now: MonotonicTime::ZERO,
         });
-        assert!(events
-            .reduce(EventInput::AckDeadline {
-                key: old,
-                now: MonotonicTime::ZERO.saturating_add(Duration::from_secs(2)),
-            })
-            .is_empty());
+        assert!(
+            events
+                .reduce(EventInput::AckDeadline {
+                    key: old,
+                    now: MonotonicTime::ZERO.saturating_add(Duration::from_secs(2)),
+                })
+                .is_empty()
+        );
         assert_eq!(
             events.reduce(EventInput::AckDeadline {
                 key: old,
@@ -291,11 +283,13 @@ mod tests {
             vec![EventEffect::Invalidate(current)]
         );
         assert_eq!(events.reduce(EventInput::Close), vec![EventEffect::Closed]);
-        assert!(events
-            .reduce(EventInput::Receive {
-                key: current,
-                ack_required: false,
-            })
-            .is_empty());
+        assert!(
+            events
+                .reduce(EventInput::Receive {
+                    key: current,
+                    ack_required: false,
+                })
+                .is_empty()
+        );
     }
 }
