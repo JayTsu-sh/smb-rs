@@ -20,7 +20,6 @@ use crate::{
 
 pub mod directory;
 pub mod file;
-pub mod file_util;
 pub mod pipe;
 
 pub use directory::*;
@@ -603,25 +602,6 @@ impl Resource {
             _ => Err(Error::InvalidState(
                 "Resource is not a directory".to_string(),
             )),
-        }
-    }
-
-    #[deprecated(note = "Use into_file() which returns Result instead of panicking")]
-    pub fn unwrap_file(self) -> File {
-        match self {
-            Resource::File(f) => f,
-            other => panic!("Expected File, got {:?}", std::mem::discriminant(&other)),
-        }
-    }
-
-    #[deprecated(note = "Use into_dir() which returns Result instead of panicking")]
-    pub fn unwrap_dir(self) -> Directory {
-        match self {
-            Resource::Directory(d) => d,
-            other => panic!(
-                "Expected Directory, got {:?}",
-                std::mem::discriminant(&other)
-            ),
         }
     }
 }

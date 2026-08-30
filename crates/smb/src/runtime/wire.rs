@@ -369,6 +369,11 @@ impl WirePipeline {
                     "compound member {i}: additional_data is not supported in compound mode",
                 )));
             }
+            if m.security.is_none() {
+                return Err(crate::Error::InvalidState(format!(
+                    "compound member {i}: protection policy is not sealed",
+                )));
+            }
         }
 
         let mut builder = WireBuilder::encode(msgs.iter_mut().map(|msg| &mut msg.message), 1)?;
@@ -446,19 +451,13 @@ impl WirePipeline {
 
     /// Transforms an outgoing message to a raw SMB message.
     pub async fn transform_outgoing(&self, mut msg: CommandRequest) -> crate::Result<SendFrame> {
-        // Single source of truth for what to do with this message: the
-        // sealed `Protection` enum. Callers that haven't been migrated
-        // off the legacy `encrypt: bool` / `flags.signed()` hint fields
-        // fall through to a compatibility branch that mirrors the old
-        // behaviour — most of those callers (Negotiate Request) want
-        // no protection at all.
-        let (should_sign, should_encrypt) = match &msg.security {
-            Some(Protection::None) => (false, false),
-            Some(Protection::SignWithChannel) | Some(Protection::SnapshotKdfSign { .. }) => {
-                (true, false)
-            }
-            Some(Protection::Encrypt) => (false, true),
-            None => (msg.message.header.flags.signed(), false),
+        let protection = msg.security.as_ref().ok_or_else(|| {
+            crate::Error::InvalidState("wire protection policy is not sealed".into())
+        })?;
+        let (should_sign, should_encrypt) = match protection {
+            Protection::None => (false, false),
+            Protection::SignWithChannel | Protection::SnapshotKdfSign { .. } => (true, false),
+            Protection::Encrypt => (false, true),
         };
         let session_id = msg.message.header.session_id;
 
@@ -918,7 +917,8 @@ mod wire_builder_tests {
         let outgoing = CommandRequest::new(
             WriteRequest::new(0, FileId::EMPTY, WriteFlags::new(), payload.len() as u32).into(),
         )
-        .with_additional_data(payload);
+        .with_additional_data(payload)
+        .with_protection(Protection::None);
 
         let wire = WirePipeline::default()
             .transform_outgoing(outgoing)

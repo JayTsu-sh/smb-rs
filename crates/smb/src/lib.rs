@@ -1,13 +1,10 @@
 #![doc = include_str!("../docs/index.md")]
 #![forbid(unsafe_code)]
 
-#[allow(dead_code)]
 pub(crate) mod client;
 mod clock;
-#[allow(dead_code)]
 pub(crate) mod command;
 pub mod compression;
-#[allow(dead_code)]
 pub(crate) mod connection;
 pub mod crypto;
 pub mod dialects;
@@ -15,16 +12,12 @@ pub mod docs;
 pub mod domain;
 pub mod error;
 pub mod facade;
-#[allow(dead_code)]
 pub(crate) mod lease;
-#[allow(dead_code)]
 pub(crate) mod resource;
 pub(crate) mod runtime;
 #[cfg(feature = "test-support")]
 mod scenario;
-#[allow(dead_code)]
 pub(crate) mod session;
-#[allow(dead_code)]
 pub(crate) mod tree;
 
 /// Test-only API surface.

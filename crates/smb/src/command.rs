@@ -15,23 +15,16 @@ pub struct CommandRequest {
     /// Channel ID to use for this message, if any.
     pub channel_id: Option<u32>,
 
-    /// Internal: explicit, sealed-at-construction safety policy.
-    /// Producers stamp this directly (`tree.submit` for share-level
-    /// encrypt_data; session-setup driver for `SnapshotKdfSign`); the
-    /// channel layer fills in the default for any message that
-    /// arrives with `None` based on session state. Once set, the
-    /// wire pipeline dispatches purely on this enum without inspecting
-    /// other mutable state — eliminating the class of bug where the
-    /// state inference looked at `session.state` to decide and got it
-    /// wrong (e.g. the Windows-DC unsigned-final-request regression).
+    /// Explicit policy that must be sealed before entering the wire module.
+    /// Channel submission derives it from Session state; connection-level
+    /// negotiation and setup requests stamp `Protection::None` directly.
     pub(crate) security: Option<Protection>,
 }
 
 /// Explicit security treatment for an [`CommandRequest`].
 ///
-/// Sealed at construction by the caller (or, for legacy paths,
-/// inferred by `ChannelContext::submit` from session state and
-/// stamped into the message before it leaves the channel layer), so
+/// Sealed by the caller or inferred by `ChannelContext::submit` before the
+/// request crosses the wire seam, so
 /// the wire pipeline can dispatch purely on this enum without
 /// inspecting other mutable state.
 #[derive(Debug, Clone)]
@@ -83,6 +76,11 @@ impl CommandRequest {
 
     pub fn with_channel_id(mut self, channel_id: Option<u32>) -> Self {
         self.channel_id = channel_id;
+        self
+    }
+
+    pub(crate) fn with_protection(mut self, protection: Protection) -> Self {
+        self.security = Some(protection);
         self
     }
 

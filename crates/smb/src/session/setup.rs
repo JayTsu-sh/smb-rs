@@ -247,7 +247,8 @@ where
             )
             .into(),
         )
-        .with_return_raw_data(true);
+        .with_return_raw_data(true)
+        .with_protection(crate::command::Protection::None);
 
         if self.kind == SetupKind::Bind {
             // TODO: what about DFS in previous session?

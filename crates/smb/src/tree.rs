@@ -1,8 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use smb_msg::{FileId, FsctlRequest, IoctlRequest, IoctlRequestFlags};
-
 use crate::connection::connection_info::ConnectionInfo;
 use crate::resource::FileCreateArgs;
 use smb_fscc::{FileAccessMask, FileAttributes};
@@ -12,12 +10,8 @@ use smb_msg::{
     tree_connect::{TreeConnectRequest, TreeDisconnectRequest},
 };
 
-use crate::{Error, command::Protection, resource::Resource, session::SessionContext};
-mod dfs_tree;
-mod ipc_tree;
 use crate::command::{CommandRequest, CommandResponse, CommandSubmission, ResponseOptions};
-pub use dfs_tree::*;
-pub use ipc_tree::*;
+use crate::{Error, command::Protection, resource::Resource, session::SessionContext};
 
 type Upstream = Arc<SessionContext>;
 
@@ -204,11 +198,6 @@ impl Tree {
             .await
     }
 
-    pub fn is_dfs_root(&self) -> crate::Result<bool> {
-        let info = self.context.info()?;
-        Ok(info.share_flags.dfs_root() && info.share_flags.dfs())
-    }
-
     /// Returns the SMB-assigned tree id for this connected share.
     /// Used by the lease cache (Phase C) so cache hits can match opens
     /// against the same tree the original Create was issued on.
@@ -229,25 +218,6 @@ impl Tree {
         &self.context
     }
 
-    pub fn as_dfs_tree(&self) -> crate::Result<DfsRootTreeRef<'_>> {
-        if !self.is_dfs_root()? {
-            return Err(Error::InvalidState("Tree is not a DFS tree".to_string()));
-        }
-        Ok(DfsRootTreeRef::new(self))
-    }
-
-    pub fn as_ipc_tree(&self) -> crate::Result<IpcTreeRef<'_>> {
-        let info = self.context.info()?;
-        if info.share_type != ShareType::Pipe {
-            return Err(Error::InvalidState(format!(
-                "Tree is not IPC tree ({:?})",
-                info.share_type
-            )));
-        }
-
-        IpcTreeRef::new(self)
-    }
-
     /// Disconnects from the tree (share) on the server.
     ///
     /// After calling this method, none of the resources held open by the tree are accessible.
@@ -255,31 +225,6 @@ impl Tree {
     pub async fn disconnect(&self) -> crate::Result<()> {
         self.context.disconnect().await?;
         Ok(())
-    }
-
-    // TODO: Make it common with ResourceHandle::fsctl_with_options
-    pub(crate) async fn fsctl_with_options<T: FsctlRequest>(
-        &self,
-        request: T,
-        max_output_response: u32,
-    ) -> crate::Result<T::Response> {
-        const NO_INPUT_IN_RESPONSE: u32 = 0;
-        let response = self
-            .context
-            .send_recv(RequestContent::Ioctl(IoctlRequest {
-                ctl_code: T::FSCTL_CODE as u32,
-                file_id: FileId::FULL,
-                max_input_response: NO_INPUT_IN_RESPONSE,
-                max_output_response,
-                flags: IoctlRequestFlags::new().with_is_fsctl(true),
-                buffer: request.into(),
-            }))
-            .await?
-            .message
-            .content
-            .to_ioctl()?
-            .parse_fsctl::<T::Response>()?;
-        Ok(response)
     }
 }
 

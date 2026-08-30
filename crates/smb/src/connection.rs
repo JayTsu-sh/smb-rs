@@ -390,7 +390,8 @@ impl Connection {
                     )
                     .into(),
                 )
-                .with_return_raw_data(true),
+                .with_return_raw_data(true)
+                .with_protection(Protection::None),
             )
             .await?;
 
