@@ -13,7 +13,6 @@ categories.workspace = true
 
 [dependencies]
 smb-dtyp = { workspace = true }
-smb-msg = { workspace = true, optional = true }
 
 bytes = { workspace = true }
 tracing = { workspace = true }
@@ -21,17 +20,6 @@ tokio = { workspace = true, features = ["net", "macros", "io-util", "time"] }
 tokio-util = { workspace = true }
 futures-core = { workspace = true }
 futures-util = { workspace = true }
-
-# QUIC
-quinn = { workspace = true, optional = true }
-rustls = { workspace = true, default-features = false, optional = true }
-rustls-platform-verifier = { workspace = true, default-features = false, optional = true }
-
-# RDMA
-# async-rdma = { git = "https://github.com/afiffon/async-rdma.git", rev = "878828dd", features = [
-#     "cm",
-#     "raw",
-# ], optional = true }
 
 binrw = { workspace = true }
 modular-bitfield = { workspace = true }
@@ -41,10 +29,14 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 smb-tests = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[[test]]
+name = "scripted_transport"
+required-features = ["test-support"]
 
 [features]
 default = ["netbios-transport"]
 
 netbios-transport = []
-quic = ["dep:quinn", "dep:rustls", "dep:rustls-platform-verifier"]
-rdma = ["dep:smb-msg"]                                             # , "dep:async-rdma"]
+test-support = []

@@ -15,10 +15,10 @@
 //! runs (e.g. before `delete` or `rename`).
 
 use crate::connection::connection_info::ConnectionInfo;
-use crate::tree::TreeMessageHandler;
+use crate::tree::TreeContext;
 use smb_dtyp::Guid;
 use smb_fscc::FileAccessMask;
-use smb_msg::{CreateDisposition, FileId, LeaseState, ShareType};
+use smb_msg::{CreateDisposition, FileId, LeaseState, OplockLevel, ShareType};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -29,11 +29,9 @@ use time::PrimitiveDateTime;
 /// into a `Copy`-cheap form for fan-out across subscribers.
 ///
 /// The client-side reaction is two-step:
-/// 1. Receive the [`LeaseBreakEvent`] (this struct) and start invalidating
-///    any cached state keyed on `lease_key`.
-/// 2. Send a `LeaseBreakAck` back to the server within the 35-second timeout.
-///    Phase B sends the ack automatically before publishing the event; Phase C
-///    will additionally drive any deferred `Close` for the affected handle.
+/// Before this event is published, the connection atomically invalidates
+/// cached state keyed on `lease_key`, then completes or times out the required
+/// `LeaseBreakAck`.
 ///
 /// Reference: MS-SMB2 2.2.23.2 (LeaseBreakNotification).
 #[derive(Debug, Clone, Copy)]
@@ -57,6 +55,9 @@ pub struct LeaseBreakEvent {
     /// 35-second timeout. `false` indicates the server is just informing
     /// us of an unconditional downgrade; no reply is required.
     pub ack_required: bool,
+    /// Terminal result of the bounded protocol acknowledgement. Cache
+    /// invalidation has already completed before this result is published.
+    pub ack_outcome: LeaseBreakAckOutcome,
     /// Wall-clock instant the client received the notification. Today
     /// this is purely observational (surfaced in tracing on the
     /// listener task); kept on the event so the future ack-timeout
@@ -68,14 +69,74 @@ pub struct LeaseBreakEvent {
     pub received_at: Instant,
 }
 
-/// Internal handler/conn-info prototype captured at slot-insert time so a
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum LeaseBreakAckOutcome {
+    NotRequired,
+    Accepted,
+    Failed,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct OplockBreakEvent {
+    pub file_id: FileId,
+    pub previous_level: OplockLevel,
+    pub new_level: OplockLevel,
+    pub ack_outcome: LeaseBreakAckOutcome,
+    pub received_at: Instant,
+}
+
+pub(crate) struct OplockSlot {
+    generation: arc_swap::ArcSwap<OplockGeneration>,
+    pub(crate) level: RwLock<OplockLevel>,
+    pub(crate) context: Arc<TreeContext>,
+}
+
+struct OplockGeneration {
+    file_id: FileId,
+    object: crate::runtime::ObjectToken,
+}
+
+impl OplockSlot {
+    pub(crate) fn new(
+        file_id: FileId,
+        level: OplockLevel,
+        context: Arc<TreeContext>,
+        object: crate::runtime::ObjectToken,
+    ) -> Self {
+        Self {
+            generation: arc_swap::ArcSwap::from_pointee(OplockGeneration { file_id, object }),
+            level: RwLock::new(level),
+            context,
+        }
+    }
+
+    pub(crate) fn file_id(&self) -> FileId {
+        self.generation.load().file_id
+    }
+
+    pub(crate) fn object(&self) -> crate::runtime::ObjectToken {
+        self.generation.load().object
+    }
+
+    pub(crate) fn replace(&self, file_id: FileId, object: crate::runtime::ObjectToken) {
+        self.generation
+            .store(Arc::new(OplockGeneration { file_id, object }));
+    }
+}
+
+/// Internal context/conn-info prototype captured at slot-insert time so a
 /// later cache hit can construct a fresh [`crate::ResourceHandle`] sharing
 /// the same FileId without re-issuing Create. Held inside [`LeaseSlot`]
 /// behind an `Arc` so cloning is cheap and stable across hits.
 pub(crate) struct ResourceProto {
-    /// Shared handler chain — `Arc`-backed under the hood, so cloning into
+    /// Shared context chain — `Arc`-backed under the hood, so cloning into
     /// a new ResourceHandle on hit is just a refcount bump.
-    pub handler: Arc<TreeMessageHandler>,
+    pub context: Arc<TreeContext>,
+    /// Runtime-owned identity shared by every cache-hit handle for this open.
+    pub object: crate::runtime::ObjectToken,
+    /// Share generation that owns `object`.
+    pub share: crate::runtime::ObjectToken,
     /// Snapshot of the connection's negotiated info at create time; the
     /// same instance every resulting ResourceHandle reads from. Cheap to
     /// clone (Arc).
@@ -132,7 +193,7 @@ pub(crate) struct ResourceProto {
 /// Three locks may be held concurrently across this type and the
 /// per-connection `lease_table`:
 ///
-/// 1. `ConnectionMessageHandler::lease_table` (outer; `Mutex<HashMap<…>>`).
+/// 1. `ConnectionCore::lease_table` (outer; `Mutex<HashMap<…>>`).
 /// 2. `LeaseSlot::granted_state` (`RwLock<LeaseState>`).
 /// 3. `LeaseSlot::last_used` (`RwLock<Instant>`).
 ///
@@ -185,7 +246,7 @@ pub struct LeaseSlot {
     pub last_used: RwLock<Instant>,
     /// Reconstruction snapshot (Phase C.3): everything a cache hit needs
     /// to materialize a fresh `ResourceHandle` without sending Create on
-    /// the wire. `pub(crate)` because it references internal handler
+    /// the wire. `pub(crate)` because it references internal context
     /// types; external callers don't need direct access.
     pub(crate) proto: Arc<ResourceProto>,
 }

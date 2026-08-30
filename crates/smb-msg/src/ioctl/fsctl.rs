@@ -820,7 +820,7 @@ mod tests {
 
     const CHUNK_SIZE: u32 = 1 << 20; // 1 MiB
     const TOTAL_SIZE: u32 = 10417096;
-    const BLOCK_NUM: u32 = (TOTAL_SIZE + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    const BLOCK_NUM: u32 = TOTAL_SIZE.div_ceil(CHUNK_SIZE);
 
     test_binrw_request! {
         struct SrvCopychunkCopy {

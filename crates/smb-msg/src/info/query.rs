@@ -270,7 +270,7 @@ mod tests {
 
     use super::*;
 
-    const QUERY_INFO_HEADER_DATA: &'static str = "";
+    const QUERY_INFO_HEADER_DATA: &str = "";
 
     test_request! {
         query_info_basic: QueryInfo {

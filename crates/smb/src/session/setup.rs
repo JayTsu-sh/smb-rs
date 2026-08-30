@@ -41,7 +41,7 @@ where
     last_setup_response: Option<SessionSetupResponse>,
     flags: Option<SessionFlags>,
 
-    handler: Option<ChannelMessageHandler>,
+    context: Option<ChannelContext>,
 
     result: Option<Arc<SessionAndChannel>>,
 
@@ -102,7 +102,7 @@ where
             last_setup_response: None,
             flags: None,
             result: None,
-            handler: None,
+            context: None,
             authenticator,
             upstream,
             conn_info,
@@ -170,12 +170,18 @@ where
                 None => self.authenticator.next(&[]).await?,
             };
             let is_auth_done = self.authenticator.is_authenticated()?;
+            if is_auth_done && next_buf.is_empty() {
+                break;
+            }
+            let is_final_request = is_auth_done || self.authenticator.session_key().is_ok();
 
             // Branches on is_auth_done; see send_final_setup_request for
             // the signing + preauth-hash contract.
-            let request = self.send_setup_request(next_buf).await?;
+            let request = self.send_setup_request(next_buf, is_final_request).await?;
 
-            let response = self.receive_setup_response(request.msg_id).await?;
+            let response = self
+                .receive_setup_response(request.msg_id, is_final_request)
+                .await?;
             let message_form = response.form;
             let session_id = response.message.header.session_id;
             let session_setup_response = response.message.content.to_sessionsetup()?;
@@ -191,7 +197,7 @@ where
                 self.set_session(session_info).await?;
             }
 
-            if is_auth_done
+            if is_final_request
                 && !session_setup_response
                     .session_flags
                     .is_guest_or_null_session()
@@ -202,11 +208,14 @@ where
                 return Err(crate::error::SetupError::UnsignedFinalResponse.into());
             }
             // Intermediate response preauth ingest is now done inside
-            // `Transformer::transform_incoming` (S4-T2); no driver-side
+            // `WirePipeline::transform_incoming` (S4-T2); no driver-side
             // bookkeeping needed.
 
             self.flags = Some(session_setup_response.session_flags);
-            self.last_setup_response = Some(session_setup_response)
+            self.last_setup_response = Some(session_setup_response);
+            if is_final_request {
+                break;
+            }
         }
 
         self.flags.ok_or(Error::InvalidState(
@@ -227,9 +236,9 @@ where
     /// only per-flavour delta is whether the `binding` flag in
     /// `SessionSetupRequest.flags` is set — true for channel binds,
     /// false for new sessions.
-    fn make_request(&self, buffer: Vec<u8>) -> OutgoingMessage {
+    fn make_request(&self, buffer: Vec<u8>) -> CommandRequest {
         let has_dfs = self.conn_info.negotiation.caps.dfs();
-        let mut msg = OutgoingMessage::new(
+        let mut msg = CommandRequest::new(
             SessionSetupRequest::new(
                 buffer,
                 SessionSecurityMode::new().with_signing_enabled(true),
@@ -238,7 +247,8 @@ where
             )
             .into(),
         )
-        .with_return_raw_data(true);
+        .with_return_raw_data(true)
+        .with_protection(crate::command::Protection::None);
 
         if self.kind == SetupKind::Bind {
             // TODO: what about DFS in previous session?
@@ -313,8 +323,8 @@ where
     }
 
     /// Run on the `Err` exit of [`Self::_setup_loop`]. New-session
-    /// cleanup invalidates the session before notifying the worker;
-    /// bind cleanup only notifies the worker (the primary session
+    /// cleanup invalidates the session before notifying the generation_runtime;
+    /// bind cleanup only notifies the generation_runtime (the primary session
     /// stays usable on its original channel).
     async fn error_cleanup(&mut self) -> crate::Result<()> {
         let session = match self.result.as_ref() {
@@ -334,8 +344,8 @@ where
         }
 
         self.upstream
-            .worker()
-            .ok_or_else(|| Error::InvalidState("Worker not available!".to_string()))?
+            .generation_runtime()
+            .ok_or_else(|| Error::InvalidState("Generation runtime not available!".to_string()))?
             .session_ended(session)
             .await
     }
@@ -349,12 +359,12 @@ where
         let session_id = session.read().await.id();
         let session = Arc::new(SessionAndChannel::new(session_id, session));
 
-        let setup_handler = ChannelMessageHandler::make_for_setup(&session, self.upstream).await?;
-        self.handler = Some(setup_handler);
+        let setup_handler = ChannelContext::make_for_setup(&session, self.upstream).await?;
+        self.context = Some(setup_handler);
 
         self.upstream
-            .worker()
-            .ok_or_else(|| Error::InvalidState("Worker not available!".to_string()))?
+            .generation_runtime()
+            .ok_or_else(|| Error::InvalidState("Generation runtime not available!".to_string()))?
             .session_started(&session)
             .await?;
 
@@ -363,16 +373,20 @@ where
         Ok(())
     }
 
-    async fn receive_setup_response(&mut self, for_msg_id: u64) -> crate::Result<IncomingMessage> {
+    async fn receive_setup_response(
+        &mut self,
+        for_msg_id: u64,
+        is_final_request: bool,
+    ) -> crate::Result<CommandResponse> {
         let is_auth_done = self.authenticator.is_authenticated()?;
 
-        let expected_status = if is_auth_done {
+        let expected_status = if is_final_request {
             &[Status::Success]
         } else {
             &[Status::MoreProcessingRequired]
         };
 
-        let roptions = ReceiveOptions::new()
+        let roptions = ResponseOptions::new()
             .with_status(expected_status)
             .with_msg_id_filter(for_msg_id);
 
@@ -381,17 +395,17 @@ where
             None => false,
         };
         let skip_security_validation = !is_auth_done && !channel_set_up;
-        let result = if let Some(handler) = &self.handler {
+        let result = if let Some(context) = &self.context {
             tracing::trace!(
-                "setup loop: receiving with channel handler; skip_security_validation={skip_security_validation}"
+                "setup loop: receiving with channel context; skip_security_validation={skip_security_validation}"
             );
-            handler
+            context
                 .recvo_internal(roptions, skip_security_validation)
                 .await
         } else {
             assert!(skip_security_validation);
-            tracing::trace!("setup loop: receiving with upstream handler");
-            self.upstream.recvo(roptions).await
+            tracing::trace!("setup loop: receiving with upstream context");
+            self.upstream.await_response(roptions).await
         };
 
         // Upgrade generic transport / channel-layer errors to
@@ -401,7 +415,7 @@ where
         // signed or encrypted" strings.
         //
         // The `InvalidMessage` string match targets the rejection in
-        // `ChannelMessageHandler::_verify_incoming`: on the final
+        // `ChannelContext::_verify_incoming`: on the final
         // SessionSetup Response that arrived unsigned, the channel
         // verifies *before* `_setup_loop` reaches its own sanity
         // check, so we re-tag the error here. (Long-term S5/S7 will
@@ -422,11 +436,14 @@ where
         })
     }
 
-    async fn send_setup_request(&mut self, buf: Vec<u8>) -> crate::Result<SendMessageResult> {
+    async fn send_setup_request(
+        &mut self,
+        buf: Vec<u8>,
+        is_final_request: bool,
+    ) -> crate::Result<CommandSubmission> {
         let request = self.make_request(buf);
-        let is_auth_done = self.authenticator.is_authenticated()?;
 
-        if is_auth_done {
+        if is_final_request {
             self.send_final_setup_request(request).await
         } else {
             self.send_intermediate_setup_request(request).await
@@ -435,17 +452,17 @@ where
 
     /// Never signed, so wire bytes == plain bytes (`signature = 0`).
     /// The connection-level preauth hash is fed by
-    /// `Transformer::transform_outgoing` (S4-T2); the driver is hands-off.
+    /// `WirePipeline::transform_outgoing` (S4-T2); the driver is hands-off.
     async fn send_intermediate_setup_request(
         &mut self,
-        request: OutgoingMessage,
-    ) -> crate::Result<SendMessageResult> {
-        if let Some(handler) = self.handler.as_ref() {
-            tracing::trace!("setup loop: sending intermediate with channel handler");
-            handler.sendo(request).await
+        request: CommandRequest,
+    ) -> crate::Result<CommandSubmission> {
+        if let Some(context) = self.context.as_ref() {
+            tracing::trace!("setup loop: sending intermediate with channel context");
+            context.submit(request).await
         } else {
-            tracing::trace!("setup loop: sending intermediate with upstream handler");
-            self.upstream.sendo(request).await
+            tracing::trace!("setup loop: sending intermediate with upstream context");
+            self.upstream.submit(request).await
         }
     }
 
@@ -454,16 +471,16 @@ where
     ///
     /// Per MS-SMB2 §3.3.5.5.3 the server **requires** this request to
     /// be signed on any non-anonymous SMB 3.x session (Windows DCs in
-    /// particular drop it silently otherwise). The transformer owns
+    /// particular drop it silently otherwise). The wire pipeline owns
     /// the preauth-hash plumbing: we just attach the GSS-derived
     /// SessionKey to the outgoing message via `setup_phase_signing_key`,
-    /// and `Transformer::transform_outgoing` ingests the plain bytes,
+    /// and `WirePipeline::transform_outgoing` ingests the plain bytes,
     /// derives a one-shot signer from the resulting finalized hash, and
     /// signs in place — all in one pass.
     async fn send_final_setup_request(
         &mut self,
-        mut request: OutgoingMessage,
-    ) -> crate::Result<SendMessageResult> {
+        mut request: CommandRequest,
+    ) -> crate::Result<CommandSubmission> {
         self.upstream.prepare_outgoing(&mut request).await?;
 
         let session_id = self
@@ -475,13 +492,13 @@ where
             .session_id;
         request.message.header.session_id = session_id;
 
-        request.security = Some(crate::msg_handler::Protection::SnapshotKdfSign {
+        request.security = Some(crate::command::Protection::SnapshotKdfSign {
             session_key: self.session_key()?,
         });
         let request = request.into_signed();
         // The SnapshotKdfSign Protection set above is what the
-        // transformer dispatches on; `into_signed` just flips the
-        // wire-protocol signed flag so worker bookkeeping that still
+        // wire pipeline dispatches on; `into_signed` just flips the
+        // wire-protocol signed flag so generation_runtime bookkeeping that still
         // inspects `flags.signed` sees a consistent state.
 
         tracing::trace!(
@@ -494,7 +511,7 @@ where
         // Install the channel into session_state *after* dispatch so
         // the receive path can verify the matching signed Response —
         // the channel signer is derived from the same preauth hash the
-        // transformer used a moment ago (it's stable now: the
+        // wire pipeline used a moment ago (it's stable now: the
         // SessionSetup Response with status=Success does NOT update
         // the hash per MS-SMB2 §3.1.4.2).
         self.make_channel().await?;
@@ -504,14 +521,14 @@ where
 
     /// Builds the [`ChannelInfo`] for this session's primary channel
     /// (or the bound channel) using the GSS SessionKey and the
-    /// transformer's finalized preauth hash, then installs it into the
-    /// shared `session_state` so the transformer can find the signer
+    /// wire pipeline's finalized preauth hash, then installs it into the
+    /// shared `session_state` so the wire pipeline can find the signer
     /// for the upcoming final SessionSetup Response.
     async fn make_channel(&mut self) -> crate::Result<()> {
         self.on_session_key_exchanged().await?;
         tracing::trace!("Session keys are set.");
 
-        // The preauth hash is owned by the transformer (S4-T1); snapshot
+        // The preauth hash is owned by the wire pipeline (S4-T1); snapshot
         // its current finalized value to derive the channel SigningKey.
         let preauth_snapshot = self.preauth_hash_snapshot().await?;
 
@@ -542,14 +559,13 @@ where
         self.authenticator.session_key()
     }
 
-    /// Snapshot the connection-level preauth hash from the transformer
+    /// Snapshot the connection-level preauth hash from the runtime wire pipeline
     /// (S4-T1).
     async fn preauth_hash_snapshot(&self) -> crate::Result<Option<PreauthHashValue>> {
         self.upstream
-            .worker()
-            .ok_or_else(|| Error::InvalidState("Worker not available!".to_string()))?
-            .transformer()
-            .snapshot_preauth_finalized()
+            .generation_runtime()
+            .ok_or_else(|| Error::InvalidState("Generation runtime not available!".to_string()))?
+            .preauth_snapshot()
             .await
     }
 

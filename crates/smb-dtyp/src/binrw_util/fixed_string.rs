@@ -194,9 +194,9 @@ mod tests {
         type FS = BaseFixedString<$chartype, 5>;
         let s = "abc";
         let fs: FS = s.parse().unwrap();
-        assert_eq!(fs.as_slice()[0], 'a' as $chartype);
-        assert_eq!(fs.as_slice()[1], 'b' as $chartype);
-        assert_eq!(fs.as_slice()[2], 'c' as $chartype);
+        assert_eq!(fs.as_slice()[0], b'a' as $chartype);
+        assert_eq!(fs.as_slice()[1], b'b' as $chartype);
+        assert_eq!(fs.as_slice()[2], b'c' as $chartype);
         for &c in &fs.as_slice()[3..] {
             assert_eq!(c, <$chartype>::default());
         }

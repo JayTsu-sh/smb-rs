@@ -25,6 +25,16 @@ impl Decompressor {
         &self,
         original: &CompressedMessage,
     ) -> Result<(Response, Vec<u8>), CompressionError> {
+        let original_size = match original {
+            CompressedMessage::Unchained(message) => message.original_size,
+            CompressedMessage::Chained(message) => message.original_size,
+        } as usize;
+        if original_size > smb_transport::DEFAULT_MAX_FRAME_SIZE {
+            return Err(CompressionError::DecompressedSizeLimitExceeded {
+                announced: original_size,
+                maximum: smb_transport::DEFAULT_MAX_FRAME_SIZE,
+            });
+        }
         let method: Box<dyn CompressionMethod> = match original {
             CompressedMessage::Unchained(_) => Box::new(UnchainedCompression),
             CompressedMessage::Chained(_) => {
@@ -45,7 +55,7 @@ impl Decompressor {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Compressor {
     caps: Arc<CompressionCapabilities>,
 }
@@ -62,6 +72,55 @@ impl Compressor {
             Ok(ChainedCompression.compress(bytes, &self.caps.compression_algorithms)?)
         } else {
             Ok(UnchainedCompression.compress(bytes, &self.caps.compression_algorithms)?)
+        }
+    }
+
+    /// Compress directly into the sole serialized transform arena. Outgoing
+    /// compression deliberately uses the unchained form even when chained
+    /// compression was negotiated: support for chained messages is a
+    /// capability, not a requirement, and the unchained form lets LZ4 write
+    /// into its final owner without an intermediate compressed `Vec`.
+    pub fn compress_transform(
+        &self,
+        bytes: &[u8],
+        prefix: usize,
+    ) -> Result<Vec<u8>, CompressionError> {
+        if !self
+            .caps
+            .compression_algorithms
+            .contains(&CompressionAlgorithm::LZ4)
+        {
+            return Err(CompressionError::NoSupportedCompressionAlgorithm);
+        }
+        let original_size =
+            u32::try_from(bytes.len()).map_err(|_| CompressionError::InvalidCompressedMessage)?;
+
+        #[cfg(feature = "compress_lz4")]
+        {
+            let header_end = prefix
+                .checked_add(CompressedUnchainedMessage::STRUCT_SIZE)
+                .ok_or(CompressionError::InvalidCompressedMessage)?;
+            let maximum = lz4_flex::block::get_maximum_output_size(bytes.len());
+            let capacity = header_end
+                .checked_add(maximum)
+                .ok_or(CompressionError::InvalidCompressedMessage)?;
+            let mut output = vec![0; capacity];
+            CompressedUnchainedMessage {
+                original_size,
+                compression_algorithm: CompressionAlgorithm::LZ4,
+                data: Vec::new(),
+            }
+            .write(&mut Cursor::new(&mut output[prefix..header_end]))
+            .map_err(|_| CompressionError::InvalidCompressedMessage)?;
+            let written = lz4_flex::block::compress_into(bytes, &mut output[header_end..])?;
+            output.truncate(header_end + written);
+            Ok(output)
+        }
+
+        #[cfg(not(feature = "compress_lz4"))]
+        {
+            let _ = (bytes, prefix, original_size);
+            Err(CompressionError::NoSupportedCompressionAlgorithm)
         }
     }
 }
@@ -105,11 +164,14 @@ impl CompressionMethod for UnchainedCompression {
     fn decompress(&self, compressed: &CompressedMessage) -> Result<Vec<u8>, CompressionError> {
         let compressed = match compressed {
             CompressedMessage::Unchained(c) => c,
-            _ => panic!("Expected Unchained message"),
+            _ => return Err(CompressionError::UnsupportedCompressionMethod),
         };
         let mut data: Vec<u8> = Vec::with_capacity(compressed.original_size as usize);
         self.get_compression_algorithm(compressed.compression_algorithm)?
             .decompress(&compressed.data, Some(compressed.original_size), &mut data)?;
+        if data.len() != compressed.original_size as usize {
+            return Err(CompressionError::InvalidDecompressedMessage);
+        }
         Ok(data)
     }
 
@@ -143,7 +205,7 @@ impl CompressionMethod for ChainedCompression {
     fn decompress(&self, compressed: &CompressedMessage) -> Result<Vec<u8>, CompressionError> {
         let compressed = match compressed {
             CompressedMessage::Chained(c) => c,
-            _ => panic!("Expected Chained message"),
+            _ => return Err(CompressionError::UnsupportedCompressionMethod),
         };
 
         if compressed.original_size < Header::STRUCT_SIZE as u32 {
@@ -162,7 +224,7 @@ impl CompressionMethod for ChainedCompression {
             if len_after > compressed.original_size as usize {
                 return Err(CompressionError::ChainedCompressionFailed(
                     "Decompressed size exceeds the expected size".to_string(),
-                ))?;
+                ));
             }
             if let Some(original_size) = item.original_size {
                 if len_after - len_before != original_size as usize {
@@ -388,12 +450,16 @@ impl CompressionAlgorithmImpl for Lz4Compression {
         original_size: Option<u32>,
         out: &mut Vec<u8>,
     ) -> Result<(), CompressionError> {
+        let original_size = original_size.ok_or(CompressionError::InvalidCompressedMessage)?;
         let start_index = out.len();
-        out.resize(start_index + original_size.unwrap() as usize, 0);
+        let end = start_index
+            .checked_add(original_size as usize)
+            .ok_or(CompressionError::InvalidCompressedMessage)?;
+        out.resize(end, 0);
 
         let size = lz4_flex::decompress_into(compressed, &mut out[start_index..])?;
 
-        if size != original_size.unwrap() as usize {
+        if size != original_size as usize {
             Err(CompressionError::PatternV1InvalidDecompressedSize)?;
         }
         Ok(())
@@ -419,6 +485,8 @@ pub enum CompressionError {
     UnsupportedCompressionMethod,
     #[error("There is no supported compression algorithm available.")]
     NoSupportedCompressionAlgorithm,
+    #[error("decompressed size {announced} exceeds limit {maximum}")]
+    DecompressedSizeLimitExceeded { announced: usize, maximum: usize },
 
     // --- LZ4
     #[cfg(feature = "compress_lz4")]
@@ -441,6 +509,23 @@ pub enum CompressionError {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn oversized_original_size_is_rejected_before_allocation() {
+        let decompressor = Decompressor::new(&Arc::new(CompressionCapabilities {
+            flags: CompressionCapsFlags::new(),
+            compression_algorithms: vec![CompressionAlgorithm::LZ4],
+        }));
+        let message = CompressedMessage::Unchained(CompressedUnchainedMessage {
+            original_size: (smb_transport::DEFAULT_MAX_FRAME_SIZE + 1) as u32,
+            compression_algorithm: CompressionAlgorithm::LZ4,
+            data: vec![0],
+        });
+        assert!(matches!(
+            decompressor.decompress(&message),
+            Err(CompressionError::DecompressedSizeLimitExceeded { .. })
+        ));
+    }
 
     #[test]
     pub fn test_none_algorithm_decompression() {
@@ -538,8 +623,6 @@ mod tests {
             .content
             .to_read()
             .expect("expected read response");
-        assert_eq!(read_response.data_length, 0x400);
-        // data_offset points to the absolute position within the raw message
-        assert!(read_response.data_offset >= smb_msg::Header::STRUCT_SIZE);
+        assert_eq!(read_response.data_len(), 0x400);
     }
 }

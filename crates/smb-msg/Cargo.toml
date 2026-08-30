@@ -26,6 +26,7 @@ smb-fscc = { workspace = true }
 smb-msg-derive = { workspace = true }
 
 binrw = { workspace = true }
+bytes = { workspace = true }
 modular-bitfield = { workspace = true }
 time = { workspace = true }
 pastey = { workspace = true }

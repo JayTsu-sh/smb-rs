@@ -7,6 +7,14 @@ pub enum TransportError {
     AlreadyConnected,
     #[error("Invalid transport message")]
     InvalidMessage,
+    #[error("transport frame length {announced} exceeds hard maximum {maximum}")]
+    FrameTooLarge { announced: usize, maximum: usize },
+    #[error("outbound segment count {actual} exceeds transport maximum {maximum}")]
+    SegmentLimitExceeded { actual: usize, maximum: usize },
+    #[error("send cursor advance {requested} exceeds remaining {remaining}")]
+    CursorAdvanceOutOfBounds { requested: usize, remaining: usize },
+    #[error("transport vectored write returned zero before frame completion")]
+    WriteZero,
     #[error("Failed to parse transport message {0}")]
     ParseError(#[from] binrw::Error),
     #[error("Not connected")]
@@ -19,14 +27,6 @@ pub enum TransportError {
     InvalidAddress(String),
     #[error("IO Error: {0}")]
     IoError(#[from] std::io::Error),
-
-    #[cfg(feature = "quic")]
-    #[error("QUIC error: {0}")]
-    QuicError(#[from] crate::quic::QuicError),
-
-    #[cfg(feature = "rdma")]
-    #[error("RDMA error: {0}")]
-    RdmaError(#[from] crate::rdma::RdmaError),
 }
 
 pub type Result<T> = std::result::Result<T, TransportError>;

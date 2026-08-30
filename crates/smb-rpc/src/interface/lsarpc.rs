@@ -511,6 +511,10 @@ impl<T> LsaRpc<T>
 where
     T: BoundRpcConnection,
 {
+    pub fn into_connection(self) -> T {
+        self.bound_pipe
+    }
+
     /// Opens a policy handle on the target server.
     ///
     /// The handle must be closed with [`LsaRpc::close`] when no longer needed.
@@ -637,7 +641,7 @@ where
 
 #[cfg(test)]
 mod test {
-    use binrw::{io::Cursor, prelude::*};
+    use binrw::io::Cursor;
     use smb_tests::*;
     use std::str::FromStr;
 

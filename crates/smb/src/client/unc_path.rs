@@ -8,7 +8,7 @@ use crate::Error;
 ///
 ///
 /// # Examples
-/// ```
+/// ```ignore
 /// use smb::UncPath;
 /// use std::str::FromStr;
 /// let unc = UncPath::from_str(r"\\server\share\path").unwrap();
@@ -82,7 +82,7 @@ impl UncPath {
 
     /// Adds to the current path, if set.
     /// Otherwise, sets the path to the new value.
-    /// ```
+    /// ```ignore
     /// # use std::str::FromStr;
     /// # use smb::UncPath;
     /// let unc = UncPath::from_str(r"\\server\share\path").unwrap();

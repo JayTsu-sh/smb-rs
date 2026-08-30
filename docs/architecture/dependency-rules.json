@@ -1,0 +1,70 @@
+{
+  "current_wave": "W6",
+  "crate_rules": [
+    {
+      "name": "smb-msg",
+      "forbidden_dependencies": ["smb", "smb-transport"],
+      "owner_wave": "W1",
+      "activation": "activated"
+    },
+    {
+      "name": "smb-transport",
+      "forbidden_dependencies": ["smb"],
+      "owner_wave": "W1",
+      "activation": "activated"
+    },
+    {
+      "name": "smb-rpc",
+      "forbidden_dependencies": ["smb"],
+      "owner_wave": "W1",
+      "activation": "activated"
+    }
+  ],
+  "module_rules": [
+    {
+      "name": "facade",
+      "root": "crates/smb/src/facade",
+      "import_prefix": "crate::facade",
+      "allowed_modules": ["domain"],
+      "allowed_crate_prefixes": ["crate::error", "crate::Result"],
+      "deny_unclassified_crate_imports": true,
+      "owner_wave": "W5",
+      "activation": "activated"
+    },
+    {
+      "name": "domain",
+      "root": "crates/smb/src/domain",
+      "import_prefix": "crate::domain",
+      "allowed_modules": ["runtime"],
+      "allowed_crate_prefixes": ["crate::error", "crate::Error", "crate::Result"],
+      "deny_unclassified_crate_imports": true,
+      "owner_wave": "W5",
+      "activation": "activated"
+    },
+    {
+      "name": "runtime",
+      "root": "crates/smb/src/runtime",
+      "import_prefix": "crate::runtime",
+      "allowed_modules": [],
+      "allowed_crate_prefixes": [
+        "crate::clock",
+        "crate::client",
+        "crate::compression",
+        "crate::connection::connection_info",
+        "crate::connection::preauth_hash",
+        "crate::crypto",
+        "crate::error",
+        "crate::command",
+        "crate::resource",
+        "crate::session",
+        "crate::tree",
+        "crate::Error",
+        "crate::Result"
+      ],
+      "deny_unclassified_crate_imports": true,
+      "owner_wave": "W3",
+      "activation": "activated"
+    }
+  ],
+  "temporary_adapters": []
+}

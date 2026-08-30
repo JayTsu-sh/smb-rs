@@ -10,26 +10,61 @@ use time::PrimitiveDateTime;
 
 use crate::{
     Error,
-    connection::connection_info::ConnectionInfo,
-    lease::{LeaseSlot, ResourceProto, SlotReleaseAction},
-    msg_handler::{
-        AsyncMessageIds, IncomingMessage, MessageHandler, MessageHandlerExt, OutgoingMessage,
-        ReceiveOptions, SendMessageResult,
+    command::{
+        AsyncMessageIds, CommandRequest, CommandResponse, CommandSubmission, ResponseOptions,
     },
-    tree::TreeMessageHandler,
+    connection::connection_info::ConnectionInfo,
+    lease::{LeaseSlot, OplockSlot, ResourceProto, SlotReleaseAction},
+    tree::TreeContext,
 };
 
 pub mod directory;
 pub mod file;
-pub mod file_util;
 pub mod pipe;
 
 pub use directory::*;
 pub use file::*;
-pub use file_util::*;
 pub use pipe::*;
 
-type Upstream = Arc<TreeMessageHandler>;
+type Upstream = Arc<TreeContext>;
+
+/// Opt-in SMB3 durable-v2 open request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableOpenRequest {
+    timeout: u32,
+    create_guid: smb_dtyp::Guid,
+    persistent: bool,
+}
+
+/// Durable-v2 properties granted by the server for this Resource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableOpenGrant {
+    pub timeout: u32,
+    pub persistent: bool,
+    pub create_guid: smb_dtyp::Guid,
+}
+
+impl DurableOpenRequest {
+    pub const fn durable(timeout: u32, create_guid: smb_dtyp::Guid) -> Self {
+        Self {
+            timeout,
+            create_guid,
+            persistent: false,
+        }
+    }
+
+    pub const fn persistent(timeout: u32, create_guid: smb_dtyp::Guid) -> Self {
+        Self {
+            timeout,
+            create_guid,
+            persistent: true,
+        }
+    }
+
+    pub const fn is_persistent(&self) -> bool {
+        self.persistent
+    }
+}
 
 #[derive(Default)]
 pub struct FileCreateArgs {
@@ -43,6 +78,10 @@ pub struct FileCreateArgs {
     /// server for read/handle/write caching; the granted state is reported
     /// back via [`ResourceHandle::lease_granted`].
     pub lease_request: Option<RequestLease>,
+    /// Optional SMB3 durable-v2 or persistent open request.
+    pub durable_request: Option<DurableOpenRequest>,
+    /// Optional timestamp for opening a read-only Previous Version.
+    pub timewarp: Option<smb_dtyp::binrw_util::prelude::FileTime>,
 }
 
 impl FileCreateArgs {
@@ -101,6 +140,61 @@ impl FileCreateArgs {
         self.lease_request = Some(lease);
         self
     }
+
+    /// Request an SMB3 durable-v2 or persistent open.
+    pub fn with_durable(mut self, request: DurableOpenRequest) -> Self {
+        self.durable_request = Some(request);
+        self
+    }
+
+    pub(crate) fn with_timewarp(
+        mut self,
+        timestamp: smb_dtyp::binrw_util::prelude::FileTime,
+    ) -> Self {
+        self.timewarp = Some(timestamp);
+        self
+    }
+}
+
+fn validate_durable_request(
+    request: DurableOpenRequest,
+    smb3: bool,
+    persistent_handles: bool,
+    continuous_availability: bool,
+) -> crate::Result<()> {
+    if !smb3 {
+        return Err(Error::UnsupportedOperation(
+            "Durable-v2 opens require an SMB3 dialect".into(),
+        ));
+    }
+    if request.persistent && (!persistent_handles || !continuous_availability) {
+        return Err(Error::UnsupportedOperation(
+            "Persistent opens require negotiated persistent handles and a continuously available share"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn requested_oplock_level(create_args: &FileCreateArgs) -> OplockLevel {
+    if create_args.lease_request.is_some() {
+        OplockLevel::Lease
+    } else if create_args.durable_request.is_some() {
+        OplockLevel::Batch
+    } else {
+        OplockLevel::None
+    }
+}
+
+fn validate_create_parent_epoch(
+    captured: crate::runtime::ObjectToken,
+    current: crate::runtime::ObjectToken,
+) -> crate::Result<()> {
+    if captured == current {
+        Ok(())
+    } else {
+        Err(Error::StaleObject)
+    }
 }
 
 /// A resource opened by a create request.
@@ -140,26 +234,43 @@ impl Resource {
             ));
         }
 
+        if let Some(request) = create_args.durable_request {
+            validate_durable_request(
+                request,
+                conn_info.negotiation.dialect_rev.is_smb3(),
+                conn_info.negotiation.caps.persistent_handles(),
+                upstream.continuously_available()?,
+            )?;
+        }
         // 标准 create context 列表：MxAc + QFid 始终发送；lease (RqLs) 仅在调用方显式
         // 请求时附加，保持现有非-lease 调用方零行为变化。
         let mut contexts: Vec<CreateContextRequest> = vec![
             QueryMaximalAccessRequest::default().into(),
             QueryOnDiskIdReq.into(),
         ];
+        if let Some(timestamp) = create_args.timewarp {
+            contexts.push(TimewarpToken { timestamp }.into());
+        }
         if let Some(lease_req) = create_args.lease_request.as_ref() {
             contexts.push(lease_req.clone().into());
+        }
+        if let Some(request) = create_args.durable_request {
+            contexts.push(
+                DurableHandleRequestV2::new(
+                    request.timeout,
+                    request.persistent,
+                    request.create_guid,
+                )
+                .into(),
+            );
         }
 
         // MS-SMB2 2.2.13: server 只在 RequestedOplockLevel = Lease (0xFF) 时把
         // `RqLs` context 当 lease 处理；任何其他值（含 None）都让 server 静默忽略。
         // 因此 lease 请求必须把 oplock level 同步切到 Lease。
-        let requested_oplock_level = if create_args.lease_request.is_some() {
-            OplockLevel::Lease
-        } else {
-            OplockLevel::None
-        };
+        let requested_oplock_level = requested_oplock_level(create_args);
 
-        let mut msg = OutgoingMessage::new(
+        let mut msg = CommandRequest::new(
             CreateRequest {
                 requested_oplock_level,
                 impersonation_level: ImpersonationLevel::Impersonation,
@@ -176,9 +287,18 @@ impl Resource {
         // Make sure to set DFS if required.
         msg.message.header.flags.set_dfs_operation(is_dfs);
 
+        let share = upstream.current_share_object().await?;
         let response = upstream
-            .sendo_recvo(msg, ReceiveOptions::new().with_allow_async(true))
-            .await?;
+            .execute_for_with_replay(
+                msg,
+                ResponseOptions::new().with_allow_async(true),
+                share,
+                crate::runtime::ReplayPolicy::NeverReplay,
+            )
+            .await?
+            .1;
+
+        validate_create_parent_epoch(share, upstream.current_share_object().await?)?;
 
         let response = response.message.content.to_create()?;
         tracing::debug!("Created file '{}', ({:?})", name, response.file_id);
@@ -219,19 +339,64 @@ impl Resource {
             None
         };
 
+        let durable_granted = if let Some(request) = create_args.durable_request {
+            let response = CreateContextResponseData::first_dh2q(&response.create_contexts)
+                .ok_or_else(|| {
+                    Error::UnsupportedOperation(
+                        "Server did not grant the requested durable-v2 open".into(),
+                    )
+                })?;
+            let persistent = response.flags.persistent();
+            if request.persistent && !persistent {
+                return Err(Error::UnsupportedOperation(
+                    "Server did not grant the requested persistent open".into(),
+                ));
+            }
+            Some(DurableOpenGrant {
+                timeout: response.timeout,
+                persistent,
+                create_guid: request.create_guid,
+            })
+        } else {
+            None
+        };
+
         // Common information is held in the handle object. `lease_slot`
         // defaults to None; if a lease was granted and the higher-level
         // client opts in, [`Client::_create_file`] will attach a slot via
         // [`Resource::attach_lease_slot`] after this function returns.
+        let object = upstream.create_resource_object_for(share).await?;
+        let oplock_slot = if matches!(
+            response.oplock_level,
+            OplockLevel::II | OplockLevel::Exclusive | OplockLevel::Batch
+        ) {
+            let slot = Arc::new(OplockSlot::new(
+                response.file_id,
+                response.oplock_level,
+                upstream.clone(),
+                object,
+            ));
+            upstream.register_oplock_slot(&slot).await;
+            Some(slot)
+        } else {
+            None
+        };
         let handle = ResourceHandle {
             name: name.to_string(),
-            handler: upstream.clone(),
+            context: upstream.clone(),
+            generation: arc_swap::ArcSwap::from_pointee(ResourceGeneration {
+                file_id: response.file_id,
+                object,
+                share,
+            }),
             open: AtomicBool::new(true),
-            _file_id: response.file_id,
+            recovery: tokio::sync::Mutex::new(()),
             created: response.creation_time.date_time(),
             modified: response.last_write_time.date_time(),
             access,
             lease_granted,
+            durable_granted,
+            oplock_slot,
             lease_slot: None,
             share_type,
             conn_info: conn_info.clone(),
@@ -302,7 +467,7 @@ impl Resource {
 
     /// Phase C.3: materialize a cache-hit resource from an existing
     /// `LeaseSlot`. Skips the wire `Create` entirely — the returned
-    /// resource reuses the slot's `FileId`, handler chain, and creation
+    /// resource reuses the slot's `FileId`, context chain, and creation
     /// metadata. The slot's refcount is *not* incremented here; the
     /// caller (`Client::_create_file`) must have already called
     /// [`LeaseSlot::try_acquire_for_reuse`] which performs the bump
@@ -328,9 +493,14 @@ impl Resource {
 
         let handle = ResourceHandle {
             name: slot.path.clone(),
-            handler: proto.handler.clone(),
+            context: proto.context.clone(),
+            generation: arc_swap::ArcSwap::from_pointee(ResourceGeneration {
+                file_id: slot.file_id,
+                object: proto.object,
+                share: proto.share,
+            }),
             open: AtomicBool::new(true),
-            _file_id: slot.file_id,
+            recovery: tokio::sync::Mutex::new(()),
             created: proto.created,
             modified: proto.modified,
             access: proto.access,
@@ -339,6 +509,8 @@ impl Resource {
                 state: granted_state,
                 epoch: proto.epoch_at_grant,
             }),
+            durable_granted: None,
+            oplock_slot: None,
             lease_slot: Some(slot.clone()),
             share_type: proto.share_type,
             conn_info: proto.conn_info.clone(),
@@ -387,7 +559,9 @@ impl Resource {
         let is_dir = matches!(self, Resource::Directory(_));
         let epoch_at_grant = h.lease_granted.map(|g| g.epoch).unwrap_or(0);
         Some(Arc::new(ResourceProto {
-            handler: upstream.clone(),
+            context: upstream.clone(),
+            object: h.generation.load().object,
+            share: h.generation.load().share,
             conn_info: h.conn_info.clone(),
             created: h.created,
             modified: h.modified,
@@ -428,25 +602,6 @@ impl Resource {
             _ => Err(Error::InvalidState(
                 "Resource is not a directory".to_string(),
             )),
-        }
-    }
-
-    #[deprecated(note = "Use into_file() which returns Result instead of panicking")]
-    pub fn unwrap_file(self) -> File {
-        match self {
-            Resource::File(f) => f,
-            other => panic!("Expected File, got {:?}", std::mem::discriminant(&other)),
-        }
-    }
-
-    #[deprecated(note = "Use into_dir() which returns Result instead of panicking")]
-    pub fn unwrap_dir(self) -> Directory {
-        match self {
-            Resource::Directory(d) => d,
-            other => panic!(
-                "Expected Directory, got {:?}",
-                std::mem::discriminant(&other)
-            ),
         }
     }
 }
@@ -512,17 +667,27 @@ impl LeaseGrant {
 }
 
 /// Holds the common information for an opened SMB resource.
+struct ResourceGeneration {
+    file_id: FileId,
+    object: crate::runtime::ObjectToken,
+    share: crate::runtime::ObjectToken,
+}
+
+impl ResourceGeneration {
+    fn belongs_to(&self, share: crate::runtime::ObjectToken) -> bool {
+        self.share == share
+    }
+}
+
 pub struct ResourceHandle {
     name: String,
-    handler: Arc<TreeMessageHandler>,
+    context: Arc<TreeContext>,
+    generation: arc_swap::ArcSwap<ResourceGeneration>,
 
     // Whether the resource is open or not.
     // TODO: Consider using RwLock here on FileId instead of AtomicBool+FileId.
     open: AtomicBool,
-
-    // Avoid accessing directly; use the `file_id()` getter,
-    // that makes sure the resource is still open.
-    _file_id: FileId,
+    recovery: tokio::sync::Mutex<()>,
     created: PrimitiveDateTime,
     modified: PrimitiveDateTime,
     share_type: ShareType,
@@ -533,6 +698,10 @@ pub struct ResourceHandle {
     /// `Some` and the server replied with an `RqLs` response context.
     /// `None` when no lease was requested or the server didn't grant one.
     lease_granted: Option<LeaseGrant>,
+
+    durable_granted: Option<DurableOpenGrant>,
+
+    oplock_slot: Option<Arc<OplockSlot>>,
 
     /// Phase C: when this handle is backed by a cached lease slot, close()
     /// and Drop release a refcount on the slot instead of sending a wire
@@ -545,6 +714,16 @@ pub struct ResourceHandle {
 }
 
 impl ResourceHandle {
+    /// Returns the currently authoritative oplock level for this open.
+    ///
+    /// The value is updated before an oplock-break acknowledgement is sent.
+    pub fn oplock_level(&self) -> OplockLevel {
+        self.oplock_slot
+            .as_ref()
+            .and_then(|slot| slot.level.read().ok().map(|level| *level))
+            .unwrap_or(OplockLevel::None)
+    }
+
     /// Returns the name of the resource.
     pub fn name(&self) -> &str {
         &self.name
@@ -571,6 +750,11 @@ impl ResourceHandle {
         self.lease_granted
     }
 
+    /// Returns the server-granted durable-v2 properties for this Resource.
+    pub fn durable_granted(&self) -> Option<DurableOpenGrant> {
+        self.durable_granted
+    }
+
     /// Returns the server-assigned `FileId` for this open, *without* the
     /// "is-open" sanity check. Exposed for the lease-cache (Phase C):
     /// `Client::create_file` snapshots the FileId at Create time and
@@ -578,7 +762,7 @@ impl ResourceHandle {
     /// cache hits can reuse the same id. Callers should not use this
     /// FileId for direct I/O — go through the resource's typed methods.
     pub fn raw_file_id(&self) -> FileId {
-        self._file_id
+        self.generation.load().file_id
     }
 
     /// Returns the current share type of the resource. See [ShareType] for more details.
@@ -595,14 +779,115 @@ impl ResourceHandle {
     /// (Internal)
     ///
     /// Returns the file ID of the resource, ensuring the resource is still open.
-    fn file_id(&self) -> crate::Result<FileId> {
+    async fn file_id(&self) -> crate::Result<FileId> {
         // The current design here allows the race condition over a close after this validation occurs.
         // therefore, this atomic load can be relaxed, and actual atomic compare and exchange are used
         // to avoid double close somehow.
         if !self.open.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(Error::InvalidState("Resource is closed".into()));
         }
-        Ok(self._file_id)
+        self.ensure_current().await?;
+        Ok(self.generation.load().file_id)
+    }
+
+    async fn ensure_current(&self) -> crate::Result<()> {
+        let share = self.context.current_share_object().await?;
+        if self.generation.load().belongs_to(share) {
+            return Ok(());
+        }
+        let grant = self.durable_granted.ok_or_else(|| {
+            Error::InvalidState("Resource belongs to a stale share generation".into())
+        })?;
+        let _owner = self.recovery.lock().await;
+        let policy = self.conn_info.config.auto_reconnect;
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(crate::clock::TokioClock::new());
+        let mut last_error = None;
+        for attempt in 1..=policy.max_attempts {
+            if attempt > 1 {
+                let shift = attempt.saturating_sub(2).min(31);
+                let delay = policy
+                    .initial_backoff
+                    .saturating_mul(1_u32 << shift)
+                    .min(policy.maximum_backoff);
+                clock.sleep_until(clock.now().saturating_add(delay)).await;
+            }
+            let previous = self.generation.load_full();
+            let future = async {
+                let share = self.context.current_share_object().await?;
+                if previous.belongs_to(share) {
+                    return crate::Result::Ok(None);
+                }
+                let contexts: Vec<CreateContextRequest> = vec![
+                    DurableHandleReconnectV2::new(
+                        previous.file_id,
+                        grant.create_guid,
+                        grant.persistent,
+                    )
+                    .into(),
+                ];
+                let response = self
+                    .context
+                    .execute_request(
+                        CommandRequest::new(
+                            CreateRequest {
+                                requested_oplock_level: OplockLevel::None,
+                                impersonation_level: ImpersonationLevel::Impersonation,
+                                desired_access: FileAccessMask::new(),
+                                file_attributes: FileAttributes::new(),
+                                share_access: ShareAccessFlags::new(),
+                                create_disposition: CreateDisposition::Open,
+                                create_options: CreateOptions::new(),
+                                name: "".into(),
+                                contexts: contexts.into(),
+                            }
+                            .into(),
+                        ),
+                        ResponseOptions::new().with_allow_async(true),
+                    )
+                    .await?
+                    .message
+                    .content
+                    .to_create()?;
+                if self.context.current_share_object().await? != share {
+                    return Err(Error::InvalidState(
+                        "Share changed during durable reconnect".into(),
+                    ));
+                }
+                let object = self.context.create_resource_object_for(share).await?;
+                crate::Result::Ok(Some(ResourceGeneration {
+                    file_id: response.file_id,
+                    object,
+                    share,
+                }))
+            };
+            match crate::session::recovery_attempt::run_bounded_attempt(
+                clock.clone(),
+                policy.attempt_timeout,
+                future,
+            )
+            .await
+            {
+                Ok(Ok(Some(candidate))) => {
+                    if let Some(slot) = &self.oplock_slot {
+                        slot.replace(candidate.file_id, candidate.object);
+                        self.context.register_oplock_slot(slot).await;
+                    }
+                    self.generation.store(Arc::new(candidate));
+                    return Ok(());
+                }
+                Ok(Ok(None)) => return Ok(()),
+                Ok(Err(error)) => {
+                    tracing::warn!(attempt, ?error, "durable reconnect attempt failed");
+                    last_error = Some(error);
+                }
+                Err(_) => {
+                    tracing::warn!(attempt, "durable reconnect attempt timed out");
+                    last_error = Some(Error::ResourceRecoveryWaitTimedOut);
+                }
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| Error::InvalidState("Durable Resource recovery is disabled".into())))
     }
 
     /// (Internal)
@@ -640,9 +925,9 @@ impl ResourceHandle {
 
         let info_type = req.info_type;
         let result = self
-            .send_recvo(
+            .execute_content(
                 req.into(),
-                ReceiveOptions::new().with_status(&[
+                ResponseOptions::new().with_status(&[
                     Status::Success,
                     Status::BufferOverflow,
                     Status::BufferTooSmall,
@@ -689,7 +974,7 @@ impl ResourceHandle {
                         required: None,
                         provided: buffer_length as usize,
                     }),
-                    _ => unreachable!(), // already filtered by send_recvo
+                    _ => unreachable!(), // already filtered by execute_content
                 }
             }
             Err(e) => Err(e),
@@ -708,7 +993,9 @@ impl ResourceHandle {
     where
         T: Into<SetInfoData>,
     {
-        let data = data.into().to_req(cls, self.file_id()?, additional_info);
+        let data = data
+            .into()
+            .to_req(cls, self.file_id().await?, additional_info);
         let response = self.send_receive(data.into()).await?;
         response.message.content.to_setinfo()?;
         Ok(())
@@ -769,7 +1056,7 @@ impl ResourceHandle {
                     output_buffer_length: 0,
                     additional_info: AdditionalInfo::new(),
                     flags: QueryInfoFlags::new().with_restart_scan(true),
-                    file_id: self.file_id()?,
+                    file_id: self.file_id().await?,
                     data: GetInfoRequestData::EaInfo(GetEaInfoList {
                         values: names
                             .iter()
@@ -812,7 +1099,7 @@ impl ResourceHandle {
                     output_buffer_length: 0,
                     additional_info: AdditionalInfo::new(),
                     flags,
-                    file_id: self.file_id()?,
+                    file_id: self.file_id().await?,
                     data: GetInfoRequestData::None(()),
                 },
                 output_buffer_length,
@@ -859,7 +1146,7 @@ impl ResourceHandle {
                     output_buffer_length: 0,
                     additional_info,
                     flags: QueryInfoFlags::new(),
-                    file_id: self.file_id()?,
+                    file_id: self.file_id().await?,
                     data: GetInfoRequestData::None(()),
                 },
                 output_buffer_length,
@@ -896,16 +1183,42 @@ impl ResourceHandle {
         request: T,
         max_output_response: u32,
     ) -> crate::Result<T::Response> {
+        self.fsctl_with_operation(
+            request,
+            max_output_response,
+            file::FileOperationOptions::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn fsctl_with_operation<T: FsctlRequest>(
+        &self,
+        request: T,
+        max_output_response: u32,
+        operation: file::FileOperationOptions,
+    ) -> crate::Result<T::Response> {
         const NO_INPUT_IN_RESPONSE: u32 = 0;
+        let request = CommandRequest::new(RequestContent::Ioctl(IoctlRequest {
+            ctl_code: T::FSCTL_CODE as u32,
+            file_id: self.file_id().await?,
+            max_input_response: NO_INPUT_IN_RESPONSE,
+            max_output_response,
+            flags: IoctlRequestFlags::new().with_is_fsctl(true),
+            buffer: request.into(),
+        }));
+        let mut options = ResponseOptions::new().with_allow_async(true);
+        if let Some(timeout) = operation.timeout {
+            options = options.with_timeout(timeout);
+        }
+        if let Some(cancellation) = operation.cancellation {
+            options = options.with_cancellation_token(cancellation);
+        }
         let ioctl_result = self
-            ._ioctl(
-                T::FSCTL_CODE as u32,
-                request.into(),
-                NO_INPUT_IN_RESPONSE,
-                max_output_response,
-                IoctlRequestFlags::new().with_is_fsctl(true),
-            )
+            .execute_request_with_replay(request, options, operation.replay)
             .await?
+            .message
+            .content
+            .to_ioctl()?
             .parse_fsctl::<T::Response>()?;
         Ok(ioctl_result)
     }
@@ -946,17 +1259,17 @@ impl ResourceHandle {
         flags: IoctlRequestFlags,
     ) -> crate::Result<IoctlResponse> {
         let result = self
-            .handler
-            .send_recvo(
+            .context
+            .execute_content(
                 RequestContent::Ioctl(IoctlRequest {
                     ctl_code,
-                    file_id: self.file_id()?,
+                    file_id: self.file_id().await?,
                     max_input_response: max_in,
                     max_output_response: max_out,
                     flags,
                     buffer: req_data,
                 }),
-                ReceiveOptions::new().with_allow_async(true),
+                ResponseOptions::new().with_allow_async(true),
             )
             .await?
             .message
@@ -1003,7 +1316,7 @@ impl ResourceHandle {
                     flags: QueryInfoFlags::new()
                         .with_restart_scan(true)
                         .with_return_single_entry(true),
-                    file_id: self.file_id()?,
+                    file_id: self.file_id().await?,
                     data: GetInfoRequestData::None(()),
                 },
                 output_buffer_length,
@@ -1076,10 +1389,13 @@ impl ResourceHandle {
     /// to avoid Use-after-free errors.
     async fn send_close(
         file_id: FileId,
-        handler: &Arc<TreeMessageHandler>,
+        context: &Arc<TreeContext>,
+        object: crate::runtime::ObjectToken,
     ) -> crate::Result<()> {
         tracing::trace!("Send close to file with ID: {file_id:?}");
-        let response = handler.send_recv(CloseRequest { file_id }.into()).await?;
+        let response = context
+            .send_recv_for(CloseRequest { file_id }.into(), object)
+            .await?;
         tracing::debug!("Close response received for file ID: {file_id:?}, {response:?}");
         Ok(())
     }
@@ -1087,14 +1403,15 @@ impl ResourceHandle {
     /// Phase C.5: pub(crate) entry point so the lease-eviction path in
     /// [`crate::Client::flush_eviction`] can send the deferred wire
     /// `Close` against a slot whose owning [`ResourceHandle`] is already
-    /// gone (refcount was zero at evict time). The handler is pulled
+    /// gone (refcount was zero at evict time). The context is pulled
     /// from `LeaseSlot::proto`, so the close goes through the same
     /// tree+session as the original Create.
     pub(crate) async fn send_close_external(
         file_id: FileId,
-        handler: &Arc<TreeMessageHandler>,
+        context: &Arc<TreeContext>,
+        object: crate::runtime::ObjectToken,
     ) -> crate::Result<()> {
-        Self::send_close(file_id, handler).await
+        Self::send_close(file_id, context, object).await
     }
 
     /// Closes the resource.
@@ -1117,16 +1434,18 @@ impl ResourceHandle {
     /// A `Result` indicating success or failure.
     #[tracing::instrument(level = "debug", skip_all, fields(name = %self.name))]
     pub async fn close(&self) -> crate::Result<()> {
+        self.ensure_current().await?;
         if !self.open.swap(false, std::sync::atomic::Ordering::Relaxed) {
             return Err(Error::InvalidState("Resource is already closed".into()));
         }
 
         if let Some(slot) = self.lease_slot.as_ref() {
+            let file_id = self.generation.load().file_id;
             match slot.release_one() {
                 SlotReleaseAction::KeepCached => {
                     tracing::debug!(
                         path = %slot.path,
-                        file_id = ?self._file_id,
+                        file_id = ?file_id,
                         "Deferred close: lease slot still cached",
                     );
                     return Ok(());
@@ -1134,7 +1453,7 @@ impl ResourceHandle {
                 SlotReleaseAction::CloseAndEvict => {
                     tracing::debug!(
                         path = %slot.path,
-                        file_id = ?self._file_id,
+                        file_id = ?file_id,
                         "Lease slot evicted; sending deferred Close on the wire",
                     );
                     // Fall through to the regular send_close path below.
@@ -1147,8 +1466,9 @@ impl ResourceHandle {
             }
         }
 
-        tracing::debug!(file_id = ?self._file_id, "Closing handle");
-        Self::send_close(self._file_id, &self.handler).await?;
+        let generation = self.generation.load_full();
+        tracing::debug!(file_id = ?generation.file_id, "Closing handle");
+        Self::send_close(generation.file_id, &self.context, generation.object).await?;
 
         tracing::debug!("Closed");
 
@@ -1159,40 +1479,66 @@ impl ResourceHandle {
     async fn send_receive(
         &self,
         msg: RequestContent,
-    ) -> crate::Result<crate::msg_handler::IncomingMessage> {
-        self.handler.send_recv(msg).await
-    }
-
-    #[inline]
-    async fn send_recvo(
-        &self,
-        msg: RequestContent,
-        options: ReceiveOptions<'_>,
-    ) -> crate::Result<IncomingMessage> {
-        self.handler
-            .sendo_recvo(OutgoingMessage::new(msg), options)
+    ) -> crate::Result<crate::command::CommandResponse> {
+        self.ensure_current().await?;
+        self.context
+            .send_recv_for(msg, self.generation.load().object)
             .await
     }
 
     #[inline]
-    async fn sendo_recvo(
+    async fn execute_content(
         &self,
-        msg: OutgoingMessage,
-        options: ReceiveOptions<'_>,
-    ) -> crate::Result<IncomingMessage> {
-        self.handler.sendo_recvo(msg, options).await
+        msg: RequestContent,
+        options: ResponseOptions<'_>,
+    ) -> crate::Result<CommandResponse> {
+        self.ensure_current().await?;
+        self.context
+            .execute_for(
+                CommandRequest::new(msg),
+                options,
+                self.generation.load().object,
+            )
+            .await
+            .map(|(_, incoming)| incoming)
     }
 
     #[inline]
-    pub async fn send_cancel(&self, msg_ids: &AsyncMessageIds) -> crate::Result<SendMessageResult> {
-        let mut outgoing_message = OutgoingMessage::new(CancelRequest {}.into());
+    async fn execute_request(
+        &self,
+        msg: CommandRequest,
+        options: ResponseOptions<'_>,
+    ) -> crate::Result<CommandResponse> {
+        self.execute_request_with_replay(msg, options, crate::runtime::ReplayPolicy::NeverReplay)
+            .await
+    }
+
+    async fn execute_request_with_replay(
+        &self,
+        msg: CommandRequest,
+        options: ResponseOptions<'_>,
+        replay: crate::runtime::ReplayPolicy,
+    ) -> crate::Result<CommandResponse> {
+        self.ensure_current().await?;
+        self.context
+            .execute_for_with_replay(msg, options, self.generation.load().object, replay)
+            .await
+            .map(|(_, incoming)| incoming)
+    }
+
+    #[inline]
+    pub async fn send_cancel(&self, msg_ids: &AsyncMessageIds) -> crate::Result<CommandSubmission> {
+        self.ensure_current().await?;
+        let mut outgoing_message = CommandRequest::new(CancelRequest {}.into());
         outgoing_message.message.header.message_id = msg_ids.msg_id.load(Ordering::Relaxed);
         outgoing_message
             .message
             .header
             .to_async(msg_ids.async_id.load(Ordering::Relaxed));
 
-        self.handler.sendo(outgoing_message).await
+        self.context
+            .submit_for(outgoing_message, self.generation.load().object)
+            .await
     }
 
     /// Returns whether current resource is opened from the same tree as the other resource.
@@ -1202,7 +1548,7 @@ impl ResourceHandle {
     /// * Even if a resource is positioned in the same tree, if the tree was accessed using different
     ///   share connections, this will return false!
     pub fn same_tree(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.handler, &other.handler)
+        Arc::ptr_eq(&self.context, &other.context)
     }
 }
 
@@ -1218,11 +1564,12 @@ impl Drop for ResourceHandle {
         // releasable (refcount=0 AND tombstoned). Otherwise the FileId
         // stays alive for the next cache hit.
         if let Some(slot) = self.lease_slot.as_ref() {
+            let file_id = self.generation.load().file_id;
             match slot.release_one() {
                 SlotReleaseAction::KeepCached => {
                     tracing::debug!(
                         path = %slot.path,
-                        file_id = ?self._file_id,
+                        file_id = ?file_id,
                         "Drop: lease slot retained (not tombstoned or refs remain)",
                     );
                     return;
@@ -1230,33 +1577,32 @@ impl Drop for ResourceHandle {
                 SlotReleaseAction::CloseAndEvict => {
                     tracing::debug!(
                         path = %slot.path,
-                        file_id = ?self._file_id,
+                        file_id = ?file_id,
                         "Drop: lease slot evicted; scheduling wire Close",
                     );
-                    // Fall through to the legacy spawn-Close branch below.
+                    // The slot is no longer retained. Explicit close remains
+                    // the only path that performs wire I/O.
                 }
             }
         }
 
-        let file_id = self._file_id;
-        let handler = self.handler.clone();
-        tracing::debug!("Spawning task to close file with ID: {file_id:?}");
-        tokio::task::spawn(async move {
-            if file_id != FileId::EMPTY {
-                if let Err(e) = Self::send_close(file_id, &handler).await {
-                    tracing::error!("Error closing file: {e}");
-                }
-            }
-        });
+        tracing::debug!("Dropped an open resource; wire cleanup requires explicit async close");
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{FileCreateArgs, LeaseGrant};
+    use super::{
+        DurableOpenRequest, FileCreateArgs, LeaseGrant, ResourceGeneration, requested_oplock_level,
+        validate_durable_request,
+    };
+    use crate::runtime::{GenerationId, ObjectEffect, ObjectKind, ObjectRegistry};
+    use smb_dtyp::Guid;
     use smb_fscc::FileAccessMask;
-    use smb_msg::{LeaseFlags, LeaseState, RequestLease, RequestLeaseV1, RequestLeaseV2};
+    use smb_msg::{
+        LeaseFlags, LeaseState, OplockLevel, RequestLease, RequestLeaseV1, RequestLeaseV2,
+    };
 
     fn make_state(read: bool, handle: bool, write: bool) -> LeaseState {
         LeaseState::new()
@@ -1324,5 +1670,72 @@ mod tests {
             args.lease_request.is_none(),
             "default must not request a lease"
         );
+    }
+
+    #[test]
+    fn file_create_args_can_request_a_durable_v2_open() {
+        let request = DurableOpenRequest::durable(
+            30_000,
+            Guid::parse_uuid("00000000-0000-0000-0000-000000000007").unwrap(),
+        );
+        let args = FileCreateArgs::default().with_durable(request);
+        assert_eq!(args.durable_request, Some(request));
+        assert!(!request.is_persistent());
+    }
+
+    #[test]
+    fn persistent_open_requires_negotiated_support_and_a_ca_share() {
+        let request = DurableOpenRequest::persistent(
+            30_000,
+            Guid::parse_uuid("00000000-0000-0000-0000-000000000007").unwrap(),
+        );
+        assert!(validate_durable_request(request, true, true, true).is_ok());
+        assert!(validate_durable_request(request, true, false, true).is_err());
+        assert!(validate_durable_request(request, true, true, false).is_err());
+        assert!(validate_durable_request(request, false, true, true).is_err());
+    }
+
+    #[test]
+    fn durable_open_without_a_lease_requests_a_batch_oplock() {
+        let args = FileCreateArgs::default().with_durable(DurableOpenRequest::durable(
+            30_000,
+            Guid::parse_uuid("00000000-0000-0000-0000-000000000007").unwrap(),
+        ));
+        assert_eq!(requested_oplock_level(&args), OplockLevel::Batch);
+        assert_eq!(
+            requested_oplock_level(&FileCreateArgs::default()),
+            OplockLevel::None
+        );
+    }
+
+    #[test]
+    fn resource_detects_share_epoch_replacement_within_same_connection_generation() {
+        let mut objects = ObjectRegistry::new(GenerationId::new(7));
+        let connection = objects.connection();
+        let session = objects
+            .create_child(connection, ObjectKind::Session)
+            .unwrap();
+        let share = objects.create_child(session, ObjectKind::Share).unwrap();
+        let object = objects.create_child(share, ObjectKind::Resource).unwrap();
+        let resource = ResourceGeneration {
+            file_id: Default::default(),
+            object,
+            share,
+        };
+
+        objects.begin_recovery(session).unwrap();
+        let ObjectEffect::ReplacementPublished {
+            replacement: replacement_session,
+            ..
+        } = objects.publish_replacement(session).unwrap()
+        else {
+            panic!("expected replacement session")
+        };
+        let replacement_share = objects
+            .create_child(replacement_session, ObjectKind::Share)
+            .unwrap();
+        assert_eq!(share.generation(), replacement_share.generation());
+        assert!(!resource.belongs_to(replacement_share));
+        assert!(super::validate_create_parent_epoch(share, replacement_share).is_err());
     }
 }

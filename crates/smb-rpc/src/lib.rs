@@ -17,6 +17,9 @@ pub enum SmbRpcError {
 
     #[error("Failed to parse response data: {0}")]
     FailedToParseRpcResponse(binrw::Error),
+
+    #[error("Remote DCE/RPC fault status 0x{status:08x}")]
+    RemoteFault { status: u32 },
 }
 
 type Result<T> = std::result::Result<T, SmbRpcError>;

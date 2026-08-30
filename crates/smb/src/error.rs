@@ -3,13 +3,14 @@ use std::{num::TryFromIntError, sync::PoisonError};
 use smb_transport::TransportError;
 use thiserror::Error;
 
-use crate::{UncPath, connection::TransformError};
-use tokio::sync::AcquireError;
+use crate::{client::UncPath, connection::TransformError};
 use smb_msg::{Command, ErrorResponse, Status};
+use tokio::sync::AcquireError;
 
 #[derive(Debug)]
 pub enum TimedOutTask {
     ReceiveNextMessage,
+    SessionReauthentication,
 }
 
 /// Fine-grained classification of session-setup failures.
@@ -56,6 +57,7 @@ pub enum SetupError {
 }
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     #[error("Unexpected Message, {0}")]
     InvalidMessage(String),
@@ -74,6 +76,49 @@ pub enum Error {
 
     #[error("Operation cancelled: {0}")]
     Cancelled(&'static str),
+
+    #[error("Operation outcome is unknown because the request may have committed")]
+    OutcomeUnknown,
+
+    #[error("The server invalidated the authenticated session")]
+    SessionInvalidated,
+
+    #[error("Operation admission is backpressured: {0}")]
+    Backpressure(&'static str),
+
+    #[error("The logical object is stale or revoked")]
+    StaleObject,
+
+    #[error("The request runtime terminated")]
+    RuntimeTerminated,
+
+    #[error("Session recovery wait queue is full")]
+    SessionRecoveryQueueFull,
+
+    #[error("Session recovery wait timed out")]
+    SessionRecoveryWaitTimedOut,
+
+    #[error("Share recovery wait queue is full")]
+    ShareRecoveryQueueFull,
+
+    #[error("Share recovery wait timed out")]
+    ShareRecoveryWaitTimedOut,
+
+    #[error("Resource recovery wait timed out")]
+    ResourceRecoveryWaitTimedOut,
+
+    #[error("{event} event queue exceeded its capacity of {capacity}")]
+    EventQueueOverflow {
+        event: &'static str,
+        capacity: usize,
+    },
+
+    #[error("transfer failed at offset {offset} after {transferred} bytes: {source}")]
+    TransferFailed {
+        offset: u64,
+        transferred: u64,
+        source: Box<Error>,
+    },
 
     #[error("Invalid state: {0}")]
     InvalidState(String),

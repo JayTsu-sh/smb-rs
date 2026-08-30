@@ -1,7 +1,22 @@
-use super::file_util::*;
 use super::*;
 use bytes::Bytes;
 use std::ops::{Deref, DerefMut};
+
+pub(crate) struct FileOperationOptions {
+    pub(crate) timeout: Option<std::time::Duration>,
+    pub(crate) cancellation: Option<tokio_util::sync::CancellationToken>,
+    pub(crate) replay: crate::runtime::ReplayPolicy,
+}
+
+impl Default for FileOperationOptions {
+    fn default() -> Self {
+        Self {
+            timeout: None,
+            cancellation: None,
+            replay: crate::runtime::ReplayPolicy::NeverReplay,
+        }
+    }
+}
 
 /// An opened file on the server.
 ///
@@ -26,6 +41,14 @@ pub struct File {
 }
 
 impl File {
+    pub(crate) fn maximum_read_size(&self) -> u32 {
+        self.handle.conn_info.negotiation.max_read_size
+    }
+
+    pub(crate) fn maximum_write_size(&self) -> u32 {
+        self.handle.conn_info.negotiation.max_write_size
+    }
+
     pub fn new(handle: ResourceHandle, end_of_file: u64) -> Self {
         File {
             handle,
@@ -72,11 +95,6 @@ impl File {
             ));
         }
 
-        // EOF
-        if pos >= self.end_of_file {
-            return Ok(0);
-        }
-
         tracing::debug!(
             "Reading up to {} bytes at offset {} from {}",
             buf.len(),
@@ -87,6 +105,15 @@ impl File {
         let response = self
             .send_read_request(buf.len() as u32, pos, channel, unbuffered)
             .await?;
+        if response
+            .message
+            .header
+            .status()
+            .map_err(std::io::Error::other)?
+            == Status::EndOfFile
+        {
+            return Ok(0);
+        }
         let content = response
             .message
             .content
@@ -95,14 +122,10 @@ impl File {
 
         // Zero-copy path: extract data directly from raw bytes using offset metadata,
         // avoiding the intermediate Vec<u8> allocation that binrw would otherwise create.
-        let data_end = content.data_offset + content.data_length;
-        if data_end > response.raw.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Read response data extends beyond raw message bounds",
-            ));
-        }
-        let raw_data = &response.raw[content.data_offset..data_end];
+        let data_range = content
+            .data_range(response.raw.len())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let raw_data = &response.raw[data_range.as_range()];
         let actual_read_length = raw_data.len();
 
         tracing::debug!(
@@ -127,40 +150,51 @@ impl File {
         channel: Option<u32>,
         unbuffered: bool,
     ) -> std::io::Result<bytes::Bytes> {
+        self.read_block_bytes_with_options(
+            max_len,
+            pos,
+            channel,
+            unbuffered,
+            FileOperationOptions::default(),
+        )
+        .await
+        .map_err(std::io::Error::other)
+    }
+
+    pub(crate) async fn read_block_bytes_with_options(
+        &self,
+        max_len: u32,
+        pos: u64,
+        channel: Option<u32>,
+        unbuffered: bool,
+        options: FileOperationOptions,
+    ) -> crate::Result<bytes::Bytes> {
         if max_len == 0 {
             return Ok(bytes::Bytes::new());
         }
 
         if !self.access.file_read_data() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "No read permission",
-            ));
-        }
-
-        if pos >= self.end_of_file {
-            return Ok(bytes::Bytes::new());
+            return Err(Error::MissingPermissions("file read data".into()));
         }
 
         let response = self
-            .send_read_request(max_len, pos, channel, unbuffered)
+            .send_read_request_with_options(max_len, pos, channel, unbuffered, options)
             .await?;
+        if response.message.header.status()? == Status::EndOfFile {
+            return Ok(bytes::Bytes::new());
+        }
         let content = response
             .message
             .content
             .to_read()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            .map_err(|error| Error::InvalidMessage(error.to_string()))?;
 
-        let data_end = content.data_offset + content.data_length;
-        if data_end > response.raw.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Read response data extends beyond raw message bounds",
-            ));
-        }
+        let data_range = content
+            .data_range(response.raw.len())
+            .map_err(|error| Error::InvalidMessage(error.to_string()))?;
 
-        // Zero-copy: slice the Bytes without any memory copy.
-        Ok(response.raw.slice(content.data_offset..data_end))
+        // Zero-copy: slice the immutable frame owner without copying payload.
+        Ok(response.raw.slice(data_range.as_range()))
     }
 
     /// Builds and sends a read request, returning the incoming response message.
@@ -172,7 +206,26 @@ impl File {
         pos: u64,
         channel: Option<u32>,
         unbuffered: bool,
-    ) -> std::io::Result<crate::msg_handler::IncomingMessage> {
+    ) -> std::io::Result<crate::command::CommandResponse> {
+        self.send_read_request_with_options(
+            length,
+            pos,
+            channel,
+            unbuffered,
+            FileOperationOptions::default(),
+        )
+        .await
+        .map_err(std::io::Error::other)
+    }
+
+    async fn send_read_request_with_options(
+        &self,
+        length: u32,
+        pos: u64,
+        channel: Option<u32>,
+        unbuffered: bool,
+        operation: FileOperationOptions,
+    ) -> crate::Result<crate::command::CommandResponse> {
         let mut flags = ReadFlags::new();
         if self.handle.conn_info.config.compression_enabled
             && self.handle.conn_info.dialect.supports_compression()
@@ -184,22 +237,31 @@ impl File {
             flags.set_read_unbuffered(true);
         }
 
-        let request = OutgoingMessage::new(
+        let request = CommandRequest::new(
             ReadRequest {
                 flags,
                 length,
                 offset: pos,
-                file_id: self.handle.file_id().map_err(std::io::Error::other)?,
+                file_id: self.handle.file_id().await?,
                 minimum_count: 1,
             }
             .into(),
         )
         .with_channel_id(channel);
 
+        let mut options = ResponseOptions::new()
+            .with_allow_async(true)
+            .with_cmd(Some(Command::Read))
+            .with_status(&[Status::Success, Status::EndOfFile]);
+        if let Some(timeout) = operation.timeout {
+            options = options.with_timeout(timeout);
+        }
+        if let Some(cancellation) = operation.cancellation {
+            options = options.with_cancellation_token(cancellation);
+        }
         self.handle
-            .sendo_recvo(request, ReceiveOptions::new().with_allow_async(true))
+            .execute_request_with_replay(request, options, operation.replay)
             .await
-            .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
     /// Write a block of data to an opened file.
@@ -234,15 +296,24 @@ impl File {
         pos: u64,
         channel: Option<u32>,
     ) -> std::io::Result<usize> {
+        self.write_block_zc_with_options(buf, pos, channel, FileOperationOptions::default())
+            .await
+            .map_err(std::io::Error::other)
+    }
+
+    pub(crate) async fn write_block_zc_with_options(
+        &self,
+        buf: Bytes,
+        pos: u64,
+        channel: Option<u32>,
+        operation: FileOperationOptions,
+    ) -> crate::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
 
         if !self.access.file_write_data() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "No write permission",
-            ));
+            return Err(Error::MissingPermissions("file write data".into()));
         }
 
         tracing::debug!(
@@ -253,10 +324,10 @@ impl File {
         );
 
         // Bytes provides zero-copy clone via internal reference counting.
-        let outgoing = OutgoingMessage::new(
+        let outgoing = CommandRequest::new(
             WriteRequest::new(
                 pos,
-                self.handle.file_id().map_err(std::io::Error::other)?,
+                self.handle.file_id().await?,
                 WriteFlags::new(),
                 buf.len() as u32,
             )
@@ -265,17 +336,23 @@ impl File {
         .with_additional_data(buf)
         .with_channel_id(channel);
 
+        let mut options = ResponseOptions::new().with_allow_async(true);
+        if let Some(timeout) = operation.timeout {
+            options = options.with_timeout(timeout);
+        }
+        if let Some(cancellation) = operation.cancellation {
+            options = options.with_cancellation_token(cancellation);
+        }
         let response = self
             .handle
-            .sendo_recvo(outgoing, ReceiveOptions::new().with_allow_async(true))
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+            .execute_request_with_replay(outgoing, options, operation.replay)
+            .await?;
 
         let content = response
             .message
             .content
             .to_write()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            .map_err(|error| Error::InvalidMessage(error.to_string()))?;
         let actual_written_length = content.count as usize;
         tracing::debug!(
             "Wrote {} bytes to {}.",
@@ -290,117 +367,18 @@ impl File {
     pub async fn flush(&self) -> std::io::Result<()> {
         let _response = self
             .handle
-            .send_recvo(
+            .execute_content(
                 FlushRequest {
-                    file_id: self.handle.file_id().map_err(std::io::Error::other)?,
+                    file_id: self.handle.file_id().await.map_err(std::io::Error::other)?,
                 }
                 .into(),
-                ReceiveOptions::new().with_allow_async(true),
+                ResponseOptions::new().with_allow_async(true),
             )
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         tracing::debug!("Flushed {}.", self.handle.name());
         Ok(())
-    }
-
-    /// Performs a server-side copy from another file on the same server.
-    /// # Arguments
-    /// * `from` - The file to copy from.
-    /// # Notes
-    /// * This copy must be performed against a file from the same share (tree) as this file.
-    #[tracing::instrument(level = "debug", skip_all, fields(to = %self.handle.name(), from = %from.handle.name()))]
-    pub async fn srv_copy(&self, from: &File) -> crate::Result<()> {
-        if !self.access.file_write_data() {
-            return Err(Error::InvalidState(
-                "No write permission on destination file".to_string(),
-            ));
-        }
-        if !from.access.file_read_data() {
-            return Err(Error::InvalidState(
-                "No read permission on source file".to_string(),
-            ));
-        }
-
-        // Even if we weren't testing it properly, the remote would have returned
-        // [Status::ObjectNameNotFound] error for unmatching trees.
-        if !self.same_tree(from) {
-            return Err(Error::InvalidArgument(
-                "Source and destination files must be opened from the same share (tree)"
-                    .to_string(),
-            ));
-        }
-
-        let other_end_of_file = from.get_len().await?;
-        self.set_len(other_end_of_file).await?;
-
-        let resume_key_response = from.fsctl(SrvRequestResumeKeyRequest(())).await?;
-        let resume_key = resume_key_response.resume_key;
-
-        let chunks = (0..other_end_of_file)
-            .step_by(CHUNK_SIZE)
-            .map(|start| {
-                let len_left = other_end_of_file - start;
-                SrvCopychunkItem {
-                    source_offset: start,
-                    target_offset: start,
-                    length: std::cmp::min(CHUNK_SIZE as u32, len_left as u32),
-                }
-            })
-            .collect::<Vec<_>>();
-
-        const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB
-        let req = SrvCopychunkCopy {
-            source_key: resume_key,
-            chunks,
-        };
-        let copy_response = self.fsctl(req).await?;
-        if copy_response.total_bytes_written as u64 != other_end_of_file {
-            return Err(Error::InvalidArgument(format!(
-                "Expected to write {} bytes, but wrote {} bytes",
-                other_end_of_file, copy_response.total_bytes_written
-            )));
-        }
-        Ok(())
-    }
-}
-
-impl ReadAtChannel for File {
-    async fn read_at_channel(
-        &self,
-        buf: &mut [u8],
-        offset: u64,
-        channel: Option<u32>,
-    ) -> crate::Result<usize> {
-        self.read_block(buf, offset, channel, false)
-            .await
-            .map_err(crate::Error::IoError)
-    }
-}
-
-impl WriteAtChannel for File {
-    async fn write_at_channel(
-        &self,
-        buf: &[u8],
-        offset: u64,
-        channel: Option<u32>,
-    ) -> crate::Result<usize> {
-        self.write_block(buf, offset, channel)
-            .await
-            .map_err(crate::Error::IoError)
-    }
-}
-
-impl GetLen for File {
-    async fn get_len(&self) -> crate::Result<u64> {
-        Ok(self.end_of_file)
-    }
-}
-
-impl SetLen for File {
-    async fn set_len(&self, len: u64) -> crate::Result<()> {
-        self.set_info(FileEndOfFileInformation { end_of_file: len })
-            .await
     }
 }
 

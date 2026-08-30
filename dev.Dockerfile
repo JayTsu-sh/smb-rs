@@ -11,7 +11,6 @@ RUN apt update && \
     tcpdump \
     neovim \
     net-tools \
-    # RDMA
-    libibverbs1 ibverbs-utils librdmacm1 libibumad3 ibverbs-providers rdma-core libibverbs-dev iproute2 perftest librdmacm-dev rdmacm-utils libprotobuf-dev protobuf-compiler clang curl
+    curl
 
 ENV RUST_BACKTRACE=1 RUST_LOG=DEBUG

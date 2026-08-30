@@ -12,7 +12,7 @@ use smb_msg_derive::*;
 /// and response (server to client) operations. The structure is identical for all three operations.
 ///
 /// Reference: MS-SMB2 2.2.23.1, 2.2.24.1, 2.2.25.1
-#[smb_request_response(size = 12)]
+#[smb_request_response(size = 24)]
 pub struct OplockBreakMsg {
     /// The oplock level. For notifications, this is the maximum level the server will accept.
     /// For acknowledgments, this is the lowered level the client accepts.
@@ -22,6 +22,23 @@ pub struct OplockBreakMsg {
     reserved: u32,
     /// The file identifier on which the oplock break occurred.
     file_id: FileId,
+}
+
+impl OplockBreakMsg {
+    pub const fn new(oplock_level: OplockLevel, file_id: FileId) -> Self {
+        Self {
+            oplock_level: oplock_level as u8,
+            file_id,
+        }
+    }
+
+    pub fn oplock_level(&self) -> Result<OplockLevel, binrw::Error> {
+        OplockLevel::read(&mut std::io::Cursor::new([self.oplock_level]))
+    }
+
+    pub const fn file_id(&self) -> FileId {
+        self.file_id
+    }
 }
 
 /// Lease Break Notification message.
@@ -61,6 +78,7 @@ pub struct LeaseBreakNotify {
 ///
 /// Reference: MS-SMB2 2.2.23.1
 #[smb_message_binrw]
+#[derive(Clone, Copy)]
 #[brw(repr(u8))]
 pub enum OplockLevel {
     /// No oplock is available.
@@ -68,7 +86,9 @@ pub enum OplockLevel {
     /// A level II oplock is available.
     II = 1,
     /// Exclusive oplock is available.
-    Exclusive = 2,
+    Exclusive = 0x08,
+    /// A batch oplock is requested or granted.
+    Batch = 0x09,
     /// Lease semantics are in effect for this open. Used in
     /// `CreateRequest::requested_oplock_level` to signal "I'm sending an
     /// `RqLs` create context; treat this as a lease request rather than an
@@ -142,6 +162,16 @@ mod tests {
     use super::*;
 
     test_binrw_response! {
+        struct OplockBreakMsg {
+            oplock_level: OplockLevel::II as u8,
+            file_id: FileId {
+                persistent: 7,
+                volatile: 9,
+            },
+        } => "180001000000000007000000000000000900000000000000"
+    }
+
+    test_binrw_response! {
         struct LeaseBreakNotify {
             new_epoch: 2,
             ack_required: 1,
@@ -165,5 +195,16 @@ mod tests {
             lease_key: "70c8619e-165d-315e-d492-a01b0cbb3af2".parse().unwrap(),
             lease_state: LeaseState::new(),
         } => "24000000000000009e61c8705d165e31d492a01b0cbb3af2000000000000000000000000"
+    }
+
+    #[test]
+    fn oplock_break_interface_retains_level_and_file_identity() {
+        let file_id = FileId {
+            persistent: 7,
+            volatile: 9,
+        };
+        let message = OplockBreakMsg::new(OplockLevel::II, file_id);
+        assert_eq!(message.oplock_level().unwrap(), OplockLevel::II);
+        assert_eq!(message.file_id(), file_id);
     }
 }

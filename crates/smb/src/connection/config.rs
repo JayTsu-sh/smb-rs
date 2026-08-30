@@ -5,6 +5,51 @@ use std::time::Duration;
 use smb_msg::Dialect;
 use smb_transport::config::*;
 
+/// Bounded automatic transport and Connection-generation recovery policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoReconnectConfig {
+    pub enabled: bool,
+    pub max_attempts: u32,
+    pub attempt_timeout: Duration,
+    pub total_timeout: Duration,
+    pub initial_backoff: Duration,
+    pub maximum_backoff: Duration,
+    pub maximum_jitter: Duration,
+    pub max_waiting_operations: usize,
+}
+
+impl Default for AutoReconnectConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_attempts: 3,
+            attempt_timeout: Duration::from_secs(10),
+            total_timeout: Duration::from_secs(30),
+            initial_backoff: Duration::from_millis(100),
+            maximum_backoff: Duration::from_secs(2),
+            maximum_jitter: Duration::from_millis(100),
+            max_waiting_operations: 1024,
+        }
+    }
+}
+
+impl AutoReconnectConfig {
+    pub(crate) fn runtime_policy(self) -> crate::runtime::RecoveryPolicy {
+        if !self.enabled {
+            return crate::runtime::RecoveryPolicy::disabled();
+        }
+        crate::runtime::RecoveryPolicy {
+            max_attempts: self.max_attempts,
+            attempt_timeout: self.attempt_timeout,
+            total_timeout: self.total_timeout,
+            initial_backoff: self.initial_backoff,
+            maximum_backoff: self.maximum_backoff,
+            maximum_jitter: self.maximum_jitter,
+            max_waiting_operations: self.max_waiting_operations,
+        }
+    }
+}
+
 /// Specifies the encryption mode for the connection.
 /// Use this as part of the [ConnectionConfig] to specify the encryption mode for the connection.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -42,9 +87,6 @@ pub enum MultiChannelConfig {
     /// interfaces. This is the recommended default for code that wants
     /// Multi-Channel where it is available.
     Auto,
-    /// Multi-channel is enabled only if using RDMA transport, and if supported by the server and client.
-    #[cfg(feature = "rdma")]
-    RdmaOnly,
 }
 
 impl MultiChannelConfig {
@@ -52,18 +94,8 @@ impl MultiChannelConfig {
     pub fn is_enabled(&self) -> bool {
         match self {
             MultiChannelConfig::Auto => true,
-            #[cfg(feature = "rdma")]
-            MultiChannelConfig::RdmaOnly => true,
             MultiChannelConfig::Disabled => false,
         }
-    }
-
-    /// Returns whether multichannel is enabled only for RDMA transport.
-    pub fn is_rdma_only(&self) -> bool {
-        #[cfg(feature = "rdma")]
-        return matches!(self, MultiChannelConfig::RdmaOnly);
-        #[cfg(not(feature = "rdma"))]
-        return false;
     }
 }
 
@@ -114,6 +146,9 @@ pub struct ConnectionConfig {
     /// Access the timeout using the [`ConnectionConfig::timeout()`] method.
     pub timeout: Option<Duration>,
 
+    /// Controls automatic recovery after unplanned transport loss.
+    pub auto_reconnect: AutoReconnectConfig,
+
     /// Specifies the minimum and maximum dialects to be used in the connection.
     ///
     /// Note, that if set, the minimum dialect must be less than or equal to the maximum dialect.
@@ -134,7 +169,7 @@ pub struct ConnectionConfig {
     /// Whether to enable compression, if supported by the server and specified connection dialects.
     ///
     /// Note: you must also have compression features enabled when building the crate, otherwise compression
-    /// would not be available. *The compression feature is enabled by default.*
+    /// would not be available. Compression is disabled in the default build.
     pub compression_enabled: bool,
 
     /// Multi-channel configuration
@@ -190,20 +225,26 @@ impl ConnectionConfig {
                 ));
             }
         }
-        // Make sure transport is supported by the dialects.
-        #[cfg(feature = "quic")]
-        if let Some(min) = self.min_dialect {
-            if min < Dialect::Smb0311 && matches!(self.transport, TransportConfig::Quic(_)) {
-                return Err(crate::Error::InvalidConfiguration(
-                    "SMB over QUIC is not supported by the selected dialect".to_string(),
-                ));
-            }
-        }
-
         if let Some(default_transaction_size) = self.default_transaction_size {
             if default_transaction_size == 0 {
                 return Err(crate::Error::InvalidConfiguration(
                     "Default transaction size cannot be zero".to_string(),
+                ));
+            }
+        }
+        if self.auto_reconnect.enabled {
+            if self.auto_reconnect.max_attempts == 0
+                || self.auto_reconnect.attempt_timeout.is_zero()
+                || self.auto_reconnect.total_timeout.is_zero()
+                || self.auto_reconnect.max_waiting_operations == 0
+            {
+                return Err(crate::Error::InvalidConfiguration(
+                    "Enabled auto reconnect requires attempts and non-zero deadlines".to_string(),
+                ));
+            }
+            if self.auto_reconnect.initial_backoff > self.auto_reconnect.maximum_backoff {
+                return Err(crate::Error::InvalidConfiguration(
+                    "Initial reconnect backoff exceeds maximum backoff".to_string(),
                 ));
             }
         }

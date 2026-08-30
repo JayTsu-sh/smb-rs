@@ -26,7 +26,7 @@ binrw = { workspace = true }
 modular-bitfield = { workspace = true }
 
 # Async
-tokio = { workspace = true, features = ["time", "rt"] }
+tokio = { workspace = true, features = ["time", "rt", "sync", "io-util"] }
 futures = { workspace = true }
 futures-core = { workspace = true }
 futures-util = { workspace = true }
@@ -39,6 +39,7 @@ tracing = { workspace = true }
 time = { workspace = true }
 thiserror = { workspace = true }
 pastey = { workspace = true }
+serde = { version = "1", features = ["derive"], optional = true }
 # Stable keyed hash used to derive per-path lease keys from the client's
 # random salt. std::DefaultHasher's algorithm is explicitly unstable
 # across Rust versions, which would break lease-cache reuse across
@@ -54,6 +55,7 @@ arc-swap = "1"
 
 # APIs
 sspi = { version = "0.20.1", features = ["ring"], default-features = false }
+zeroize = "1"
 reqwest = { workspace = true, optional = true }
 
 # Crypto
@@ -77,10 +79,40 @@ lz4_flex = { version = "0.11", default-features = false, features = [
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 serial_test = "3.2"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "test-util"] }
+serde_json = "1"
+smb-tests = { workspace = true }
+
+[[test]]
+name = "conformance_anonymous"
+required-features = ["test-support"]
+
+[[test]]
+name = "conformance_smb302"
+required-features = ["test-support"]
+
+[[test]]
+name = "conformance_smoke"
+required-features = ["test-support"]
+
+[[test]]
+name = "conformance_windows_dc_ntlm"
+required-features = ["test-support"]
+
+[[test]]
+name = "lifecycle_scenario"
+required-features = ["test-support"]
+
+[[test]]
+name = "ontap_performance"
+required-features = ["real-server-tests"]
+
+[[test]]
+name = "transform_copy_budget"
+required-features = ["compress"]
 
 [features]
-default = ["sign", "encrypt", "compress", "std-fs-impls", "netbios-transport"]
+default = ["sign", "encrypt", "netbios-transport"]
 
 # Compression
 compress_pattern_v1 = []
@@ -104,32 +136,19 @@ sign_hmac = []
 sign = ["sign_gmac", "sign_cmac", "sign_hmac"]
 
 # Transport
-quic = ["smb-transport/quic"]
-rdma = ["smb-transport/rdma"]
 netbios-transport = ["smb-transport/netbios-transport"]
 
 # Kerberos requires reqwest for HTTP transport, for kerberos
 kerberos = ["reqwest", "dep:byteorder"]
-
-# Implement traits for std::fs::File/tokio::fs::File
-std-fs-impls = ["tokio/fs"]
-
-# Debugging
-__debug-dump-keys = []
 
 # Test-only API surface: exposes session-setup internals (GssState,
 # authenticate_with_gss) and pulls in the smb-msg `server` feature so
 # integration tests can construct server-direction frames (e.g. a
 # scripted NegotiateResponse) via BinWrite. Never enable in production
 # — the re-exported items are not subject to SemVer.
-test-support = ["smb-msg/server"]
-
-# Tests
-test-multichannel = []
-test-ndr64 = []
-test-quic = []
-test-rdma = []
+test-support = ["smb-msg/server", "smb-transport/test-support", "dep:serde"]
+real-server-tests = []
 
 [package.metadata.docs.rs]
-features = ["sign", "encrypt", "compress", "kerberos", "quic"]
+features = ["sign", "encrypt", "compress", "kerberos"]
 no-default-features = true

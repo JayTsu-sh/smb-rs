@@ -1,43 +1,48 @@
-pub(crate) mod actor;
 pub mod config;
 pub mod connection_info;
+mod generation_runtime;
 pub mod preauth_hash;
-pub mod transformer;
-pub mod worker;
+mod registry;
 
+use crate::clock::TokioClock;
 use crate::compression;
 use crate::connection::preauth_hash::PreauthHashState;
 use crate::dialects::DialectImpl;
-use crate::lease::{LeaseBreakEvent, LeaseSlot};
-use std::sync::Arc;
-use tokio::select;
-use tokio::sync::{OnceCell, Semaphore};
-use tokio_util::sync::CancellationToken;
-use crate::{Error, crypto, msg_handler::*, session::Session};
-use actor::{ConnectionActor, ConnectionActorHandle};
+use crate::lease::{
+    LeaseBreakAckOutcome, LeaseBreakEvent, LeaseSlot, OplockBreakEvent, OplockSlot,
+};
+pub use crate::runtime::wire::TransformError;
+use crate::runtime::{
+    GenerationBootstrap, GenerationId, GenerationPublication, PreparedGeneration,
+    RandomRecoveryJitter, RecoveryDriver, RecoveryError, RuntimeError,
+};
+use crate::{Error, command::*, crypto, session::Session};
+use arc_swap::ArcSwapOption;
 use binrw::prelude::*;
 pub use config::*;
 use connection_info::{ConnectionInfo, NegotiatedProperties};
+use futures_core::future::BoxFuture;
+use futures_util::FutureExt;
+use generation_runtime::GenerationRuntime;
 use rand::RngCore;
 use rand::rngs::OsRng;
+use registry::ConnectionRegistry;
 use smb_dtyp::*;
 use smb_msg::{
-    Command, RequestContent, Response, ResponseContent, negotiate::*, oplock::LeaseBreakAck,
+    OplockLevel, RequestContent, Response, ResponseContent, negotiate::*, oplock::LeaseBreakAck,
     smb1::SMB1NegotiateMessage,
 };
 use smb_transport::*;
-use std::cmp::max;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use std::time::Instant;
-pub use transformer::TransformError;
-use worker::{Worker, WorkerImpl};
+use std::sync::Weak;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+use tokio::select;
+use tokio_util::sync::CancellationToken;
 
 /// Capacity of the per-connection lease-break broadcast. A handful of slow
-/// subscribers wouldn't trail behind by more than this many events; if they
-/// do, they receive `RecvError::Lagged` and miss the older notifications —
-/// acceptable since the ack itself has already been sent by the connection
-/// task and the subscriber's role is just to invalidate cached state.
+/// subscribers wouldn't trail behind by more than this many events. Internal
+/// cache invalidation is authoritative and does not depend on this channel.
 const LEASE_BREAK_CHANNEL_CAPACITY: usize = 64;
 
 /// Represents an SMB connection.
@@ -45,11 +50,93 @@ const LEASE_BREAK_CHANNEL_CAPACITY: usize = 64;
 /// Each SMB connection has a single matching transport (e.g. TCP connection).
 /// Usually, most use cases require a single connection per server-client communication.
 pub struct Connection {
-    handler: Arc<ConnectionMessageHandler>,
+    context: Arc<ConnectionCore>,
     config: ConnectionConfig,
 
     server_name: String,
     server_address: SocketAddr,
+}
+
+struct ConnectionRecoveryBootstrap {
+    context: Weak<ConnectionCore>,
+    config: ConnectionConfig,
+    server_name: String,
+    server_address: SocketAddr,
+}
+
+struct ConnectionGenerationPublication {
+    context: Arc<ConnectionCore>,
+    generation_runtime: Arc<GenerationRuntime>,
+    info: Arc<ConnectionInfo>,
+}
+
+impl GenerationPublication for ConnectionGenerationPublication {
+    fn publish(self: Box<Self>) {
+        self.context
+            .publish_generation(self.generation_runtime, self.info);
+    }
+}
+
+impl GenerationBootstrap for ConnectionRecoveryBootstrap {
+    fn bootstrap(
+        &self,
+        generation: GenerationId,
+        _deadline: crate::clock::MonotonicTime,
+    ) -> BoxFuture<'static, Result<PreparedGeneration, RuntimeError>> {
+        let context = self.context.clone();
+        let config = self.config.clone();
+        let server_name = self.server_name.clone();
+        let server_address = self.server_address;
+        async move {
+            let context = context.upgrade().ok_or(RuntimeError::Closed)?;
+            let connection = Connection {
+                context: context.clone(),
+                config: config.clone(),
+                server_name: server_name.clone(),
+                server_address,
+            };
+            let mut transport = make_transport(&config.transport, config.timeout())
+                .map_err(|_| RuntimeError::Transport("recovery-make-transport"))?;
+            let mut address = server_address;
+            if address.port() == 0 {
+                address.set_port(config.port.unwrap_or_else(|| transport.default_port()));
+            }
+            transport
+                .connect(&server_name, address)
+                .await
+                .map_err(|_| RuntimeError::Transport("recovery-connect"))?;
+            let remote_address = transport
+                .remote_address()
+                .map_err(|_| RuntimeError::Transport("recovery-remote-address"))?;
+            let generation_runtime = connection
+                ._negotiate_switch_to_smb2(transport, config.smb2_only_negotiate, generation)
+                .await
+                .map_err(|_| RuntimeError::Wire("recovery-negotiate-switch"))?;
+            let info = match connection
+                ._negotiate_smb2(remote_address, &generation_runtime)
+                .await
+            {
+                Ok(info) => Arc::new(info),
+                Err(_) => {
+                    let _ = generation_runtime.stop().await;
+                    return Err(RuntimeError::Wire("recovery-negotiate"));
+                }
+            };
+            if generation_runtime.negotaite_complete(&info).await.is_err() {
+                let _ = generation_runtime.stop().await;
+                return Err(RuntimeError::Wire("recovery-negotiate-commit"));
+            }
+            Ok(PreparedGeneration::new(
+                generation_runtime.runtime_handle(),
+                Box::new(ConnectionGenerationPublication {
+                    context,
+                    generation_runtime,
+                    info,
+                }),
+            ))
+        }
+        .boxed()
+    }
 }
 
 impl Connection {
@@ -63,10 +150,7 @@ impl Connection {
     ) -> crate::Result<Self> {
         config.validate()?;
         Ok(Connection {
-            handler: Arc::new(ConnectionMessageHandler::new(
-                client_guid,
-                config.credits_backlog,
-            )),
+            context: Arc::new(ConnectionCore::new(client_guid)),
             config,
             server_name: server_name.to_string(),
             server_address,
@@ -111,8 +195,8 @@ impl Connection {
         primary_session
             .bind(
                 identity,
-                &self.handler,
-                self.handler.conn_info.get().ok_or_else(|| {
+                &self.context,
+                &self.context.conn_info().ok_or_else(|| {
                     Error::InvalidState("Connection info not available.".to_string())
                 })?,
             )
@@ -122,7 +206,7 @@ impl Connection {
     /// Connects to the specified server, if it is not already connected, and negotiates the connection.
     #[tracing::instrument(level = "debug", skip_all, fields(server = %self.server_name))]
     pub async fn connect(&self) -> crate::Result<()> {
-        if self.handler.worker().is_some() {
+        if self.context.generation_runtime().is_some() {
             return Err(Error::InvalidState("Already connected".into()));
         }
 
@@ -140,7 +224,7 @@ impl Connection {
             .await?;
 
         tracing::info!("Connected. Negotiating");
-        self._negotiate(transport, self.config.smb2_only_negotiate)
+        self._negotiate(transport, self.config.smb2_only_negotiate, true)
             .await?;
 
         Ok(())
@@ -160,7 +244,7 @@ impl Connection {
     /// A new [`Connection`] object with the specified transport and configuration.
     ///
     ///
-    /// ```no_run
+    /// ```ignore
     /// # use smb::*;
     /// # use std::time::Duration;
     /// use smb_transport::TcpTransport;
@@ -179,7 +263,7 @@ impl Connection {
         config: ConnectionConfig,
     ) -> crate::Result<Self> {
         let conn = Self::build(server, transport.remote_address()?, client_guid, config)?;
-        conn._negotiate(transport, conn.config.smb2_only_negotiate)
+        conn._negotiate(transport, conn.config.smb2_only_negotiate, false)
             .await?;
         Ok(conn)
     }
@@ -192,25 +276,33 @@ impl Connection {
     /// See also [`Client::close`][`crate::Client::close`].
     #[tracing::instrument(level = "debug", skip_all, fields(server = %self.server_name))]
     pub async fn close(&self) -> crate::Result<()> {
-        match self.handler.worker() {
+        self.context.stop_notify();
+        self.context.close_recovery().await;
+        let result = match self.context.generation_runtime() {
             Some(c) => c.stop().await,
             None => Ok(()),
-        }
+        };
+        self.context.join_support_tasks().await;
+        result
     }
 
     /// Switches the protocol to SMB2 against the server if required,
-    /// and wraps the transport in a SMB2 worker.
+    /// and wraps the transport in a SMB2 generation_runtime.
     async fn _negotiate_switch_to_smb2(
         &self,
         mut transport: Box<dyn SmbTransport>,
         smb2_only_neg: bool,
-    ) -> crate::Result<Arc<WorkerImpl>> {
+        generation: GenerationId,
+    ) -> crate::Result<Arc<GenerationRuntime>> {
+        let mut initial_message_id = 0;
         // Multi-protocol negotiation: Begin with SMB1, expect SMB2.
         if !smb2_only_neg {
             tracing::debug!("Negotiating multi-protocol: Sending SMB1");
             // 1. Send SMB1 negotiate request
             let msg_bytes: Vec<u8> = SMB1NegotiateMessage::default().try_into()?;
-            transport.send(&IoVec::from(msg_bytes)).await?;
+            let frame =
+                smb_transport::SendFrame::from_segments(vec![bytes::Bytes::from(msg_bytes)], 1)?;
+            transport.send(&frame).await?;
 
             tracing::debug!("Sent SMB1 negotiate request, Receieving SMB2 response");
             // 2. Expect SMB2 negotiate response
@@ -242,22 +334,25 @@ impl Connection {
                 ));
             }
             // Increase sequence number.
-            self.handler.curr_msg_id.fetch_add(1, Ordering::Relaxed);
+            initial_message_id = 1;
         }
 
-        WorkerImpl::start(transport, self.config.timeout()).await
+        GenerationRuntime::start_generation_at(
+            transport,
+            self.config.timeout(),
+            initial_message_id,
+            u32::from(self.config.credits_backlog.unwrap_or(128)),
+            generation,
+        )
+        .await
     }
 
     /// This method perofrms the SMB2 negotiation.
     async fn _negotiate_smb2(
         &self,
         server_address: std::net::SocketAddr,
+        generation_runtime: &Arc<GenerationRuntime>,
     ) -> crate::Result<ConnectionInfo> {
-        // Confirm that we're not already negotiated.
-        if self.handler.conn_info.get().is_some() {
-            return Err(Error::InvalidState("Already negotiated".into()));
-        }
-
         tracing::debug!("Negotiating SMB2");
 
         // List possible versions to run with.
@@ -283,9 +378,10 @@ impl Connection {
 
         // Send SMB2 negotiate request
         let (request_status, response) = self
-            .handler
-            .sendor_recv(
-                OutgoingMessage::new(
+            .context
+            .execute_with_worker(
+                generation_runtime,
+                CommandRequest::new(
                     self._make_smb2_neg_request(
                         dialects,
                         crypto::SIGNING_ALGOS.to_vec(),
@@ -294,7 +390,8 @@ impl Connection {
                     )
                     .into(),
                 )
-                .with_return_raw_data(true),
+                .with_return_raw_data(true)
+                .with_protection(Protection::None),
             )
             .await?;
 
@@ -343,14 +440,11 @@ impl Connection {
         );
 
         let preauth_hash = if dialect_impl.preauth_hash_supported() {
-            let mut request_raw = request_status
+            let request_raw = request_status
                 .raw
                 .expect("Preauth hash must be calculated for supported dialect!");
-            request_raw.consolidate();
             PreauthHashState::begin()
-                .next(request_raw.first().ok_or_else(|| {
-                    Error::InvalidState("Preauth hash request data is empty.".to_string())
-                })?)?
+                .next(&request_raw)?
                 .next(&response.raw)?
         } else {
             PreauthHashState::unsupported()
@@ -362,7 +456,7 @@ impl Connection {
             config: self.config.clone(),
             server_name: self.server_name.clone(),
             preauth_hash,
-            client_guid: self.handler.client_guid,
+            client_guid: self.context.client_guid,
             server_address,
         })
     }
@@ -375,7 +469,7 @@ impl Connection {
         encrypting_algorithms: Vec<EncryptionCipher>,
         compression_algorithms: Vec<CompressionAlgorithm>,
     ) -> NegotiateRequest {
-        let client_guid = self.handler.client_guid;
+        let client_guid = self.context.client_guid;
         let client_netname = self
             .config
             .client_name
@@ -398,39 +492,13 @@ impl Connection {
                     netname: client_netname.into(),
                 }
                 .into(),
-                EncryptionCapabilities {
-                    ciphers: encrypting_algorithms,
-                }
-                .into(),
-                CompressionCapabilities {
-                    flags: CompressionCapsFlags::new()
-                        .with_chained(!compression_algorithms.is_empty()),
-                    compression_algorithms,
-                }
-                .into(),
-                SigningCapabilities { signing_algorithms }.into(),
             ];
-            // QUIC
-            #[cfg(feature = "quic")]
-            if matches!(self.config.transport, TransportConfig::Quic(_)) {
-                ctx_list.push(NegotiateContext {
-                    context_type: NegotiateContextType::TransportCapabilities,
-                    data: NegotiateContextValue::TransportCapabilities(
-                        TransportCapabilities::new().with_accept_transport_layer_security(true),
-                    ),
-                });
-            }
-            // TODO: Add to config
-            if cfg!(feature = "rdma") {
-                ctx_list.push(NegotiateContext {
-                    context_type: NegotiateContextType::RdmaTransformCapabilities,
-                    data: NegotiateContextValue::RdmaTransformCapabilities(
-                        RdmaTransformCapabilities {
-                            transforms: vec![RdmaTransformId::None],
-                        },
-                    ),
-                });
-            }
+            Self::append_optional_negotiate_contexts(
+                &mut ctx_list,
+                encrypting_algorithms,
+                compression_algorithms,
+                signing_algorithms,
+            );
             Some(ctx_list)
         } else {
             None
@@ -445,7 +513,9 @@ impl Connection {
                 .with_leasing(true)
                 .with_large_mtu(true)
                 .with_multi_channel(self.config.multichannel.is_enabled())
-                .with_persistent_handles(false)
+                // SMB3 clients must advertise persistent-handle support before
+                // a CA share can grant a DH2Q persistent create context.
+                .with_persistent_handles(true)
                 .with_directory_leasing(true);
 
             if has_encryption {
@@ -460,7 +530,9 @@ impl Connection {
             capabilities
         };
 
-        let security_mode = NegotiateSecurityMode::new().with_signing_enabled(has_signing);
+        let security_mode = NegotiateSecurityMode::new()
+            .with_signing_enabled(has_signing)
+            .with_signing_required(has_signing);
 
         NegotiateRequest {
             security_mode,
@@ -471,36 +543,60 @@ impl Connection {
         }
     }
 
+    fn append_optional_negotiate_contexts(
+        contexts: &mut Vec<NegotiateContext>,
+        encrypting_algorithms: Vec<EncryptionCipher>,
+        compression_algorithms: Vec<CompressionAlgorithm>,
+        signing_algorithms: Vec<SigningAlgorithmId>,
+    ) {
+        if !encrypting_algorithms.is_empty() {
+            contexts.push(
+                EncryptionCapabilities {
+                    ciphers: encrypting_algorithms,
+                }
+                .into(),
+            );
+        }
+        if !compression_algorithms.is_empty() {
+            contexts.push(
+                CompressionCapabilities {
+                    flags: CompressionCapsFlags::new().with_chained(true),
+                    compression_algorithms,
+                }
+                .into(),
+            );
+        }
+        if !signing_algorithms.is_empty() {
+            contexts.push(SigningCapabilities { signing_algorithms }.into());
+        }
+    }
+
     /// Performs SMB negotiation post-connect.
     async fn _negotiate(
         &self,
         transport: Box<dyn SmbTransport>,
         smb2_only_neg: bool,
+        recoverable: bool,
     ) -> crate::Result<()> {
-        if self.handler.conn_info.get().is_some() {
+        if self.context.conn_info().is_some() {
             return Err(Error::InvalidState("Already negotiated".into()));
         }
 
         let server_address = transport.remote_address()?;
         // Negotiate SMB1, Switch to SMB2
-        let worker = self
-            ._negotiate_switch_to_smb2(transport, smb2_only_neg)
+        let generation_runtime = self
+            ._negotiate_switch_to_smb2(transport, smb2_only_neg, GenerationId::new(1))
             .await?;
 
-        self.handler
-            .worker
-            .set(worker)
-            .map_err(|_| Error::InvalidState("Worker already set.".to_string()))?;
-
         // Negotiate SMB2
-        let info = Arc::new(self._negotiate_smb2(server_address).await?);
+        let info = Arc::new(
+            self._negotiate_smb2(server_address, &generation_runtime)
+                .await?,
+        );
 
-        self.handler
-            .worker
-            .get()
-            .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?
-            .negotaite_complete(&info)
-            .await;
+        generation_runtime.negotaite_complete(&info).await?;
+        self.context
+            .publish_generation(generation_runtime.clone(), info.clone());
 
         // Always start the notify task unless the caller explicitly disabled
         // it. `caps.notifications()` is the SMB 3.1.1 ChangeNotify capability
@@ -513,20 +609,18 @@ impl Connection {
                 "Starting Notification job (server notifications cap={}).",
                 info.negotiation.caps.notifications()
             );
-            self.handler.start_notify().await?;
+            self.context.start_notify().await?;
             tracing::debug!("Notification job started.");
-
-            // Phase C.2: the break-listener consumes the per-connection
-            // lease_event_tx broadcast (fed by handle_lease_break) and
-            // tombstones matching slots in lease_table so new opens
-            // miss the cache after a server-side break.
-            self.handler.start_lease_break_listener();
         }
 
-        self.handler
-            .conn_info
-            .set(info)
-            .map_err(|_| Error::InvalidState("Connection info already set.".to_string()))?;
+        if recoverable {
+            self.context.start_recovery(
+                generation_runtime,
+                self.config.clone(),
+                self.server_name.clone(),
+                self.server_address,
+            )?;
+        }
 
         tracing::debug!("Negotiation successful");
         Ok(())
@@ -546,20 +640,33 @@ impl Connection {
     /// * Use the [`ConnectionConfig`] to configure authentication options.
     #[tracing::instrument(level = "debug", skip_all, fields(server = %self.server_name, user = %identity.username.account_name()))]
     pub async fn authenticate(&self, identity: sspi::AuthIdentity) -> crate::Result<Session> {
-        let session = Session::create(
-            identity,
-            &self.handler,
-            self.handler
-                .conn_info
-                .get()
-                .ok_or_else(|| Error::InvalidState("Connection not negotiated.".to_string()))?,
-        )
-        .await?;
-        let session_handler = Arc::downgrade(&session.handler);
-        self.handler
-            .actor
-            .insert_session(session.session_id(), session_handler)
-            .await?;
+        let conn_info = self
+            .context
+            .conn_info()
+            .ok_or_else(|| Error::InvalidState("Connection not negotiated.".to_string()))?;
+        let session = Session::create(identity, &self.context, &conn_info).await?;
+        let session_context = Arc::downgrade(&session.recovery_context());
+        self.context
+            .registry
+            .insert_session(session.session_id(), session_context)
+            .await;
+        Ok(session)
+    }
+
+    pub(crate) async fn authenticate_with_credential_provider(
+        &self,
+        provider: crate::session::credential::SharedCredentialProvider,
+    ) -> crate::Result<Session> {
+        let conn_info = self
+            .context
+            .conn_info()
+            .ok_or_else(|| Error::InvalidState("Connection not negotiated.".to_string()))?;
+        let session = Session::create_with_provider(provider, &self.context, &conn_info).await?;
+        let session_context = Arc::downgrade(&session.recovery_context());
+        self.context
+            .registry
+            .insert_session(session.session_id(), session_context)
+            .await;
         Ok(session)
     }
 
@@ -573,61 +680,69 @@ impl Connection {
     /// must produce a known sequence of bytes.
     ///
     /// Behaviour, error semantics, and bookkeeping (session table,
-    /// handler weak ref) are identical to [`Self::authenticate`].
+    /// context weak ref) are identical to [`Self::authenticate`].
     #[cfg(feature = "test-support")]
     #[tracing::instrument(level = "debug", skip_all, fields(server = %self.server_name))]
     pub async fn authenticate_with_gss<G>(&self, gss: G) -> crate::Result<Session>
     where
         G: crate::session::gss::GssState + 'static,
     {
-        let session = Session::create_with_gss(
-            gss,
-            &self.handler,
-            self.handler
-                .conn_info
-                .get()
-                .ok_or_else(|| Error::InvalidState("Connection not negotiated.".to_string()))?,
-        )
-        .await?;
-        let session_handler = Arc::downgrade(&session.handler);
-        self.handler
-            .actor
-            .insert_session(session.session_id(), session_handler)
-            .await?;
+        let conn_info = self
+            .context
+            .conn_info()
+            .ok_or_else(|| Error::InvalidState("Connection not negotiated.".to_string()))?;
+        let session = Session::create_with_gss(gss, &self.context, &conn_info).await?;
+        let session_context = Arc::downgrade(&session.recovery_context());
+        self.context
+            .registry
+            .insert_session(session.session_id(), session_context)
+            .await;
         Ok(session)
     }
 
     /// Returns the connection information, if the connection has been negotiated.
     /// Otherwise, returns `None`.
-    pub fn conn_info(&self) -> Option<&Arc<ConnectionInfo>> {
-        self.handler.conn_info.get()
+    pub fn conn_info(&self) -> Option<Arc<ConnectionInfo>> {
+        self.context.conn_info()
+    }
+
+    /// Test-only observation of the opaque runtime generation identity.
+    #[cfg(feature = "test-support")]
+    pub fn observed_generation(&self) -> Option<u64> {
+        self.context
+            .generation_runtime()
+            .map(|generation_runtime| generation_runtime.generation().value())
     }
 
     /// Subscribe to lease-break notifications received on this connection.
-    /// See [`ConnectionMessageHandler::subscribe_lease_breaks`] for semantics.
+    /// See [`ConnectionCore::subscribe_lease_breaks`] for semantics.
     pub fn subscribe_lease_breaks(&self) -> tokio::sync::broadcast::Receiver<LeaseBreakEvent> {
-        self.handler.subscribe_lease_breaks()
+        self.context.subscribe_lease_breaks()
+    }
+
+    pub fn subscribe_oplock_breaks(&self) -> tokio::sync::broadcast::Receiver<OplockBreakEvent> {
+        self.context.subscribe_oplock_breaks()
     }
 
     /// Install a [`crate::lease::LeaseSlot`] into this connection's
-    /// lease cache. See [`ConnectionMessageHandler::insert_lease_slot`].
+    /// lease cache. See [`ConnectionCore::insert_lease_slot`].
     pub async fn insert_lease_slot(&self, slot: Arc<LeaseSlot>) -> crate::Result<()> {
-        self.handler.insert_lease_slot(slot).await
+        self.context.insert_lease_slot(slot).await
     }
 
     /// Return the current number of cached lease slots.
     pub async fn lease_slot_count(&self) -> crate::Result<usize> {
-        self.handler.lease_slot_count().await
+        self.context.lease_slot_count().await
     }
 
     /// Look up a cached lease slot by path; `None` when absent.
     pub async fn peek_lease_slot(&self, path: &str) -> crate::Result<Option<Arc<LeaseSlot>>> {
-        self.handler.peek_lease_slot(path).await
+        self.context.peek_lease_slot(path).await
     }
 
     /// Atomic cache-hit acquire: peek a slot and bump its refcount inside
     /// the `lease_table` lock. See
-    /// [`ConnectionMessageHandler::try_acquire_lease`] for semantics and
+    /// [`ConnectionCore::try_acquire_lease`] for semantics and
     /// the rationale around lock ordering vs eviction.
     pub async fn try_acquire_lease(
         &self,
@@ -636,7 +751,7 @@ impl Connection {
         requested_disposition: smb_msg::CreateDisposition,
         wants_directory: bool,
     ) -> crate::Result<Option<Arc<LeaseSlot>>> {
-        self.handler
+        self.context
             .try_acquire_lease(
                 path,
                 requested_access,
@@ -647,10 +762,10 @@ impl Connection {
     }
 
     /// Phase C.5: tombstone a lease slot and remove it from the table.
-    /// See [`ConnectionMessageHandler::take_lease_for_evict`] for the
+    /// See [`ConnectionCore::take_lease_for_evict`] for the
     /// race-free contract.
     pub async fn take_lease_for_evict(&self, path: &str) -> crate::Result<Option<LeaseEviction>> {
-        self.handler.take_lease_for_evict(path).await
+        self.context.take_lease_for_evict(path).await
     }
 
     /// Phase C.5: scan the connection's lease table and tombstone any
@@ -663,30 +778,27 @@ impl Connection {
         &self,
         older_than: std::time::Duration,
     ) -> crate::Result<Vec<LeaseEviction>> {
-        self.handler.sweep_idle_leases(older_than).await
+        self.context.sweep_idle_leases(older_than).await
     }
 
-    /// Send an SMB2 compound chain through this connection's worker and
+    /// Send an SMB2 compound chain through this connection's generation_runtime and
     /// receive each member's response.
     ///
     /// For each message in `msgs` (in order) this:
-    /// 1. Sets `priority_mask` per the negotiated dialect — matches the
-    ///    single-message [`crate::msg_handler::MessageHandler::sendo`]
-    ///    path.
-    /// 2. Calls [`ConnectionMessageHandler::process_sequence_outgoing`]
-    ///    to allocate `message_id` + credit_charge / credit_request.
-    ///    Same accounting as a single-shot send, so server-side credit
-    ///    windows stay consistent.
+    /// 1. Sets `priority_mask` per the negotiated dialect, matching the
+    ///    single-command execution path.
+    /// 2. Submits the entire typed batch atomically; the runtime owner
+    ///    allocates MessageIds and credit charge/request values.
     /// 3. After all members are prepared, hands the whole batch to
-    ///    [`crate::connection::worker::WorkerImpl::send_compound`] for
+    ///    [`crate::connection::generation_runtime::GenerationRuntime::send_compound`] for
     ///    the single TCP write.
     /// 4. Awaits each member's response separately via
-    ///    `Worker::receive` — server splits the compound response into
+    ///    `Generation runtime::receive` — server splits the compound response into
     ///    N parts; our compound-aware incoming-side parser routes each
     ///    part by message_id, and these receives just consume the
     ///    pre-routed entries.
-    /// 5. Calls `process_sequence_incoming` on each response to return
-    ///    credits to the pool (mirroring the single-message path).
+    /// 5. The runtime owner applies every response grant before publishing
+    ///    the corresponding typed result.
     ///
     /// The caller owns everything semantic: setting
     /// `flags.related_operations` on members 2..N to chain off the
@@ -709,11 +821,24 @@ impl Connection {
     /// twice, which defeats the point of the single-write path.
     pub async fn send_compound(
         &self,
-        mut msgs: Vec<OutgoingMessage>,
-    ) -> crate::Result<Vec<IncomingMessage>> {
+        msgs: Vec<CommandRequest>,
+    ) -> crate::Result<Vec<CommandResponse>> {
+        self.send_compound_for(msgs, self.context.connection_object()?)
+            .await
+    }
+
+    pub(crate) async fn send_compound_for(
+        &self,
+        mut msgs: Vec<CommandRequest>,
+        dependency: crate::runtime::ObjectToken,
+    ) -> crate::Result<Vec<CommandResponse>> {
+        let dependency = self
+            .context
+            .resolve_dependency(dependency, Some(self.config.timeout()), None)
+            .await?;
         // CancelRequest has its own bespoke path inside the single-message
-        // `sendo` (it reuses an already-allocated message_id and skips
-        // `process_sequence_outgoing`). Bundling it into a compound chain
+        // `submit` (it reuses an already-allocated message_id and skips
+        // owner admission). Bundling it into a compound chain
         // would either re-allocate its message_id — silently breaking the
         // cancel target — or skip the per-member accounting we run below.
         // Reject up front rather than letting either failure mode bite.
@@ -725,7 +850,7 @@ impl Connection {
                 )));
             }
         }
-        let priority_value = match self.handler.conn_info.get() {
+        let priority_value = match self.context.conn_info() {
             Some(neg_info) => match neg_info.negotiation.dialect_rev {
                 Dialect::Smb0311 => 1,
                 _ => 0,
@@ -734,23 +859,24 @@ impl Connection {
         };
         for m in msgs.iter_mut() {
             m.message.header.flags = m.message.header.flags.with_priority_mask(priority_value);
-            self.handler.process_sequence_outgoing(m).await?;
         }
 
-        let worker = self
-            .handler
-            .worker
-            .get()
-            .ok_or(Error::InvalidState("Worker is uninitialized".into()))?;
-        let send_results = worker.send_compound(msgs).await?;
+        let generation_runtime = self
+            .context
+            .generation_runtime()
+            .ok_or(Error::InvalidState(
+                "Generation runtime is uninitialized".into(),
+            ))?;
+        let send_results = generation_runtime
+            .send_compound_for(msgs, dependency)
+            .await?;
 
         let mut responses = Vec::with_capacity(send_results.len());
         for r in send_results {
-            let mut opts = ReceiveOptions::new();
+            let mut opts = ResponseOptions::new();
             opts.msg_id = r.msg_id;
             opts.allow_async = true;
-            let incoming = worker.receive(&opts).await?;
-            self.handler.process_sequence_incoming(&incoming).await?;
+            let incoming = generation_runtime.receive(&opts).await?;
             responses.push(incoming);
         }
         Ok(responses)
@@ -771,62 +897,191 @@ pub struct LeaseEviction {
     /// `true` when this eviction owns the wire `Close`: at removal time
     /// the slot had zero live handles, so no `release_one` path will
     /// fire it. The caller must send `CloseRequest` against
-    /// `slot.file_id` through `slot.proto.handler`. `false` when at
+    /// `slot.file_id` through `slot.proto.context`. `false` when at
     /// least one live handle was present; that handle's
     /// `release_one` -> `CloseAndEvict` path will own the wire Close.
     pub needs_wire_close: bool,
 }
 
-/// This struct is the internal message handler for the SMB client.
-pub(crate) struct ConnectionMessageHandler {
+/// This struct is the internal message context for the SMB client.
+pub(crate) struct ConnectionCore {
     client_guid: Guid,
 
-    /// The number of extra credits to be requested by the client
-    /// to enable larger requests/multiple outstanding requests.
-    credits_backlog: u16,
+    generation: ArcSwapOption<ConnectionGeneration>,
 
-    worker: OnceCell<Arc<WorkerImpl>>,
+    recovery: OnceLock<Arc<RecoveryDriver>>,
+
+    tasks: std::sync::Mutex<ConnectionTasks>,
 
     /// Cancellation token for stopping notifications.
     stop_notifications: CancellationToken,
 
-    // Negotiation-related state.
-    conn_info: OnceCell<Arc<ConnectionInfo>>,
-
-    /// Number of credits available to the client at the moment, for the next requests.
-    curr_credits: Semaphore,
-    /// The current message ID to be used in the next message.
-    curr_msg_id: AtomicU64,
-    /// The number of credits granted to the client by the server, including the being-used ones.
-    /// This field is used ONLY when large MTU is enabled.
-    credit_pool: AtomicU16,
-
     /// Broadcasts [`LeaseBreakEvent`] to any [`crate::Client::subscribe_lease_breaks`]
     /// consumers when the server sends a `LeaseBreakNotify`.
     lease_event_tx: tokio::sync::broadcast::Sender<LeaseBreakEvent>,
+    oplock_event_tx: tokio::sync::broadcast::Sender<OplockBreakEvent>,
 
-    /// Handle to the per-connection state actor (S7). Owns the
-    /// Phase C lease cache (keyed by share-relative path) and the
-    /// sessions table. All mutation of those maps happens inside the
-    /// actor task; callers send commands and await typed replies.
-    actor: ConnectionActorHandle,
+    /// Domain-only lease/session registry. It owns no task and no request or
+    /// transport authority; every lock is released before wire I/O.
+    registry: ConnectionRegistry,
 }
 
-impl ConnectionMessageHandler {
-    fn new(client_guid: Guid, credits_backlog: Option<u16>) -> ConnectionMessageHandler {
-        let (lease_event_tx, _) = tokio::sync::broadcast::channel(LEASE_BREAK_CHANNEL_CAPACITY);
+struct ConnectionGeneration {
+    generation_runtime: Arc<GenerationRuntime>,
+    conn_info: Arc<ConnectionInfo>,
+}
 
-        ConnectionMessageHandler {
+#[derive(Default)]
+struct ConnectionTasks {
+    recovery: Option<tokio::task::JoinHandle<()>>,
+    notifications: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl ConnectionCore {
+    pub(crate) fn connection_object(&self) -> crate::Result<crate::runtime::ObjectToken> {
+        Ok(self
+            .generation_runtime()
+            .ok_or_else(|| Error::InvalidState("Runtime is uninitialized".into()))?
+            .connection_object())
+    }
+
+    pub(crate) async fn create_object(
+        &self,
+        parent: crate::runtime::ObjectToken,
+        kind: crate::runtime::ObjectKind,
+    ) -> crate::Result<crate::runtime::ObjectToken> {
+        let parent = self.resolve_dependency(parent, None, None).await?;
+        self.generation_runtime()
+            .ok_or_else(|| Error::InvalidState("Runtime is uninitialized".into()))?
+            .create_object(parent, kind)
+            .await
+    }
+
+    pub(crate) async fn execute_for_with_replay(
+        &self,
+        mut msg: CommandRequest,
+        mut options: ResponseOptions<'_>,
+        dependency: crate::runtime::ObjectToken,
+        replay: crate::runtime::ReplayPolicy,
+    ) -> crate::Result<(CommandSubmission, CommandResponse)> {
+        let timeout = options
+            .timeout
+            .or_else(|| self.conn_info().map(|info| info.config.timeout()));
+        let dependency = self
+            .resolve_dependency(dependency, timeout, options.async_cancel.clone())
+            .await?;
+        let channel_id = msg.channel_id;
+        self.prepare_outgoing(&mut msg).await?;
+        options.channel_id = channel_id;
+        let result = self
+            .generation_runtime()
+            .ok_or_else(|| Error::InvalidState("Generation runtime is uninitialized.".to_string()))?
+            .execute_for_with_replay(msg, &options, dependency, replay)
+            .await?;
+        if !result.1.message.header.flags.server_to_redir() {
+            return Err(Error::InvalidMessage(
+                "Expected server-to-redir message".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    pub(crate) async fn submit_for(
+        &self,
+        mut message: CommandRequest,
+        dependency: crate::runtime::ObjectToken,
+    ) -> crate::Result<CommandSubmission> {
+        let timeout = self.conn_info().map(|info| info.config.timeout());
+        let dependency = self.resolve_dependency(dependency, timeout, None).await?;
+        self.prepare_outgoing(&mut message).await?;
+        self.generation_runtime()
+            .ok_or_else(|| Error::InvalidState("Runtime is uninitialized".into()))?
+            .send_for(message, dependency)
+            .await
+    }
+
+    async fn execute_with_worker(
+        &self,
+        generation_runtime: &Arc<GenerationRuntime>,
+        mut message: CommandRequest,
+    ) -> crate::Result<(CommandSubmission, CommandResponse)> {
+        let command = message.message.content.associated_cmd();
+        // Candidate Connection negotiation must not inherit header policy
+        // from the currently published generation.
+        message.message.header.flags.set_priority_mask(0);
+        let result = generation_runtime
+            .execute_for(
+                message,
+                &ResponseOptions::new().with_cmd(Some(command)),
+                generation_runtime.connection_object(),
+            )
+            .await?;
+        if !result.1.message.header.flags.server_to_redir() {
+            return Err(Error::InvalidMessage(
+                "Expected server-to-redir message".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    pub(crate) async fn receive(
+        &self,
+        options: ResponseOptions<'_>,
+    ) -> crate::Result<CommandResponse> {
+        Self::validate_incoming(
+            self.generation_runtime()
+                .ok_or_else(|| {
+                    Error::InvalidState("Generation runtime is uninitialized.".to_string())
+                })?
+                .receive(&options)
+                .await?,
+            &options,
+        )
+    }
+
+    fn validate_incoming(
+        msg: CommandResponse,
+        options: &ResponseOptions<'_>,
+    ) -> crate::Result<CommandResponse> {
+        if let Some(cmd) = options.cmd
+            && msg.message.header.command != cmd
+        {
+            return Err(Error::UnexpectedMessageCommand(msg.message.header.command));
+        }
+        if !msg.message.header.flags.server_to_redir() {
+            return Err(Error::InvalidMessage(
+                "Expected server-to-redir message".into(),
+            ));
+        }
+        if !options
+            .status
+            .iter()
+            .any(|status| msg.message.header.status == *status as u32)
+        {
+            if let ResponseContent::Error(error) = msg.message.content {
+                return Err(Error::ReceivedErrorMessage(
+                    msg.message.header.status,
+                    error,
+                ));
+            }
+            return Err(Error::UnexpectedMessageStatus(msg.message.header.status));
+        }
+        Ok(msg)
+    }
+
+    fn new(client_guid: Guid) -> ConnectionCore {
+        let (lease_event_tx, _) = tokio::sync::broadcast::channel(LEASE_BREAK_CHANNEL_CAPACITY);
+        let (oplock_event_tx, _) = tokio::sync::broadcast::channel(LEASE_BREAK_CHANNEL_CAPACITY);
+
+        ConnectionCore {
             client_guid,
-            worker: OnceCell::new(),
-            conn_info: OnceCell::new(),
-            credits_backlog: credits_backlog.unwrap_or(128),
-            curr_credits: Semaphore::new(1),
-            curr_msg_id: AtomicU64::new(0),
-            credit_pool: AtomicU16::new(1),
+            generation: ArcSwapOption::empty(),
+            recovery: OnceLock::new(),
+            tasks: std::sync::Mutex::new(ConnectionTasks::default()),
             stop_notifications: Default::default(),
             lease_event_tx,
-            actor: ConnectionActor::spawn(),
+            oplock_event_tx,
+            registry: ConnectionRegistry::new(),
         }
     }
 
@@ -837,7 +1092,7 @@ impl ConnectionMessageHandler {
     /// other side) is logically equivalent to no cache hit.
     pub async fn insert_lease_slot(&self, slot: Arc<LeaseSlot>) -> crate::Result<()> {
         use std::sync::atomic::Ordering;
-        let displaced = self.actor.insert_lease(slot).await?;
+        let displaced = self.registry.insert_lease(slot).await;
         if let Some(prev) = displaced {
             // Tombstone the displaced slot. If a live ResourceHandle is
             // still holding it (refcount > 0), its eventual close/Drop
@@ -856,40 +1111,35 @@ impl ConnectionMessageHandler {
             );
             if live == 0 && prev.file_id != smb_msg::FileId::EMPTY {
                 let file_id = prev.file_id;
-                let handler = prev.proto.handler.clone();
-                // The spawned task captures the `handler` chain
-                // (TreeMessageHandler -> SessionMessageHandler)
-                // by Arc clone, but NOT this
-                // ConnectionMessageHandler itself. If the Connection
-                // races into Drop before the spawn runs, its
-                // `worker.stop()` (in Connection::Drop) will complete
-                // first and send_close_external will see a stopped
-                // worker — at worst we lose this displaced FileId,
-                // which the session-disconnect garbage-collects anyway.
-                // The spawn does *not* extend the Connection's lifetime;
-                // tying it to Connection would require Arc'ing the
-                // handler chain back up, which we explicitly avoid.
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        crate::resource::ResourceHandle::send_close_external(file_id, &handler)
-                            .await
-                    {
-                        tracing::warn!(
-                            file_id = ?file_id,
-                            error = ?e,
-                            "Displaced-slot wire Close failed (FileId leaked until session end)",
-                        );
-                    }
-                });
+                let context = prev.proto.context.clone();
+                // Close synchronously within the caller's owned operation;
+                // detached cleanup tasks are forbidden.
+                if let Err(e) = crate::resource::ResourceHandle::send_close_external(
+                    file_id,
+                    &context,
+                    prev.proto.object,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        file_id = ?file_id,
+                        error = ?e,
+                        "Displaced-slot wire Close failed (FileId leaked until session end)",
+                    );
+                }
             }
         }
         Ok(())
     }
 
+    pub(crate) async fn insert_oplock_slot(&self, slot: &Arc<OplockSlot>) {
+        self.registry.insert_oplock(slot).await;
+    }
+
     /// Return the current number of cached lease slots. Primarily for
     /// observability and tests; not in any hot path.
     pub async fn lease_slot_count(&self) -> crate::Result<usize> {
-        self.actor.lease_slot_count().await
+        Ok(self.registry.lease_slot_count().await)
     }
 
     /// Look up a cached lease slot by path. Returns `None` when there is
@@ -898,7 +1148,7 @@ impl ConnectionMessageHandler {
     /// [`Self::try_acquire_lease`] instead so the bump is atomic with the
     /// lookup against concurrent evictions.
     pub async fn peek_lease_slot(&self, path: &str) -> crate::Result<Option<Arc<LeaseSlot>>> {
-        self.actor.peek_lease(path.to_string()).await
+        Ok(self.registry.peek_lease(path).await)
     }
 
     /// Phase C.5 race-free acquire: look up `path` and call
@@ -917,14 +1167,15 @@ impl ConnectionMessageHandler {
         requested_disposition: smb_msg::CreateDisposition,
         wants_directory: bool,
     ) -> crate::Result<Option<Arc<LeaseSlot>>> {
-        self.actor
+        Ok(self
+            .registry
             .try_acquire_lease(
-                path.to_string(),
+                path,
                 requested_access,
                 requested_disposition,
                 wants_directory,
             )
-            .await
+            .await)
     }
 
     /// Phase C.5: atomically tombstone a slot keyed by `path`, remove it
@@ -938,7 +1189,7 @@ impl ConnectionMessageHandler {
     ///
     /// Returns `None` when `path` had no entry.
     pub async fn take_lease_for_evict(&self, path: &str) -> crate::Result<Option<LeaseEviction>> {
-        self.actor.take_lease_for_evict(path.to_string()).await
+        Ok(self.registry.take_lease_for_evict(path).await)
     }
 
     /// Phase C.5 idle sweep: walk the lease table, tombstone every slot
@@ -951,53 +1202,7 @@ impl ConnectionMessageHandler {
         &self,
         older_than: std::time::Duration,
     ) -> crate::Result<Vec<LeaseEviction>> {
-        self.actor.sweep_idle_leases(older_than).await
-    }
-
-    /// Spawn a long-running task that consumes the lease-break broadcast
-    /// and tombstones matching slots in `lease_table`. Idempotent — only
-    /// the first call subscribes; subsequent calls are no-ops. Async-only:
-    /// the broadcast channel doesn't exist in sync builds.
-    fn start_lease_break_listener(self: &Arc<Self>) {
-        let mut rx = self.lease_event_tx.subscribe();
-        let self_clone = self.clone();
-        let stop = self.stop_notifications.clone();
-        tokio::spawn(async move {
-            loop {
-                select! {
-                    _ = stop.cancelled() => {
-                        tracing::debug!("Lease break listener cancelled.");
-                        break;
-                    }
-                    next = rx.recv() => {
-                        match next {
-                            Ok(event) => {
-                                self_clone.apply_lease_break(&event).await;
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                                // Listener fell behind the producer. The
-                                // ack for the missed events has already
-                                // been sent by handle_lease_break; the
-                                // only consequence here is that we may
-                                // miss some tombstones. The next break
-                                // for the same lease_key will recover us.
-                                tracing::warn!(
-                                    skipped,
-                                    "Lease break listener lagged; some tombstones may have been missed",
-                                );
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                tracing::debug!(
-                                    "Lease break channel closed; exiting listener.",
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            tracing::debug!("Lease break listener task stopped.");
-        });
+        Ok(self.registry.sweep_idle_leases(older_than).await)
     }
 
     /// Apply a single [`LeaseBreakEvent`] to the connection's lease table.
@@ -1006,32 +1211,26 @@ impl ConnectionMessageHandler {
     /// updated to the server's new state.
     ///
     /// The tombstone-store, granted_state update, and table removal all
-    /// happen inside the actor task so a concurrent `try_acquire_lease`
+    /// happen inside one registry critical section so a concurrent `try_acquire_lease`
     /// either runs strictly before (and gets a still-valid slot for
     /// which the wire I/O may racily fail — recoverable) or strictly
     /// after (and finds the slot gone, falling back to a fresh wire
     /// Create). Without this fence the in-flight acquirer could observe
     /// `tombstoned == false`, bump refcount, and hand out a FileId the
     /// server has already revoked.
-    async fn apply_lease_break(&self, event: &LeaseBreakEvent) {
+    async fn apply_lease_break(&self, event: &LeaseBreakEvent) -> Vec<Arc<LeaseSlot>> {
         let event_key = event.lease_key.as_u128();
-        let matching = match self.actor.apply_lease_break(event_key, event.new_state).await {
-            Ok(m) => m,
-            Err(_) => {
-                // Connection actor has shut down — break fan-out is a
-                // best-effort cleanup, so swallow the error rather than
-                // panicking the listener task. The connection is on its
-                // way down; the slots will be reclaimed by Drop.
-                return;
-            }
-        };
+        let matching = self
+            .registry
+            .apply_lease_break(event_key, event.new_state)
+            .await;
 
         if matching.is_empty() {
             tracing::trace!(
                 lease_key = ?event.lease_key,
                 "Break event has no matching slot in this connection's cache",
             );
-            return;
+            return matching;
         }
         for slot in &matching {
             tracing::debug!(
@@ -1041,6 +1240,7 @@ impl ConnectionMessageHandler {
                 "Lease slot tombstoned + removed by server break",
             );
         }
+        matching
     }
 
     /// Subscribe to lease-break notifications received on this connection.
@@ -1055,30 +1255,167 @@ impl ConnectionMessageHandler {
         self.lease_event_tx.subscribe()
     }
 
-    pub fn worker(&self) -> Option<&Arc<WorkerImpl>> {
-        self.worker.get()
+    pub fn subscribe_oplock_breaks(&self) -> tokio::sync::broadcast::Receiver<OplockBreakEvent> {
+        self.oplock_event_tx.subscribe()
     }
 
-    const SET_CREDIT_CHARGE_CMDS: &'static [Command] = &[
-        Command::Read,
-        Command::Write,
-        Command::Ioctl,
-        Command::QueryDirectory,
-    ];
+    pub fn generation_runtime(&self) -> Option<Arc<GenerationRuntime>> {
+        self.generation
+            .load_full()
+            .map(|generation| generation.generation_runtime.clone())
+    }
 
-    const CREDIT_CALC_RATIO: u32 = 65536;
-    const CREDITS_PER_MSG_NO_LARGE_MTU: u32 = 1;
+    pub(crate) fn conn_info(&self) -> Option<Arc<ConnectionInfo>> {
+        self.generation
+            .load_full()
+            .map(|generation| generation.conn_info.clone())
+    }
 
-    /// Stamp an [`OutgoingMessage`] with priority, credit charge, and a
-    /// fresh message_id. Callers that need the wire-bytes of a
-    /// request *before* it goes through [`Self::sendo`] (e.g. the
+    fn publish_generation(
+        &self,
+        generation_runtime: Arc<GenerationRuntime>,
+        conn_info: Arc<ConnectionInfo>,
+    ) {
+        self.generation.store(Some(Arc::new(ConnectionGeneration {
+            generation_runtime,
+            conn_info,
+        })));
+    }
+
+    fn start_recovery(
+        self: &Arc<Self>,
+        generation_runtime: Arc<GenerationRuntime>,
+        config: ConnectionConfig,
+        server_name: String,
+        server_address: SocketAddr,
+    ) -> crate::Result<()> {
+        let clock = Arc::new(TokioClock::new());
+        let bootstrap = Arc::new(ConnectionRecoveryBootstrap {
+            context: Arc::downgrade(self),
+            config: config.clone(),
+            server_name,
+            server_address,
+        });
+        let driver = Arc::new(RecoveryDriver::new(
+            generation_runtime.connection_object(),
+            config.auto_reconnect.runtime_policy(),
+            clock,
+            bootstrap,
+            Arc::new(RandomRecoveryJitter::new(
+                config.auto_reconnect.maximum_jitter,
+            )),
+        ));
+        self.recovery
+            .set(driver.clone())
+            .map_err(|_| Error::InvalidState("Recovery coordinator already started".into()))?;
+        let context = Arc::downgrade(self);
+        let task = tokio::spawn(async move {
+            let mut current = generation_runtime;
+            loop {
+                let exit = current.exited().await;
+                match driver.recover(exit).await {
+                    Ok(_) => {
+                        let Some(context) = context.upgrade() else {
+                            driver.close().await;
+                            break;
+                        };
+                        let Some(replacement) = context.generation_runtime() else {
+                            driver.close().await;
+                            break;
+                        };
+                        context.recover_sessions().await;
+                        if !config.disable_notifications
+                            && let Err(error) = context.start_notify().await
+                        {
+                            tracing::warn!(?error, "recovered notification lane failed");
+                        }
+                        current = replacement;
+                    }
+                    Err(RecoveryError::NotRecoverable | RecoveryError::Closed) => break,
+                    Err(error) => {
+                        tracing::warn!(?error, "connection recovery terminated");
+                        break;
+                    }
+                }
+            }
+        });
+        self.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recovery = Some(task);
+        Ok(())
+    }
+
+    async fn close_recovery(&self) {
+        if let Some(driver) = self.recovery.get() {
+            driver.close().await;
+        }
+    }
+
+    async fn join_support_tasks(&self) {
+        let tasks = {
+            let mut tasks = self
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let recovery = tasks.recovery.take();
+            let notifications = std::mem::take(&mut tasks.notifications);
+            (recovery, notifications)
+        };
+        if let Some(recovery) = tasks.0 {
+            let _ = recovery.await;
+        }
+        for notification in tasks.1 {
+            let _ = notification.await;
+        }
+    }
+
+    async fn recover_sessions(&self) {
+        let sessions = self.registry.recoverable_sessions().await;
+        let results =
+            futures_util::future::join_all(sessions.into_iter().map(|session| async move {
+                let previous = session.session_id();
+                let result = session.reauthenticate(previous).await;
+                (session, result)
+            }))
+            .await;
+        for (session, result) in results {
+            match result {
+                Ok((previous, replacement)) => {
+                    self.registry
+                        .replace_session(previous, replacement, Arc::downgrade(&session))
+                        .await;
+                }
+                Err(error) => tracing::warn!(?error, "session reauthentication failed"),
+            }
+        }
+    }
+
+    pub(crate) async fn recover_session(&self, session_id: u64) -> crate::Result<()> {
+        let session = self
+            .registry
+            .recoverable_sessions()
+            .await
+            .into_iter()
+            .find(|session| session.session_id() == session_id)
+            .ok_or_else(|| Error::InvalidState("Session recovery context is unavailable".into()))?;
+        let (previous, replacement) = session.reauthenticate(session_id).await?;
+        self.registry
+            .replace_session(previous, replacement, Arc::downgrade(&session))
+            .await;
+        Ok(())
+    }
+
+    /// Stamp an [`CommandRequest`] with connection-level header policy.
+    /// Callers that need the wire-bytes of a
+    /// request *before* it goes through [`Self::submit`] (e.g. the
     /// session-setup driver hashing the final SessionSetup Request
     /// into the SMB 3.1.1 preauth integrity chain) invoke this
     /// directly, then call [`Self::dispatch_outgoing`] to hand the
-    /// message off — bypassing `sendo` so the sequencing logic does
+    /// message off — bypassing `submit` so the sequencing logic does
     /// not run twice.
-    pub(crate) async fn prepare_outgoing(&self, msg: &mut OutgoingMessage) -> crate::Result<()> {
-        let priority_value = match self.conn_info.get() {
+    pub(crate) async fn prepare_outgoing(&self, msg: &mut CommandRequest) -> crate::Result<()> {
+        let priority_value = match self.conn_info() {
             Some(neg_info) => match neg_info.negotiation.dialect_rev {
                 Dialect::Smb0311 => 1,
                 _ => 0,
@@ -1087,10 +1424,7 @@ impl ConnectionMessageHandler {
         };
         msg.message.header.flags = msg.message.header.flags.with_priority_mask(priority_value);
 
-        let is_cancel = msg.message.content.as_cancel().is_ok();
-        if !is_cancel {
-            self.process_sequence_outgoing(msg).await?;
-        } else if msg.message.header.message_id == 0 {
+        if msg.message.content.as_cancel().is_ok() && msg.message.header.message_id == 0 {
             return Err(Error::InvalidState(
                 "Cancel message must have a valid message ID".into(),
             ));
@@ -1098,124 +1432,53 @@ impl ConnectionMessageHandler {
         Ok(())
     }
 
-    /// Hand a fully-prepared [`OutgoingMessage`] to the worker for
+    /// Hand a fully-prepared [`CommandRequest`] to the generation_runtime for
     /// transformation (sign/compress/encrypt) and transmission.
     /// Callers must have invoked [`Self::prepare_outgoing`] first.
-    /// [`Self::sendo`] is the public, all-in-one entry point that
+    /// [`Self::submit`] is the public, all-in-one entry point that
     /// combines both.
     pub(crate) async fn dispatch_outgoing(
         &self,
-        msg: OutgoingMessage,
-    ) -> crate::Result<SendMessageResult> {
-        self.worker
-            .get()
-            .ok_or(Error::InvalidState("Worker is uninitialized".into()))?
-            .send(msg)
+        msg: CommandRequest,
+    ) -> crate::Result<CommandSubmission> {
+        let dependency = self.connection_object()?;
+        let timeout = self.conn_info().map(|info| info.config.timeout());
+        let dependency = self.resolve_dependency(dependency, timeout, None).await?;
+        self.generation_runtime()
+            .ok_or(Error::InvalidState(
+                "Generation runtime is uninitialized".into(),
+            ))?
+            .send_for(msg, dependency)
             .await
     }
 
-    async fn process_sequence_outgoing(&self, msg: &mut OutgoingMessage) -> crate::Result<()> {
-        if let Some(neg) = self.conn_info.get() {
-            if neg.negotiation.caps.large_mtu() {
-                // Calculate the cost of the message (charge).
-                let cost = if Self::SET_CREDIT_CHARGE_CMDS.contains(&msg.message.header.command) {
-                    let send_payload_size = msg.message.content.req_payload_size();
-                    let expected_response_payload_size = msg.message.content.expected_resp_size();
-                    (1 + (max(send_payload_size, expected_response_payload_size) - 1)
-                        / Self::CREDIT_CALC_RATIO)
-                        .try_into()
-                        .map_err(|_| Error::InvalidState("Credit charge overflow.".to_string()))?
-                } else {
-                    1
-                };
-
-                // First, acquire credits from the semaphore, and forget them.
-                // They may be returned via the response message, at `process_sequence_incoming` below.
-                self.curr_credits.acquire_many(cost as u32).await?.forget();
-
-                let mut request = cost;
-                // Request additional credits if required: if balance < extra, add to request the diff:
-                let current_pool_size = self.credit_pool.load(Ordering::Relaxed);
-                if current_pool_size < self.credits_backlog {
-                    request += self.credits_backlog - current_pool_size;
-                }
-
-                msg.message.header.credit_charge = cost;
-                msg.message.header.credit_request = request;
-                msg.message.header.message_id =
-                    self.curr_msg_id.fetch_add(cost as u64, Ordering::Relaxed);
-
-                return Ok(());
-            } else {
-                debug_assert_eq!(msg.message.header.credit_request, 0);
-                debug_assert_eq!(msg.message.header.credit_charge, 0);
-            }
-        }
-
-        // Default case: logically waiting for single credit per message,
-        // which will make the client wait for next response before allowing next request.
-        self.curr_credits
-            .acquire_many(Self::CREDITS_PER_MSG_NO_LARGE_MTU)
-            .await?
-            .forget();
-        debug_assert!(
-            self.curr_credits.available_permits() == 0,
-            "Expected 0 credits available with no large mtu, got {}",
-            self.curr_credits.available_permits()
-        );
-
-        msg.message.header.message_id = self
-            .curr_msg_id
-            .fetch_add(Self::CREDITS_PER_MSG_NO_LARGE_MTU as u64, Ordering::Relaxed);
-
-        Ok(())
-    }
-
-    async fn process_sequence_incoming(&self, msg: &IncomingMessage) -> crate::Result<()> {
-        if let Some(neg) = self.conn_info.get() {
-            if neg.negotiation.caps.large_mtu() {
-                let granted_credits = msg.message.header.credit_request;
-                let charged_credits = msg.message.header.credit_charge;
-                // Update the pool size - return how many EXTRA credits were granted.
-                // also, handle the case where the server granted less credits than charged.
-                if charged_credits > granted_credits {
-                    self.credit_pool
-                        .fetch_sub(charged_credits - granted_credits, Ordering::Relaxed);
-                } else {
-                    self.credit_pool
-                        .fetch_add(granted_credits - charged_credits, Ordering::Relaxed);
-                }
-
-                // Return the credits to the pool.
-                self.curr_credits.add_permits(granted_credits as usize);
-                return Ok(());
-            }
-        }
-
-        // Default case: return a single credit to the pool.
-        self.curr_credits
-            .add_permits(Self::CREDITS_PER_MSG_NO_LARGE_MTU as usize);
-        debug_assert!(
-            self.curr_credits.available_permits() <= Self::CREDITS_PER_MSG_NO_LARGE_MTU as usize,
-            "Expected at most {} credits available with no large mtu, got {}",
-            Self::CREDITS_PER_MSG_NO_LARGE_MTU,
-            self.curr_credits.available_permits()
-        );
-        Ok(())
+    async fn resolve_dependency(
+        &self,
+        dependency: crate::runtime::ObjectToken,
+        timeout: Option<std::time::Duration>,
+        cancellation: Option<CancellationToken>,
+    ) -> crate::Result<crate::runtime::ObjectToken> {
+        let Some(recovery) = self.recovery.get() else {
+            return Ok(dependency);
+        };
+        let deadline = timeout.map(|timeout| recovery.deadline_after(timeout));
+        recovery
+            .resolve_dependency(dependency, deadline, cancellation)
+            .await
+            .map_err(|error| Error::InvalidState(error.to_string()))
     }
 
     async fn start_notify(self: &Arc<Self>) -> crate::Result<()> {
-        let worker = self
-            .worker
-            .get()
-            .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?;
-        let worker = worker.clone();
+        let generation_runtime = self.generation_runtime().ok_or_else(|| {
+            Error::InvalidState("Generation runtime is uninitialized.".to_string())
+        })?;
+        let generation_runtime = generation_runtime.clone();
         const CHANNEL_BUFFER_SIZE: usize = 10;
         let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_BUFFER_SIZE);
-        worker.start_notify_channel(tx)?;
+        generation_runtime.start_notify_channel(tx)?;
         let stop_notification = self.stop_notifications.clone();
         let self_clone = self.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             // Race the cancellation token against each `rx.recv()` so that
             // (a) we keep draining notifications as they arrive and
             // (b) we exit promptly when the connection is shutting down.
@@ -1228,7 +1491,7 @@ impl ConnectionMessageHandler {
             loop {
                 select! {
                     _ = stop_notification.cancelled() => {
-                        tracing::info!("Notification handler cancelled.");
+                        tracing::info!("Notification context cancelled.");
                         break;
                     }
                     next = rx.recv() => {
@@ -1240,7 +1503,7 @@ impl ConnectionMessageHandler {
                             }
                             None => {
                                 tracing::debug!(
-                                    "Notification channel closed; exiting handler."
+                                    "Notification channel closed; exiting context."
                                 );
                                 break;
                             }
@@ -1248,66 +1511,36 @@ impl ConnectionMessageHandler {
                     }
                 }
             }
-            tracing::info!("Notification handler thread stopped.");
+            tracing::info!("Notification context thread stopped.");
         });
+        self.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .notifications
+            .push(task);
         Ok(())
     }
 
     pub fn stop_notify(&self) {
         self.stop_notifications.cancel();
-        tracing::info!("Notification handler stopped.");
+        tracing::info!("Notification context stopped.");
     }
 }
 
-impl MessageHandler for ConnectionMessageHandler {
-    async fn sendo(&self, mut msg: OutgoingMessage) -> crate::Result<SendMessageResult> {
+impl ConnectionCore {
+    pub(crate) async fn submit(&self, mut msg: CommandRequest) -> crate::Result<CommandSubmission> {
         self.prepare_outgoing(&mut msg).await?;
         self.dispatch_outgoing(msg).await
     }
 
-    async fn recvo(&self, options: ReceiveOptions<'_>) -> crate::Result<IncomingMessage> {
-        let msg = self
-            .worker
-            .get()
-            .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?
-            .receive(&options)
-            .await?;
-
-        // Command matching (if needed).
-        if let Some(cmd) = options.cmd {
-            if msg.message.header.command != cmd {
-                return Err(Error::UnexpectedMessageCommand(msg.message.header.command));
-            }
-        }
-
-        // Direction matching.
-        if !msg.message.header.flags.server_to_redir() {
-            return Err(Error::InvalidMessage(
-                "Expected server-to-redir message".into(),
-            ));
-        }
-
-        self.process_sequence_incoming(&msg).await?;
-
-        // Expected status matching. Error if no match.
-        if !options
-            .status
-            .iter()
-            .any(|s| msg.message.header.status == *s as u32)
-        {
-            if let ResponseContent::Error(error_res) = msg.message.content {
-                return Err(Error::ReceivedErrorMessage(
-                    msg.message.header.status,
-                    error_res,
-                ));
-            }
-            return Err(Error::UnexpectedMessageStatus(msg.message.header.status));
-        }
-
-        Ok(msg)
+    pub(crate) async fn await_response(
+        &self,
+        options: ResponseOptions<'_>,
+    ) -> crate::Result<CommandResponse> {
+        self.receive(options).await
     }
 
-    async fn notify(&self, msg: IncomingMessage) -> crate::Result<()> {
+    async fn notify(&self, msg: CommandResponse) -> crate::Result<()> {
         // Intercept LeaseBreakNotify *before* the session-id sanity check
         // because the server sends lease breaks with `session_id = 0` per
         // MS-SMB2 2.2.23.2 — the notification is keyed on lease_key, not
@@ -1316,18 +1549,25 @@ impl MessageHandler for ConnectionMessageHandler {
         if matches!(msg.message.content, ResponseContent::LeaseBreakNotify(_)) {
             return self.handle_lease_break(msg).await;
         }
+        if matches!(msg.message.content, ResponseContent::OplockBreakNotify(_)) {
+            return self.handle_oplock_break(msg).await;
+        }
 
         if msg.message.header.session_id == 0 {
             tracing::warn!("Received notification without session ID: {msg:?}");
             return Ok(());
         }
 
-        // Lookup runs inside the actor task; we receive a typed result
+        // Lookup and weak-reference upgrade run in one registry critical section.
         // that distinguishes unknown session_id (warn and drop) from a
         // known-but-dropped session (raise InvalidState to surface the
         // ordering bug to callers).
-        let session = match self.actor.get_session(msg.message.header.session_id).await? {
-            Ok(Some(handler)) => handler,
+        let session = match self
+            .registry
+            .get_session(msg.message.header.session_id)
+            .await
+        {
+            Ok(Some(context)) => context,
             Ok(None) => {
                 tracing::warn!(
                     "Received notification for unknown session ID {}: {msg:?}",
@@ -1335,7 +1575,7 @@ impl MessageHandler for ConnectionMessageHandler {
                 );
                 return Ok(());
             }
-            Err(actor::SessionGone) => {
+            Err(registry::SessionGone) => {
                 return Err(Error::InvalidState(format!(
                     "Session {} is no longer available",
                     msg.message.header.session_id
@@ -1348,7 +1588,81 @@ impl MessageHandler for ConnectionMessageHandler {
     }
 }
 
-impl ConnectionMessageHandler {
+impl ConnectionCore {
+    async fn handle_oplock_break(&self, msg: CommandResponse) -> crate::Result<()> {
+        let notify = match msg.message.content {
+            ResponseContent::OplockBreakNotify(notify) => notify,
+            other => {
+                return Err(Error::InvalidState(format!(
+                    "handle_oplock_break called with non-oplock content: {other:?}"
+                )));
+            }
+        };
+        let new_level = notify
+            .oplock_level()
+            .map_err(|error| Error::InvalidMessage(error.to_string()))?;
+        let Some(slot) = self.registry.find_oplock(notify.file_id()).await else {
+            tracing::warn!(file_id = ?notify.file_id(), "Unknown oplock break owner");
+            return Ok(());
+        };
+        let Some(generation_runtime) = self.generation_runtime() else {
+            return Err(Error::InvalidState("Runtime is uninitialized".into()));
+        };
+        if slot.object().generation() != generation_runtime.connection_object().generation() {
+            tracing::debug!(file_id = ?notify.file_id(), "Ignoring stale-generation oplock break");
+            return Ok(());
+        }
+        let previous_level = {
+            let mut level = slot
+                .level
+                .write()
+                .map_err(|_| Error::InvalidState("Oplock state is unavailable".into()))?;
+            let previous = *level;
+            *level = new_level;
+            previous
+        };
+        let ack_required = previous_level != OplockLevel::II;
+        let ack_outcome = if ack_required {
+            const ACK_DEADLINE: Duration = Duration::from_secs(35);
+            match tokio::time::timeout(ACK_DEADLINE, self.send_oplock_break_ack(&slot, new_level))
+                .await
+            {
+                Ok(Ok(())) => LeaseBreakAckOutcome::Accepted,
+                Ok(Err(error)) => {
+                    tracing::warn!(?error, "OplockBreakAck failed");
+                    LeaseBreakAckOutcome::Failed
+                }
+                Err(_) => LeaseBreakAckOutcome::TimedOut,
+            }
+        } else {
+            LeaseBreakAckOutcome::NotRequired
+        };
+        let _ = self.oplock_event_tx.send(OplockBreakEvent {
+            file_id: notify.file_id(),
+            previous_level,
+            new_level,
+            ack_outcome,
+            received_at: Instant::now(),
+        });
+        Ok(())
+    }
+
+    async fn send_oplock_break_ack(
+        &self,
+        slot: &Arc<OplockSlot>,
+        level: OplockLevel,
+    ) -> crate::Result<()> {
+        let ack = smb_msg::OplockBreakAck::new(level, slot.file_id());
+        slot.context
+            .execute_for(
+                CommandRequest::new(RequestContent::OplockBreakAck(ack)),
+                ResponseOptions::new().with_cmd(Some(smb_msg::Command::OplockBreak)),
+                slot.object(),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Process an incoming `LeaseBreakNotify`. Called from [`Self::notify`]
     /// before any session forwarding so that:
     ///
@@ -1363,7 +1677,7 @@ impl ConnectionMessageHandler {
     /// connection-wide notify loop must keep draining notifications even
     /// if a single ack fails. Phase C will surface ack failures back to
     /// the affected handle through the broadcast event.
-    async fn handle_lease_break(&self, msg: IncomingMessage) -> crate::Result<()> {
+    async fn handle_lease_break(&self, msg: CommandResponse) -> crate::Result<()> {
         let notify = match msg.message.content {
             ResponseContent::LeaseBreakNotify(n) => n,
             // SAFETY: caller (`Self::notify`) just matched the variant.
@@ -1383,108 +1697,94 @@ impl ConnectionMessageHandler {
             "LeaseBreakNotify received"
         );
 
-        // ACK FIRST (latency-critical path): NetApp-class clustered storage
-        // doesn't always wait the spec-mandated 60s for the ack before
-        // completing the open that caused the break — some tear down the
-        // lease entry as soon as they dispatch the notify, returning
-        // STATUS_NETWORK_NAME_DELETED for a "stale" ack. Send it before
-        // the in-memory broadcast so the wire-time gap is minimal.
+        let received_at = Instant::now();
+        let mut event = LeaseBreakEvent {
+            lease_key: notify.lease_key,
+            current_state: notify.current_lease_state,
+            new_state: notify.new_lease_state,
+            epoch: notify.new_epoch,
+            ack_required,
+            ack_outcome: LeaseBreakAckOutcome::NotRequired,
+            received_at,
+        };
+
+        // Invalidate under the registry's one critical section before any
+        // acknowledgement can unblock the conflicting server operation.
+        let invalidated = self.apply_lease_break(&event).await;
         if ack_required {
-            self.send_lease_break_ack(&notify).await;
+            const ACK_DEADLINE: Duration = Duration::from_secs(35);
+            event.ack_outcome = match tokio::time::timeout(
+                ACK_DEADLINE,
+                self.send_lease_break_ack(invalidated.first(), &notify),
+            )
+            .await
+            {
+                Ok(Ok(())) => LeaseBreakAckOutcome::Accepted,
+                Ok(Err(error)) => {
+                    tracing::warn!(?error, "LeaseBreakAck failed");
+                    LeaseBreakAckOutcome::Failed
+                }
+                Err(_) => {
+                    tracing::warn!("LeaseBreakAck deadline elapsed");
+                    LeaseBreakAckOutcome::TimedOut
+                }
+            };
         }
 
-        // FAN OUT EVENT (after ack so wire-time is minimized)
-        //
-        // Subscribers (Phase C lease_table, Phase D cifs handle_cache)
-        // see this event regardless of whether the ack reached the server
-        // — they invalidate their cached state because the lease is
-        // logically broken from this moment on.
-        {
-            let event = LeaseBreakEvent {
-                lease_key: notify.lease_key,
-                current_state: notify.current_lease_state,
-                new_state: notify.new_lease_state,
-                epoch: notify.new_epoch,
-                ack_required,
-                received_at: Instant::now(),
-            };
-            // send returns Err only when there are zero active receivers,
-            // which is normal during early bring-up; ignore it.
-            let _ = self.lease_event_tx.send(event);
-        }
+        // Public consumer lag cannot affect internal cache correctness: the
+        // authoritative invalidation above has already completed.
+        let _ = self.lease_event_tx.send(event);
 
         Ok(())
     }
 
     /// Construct and send a `LeaseBreakAck` for the given notification.
     ///
-    /// Fire-and-forget (`has_response = false`): the server's
-    /// `LeaseBreakResponse` is purely informational, and waiting for it
-    /// would block the notify task. If it arrives later, the worker's
-    /// response router drops it as unmatched.
-    ///
-    /// The ack is sent through any active session on this connection so
-    /// it gets signed under the session key — sending unsigned via the
-    /// bare connection handler triggers STATUS_NETWORK_NAME_DELETED on
-    /// Samba-based servers. Lease identity is in the lease_key, not the
-    /// session, so the choice of session doesn't matter.
-    async fn send_lease_break_ack(&self, notify: &smb_msg::LeaseBreakNotify) {
-        let session_handler = match self.actor.any_live_session().await {
-            Ok(h) => h,
-            Err(_) => {
-                // Connection actor has shut down — best-effort path.
-                tracing::warn!(
-                    lease_key = ?notify.lease_key,
-                    "Cannot send LeaseBreakAck: connection actor stopped",
-                );
-                return;
-            }
-        };
-
-        let Some(h) = session_handler else {
-            tracing::warn!(
-                lease_key = ?notify.lease_key,
-                "Cannot send LeaseBreakAck: no active session on this connection",
-            );
-            return;
-        };
+    /// MS-SMB2 requires the acknowledgement to use the SessionId and TreeId
+    /// of the open that owns the lease. Route through the context retained in
+    /// that lease slot so the normal context chain stamps both identifiers and
+    /// applies the tree's signing/encryption policy.
+    async fn send_lease_break_ack(
+        &self,
+        slot: Option<&Arc<LeaseSlot>>,
+        notify: &smb_msg::LeaseBreakNotify,
+    ) -> crate::Result<()> {
+        let slot = slot.ok_or_else(|| {
+            Error::InvalidState("Cannot acknowledge lease break without its owning Resource".into())
+        })?;
 
         let ack = LeaseBreakAck {
             lease_key: notify.lease_key,
             lease_state: notify.new_lease_state,
         };
-        // Fire-and-forget: caller intentionally never invokes recvo on
-        // this message. The wire-protocol response (if any) is ignored
-        // by the worker's response router as an unmatched msg_id; there
-        // is no per-message field telling the worker not to allocate a
-        // response slot.
-        let out = OutgoingMessage::new(RequestContent::LeaseBreakAck(ack));
-        match h.sendo(out).await {
-            Ok(r) => tracing::debug!(
-                lease_key = ?notify.lease_key,
-                msg_id = r.msg_id,
-                "LeaseBreakAck sent (fire-and-forget)",
-            ),
-            Err(e) => tracing::warn!(
-                lease_key = ?notify.lease_key,
-                error = ?e,
-                "LeaseBreakAck send failed — server will revoke the lease",
-            ),
-        }
+        slot.proto
+            .context
+            .send_recv(RequestContent::LeaseBreakAck(ack))
+            .await?;
+        tracing::debug!(
+            lease_key = ?notify.lease_key,
+            tree_id = slot.tree_id,
+            "LeaseBreakAck accepted",
+        );
+        Ok(())
     }
 }
 
-impl Drop for ConnectionMessageHandler {
+impl Drop for ConnectionCore {
     fn drop(&mut self) {
         self.stop_notify();
+        self.generation.store(None);
+    }
+}
 
-        let worker = match self.worker.take() {
-            Some(worker) => worker,
-            None => return,
-        };
+#[cfg(test)]
+mod negotiate_context_tests {
+    use super::*;
 
-        tokio::task::spawn(async move {
-            worker.stop().await.ok();
-        });
+    #[test]
+    fn disabled_algorithms_do_not_emit_empty_capability_contexts() {
+        let mut contexts = Vec::new();
+        Connection::append_optional_negotiate_contexts(&mut contexts, vec![], vec![], vec![]);
+        assert!(contexts.is_empty());
     }
 }
