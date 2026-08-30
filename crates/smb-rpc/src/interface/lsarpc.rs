@@ -641,7 +641,7 @@ where
 
 #[cfg(test)]
 mod test {
-    use binrw::{io::Cursor, prelude::*};
+    use binrw::io::Cursor;
     use smb_tests::*;
     use std::str::FromStr;
 
