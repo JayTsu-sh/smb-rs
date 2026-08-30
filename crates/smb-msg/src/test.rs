@@ -34,7 +34,7 @@ macro_rules! _test_generic_read {
                 let mut cursor = Cursor::new(Vec::new());
                 fake_header_for_test.write(&mut cursor).unwrap();
 
-                cursor.write(::smb_tests::hex_to_u8_array! { $hex }.as_slice()).unwrap();
+                cursor.write_all(::smb_tests::hex_to_u8_array! { $hex }.as_slice()).unwrap();
                 cursor.seek(std::io::SeekFrom::Start(0)).unwrap();
 
                 let msg: [<Plain $req_or_resp:camel>] = cursor.read_le().unwrap();

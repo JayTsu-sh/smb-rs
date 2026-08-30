@@ -181,7 +181,7 @@ mod tests {
         0x1543,
         [0xb0, 0x4f, 0x10, 0xe6, 0x90, 0x84, 0xc9, 0xae],
     );
-    const TEST_GUID_BYTES: &'static str = "f1ad5e06af6d4315b04f10e69084c9ae";
+    const TEST_GUID_BYTES: &str = "f1ad5e06af6d4315b04f10e69084c9ae";
 
     #[test]
     pub fn test_guid_parse_runtime() {

@@ -92,7 +92,7 @@ mod tests {
     use smb_tests::*;
 
     test_binrw! {
-        MultiWSz: (vec![
+        MultiWSz: ([
             "FirstS",
             "AnOther",
             "ThirdS",
