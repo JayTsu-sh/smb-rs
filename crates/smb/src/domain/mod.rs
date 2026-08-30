@@ -604,6 +604,23 @@ pub struct File {
     close_authority: FileCloseAuthority,
 }
 
+/// Negotiated data-plane limits exposed to upper-layer I/O schedulers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IoCapabilities {
+    maximum_read_chunk: u32,
+    maximum_write_chunk: u32,
+}
+
+impl IoCapabilities {
+    pub const fn maximum_read_chunk(self) -> u32 {
+        self.maximum_read_chunk
+    }
+
+    pub const fn maximum_write_chunk(self) -> u32 {
+        self.maximum_write_chunk
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CloseOutcome {
     Confirmed,
@@ -655,6 +672,17 @@ impl FileCloseAuthority {
 }
 
 impl File {
+    /// Returns the maximum read and write request sizes negotiated by smb-rs.
+    ///
+    /// Upper layers may select smaller chunks for their concurrency and memory
+    /// policy, but must not exceed these protocol limits.
+    pub fn io_capabilities(&self) -> IoCapabilities {
+        IoCapabilities {
+            maximum_read_chunk: self.inner.maximum_read_size(),
+            maximum_write_chunk: self.inner.maximum_write_size(),
+        }
+    }
+
     pub fn persistent_granted(&self) -> bool {
         self.inner.persistent_granted()
     }

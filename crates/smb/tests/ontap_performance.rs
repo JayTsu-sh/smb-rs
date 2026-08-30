@@ -5,10 +5,9 @@ mod common;
 use bytes::Bytes;
 use futures_util::{StreamExt, future::try_join_all, stream::FuturesUnordered};
 use serde_json::json;
-use smb::{Client, ClientConfig, File, FileOpenOptions, SharePath, ShareTarget};
+use smb::{Client, ClientConfig, File, FileOpenOptions, IoCapabilities, SharePath, ShareTarget};
 use std::time::{Duration, Instant};
 
-const CHUNK_SIZE: usize = 1024 * 1024;
 const MINIMUM_BYTES_PER_SAMPLE: usize = 16 * 1024 * 1024;
 const DEFAULT_BYTES_PER_CONNECTION: usize = 1024 * 1024 * 1024;
 const MEASURED_SAMPLES: usize = 5;
@@ -50,7 +49,15 @@ const SHAPES: [Shape; 3] = [
 struct Stream {
     client: Client,
     file: File,
-    pattern: Bytes,
+    write_pattern: Bytes,
+    read_chunk: usize,
+    fill: u8,
+}
+
+struct Measurement {
+    write_mib_s: f64,
+    read_mib_s: f64,
+    capabilities: IoCapabilities,
 }
 
 #[derive(Debug)]
@@ -76,13 +83,23 @@ async fn plain_or_encrypted_concurrency_matrix() -> smb::Result<()> {
     for shape in selected_shapes()? {
         let mut writes = Vec::with_capacity(MEASURED_SAMPLES);
         let mut reads = Vec::with_capacity(MEASURED_SAMPLES);
+        let mut capabilities = None;
         for sample in 0..=MEASURED_SAMPLES {
             let measured = run_sample(shape, bytes_per_connection, repetitions, sample).await?;
+            if capabilities
+                .replace(measured.capabilities)
+                .is_some_and(|previous| previous != measured.capabilities)
+            {
+                return Err(smb::Error::InvalidMessage(
+                    "negotiated I/O capabilities changed between samples".into(),
+                ));
+            }
             if sample != 0 {
-                writes.push(measured.0);
-                reads.push(measured.1);
+                writes.push(measured.write_mib_s);
+                reads.push(measured.read_mib_s);
             }
         }
+        let capabilities = capabilities.expect("at least the warm-up sample ran");
         let write = statistics(&writes);
         let read = statistics(&reads);
         let rss = peak_rss_kib().ok_or_else(|| {
@@ -96,6 +113,8 @@ async fn plain_or_encrypted_concurrency_matrix() -> smb::Result<()> {
                 "inflight_per_connection": shape.inflight_per_connection,
                 "bytes_per_connection": bytes_per_connection,
                 "repetitions_per_sample": repetitions,
+                "negotiated_maximum_read_chunk": capabilities.maximum_read_chunk(),
+                "negotiated_maximum_write_chunk": capabilities.maximum_write_chunk(),
                 "measured_samples": MEASURED_SAMPLES,
                 "write_mib_s": { "median": write.median, "p95": write.p95, "cv": write.cv },
                 "read_mib_s": { "median": read.median, "p95": read.p95, "cv": read.cv },
@@ -158,9 +177,9 @@ fn payload_from_env() -> smb::Result<usize> {
         .transpose()
         .map_err(|_| smb::Error::InvalidArgument("invalid performance payload size".into()))?
         .unwrap_or(DEFAULT_BYTES_PER_CONNECTION);
-    if bytes == 0 || bytes % bytes.min(CHUNK_SIZE) != 0 {
+    if bytes == 0 {
         return Err(smb::Error::InvalidArgument(
-            "performance payload must be non-zero and 1 MiB-aligned above 1 MiB".into(),
+            "performance payload must be non-zero".into(),
         ));
     }
     Ok(bytes)
@@ -171,8 +190,9 @@ async fn run_sample(
     bytes_per_connection: usize,
     repetitions: usize,
     sample: usize,
-) -> smb::Result<(f64, f64)> {
+) -> smb::Result<Measurement> {
     let mut streams = Vec::with_capacity(shape.connections);
+    let mut negotiated_capabilities = None;
     for connection in 0..shape.connections {
         let client = Client::new(ClientConfig::default());
         let share = client
@@ -186,12 +206,32 @@ async fn run_sample(
             std::process::id()
         ))?;
         let file = share.open_file(&path, FileOpenOptions::overwrite()).await?;
-        let chunk_size = chunk_size(bytes_per_connection, shape.inflight_per_connection)?;
-        let pattern = Bytes::from(vec![(connection as u8).wrapping_mul(37); chunk_size]);
+        let capabilities = file.io_capabilities();
+        if negotiated_capabilities
+            .replace(capabilities)
+            .is_some_and(|previous| previous != capabilities)
+        {
+            return Err(smb::Error::InvalidMessage(
+                "connections negotiated different I/O capabilities".into(),
+            ));
+        }
+        let write_chunk = chunk_size(
+            capabilities.maximum_write_chunk(),
+            bytes_per_connection,
+            shape.inflight_per_connection,
+        )?;
+        let read_chunk = chunk_size(
+            capabilities.maximum_read_chunk(),
+            bytes_per_connection,
+            shape.inflight_per_connection,
+        )?;
+        let fill = (connection as u8).wrapping_mul(37);
         streams.push(Stream {
             client,
             file,
-            pattern,
+            write_pattern: Bytes::from(vec![fill; write_chunk]),
+            read_chunk,
+            fill,
         });
     }
 
@@ -223,11 +263,20 @@ async fn run_sample(
         (Ok(_), Err(error)) => return Err(error),
     };
     let mib = (bytes_per_connection * shape.connections * repetitions) as f64 / (1024.0 * 1024.0);
-    Ok((mib / write_seconds, mib / read_seconds))
+    Ok(Measurement {
+        write_mib_s: mib / write_seconds,
+        read_mib_s: mib / read_seconds,
+        capabilities: negotiated_capabilities.expect("at least one connection was created"),
+    })
 }
 
-fn chunk_size(bytes_per_connection: usize, inflight: usize) -> smb::Result<usize> {
-    let chunk_size = CHUNK_SIZE.min(bytes_per_connection / inflight.max(1));
+fn chunk_size(
+    negotiated_maximum: u32,
+    bytes_per_connection: usize,
+    inflight: usize,
+) -> smb::Result<usize> {
+    let chunk_size = negotiated_maximum as usize;
+    let chunk_size = chunk_size.min(bytes_per_connection / inflight.max(1));
     if chunk_size == 0 || bytes_per_connection % chunk_size != 0 {
         return Err(smb::Error::InvalidArgument(
             "payload cannot be divided into the requested in-flight window".into(),
@@ -263,13 +312,13 @@ async fn write_windowed(
     bytes_per_connection: usize,
     inflight: usize,
 ) -> smb::Result<()> {
-    let chunk_size = stream.pattern.len();
+    let chunk_size = stream.write_pattern.len();
     for first in (0..bytes_per_connection).step_by(chunk_size * inflight) {
         let last = (first + chunk_size * inflight).min(bytes_per_connection);
         try_join_all((first..last).step_by(chunk_size).map(|offset| {
             stream
                 .file
-                .write_all_at(offset as u64, stream.pattern.clone())
+                .write_all_at(offset as u64, stream.write_pattern.clone())
                 .timeout(Duration::from_secs(30))
         }))
         .await?;
@@ -282,7 +331,7 @@ async fn read_windowed(
     bytes_per_connection: usize,
     inflight: usize,
 ) -> smb::Result<()> {
-    let chunk_size = stream.pattern.len();
+    let chunk_size = stream.read_chunk;
     for first in (0..bytes_per_connection).step_by(chunk_size * inflight) {
         let last = (first + chunk_size * inflight).min(bytes_per_connection);
         let pending = (first..last)
@@ -296,7 +345,8 @@ async fn read_windowed(
             .collect::<FuturesUnordered<_>>();
         futures_util::pin_mut!(pending);
         while let Some(actual) = pending.next().await {
-            if actual? != stream.pattern {
+            let actual = actual?;
+            if actual.len() != chunk_size || actual.iter().any(|byte| *byte != stream.fill) {
                 return Err(smb::Error::InvalidMessage(
                     "performance read-back mismatch".into(),
                 ));
@@ -377,7 +427,11 @@ fn statistics_use_nearest_rank_p95_and_population_cv() {
 
 #[test]
 fn chunk_size_preserves_real_inflight_requests_for_small_payloads() {
-    assert_eq!(chunk_size(64 * 1024, 16).unwrap(), 4 * 1024);
-    assert_eq!(chunk_size(1024 * 1024, 16).unwrap(), 64 * 1024);
-    assert_eq!(chunk_size(1024 * 1024 * 1024, 16).unwrap(), CHUNK_SIZE);
+    let negotiated = 1024 * 1024;
+    assert_eq!(chunk_size(negotiated, 64 * 1024, 16).unwrap(), 4 * 1024);
+    assert_eq!(chunk_size(negotiated, 1024 * 1024, 16).unwrap(), 64 * 1024);
+    assert_eq!(
+        chunk_size(negotiated, 1024 * 1024 * 1024, 16).unwrap(),
+        negotiated as usize
+    );
 }

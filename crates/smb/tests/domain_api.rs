@@ -8,8 +8,8 @@ use smb::{
 };
 use smb::{
     Client, ClientConfig, CloseOutcome, Credentials, Directory, DirectoryOpenOptions, File,
-    FileCursor, FileOpenOptions, Pipe, PipeName, PreviousVersion, ReplayPolicy, Session, Share,
-    SharePath, ShareTarget, Transfer, TransferEvents,
+    FileCursor, FileOpenOptions, IoCapabilities, Pipe, PipeName, PreviousVersion, ReplayPolicy,
+    Session, Share, SharePath, ShareTarget, Transfer, TransferEvents,
 };
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
@@ -44,6 +44,7 @@ fn public_spine_types_are_send_sync_and_domain_named() {
     assert_send_sync::<Session>();
     assert_send_sync::<Share>();
     assert_send_sync::<File>();
+    assert_send_sync::<IoCapabilities>();
     assert_send_sync::<Directory>();
     assert_send_sync::<Pipe>();
     assert_clone::<Client>();
@@ -80,6 +81,9 @@ async fn domain_resource_open_and_metadata() -> smb::Result<()> {
     let file = share
         .open_file(&path, FileOpenOptions::create_new())
         .await?;
+    let capabilities = file.io_capabilities();
+    assert!(capabilities.maximum_read_chunk() > 0);
+    assert!(capabilities.maximum_write_chunk() > 0);
     tracing::info!("metadata-stage=write");
     file.write_all_at(0, Bytes::from_static(b"domain-metadata"))
         .await?;

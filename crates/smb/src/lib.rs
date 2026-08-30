@@ -50,8 +50,8 @@ pub use domain::{
     Batch, BatchCommand, BatchOutcome, BatchRef, BatchResult, CancelToken, CloseOutcome,
     Credentials, Deadline, Directory, DirectoryEntries, DirectoryEntry, DirectoryEvent,
     DirectoryEvents, DirectoryOpenOptions, DirectoryWatchOptions, File, FileCursor,
-    FileOpenOptions, Operation, Pipe, PipeName, PreviousVersion, ReplayPolicy, Resource,
-    ResourceMetadata, RpcPipeConnection, SecurityDescriptor, SecurityOpenOptions,
+    FileOpenOptions, IoCapabilities, Operation, Pipe, PipeName, PreviousVersion, ReplayPolicy,
+    Resource, ResourceMetadata, RpcPipeConnection, SecurityDescriptor, SecurityOpenOptions,
     SecuritySelection, Session, Share, SharePath, ShareTarget, Transfer, TransferEvents,
     TransferOptions, TransferProgress, TransferReport, TransferStrategy,
 };
