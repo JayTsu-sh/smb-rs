@@ -185,10 +185,22 @@ impl GenerationRuntime {
             completion.await
         }
         .map_err(|error| self.map_runtime_error(error))?;
-        Ok((
-            CommandSubmission::new(result.key.message_id, result.request_raw),
-            result.response,
-        ))
+        let submission = CommandSubmission::new(result.key.message_id, result.request_raw);
+        let response = result.response;
+        if !options
+            .status
+            .iter()
+            .any(|accepted| response.message.header.status == *accepted as u32)
+        {
+            let status = response.message.header.status;
+            return match response.message.content {
+                smb_msg::ResponseContent::Error(error) => {
+                    Err(Error::ReceivedErrorMessage(status, error))
+                }
+                _ => Err(Error::UnexpectedMessageStatus(status)),
+            };
+        }
+        Ok((submission, response))
     }
 
     pub(crate) async fn receive(&self, options: &ResponseOptions<'_>) -> Result<CommandResponse> {

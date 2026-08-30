@@ -1652,8 +1652,13 @@ fn process_decoded_response(
         );
         return;
     }
+    let response_is_accepted = response_status_is_admissible(
+        &pending.response,
+        status,
+        matches!(message.message.content, smb_msg::ResponseContent::Error(_)),
+    );
     if message.message.header.command != pending.response.wire_command()
-        || (!session_invalidated && !pending.response.accepts_status(status))
+        || (!session_invalidated && !response_is_accepted)
     {
         *fatal = Some(RuntimeError::Wire("operation-response-contract"));
         return;
@@ -1693,6 +1698,14 @@ fn process_decoded_response(
     {
         authority.operation_pending.remove(&key);
     }
+}
+
+fn response_status_is_admissible(
+    policy: &ResponsePolicy,
+    status: smb_msg::Status,
+    is_server_error: bool,
+) -> bool {
+    policy.accepts_status(status) || is_server_error
 }
 
 fn apply_operation_effects(
@@ -2364,6 +2377,17 @@ mod tests {
         let mut encoded = Vec::new();
         response.write(&mut Cursor::new(&mut encoded)).unwrap();
         Bytes::from(encoded)
+    }
+
+    #[test]
+    fn same_command_server_error_is_accepted_for_caller_classification() {
+        let policy =
+            ResponsePolicy::one_of(smb_msg::Command::Create, [smb_msg::Status::Success]).unwrap();
+        assert!(response_status_is_admissible(
+            &policy,
+            smb_msg::Status::AccessDenied,
+            true,
+        ));
     }
 
     fn pending_session_setup_response(message_id: u64, async_id: u64) -> Bytes {
