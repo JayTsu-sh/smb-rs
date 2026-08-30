@@ -277,11 +277,13 @@ impl Connection {
     #[tracing::instrument(level = "debug", skip_all, fields(server = %self.server_name))]
     pub async fn close(&self) -> crate::Result<()> {
         self.context.stop_notify();
-        self.context.stop_recovery().await;
-        match self.context.generation_runtime() {
+        self.context.close_recovery().await;
+        let result = match self.context.generation_runtime() {
             Some(c) => c.stop().await,
             None => Ok(()),
-        }
+        };
+        self.context.join_support_tasks().await;
+        result
     }
 
     /// Switches the protocol to SMB2 against the server if required,
@@ -1345,10 +1347,13 @@ impl ConnectionCore {
         Ok(())
     }
 
-    async fn stop_recovery(&self) {
+    async fn close_recovery(&self) {
         if let Some(driver) = self.recovery.get() {
             driver.close().await;
         }
+    }
+
+    async fn join_support_tasks(&self) {
         let tasks = {
             let mut tasks = self
                 .tasks
