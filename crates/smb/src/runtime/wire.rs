@@ -790,6 +790,7 @@ impl WirePipeline {
             value if value == Status::UserSessionDeleted as u32
                 || value == Status::NetworkSessionExpired as u32
         ) {
+            form.unauthenticated_recovery_hint = true;
             return Ok(());
         }
         // Check if signing check is required.
@@ -926,6 +927,25 @@ mod wire_builder_tests {
 
         assert_eq!(wire.segments().len(), 2);
         assert_eq!(wire.segments()[1].as_ptr(), pointer);
+    }
+
+    #[tokio::test]
+    async fn unsigned_session_loss_is_marked_only_as_a_recovery_hint() {
+        let mut response = PlainResponse::new(ResponseContent::Logoff(LogoffResponse {}));
+        response.header.status = Status::UserSessionDeleted as u32;
+        response.header.credit_request = 64;
+        response.header.flags.set_server_to_redir(true);
+        response.header.flags.set_signed(true);
+        response.header.signature = 0xfeed;
+        let mut form = MessageForm::default();
+
+        WirePipeline::default()
+            .verify_plain_incoming(&mut response, &[0; 64], &mut form)
+            .await
+            .unwrap();
+
+        assert!(form.unauthenticated_recovery_hint);
+        assert!(!form.signed_or_encrypted());
     }
 
     #[test]

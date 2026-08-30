@@ -145,6 +145,9 @@ pub struct MessageForm {
     pub compressed: bool,
     pub encrypted: bool,
     pub signed: bool,
+    /// The server reported that the signing session no longer exists, so the
+    /// frame is usable only as an untrusted hint to start recovery.
+    pub unauthenticated_recovery_hint: bool,
 }
 
 impl MessageForm {
