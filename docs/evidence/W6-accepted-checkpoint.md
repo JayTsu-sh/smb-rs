@@ -2,8 +2,8 @@
 
 ## Accepted boundary
 
-W6 accepts the runtime implementation through `ee306e4`, the final isolated
-appliance evidence through `05d96dc`, and the complete W0-W6 architecture map.
+W6 accepts the runtime implementation through `eb7236f`, the final isolated
+appliance evidence in this checkpoint, and the complete W0-W6 architecture map.
 The W6 evidence chain is:
 
 - `W6-1-residue-contract-audit.md`;
@@ -28,7 +28,7 @@ zero-copy.
 | Gate | Result |
 | --- | --- |
 | complete workspace all-target tests | Passed |
-| `smb` library tests | Passed: 124 |
+| all-feature tests | Passed: 138 |
 | strict workspace Clippy | Passed with warnings denied |
 | architecture dependency and activation rules | Passed: 0 violations |
 | evidence schema and residue contract | Passed |
@@ -62,7 +62,7 @@ identifier, or generated appliance object name is retained in the repository.
 
 Every connection negotiated 1 MiB maximum read and write chunks. At 1 GiB,
 single-connection 16-in-flight execution improved encrypted median write/read
-throughput by 35.6%/37.3% over serial execution. Plain four-connection
+throughput by 32.6%/32.5% over serial execution. Plain four-connection
 throughput approached the practical limit of the shared 1 GbE management path.
 The detailed medians, p95, CV, RSS, failed-sample transparency, recovery model,
 and cleanup evidence are recorded in `W6-3-fas2750-total-matrix.md`.

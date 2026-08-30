@@ -3,11 +3,9 @@
 ## Accepted implementation and isolation
 
 The final fresh manifest was created from and cryptographically bound to
-implementation `ee306e4`, the appliance preflight state, an anonymized test
-identity, and one unique validation run. The plan hash was
-`b3b5607e5f5d8602a784dafdabf4f209dbc0a48920b23cb48915734915dc1a4e` and the
-anonymous target identity was
-`afd7d49a973e4271b2cdcc61b7ff430435bab6b5ff04e1b6dd0a0cbb4da9fc89`.
+implementation `eb7236f`, the appliance preflight state, an anonymized test
+identity, and one unique validation run. Binding identifiers are deliberately
+not retained in the repository.
 Runtime inputs were supplied through one-shot file descriptors. This document
 retains no endpoint, account, credential, manifest, run identifier, or
 generated appliance object name.
@@ -88,12 +86,12 @@ limit.
 
 | Connections x in-flight | Write median | Write p95 | Write CV | Read median | Read p95 | Read CV | Peak RSS |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 x 1 | 21.33 MiB/s | 21.83 | 1.45% | 22.59 MiB/s | 23.17 | 2.22% | 15,636 KiB |
-| 1 x 16 | 32.35 MiB/s | 33.14 | 1.61% | 35.42 MiB/s | 36.77 | 3.07% | 29,244 KiB |
-| 4 x 16 | 92.48 MiB/s | 94.57 | 1.72% | 84.47 MiB/s | 88.40 | 3.34% | 47,684 KiB |
+| 1 x 1 | 22.50 MiB/s | 22.67 | 0.79% | 22.85 MiB/s | 23.25 | 1.22% | 16,540 KiB |
+| 1 x 16 | 32.12 MiB/s | 32.95 | 1.40% | 33.78 MiB/s | 34.91 | 7.52% | 27,388 KiB |
+| 4 x 16 | 93.64 MiB/s | 94.74 | 0.55% | 68.01 MiB/s | 71.52 | 2.24% | 47,344 KiB |
 
 The first complete 4 x 16 run met throughput and RSS gates but failed the read
-stability gate with CV 18.53% after one slow sample. The identical shape was
+stability gate with CV 15.57% after one slow sample. The identical shape was
 rerun without changing code, payload, window, sample count, appliance objects,
 or thresholds; the table records that complete passing rerun. The failed run is
 part of the acceptance history rather than being silently discarded.
@@ -114,21 +112,21 @@ maximum read chunk and a 1 MiB maximum write chunk.
 
 | Payload | In-flight | Write median | Write p95 | Write CV | Read median | Read p95 | Read CV | Peak RSS |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 KiB | 1 | 16.44 MiB/s | 16.75 | 4.52% | 15.61 MiB/s | 17.09 | 6.80% | 11,044 KiB |
-| 64 KiB | 16 | 15.74 MiB/s | 16.10 | 2.58% | 17.00 MiB/s | 17.93 | 8.98% | 17,556 KiB |
-| 1 MiB | 1 | 20.16 MiB/s | 20.44 | 0.99% | 19.86 MiB/s | 20.07 | 2.04% | 20,272 KiB |
-| 1 MiB | 16 | 23.32 MiB/s | 23.64 | 2.38% | 26.16 MiB/s | 27.45 | 2.19% | 13,884 KiB |
-| 1 GiB | 1 | 19.96 MiB/s | 20.13 | 0.53% | 19.44 MiB/s | 19.65 | 0.63% | 20,004 KiB |
-| 1 GiB | 16 | 27.06 MiB/s | 27.79 | 1.49% | 26.70 MiB/s | 27.11 | 2.94% | 52,732 KiB |
+| 64 KiB | 1 | 15.65 MiB/s | 15.74 | 0.57% | 16.95 MiB/s | 17.41 | 8.72% | 9,776 KiB |
+| 64 KiB | 16 | 15.96 MiB/s | 16.29 | 4.75% | 16.73 MiB/s | 17.74 | 4.96% | 18,120 KiB |
+| 1 MiB | 1 | 20.20 MiB/s | 20.89 | 1.50% | 20.15 MiB/s | 20.30 | 4.98% | 18,616 KiB |
+| 1 MiB | 16 | 23.37 MiB/s | 24.23 | 3.03% | 27.25 MiB/s | 28.24 | 2.23% | 12,508 KiB |
+| 1 GiB | 1 | 20.06 MiB/s | 20.26 | 0.86% | 19.30 MiB/s | 19.56 | 1.33% | 17,972 KiB |
+| 1 GiB | 16 | 26.59 MiB/s | 26.74 | 0.79% | 25.56 MiB/s | 25.91 | 3.69% | 51,048 KiB |
 
 Concurrency is neutral at 64 KiB but materially helps larger transfers. At
-1 GiB, 16 in-flight operations improve median write throughput by 35.6% and
-read throughput by 37.3%. The client VM exposes no AES acceleration, so the
+1 GiB, 16 in-flight operations improve median write throughput by 32.6% and
+read throughput by 32.5%. The client VM exposes no AES acceleration, so the
 encrypted figures are software-crypto limited.
 
 ## Local total gates
 
-The final implementation passes 124 `smb` library tests, the public-domain API
+The final implementation passes 138 all-feature tests, the public-domain API
 tests, strict Clippy with warnings denied, and the complete workspace all-target
 test suite. The workspace run includes architecture rules, evidence schema,
 manifest lifecycle, residue, and wire-copy-budget gates. The zero-copy gates
