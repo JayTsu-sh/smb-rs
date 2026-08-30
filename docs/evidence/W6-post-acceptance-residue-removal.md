@@ -37,4 +37,7 @@ interface or an alternative lifecycle authority.
 - strict SMB all-target Clippy with warnings denied: passed;
 - `smb` library tests after deletion: passed;
 - architecture, residue, evidence, and copy-budget gates: passed;
+- fresh isolated appliance public-domain roundtrip: passed on plain and
+  encryption-required Shares;
+- manifest-authoritative appliance cleanup: passed with zero retained objects;
 - secret and endpoint scan: passed.
