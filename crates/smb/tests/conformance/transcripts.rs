@@ -74,7 +74,11 @@ pub fn negotiate_response_windows_dc() -> Bytes {
             negotiate_ctx_signing(),
         ]),
     };
-    encode(make_response(ResponseContent::Negotiate(content), 0, Status::Success))
+    encode(make_response(
+        ResponseContent::Negotiate(content),
+        0,
+        Status::Success,
+    ))
 }
 
 /// Variant of [`negotiate_response_windows_dc`] modeling a server

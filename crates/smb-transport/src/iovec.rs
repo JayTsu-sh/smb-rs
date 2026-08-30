@@ -90,7 +90,6 @@ impl IoVec {
             })
             .collect()
     }
-
 }
 
 impl From<Vec<IoVecBuf>> for IoVec {

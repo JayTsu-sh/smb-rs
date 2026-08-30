@@ -7,8 +7,8 @@ use smb::{
     SecurityOpenOptions, SecuritySelection, TransferOptions, TransferProgress,
 };
 use smb::{
-    Client, CloseOutcome, Credentials, Directory, DirectoryOpenOptions, File,
-    FileCursor, FileOpenOptions, IoCapabilities, ObjectGeneration, Pipe, PipeName, PreviousVersion,
+    Client, CloseOutcome, Credentials, Directory, DirectoryOpenOptions, File, FileCursor,
+    FileOpenOptions, IoCapabilities, ObjectGeneration, Pipe, PipeName, PreviousVersion,
     ReplayPolicy, Session, Share, SharePath, ShareTarget, Transfer, TransferEvents,
 };
 use std::time::{Duration, Instant};

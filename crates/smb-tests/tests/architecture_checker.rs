@@ -235,6 +235,9 @@ fn repository_rules_pass_through_the_same_cli_seam() {
     let report = check_workspace(workspace_root, &rules_path).expect("repository rules load");
 
     assert!(report.passed(), "{:?}", report.violations);
-    assert_eq!(report.activated_modules, vec!["domain", "facade", "runtime"]);
+    assert_eq!(
+        report.activated_modules,
+        vec!["domain", "facade", "runtime"]
+    );
     assert!(report.not_yet_activated_modules.is_empty());
 }

@@ -46,13 +46,25 @@ impl WireRange {
         alignment: usize,
     ) -> Result<Self> {
         if offset < minimum_offset || alignment == 0 || offset % alignment != 0 {
-            return Err(SmbMsgError::InvalidWireRange { field, offset, length });
+            return Err(SmbMsgError::InvalidWireRange {
+                field,
+                offset,
+                length,
+            });
         }
         let end = offset
             .checked_add(length)
-            .ok_or(SmbMsgError::InvalidWireRange { field, offset, length })?;
+            .ok_or(SmbMsgError::InvalidWireRange {
+                field,
+                offset,
+                length,
+            })?;
         if end > member_len {
-            return Err(SmbMsgError::InvalidWireRange { field, offset, length });
+            return Err(SmbMsgError::InvalidWireRange {
+                field,
+                offset,
+                length,
+            });
         }
         Ok(Self { start: offset, end })
     }
@@ -76,8 +88,17 @@ mod tests {
 
     #[test]
     fn validates_exact_end_and_empty_ranges() {
-        assert_eq!(WireRange::validate("data", 8, 8, 16, 8, 1).unwrap().as_range(), 8..16);
-        assert!(WireRange::validate("data", 16, 0, 16, 8, 1).unwrap().is_empty());
+        assert_eq!(
+            WireRange::validate("data", 8, 8, 16, 8, 1)
+                .unwrap()
+                .as_range(),
+            8..16
+        );
+        assert!(
+            WireRange::validate("data", 16, 0, 16, 8, 1)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

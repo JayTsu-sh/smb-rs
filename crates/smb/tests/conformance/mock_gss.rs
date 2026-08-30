@@ -69,8 +69,9 @@ impl MockGss {
         let user_name = match domain {
             Some(d) => sspi::Username::new(account, Some(d))
                 .expect("MockGss: failed to build sspi::Username"),
-            None => sspi::Username::parse(account)
-                .expect("MockGss: failed to parse sspi::Username"),
+            None => {
+                sspi::Username::parse(account).expect("MockGss: failed to parse sspi::Username")
+            }
         };
         Self {
             user_name,

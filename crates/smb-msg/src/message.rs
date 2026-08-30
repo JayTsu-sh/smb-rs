@@ -1,7 +1,7 @@
 //! Full Request & Response enums, including plain or transformed (encrypted/compressed).
 
-use bytes::Bytes;
 use binrw::prelude::*;
+use bytes::Bytes;
 use smb_msg_derive::*;
 
 macro_rules! make_message {

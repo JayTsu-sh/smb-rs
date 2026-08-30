@@ -23,8 +23,8 @@ pub mod query_dir;
 pub mod session_setup;
 pub mod smb1;
 pub mod tree_connect;
-mod wire_range;
 mod wire_out;
+mod wire_range;
 
 pub use cancel::*;
 pub use compressed::*;
@@ -46,8 +46,8 @@ pub use plain::*;
 pub use query_dir::*;
 pub use session_setup::*;
 pub use tree_connect::*;
-pub use wire_range::{DecodedFrame, WireRange};
 pub use wire_out::{TransformFrame, WireBuilder, WireMessage};
+pub use wire_range::{DecodedFrame, WireRange};
 
 #[cfg(test)]
 mod test;

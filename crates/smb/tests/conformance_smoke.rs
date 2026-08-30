@@ -53,14 +53,8 @@ async fn scripted_transport_round_trip() {
     // Now send a frame: header then body.
     let payload = b"client-emits-this";
     let frame_len_be = (payload.len() as u32).to_be_bytes();
-    write
-        .send_raw(&frame_len_be)
-        .await
-        .expect("send NB header");
-    write
-        .send_raw(payload)
-        .await
-        .expect("send body");
+    write.send_raw(&frame_len_be).await.expect("send NB header");
+    write.send_raw(payload).await.expect("send body");
 
     // Captured frames should reflect only the body (NB header stripped).
     let captured = control.captured_client_frames();

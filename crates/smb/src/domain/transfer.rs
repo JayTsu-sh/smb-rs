@@ -106,7 +106,6 @@ impl TransferReport {
     pub const fn chunks(&self) -> u64 {
         self.chunks
     }
-
 }
 
 #[must_use = "transfers do nothing until polled or awaited"]
