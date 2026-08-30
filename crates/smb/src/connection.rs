@@ -653,6 +653,23 @@ impl Connection {
         Ok(session)
     }
 
+    pub(crate) async fn authenticate_with_credential_provider(
+        &self,
+        provider: crate::session::credential::SharedCredentialProvider,
+    ) -> crate::Result<Session> {
+        let conn_info = self
+            .context
+            .conn_info()
+            .ok_or_else(|| Error::InvalidState("Connection not negotiated.".to_string()))?;
+        let session = Session::create_with_provider(provider, &self.context, &conn_info).await?;
+        let session_context = Arc::downgrade(&session.recovery_context());
+        self.context
+            .registry
+            .insert_session(session.session_id(), session_context)
+            .await;
+        Ok(session)
+    }
+
     /// Test-only: drive SessionSetup with a caller-supplied [`GssState`]
     /// implementor.
     ///

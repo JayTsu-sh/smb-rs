@@ -7,10 +7,14 @@ use smb::{
     SecurityOpenOptions, SecuritySelection, TransferOptions, TransferProgress,
 };
 use smb::{
-    Client, CloseOutcome, CloseReport, Credentials, Directory, DirectoryOpenOptions, File,
-    FileCursor, FileOpenOptions, IoCapabilities, ObjectGeneration, Operation, Pipe, PipeName,
-    PreviousVersion, ReplayPolicy, Session, Share, SharePath, ShareTarget, Transfer,
-    TransferEvents,
+    Client, CloseOutcome, CloseReport, CredentialProvider, Credentials, Directory,
+    DirectoryOpenOptions, File, FileCursor, FileOpenOptions, IoCapabilities, ObjectGeneration,
+    OpenInfo, Operation, Pipe, PipeName, PreviousVersion, ReplayPolicy, Session, SessionInfo,
+    Share, ShareInfo, SharePath, ShareTarget, Transfer, TransferEvents,
+};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
@@ -24,6 +28,23 @@ fn assert_send<T: Send>() {}
 fn assert_cursor<T: AsyncRead + AsyncWrite + AsyncSeek + Unpin + Send>() {}
 fn assert_lazy<T>(operation: Operation<'_, T>) {
     drop(operation);
+}
+
+struct RotatingCredentials {
+    calls: Arc<AtomicUsize>,
+}
+
+impl CredentialProvider for RotatingCredentials {
+    fn cache_key(&self) -> &str {
+        "domain/user"
+    }
+
+    fn credentials(&self) -> futures_core::future::BoxFuture<'_, smb::Result<Credentials>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            Ok(Credentials::ntlm("domain/user", "refreshed-secret"))
+        })
+    }
 }
 
 fn session_connect_is_lazy<'a>(session: &'a Session, name: &'a str) -> Operation<'a, Share> {
@@ -40,6 +61,26 @@ fn share_close_is_lazy(share: &Share) -> Operation<'_, CloseReport> {
 
 fn file_delete_is_lazy(file: &File) -> Operation<'_, ()> {
     file.delete()
+}
+
+fn session_info_is_redacted_snapshot(session: &Session) -> SessionInfo {
+    session.info()
+}
+
+fn share_info_is_redacted_snapshot(share: &Share) -> ShareInfo {
+    share.info()
+}
+
+fn file_info_is_open_snapshot(file: &File) -> OpenInfo {
+    file.info()
+}
+
+fn directory_info_is_open_snapshot(directory: &Directory) -> OpenInfo {
+    directory.info()
+}
+
+fn pipe_info_is_open_snapshot(pipe: &Pipe) -> OpenInfo {
+    pipe.info()
 }
 
 #[test]
@@ -61,6 +102,27 @@ fn public_spine_defers_async_work_to_lazy_operations() {
     let _ = session_close_is_lazy;
     let _ = share_close_is_lazy;
     let _ = file_delete_is_lazy;
+    let _ = session_info_is_redacted_snapshot;
+    let _ = share_info_is_redacted_snapshot;
+    let _ = file_info_is_open_snapshot;
+    let _ = directory_info_is_open_snapshot;
+    let _ = pipe_info_is_open_snapshot;
+}
+
+#[test]
+fn credential_provider_is_not_polled_before_authentication_operation() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let client = Client::new();
+    let operation = client.authenticate(
+        "server",
+        Credentials::provider(RotatingCredentials {
+            calls: calls.clone(),
+        }),
+    );
+
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+    drop(operation);
+    assert_eq!(calls.load(Ordering::Acquire), 0);
 }
 
 #[tokio::test]

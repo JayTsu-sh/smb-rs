@@ -21,13 +21,41 @@ use sspi::{AuthIdentity, Secret, Username};
 use crate::{
     Error,
     client::{Client as LegacyClient, ClientConfig as LegacyClientConfig, UncPath},
+    domain::{CredentialProvider, Credentials},
     resource::{
         Directory as LegacyDirectory, File as LegacyFile, FileCreateArgs, Pipe as LegacyPipe,
         Resource as LegacyResource, file::FileOperationOptions,
     },
-    session::Session as LegacySession,
+    session::{
+        Session as LegacySession,
+        credential::{SessionCredentialProvider, SharedCredentialProvider},
+    },
     tree::Tree as LegacyShare,
 };
+
+struct RefreshingCredentialAdapter {
+    provider: Arc<dyn CredentialProvider>,
+}
+
+impl SessionCredentialProvider for RefreshingCredentialAdapter {
+    fn identity(&self) -> futures_core::future::BoxFuture<'_, crate::Result<AuthIdentity>> {
+        Box::pin(async move {
+            match self.provider.credentials().await? {
+                Credentials::Ntlm { username, password } => Ok(AuthIdentity {
+                    username: Username::parse(username.as_str())
+                        .map_err(|error| Error::SspiError(error.into()))?,
+                    password: Secret::from(password.to_string()),
+                }),
+                Credentials::Anonymous => Err(Error::UnsupportedOperation(
+                    "anonymous authentication is not activated".into(),
+                )),
+                Credentials::Provider(_) => Err(Error::InvalidArgument(
+                    "credential providers must return concrete credentials".into(),
+                )),
+            }
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OpenMode {
@@ -59,6 +87,22 @@ impl RuntimeClient {
             password: Secret::from(password),
         };
         let session = connection.authenticate(identity).await?;
+        Ok(RuntimeSession {
+            inner: Arc::new(session),
+            server: server.to_owned(),
+        })
+    }
+
+    pub(crate) async fn authenticate_with_provider(
+        &self,
+        server: &str,
+        provider: Arc<dyn CredentialProvider>,
+    ) -> crate::Result<RuntimeSession> {
+        let connection = self.inner.connect(server).await?;
+        let provider: SharedCredentialProvider = Arc::new(RefreshingCredentialAdapter { provider });
+        let session = connection
+            .authenticate_with_credential_provider(provider)
+            .await?;
         Ok(RuntimeSession {
             inner: Arc::new(session),
             server: server.to_owned(),

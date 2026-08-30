@@ -22,7 +22,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures_core::Stream;
+use futures_core::{Stream, future::BoxFuture};
 use futures_util::{StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OnceCell};
@@ -44,6 +44,16 @@ pub enum Credentials {
         password: Zeroizing<String>,
     },
     Anonymous,
+    Provider(Arc<dyn CredentialProvider>),
+}
+
+/// Refreshable authentication source owned by a logical Session.
+pub trait CredentialProvider: Send + Sync {
+    /// Stable, non-secret identity used only for Session cache partitioning.
+    fn cache_key(&self) -> &str;
+
+    /// Obtain fresh authentication material for one SessionSetup attempt.
+    fn credentials(&self) -> BoxFuture<'_, crate::Result<Credentials>>;
 }
 
 /// Aggregate result of closing a logical parent handle and its descendants.
@@ -88,12 +98,73 @@ impl CloseReport {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionInfo {
+    server: String,
+}
+
+impl SessionInfo {
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShareInfo {
+    server: String,
+    share: String,
+}
+
+impl ShareInfo {
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+
+    pub fn share(&self) -> &str {
+        &self.share
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenKind {
+    File,
+    Directory,
+    Pipe,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenInfo {
+    kind: OpenKind,
+    name: String,
+}
+
+impl OpenInfo {
+    fn new(kind: OpenKind, name: impl Into<String>) -> Self {
+        Self {
+            kind,
+            name: name.into(),
+        }
+    }
+
+    pub const fn kind(&self) -> OpenKind {
+        self.kind
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 impl Credentials {
     pub fn ntlm(username: impl Into<String>, password: impl Into<String>) -> Self {
         Self::Ntlm {
             username: Zeroizing::new(username.into()),
             password: Zeroizing::new(password.into()),
         }
+    }
+
+    pub fn provider(provider: impl CredentialProvider + 'static) -> Self {
+        Self::Provider(Arc::new(provider))
     }
 }
 
@@ -314,17 +385,23 @@ impl DomainClient {
         server: &str,
         credentials: Credentials,
     ) -> crate::Result<Session> {
-        let Credentials::Ntlm { username, password } = credentials else {
-            return Err(Error::UnsupportedOperation(
-                "anonymous authentication is not activated".into(),
-            ));
+        let credential_digest: [u8; 32] = match &credentials {
+            Credentials::Ntlm { username, password } => Sha256::new()
+                .chain_update(username.as_bytes())
+                .chain_update([0])
+                .chain_update(password.as_bytes())
+                .finalize()
+                .into(),
+            Credentials::Provider(provider) => Sha256::new()
+                .chain_update(provider.cache_key().as_bytes())
+                .finalize()
+                .into(),
+            Credentials::Anonymous => {
+                return Err(Error::UnsupportedOperation(
+                    "anonymous authentication is not activated".into(),
+                ));
+            }
         };
-        let credential_digest: [u8; 32] = Sha256::new()
-            .chain_update(username.as_bytes())
-            .chain_update([0])
-            .chain_update(password.as_bytes())
-            .finalize()
-            .into();
         let key = (server.to_owned(), credential_digest);
         if let Some(inner) = self
             .inner
@@ -336,14 +413,24 @@ impl DomainClient {
         {
             return Ok(Session { inner });
         }
-        let runtime = Arc::new(
-            self.inner
-                .runtime
-                .authenticate(server, username.as_str(), password.to_string())
-                .await?,
-        );
+        let runtime = Arc::new(match credentials {
+            Credentials::Ntlm { username, password } => {
+                self.inner
+                    .runtime
+                    .authenticate(server, username.as_str(), password.to_string())
+                    .await?
+            }
+            Credentials::Provider(provider) => {
+                self.inner
+                    .runtime
+                    .authenticate_with_provider(server, provider)
+                    .await?
+            }
+            Credentials::Anonymous => unreachable!("anonymous credentials were rejected above"),
+        });
         let inner = Arc::new(SessionInner {
             runtime,
+            server: server.to_owned(),
             close_report: OnceCell::new(),
             shares: AtomicUsize::new(0),
             resources: AtomicUsize::new(0),
@@ -391,6 +478,7 @@ pub struct Session {
 
 struct SessionInner {
     runtime: Arc<RuntimeSession>,
+    server: String,
     close_report: OnceCell<CloseReport>,
     shares: AtomicUsize,
     resources: AtomicUsize,
@@ -422,6 +510,12 @@ pub struct ObjectGeneration {
 }
 
 impl Session {
+    pub fn info(&self) -> SessionInfo {
+        SessionInfo {
+            server: self.inner.server.clone(),
+        }
+    }
+
     pub fn generation(&self) -> crate::Result<ObjectGeneration> {
         Ok(ObjectGeneration {
             identity: self.inner.runtime.object_identity()?,
@@ -437,6 +531,7 @@ impl Session {
                 Ok(Share {
                     inner: Arc::new(ShareInner {
                         runtime,
+                        name: name.to_owned(),
                         close_report: OnceCell::new(),
                         resources: AtomicUsize::new(0),
                     }),
@@ -465,6 +560,7 @@ pub struct Share {
 
 struct ShareInner {
     runtime: RuntimeShare,
+    name: String,
     close_report: OnceCell<CloseReport>,
     resources: AtomicUsize,
 }
@@ -488,6 +584,12 @@ impl ShareInner {
 }
 
 impl Share {
+    pub fn info(&self) -> ShareInfo {
+        ShareInfo {
+            server: self._session.server.clone(),
+            share: self.inner.name.clone(),
+        }
+    }
     fn record_resource_open(&self) {
         self.inner.resources.fetch_add(1, Ordering::AcqRel);
         self._session.resources.fetch_add(1, Ordering::AcqRel);
@@ -515,14 +617,17 @@ impl Share {
                     RuntimeResource::File(inner) => Resource::File(Box::new(File {
                         inner,
                         close_authority: FileCloseAuthority::new(),
+                        info: OpenInfo::new(OpenKind::File, path.as_str()),
                     })),
                     RuntimeResource::Directory(inner) => Resource::Directory(Directory {
                         inner,
                         close_authority: FileCloseAuthority::new(),
+                        info: OpenInfo::new(OpenKind::Directory, path.as_str()),
                     }),
                     RuntimeResource::Pipe(inner) => Resource::Pipe(Pipe {
                         inner,
                         close_authority: FileCloseAuthority::new(),
+                        info: OpenInfo::new(OpenKind::Pipe, path.as_str()),
                     }),
                 })
             })
@@ -553,14 +658,17 @@ impl Share {
                     RuntimeResource::File(inner) => Resource::File(Box::new(File {
                         inner,
                         close_authority: FileCloseAuthority::new(),
+                        info: OpenInfo::new(OpenKind::File, path.as_str()),
                     })),
                     RuntimeResource::Directory(inner) => Resource::Directory(Directory {
                         inner,
                         close_authority: FileCloseAuthority::new(),
+                        info: OpenInfo::new(OpenKind::Directory, path.as_str()),
                     }),
                     RuntimeResource::Pipe(inner) => Resource::Pipe(Pipe {
                         inner,
                         close_authority: FileCloseAuthority::new(),
+                        info: OpenInfo::new(OpenKind::Pipe, path.as_str()),
                     }),
                 })
             })
@@ -594,6 +702,7 @@ impl Share {
                 Ok(File {
                     inner,
                     close_authority: FileCloseAuthority::new(),
+                    info: OpenInfo::new(OpenKind::File, path.as_str()),
                 })
             })
         })
@@ -623,6 +732,7 @@ impl Share {
                 Ok(File {
                     inner,
                     close_authority: FileCloseAuthority::new(),
+                    info: OpenInfo::new(OpenKind::File, path.as_str()),
                 })
             })
         })
@@ -651,6 +761,7 @@ impl Share {
                 Ok(Directory {
                     inner,
                     close_authority: FileCloseAuthority::new(),
+                    info: OpenInfo::new(OpenKind::Directory, path.as_str()),
                 })
             })
         })
@@ -671,6 +782,7 @@ impl Share {
                 Ok(Pipe {
                     inner,
                     close_authority: FileCloseAuthority::new(),
+                    info: OpenInfo::new(OpenKind::Pipe, name.as_str()),
                 })
             })
         })
@@ -762,6 +874,7 @@ impl Resource {
 pub struct File {
     inner: RuntimeFile,
     close_authority: FileCloseAuthority,
+    info: OpenInfo,
 }
 
 /// Negotiated data-plane limits exposed to upper-layer I/O schedulers.
@@ -832,6 +945,10 @@ impl FileCloseAuthority {
 }
 
 impl File {
+    pub fn info(&self) -> OpenInfo {
+        self.info.clone()
+    }
+
     /// Returns the maximum read and write request sizes negotiated by smb-rs.
     ///
     /// Upper layers may select smaller chunks for their concurrency and memory
@@ -1185,6 +1302,7 @@ impl DirectoryEntry {
 pub struct Directory {
     inner: crate::runtime::port::RuntimeDirectory,
     close_authority: FileCloseAuthority,
+    info: OpenInfo,
 }
 
 pub type DirectoryEntries<'a> =
@@ -1222,6 +1340,10 @@ fn pair_directory_event(
 }
 
 impl Directory {
+    pub fn info(&self) -> OpenInfo {
+        self.info.clone()
+    }
+
     pub fn metadata(&self) -> Operation<'_, ResourceMetadata> {
         Operation::new(move |context| {
             Box::pin(async move {
@@ -1314,9 +1436,14 @@ impl Directory {
 pub struct Pipe {
     inner: crate::runtime::port::RuntimePipe,
     close_authority: FileCloseAuthority,
+    info: OpenInfo,
 }
 
 impl Pipe {
+    pub fn info(&self) -> OpenInfo {
+        self.info.clone()
+    }
+
     pub fn read(&self, max_len: u32) -> Operation<'_, Bytes> {
         Operation::new(move |context| {
             Box::pin(async move {

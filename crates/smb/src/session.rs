@@ -23,7 +23,7 @@ use tokio::sync::RwLock;
 
 mod authenticator;
 mod channel;
-mod credential;
+pub(crate) mod credential;
 mod encryptor_decryptor;
 pub(crate) mod gss;
 pub(crate) mod recovery_attempt;
@@ -73,6 +73,24 @@ impl Session {
     ) -> crate::Result<Session> {
         let credential_provider: SharedCredentialProvider =
             Arc::new(StaticCredentialProvider::new(identity));
+        let setup_result = SessionSetup::new(
+            credential_provider.identity().await?,
+            upstream,
+            conn_info,
+            PRIMARY_CHANNEL_ID,
+            None,
+            SetupKind::New,
+        )
+        .await?;
+
+        Self::_finish_create(setup_result, Some(credential_provider)).await
+    }
+
+    pub(crate) async fn create_with_provider(
+        credential_provider: SharedCredentialProvider,
+        upstream: &ChannelUpstream,
+        conn_info: &Arc<ConnectionInfo>,
+    ) -> crate::Result<Session> {
         let setup_result = SessionSetup::new(
             credential_provider.identity().await?,
             upstream,
