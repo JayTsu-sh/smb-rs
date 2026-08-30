@@ -8,8 +8,8 @@ use smb::{
 };
 use smb::{
     Client, ClientConfig, CloseOutcome, Credentials, Directory, DirectoryOpenOptions, File,
-    FileCursor, FileOpenOptions, Pipe, PipeName, ReplayPolicy, Session, Share, SharePath,
-    ShareTarget, Transfer, TransferEvents,
+    FileCursor, FileOpenOptions, Pipe, PipeName, PreviousVersion, ReplayPolicy, Session, Share,
+    SharePath, ShareTarget, Transfer, TransferEvents,
 };
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
@@ -21,6 +21,14 @@ fn assert_send_sync<T: Send + Sync>() {}
 fn assert_clone<T: Clone>() {}
 fn assert_send<T: Send>() {}
 fn assert_cursor<T: AsyncRead + AsyncWrite + AsyncSeek + Unpin + Send>() {}
+
+#[test]
+fn previous_version_tokens_are_validated_at_the_domain_boundary() {
+    let version = PreviousVersion::from_gmt_token("@GMT-2026.08.30-05.10.00").unwrap();
+    assert_eq!(version.gmt_token(), "@GMT-2026.08.30-05.10.00");
+    assert!(PreviousVersion::from_gmt_token("snapshot-name").is_err());
+    assert!(PreviousVersion::from_gmt_token("@GMT-2026.02.30-05.10.00").is_err());
+}
 
 #[test]
 fn public_spine_types_are_send_sync_and_domain_named() {
@@ -409,6 +417,58 @@ async fn domain_directory_query_only() -> smb::Result<()> {
     assert!(entries.iter().any(|entry| entry.name() == "."));
     directory.delete().await?;
     directory.close().await?;
+    share.close().await?;
+    client.close().await
+}
+
+#[cfg(feature = "real-server-tests")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[ignore = "requires a manifest-owned ONTAP Snapshot between prepare and verify"]
+async fn previous_versions_prepare_version_a() -> smb::Result<()> {
+    let client = Client::new(ClientConfig::default());
+    let share = client
+        .connect_share(
+            &ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?,
+            common::smb_test_credentials(),
+        )
+        .await?;
+    let path = SharePath::new("w6-previous-version.bin")?;
+    let file = share.open_file(&path, FileOpenOptions::overwrite()).await?;
+    file.write_all_at(0, Bytes::from_static(b"version-a"))
+        .await?;
+    file.close().await?;
+    share.close().await?;
+    client.close().await
+}
+
+#[cfg(feature = "real-server-tests")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[ignore = "requires the manifest-owned ONTAP Snapshot created after prepare"]
+async fn previous_versions_read_snapshot_and_active_version() -> smb::Result<()> {
+    let client = Client::new(ClientConfig::default());
+    let share = client
+        .connect_share(
+            &ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?,
+            common::smb_test_credentials(),
+        )
+        .await?;
+    let path = SharePath::new("w6-previous-version.bin")?;
+    let active = share
+        .open_file(&path, FileOpenOptions::open_existing())
+        .await?;
+    active
+        .write_all_at(0, Bytes::from_static(b"version-b"))
+        .await?;
+    let versions = active.previous_versions().await?;
+    let version = versions
+        .last()
+        .ok_or_else(|| Error::InvalidState("server returned no Previous Versions".into()))?;
+    let previous = share.open_file_at_version(&path, version).await?;
+    assert_eq!(previous.read_exact_at(0, 9).await?, b"version-a"[..]);
+    assert_eq!(active.read_exact_at(0, 9).await?, b"version-b"[..]);
+    previous.close().await?;
+    active.delete().await?;
+    active.close().await?;
     share.close().await?;
     client.close().await
 }

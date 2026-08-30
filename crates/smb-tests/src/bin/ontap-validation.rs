@@ -84,6 +84,20 @@ fn run() -> Result<(), String> {
             }
             println!("manifest-owned resources are cleaned");
         }
+        "snapshot-create" => {
+            let manifest = RunManifest::load(&manifest_path)?;
+            ensure_identity(&manifest, test_identity.as_str())?;
+            ApplyAuthorization::new(manifest.plan(), required(&options, "--apply")?)?;
+            ProvisioningRun::new(manifest, &mut adapter).create_snapshot()?;
+            println!("manifest-owned Snapshot is Ready");
+        }
+        "snapshot-delete" => {
+            let manifest = RunManifest::load(&manifest_path)?;
+            ensure_identity(&manifest, test_identity.as_str())?;
+            ApplyAuthorization::new(manifest.plan(), required(&options, "--apply")?)?;
+            ProvisioningRun::new(manifest, &mut adapter).delete_snapshot()?;
+            println!("manifest-owned Snapshot is deleted");
+        }
         _ => return Err(usage()),
     }
     Ok(())
@@ -161,7 +175,7 @@ fn command_output(program: &str, arguments: &[&str]) -> Result<String, String> {
 }
 
 fn usage() -> String {
-    "usage: ontap-validation <plan|apply|cleanup> --manifest PATH --target-fd N --management-user-fd N --test-identity-fd N --management-password-fd N [--svm NAME --aggregate NAME] [--apply PLAN_HASH]".into()
+    "usage: ontap-validation <plan|apply|snapshot-create|snapshot-delete|cleanup> --manifest PATH --target-fd N --management-user-fd N --test-identity-fd N --management-password-fd N [--svm NAME --aggregate NAME] [--apply PLAN_HASH]".into()
 }
 
 #[cfg(test)]

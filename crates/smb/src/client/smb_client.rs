@@ -415,6 +415,7 @@ impl Client {
                     desired_access: args.desired_access,
                     lease_request: Some(lease),
                     durable_request: args.durable_request,
+                    timewarp: args.timewarp,
                 };
                 &owned_args
             } else {

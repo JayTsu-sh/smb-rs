@@ -23,6 +23,7 @@ pub struct Plan {
     volume: String,
     plain_share: String,
     encrypted_share: String,
+    snapshot: String,
     junction: String,
     owner_comment: String,
     preflight_state_hash: Option<String>,
@@ -63,6 +64,7 @@ impl Plan {
             volume: format!("{stem}_functional"),
             plain_share: format!("{stem}_plain"),
             encrypted_share: format!("{stem}_encrypted"),
+            snapshot: format!("{stem}_previous"),
             junction: format!("/{stem}_functional"),
             owner_comment: format!("smb-rs-validation:{run_id}"),
             preflight_state_hash: None,
@@ -77,6 +79,9 @@ impl Plan {
             ShareRole::Plain => &self.plain_share,
             ShareRole::Encrypted => &self.encrypted_share,
         }
+    }
+    pub fn snapshot_name(&self) -> &str {
+        &self.snapshot
     }
 
     pub fn matches_test_identity(&self, identity: &str) -> bool {
@@ -230,6 +235,7 @@ pub enum ResourceKind {
     Volume,
     PlainShare,
     EncryptedShare,
+    Snapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -280,6 +286,7 @@ impl Inventory {
                 (ResourceKind::Volume, Lifecycle::Planned),
                 (ResourceKind::PlainShare, Lifecycle::Planned),
                 (ResourceKind::EncryptedShare, Lifecycle::Planned),
+                (ResourceKind::Snapshot, Lifecycle::Planned),
             ]),
         }
     }
@@ -318,6 +325,7 @@ impl Inventory {
 
     pub fn cleanup_order(&self) -> Vec<ResourceKind> {
         [
+            ResourceKind::Snapshot,
             ResourceKind::EncryptedShare,
             ResourceKind::PlainShare,
             ResourceKind::Volume,
@@ -337,9 +345,13 @@ impl Inventory {
             return Err("resource ownership does not match the manifest".into());
         }
         if kind == ResourceKind::Volume
-            && [ResourceKind::PlainShare, ResourceKind::EncryptedShare]
-                .into_iter()
-                .any(|share| self.state(share) == Some(Lifecycle::OwnershipMismatch))
+            && [
+                ResourceKind::PlainShare,
+                ResourceKind::EncryptedShare,
+                ResourceKind::Snapshot,
+            ]
+            .into_iter()
+            .any(|share| self.state(share) == Some(Lifecycle::OwnershipMismatch))
         {
             return Err("child ownership mismatch blocks parent deletion".into());
         }
@@ -373,6 +385,7 @@ impl Inventory {
             ResourceKind::Volume,
             ResourceKind::PlainShare,
             ResourceKind::EncryptedShare,
+            ResourceKind::Snapshot,
         ];
         if self.resources.len() != expected.len()
             || expected
@@ -632,6 +645,8 @@ pub trait OntapAdapter {
     fn unmount_volume(&mut self, plan: &Plan) -> Result<(), String>;
     fn offline_volume(&mut self, plan: &Plan) -> Result<(), String>;
     fn delete_volume(&mut self, plan: &Plan) -> Result<(), String>;
+    fn create_snapshot(&mut self, plan: &Plan) -> Result<(), String>;
+    fn delete_snapshot(&mut self, plan: &Plan) -> Result<(), String>;
 }
 
 /// Transactional provisioning and cleanup orchestration over an ONTAP Adapter.
@@ -671,6 +686,33 @@ impl<'a, A: OntapAdapter> ProvisioningRun<'a, A> {
         } else {
             Err(errors.join("; "))
         }
+    }
+
+    pub fn create_snapshot(mut self) -> Result<RunManifest, String> {
+        let plan = self.manifest.plan.clone();
+        if self.manifest.state(ResourceKind::Snapshot) != Some(Lifecycle::Planned) {
+            return Err("snapshot is not in Planned state".into());
+        }
+        self.adapter.create_snapshot(&plan)?;
+        self.manifest.record_created(ResourceKind::Snapshot)?;
+        if !self.adapter.verify_ready(&plan, ResourceKind::Snapshot)? {
+            return Err("Snapshot did not match the ready plan".into());
+        }
+        self.manifest.record_ready(ResourceKind::Snapshot)?;
+        Ok(self.manifest)
+    }
+
+    pub fn delete_snapshot(mut self) -> Result<RunManifest, String> {
+        let plan = self.manifest.plan.clone();
+        self.manifest.may_delete(ResourceKind::Snapshot)?;
+        if !self.adapter.verify_owned(&plan, ResourceKind::Snapshot)? {
+            self.manifest
+                .record_ownership_mismatch(ResourceKind::Snapshot)?;
+            return Err("Snapshot ownership mismatch".into());
+        }
+        self.adapter.delete_snapshot(&plan)?;
+        self.manifest.record_deleted(ResourceKind::Snapshot)?;
+        Ok(self.manifest)
     }
 
     fn provision(&mut self) -> Result<(), String> {
@@ -756,6 +798,7 @@ impl<'a, A: OntapAdapter> ProvisioningRun<'a, A> {
                     }
                     self.adapter.delete_volume(&plan)
                 }
+                ResourceKind::Snapshot => self.adapter.delete_snapshot(&plan),
             };
             match deletion {
                 Ok(()) => {

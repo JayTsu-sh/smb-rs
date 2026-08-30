@@ -229,6 +229,7 @@ impl OntapAdapter for ScriptedOntap {
             ResourceKind::Volume => "verify-volume-ready",
             ResourceKind::PlainShare => "verify-plain-share-ready",
             ResourceKind::EncryptedShare => "verify-encrypted-share-ready",
+            ResourceKind::Snapshot => "verify-snapshot-ready",
         });
         Ok(self.mismatch != Some(kind))
     }
@@ -237,6 +238,7 @@ impl OntapAdapter for ScriptedOntap {
             ResourceKind::Volume => "verify-volume-owned",
             ResourceKind::PlainShare => "verify-plain-share-owned",
             ResourceKind::EncryptedShare => "verify-encrypted-share-owned",
+            ResourceKind::Snapshot => "verify-snapshot-owned",
         });
         Ok(self.mismatch != Some(kind))
     }
@@ -255,6 +257,38 @@ impl OntapAdapter for ScriptedOntap {
     fn delete_volume(&mut self, _: &Plan) -> Result<(), String> {
         self.action("delete-volume")
     }
+    fn create_snapshot(&mut self, _: &Plan) -> Result<(), String> {
+        self.action("create-snapshot")
+    }
+    fn delete_snapshot(&mut self, _: &Plan) -> Result<(), String> {
+        self.action("delete-snapshot")
+    }
+}
+
+#[test]
+fn snapshot_is_manifest_owned_before_it_can_be_cleaned() {
+    let path = temp_manifest("snapshot");
+    let plan = fixture();
+    let authorization = ApplyAuthorization::new(&plan, &plan.hash()).unwrap();
+    let manifest = RunManifest::create(&path, plan).unwrap();
+    let mut adapter = ScriptedOntap::default();
+    let manifest = ProvisioningRun::new(manifest, &mut adapter)
+        .apply(&authorization)
+        .unwrap();
+    let manifest = ProvisioningRun::new(manifest, &mut adapter)
+        .create_snapshot()
+        .unwrap();
+    assert_eq!(
+        manifest.state(ResourceKind::Snapshot),
+        Some(Lifecycle::Ready)
+    );
+    assert_eq!(manifest.cleanup_order()[0], ResourceKind::Snapshot);
+    ProvisioningRun::new(manifest, &mut adapter)
+        .delete_snapshot()
+        .unwrap();
+    assert!(adapter.calls.contains(&"create-snapshot"));
+    assert!(adapter.calls.contains(&"delete-snapshot"));
+    fs::remove_file(path).unwrap();
 }
 
 #[test]

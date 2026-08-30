@@ -81,6 +81,8 @@ pub struct FileCreateArgs {
     pub lease_request: Option<RequestLease>,
     /// Optional SMB3 durable-v2 or persistent open request.
     pub durable_request: Option<DurableOpenRequest>,
+    /// Optional timestamp for opening a read-only Previous Version.
+    pub timewarp: Option<smb_dtyp::binrw_util::prelude::FileTime>,
 }
 
 impl FileCreateArgs {
@@ -143,6 +145,14 @@ impl FileCreateArgs {
     /// Request an SMB3 durable-v2 or persistent open.
     pub fn with_durable(mut self, request: DurableOpenRequest) -> Self {
         self.durable_request = Some(request);
+        self
+    }
+
+    pub(crate) fn with_timewarp(
+        mut self,
+        timestamp: smb_dtyp::binrw_util::prelude::FileTime,
+    ) -> Self {
+        self.timewarp = Some(timestamp);
         self
     }
 }
@@ -222,13 +232,15 @@ impl Resource {
                 upstream.continuously_available()?,
             )?;
         }
-
         // 标准 create context 列表：MxAc + QFid 始终发送；lease (RqLs) 仅在调用方显式
         // 请求时附加，保持现有非-lease 调用方零行为变化。
         let mut contexts: Vec<CreateContextRequest> = vec![
             QueryMaximalAccessRequest::default().into(),
             QueryOnDiskIdReq.into(),
         ];
+        if let Some(timestamp) = create_args.timewarp {
+            contexts.push(TimewarpToken { timestamp }.into());
+        }
         if let Some(lease_req) = create_args.lease_request.as_ref() {
             contexts.push(lease_req.clone().into());
         }

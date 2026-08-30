@@ -107,6 +107,10 @@ required-features = ["test-support"]
 name = "rpc"
 required-features = ["real-server-tests"]
 
+[[test]]
+name = "ontap_performance"
+required-features = ["real-server-tests"]
+
 [features]
 default = ["sign", "encrypt", "compress", "std-fs-impls", "netbios-transport"]
 

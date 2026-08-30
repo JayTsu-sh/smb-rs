@@ -231,6 +231,25 @@ impl SshOntapAdapter {
         Ok(has_exact_token(&granted, self.test_identity.as_str())
             && !has_exact_token(&everyone, "Everyone"))
     }
+
+    fn snapshot_owned(&self, plan: &Plan) -> Result<bool, String> {
+        let output = self.run(&[
+            "volume",
+            "snapshot",
+            "show",
+            "-vserver",
+            &plan.svm,
+            "-volume",
+            &plan.volume,
+            "-snapshot",
+            &plan.snapshot,
+            "-comment",
+            &plan.owner_comment,
+            "-fields",
+            "snapshot",
+        ])?;
+        Ok(has_exact_token(&output, &plan.snapshot))
+    }
 }
 
 impl OntapAdapter for SshOntapAdapter {
@@ -279,6 +298,7 @@ impl OntapAdapter for SshOntapAdapter {
             ResourceKind::Volume => self.volume_owned(plan, true),
             ResourceKind::PlainShare => self.share_owned(plan, ShareRole::Plain, true),
             ResourceKind::EncryptedShare => self.share_owned(plan, ShareRole::Encrypted, true),
+            ResourceKind::Snapshot => self.snapshot_owned(plan),
         }
     }
 
@@ -287,6 +307,7 @@ impl OntapAdapter for SshOntapAdapter {
             ResourceKind::Volume => self.volume_owned(plan, false),
             ResourceKind::PlainShare => self.share_owned(plan, ShareRole::Plain, false),
             ResourceKind::EncryptedShare => self.share_owned(plan, ShareRole::Encrypted, false),
+            ResourceKind::Snapshot => self.snapshot_owned(plan),
         }
     }
 
@@ -338,6 +359,40 @@ impl OntapAdapter for SshOntapAdapter {
             &plan.svm,
             "-volume",
             &plan.volume,
+            "-foreground",
+            "true",
+        ])
+        .map(drop)
+    }
+
+    fn create_snapshot(&mut self, plan: &Plan) -> Result<(), String> {
+        self.run(&[
+            "volume",
+            "snapshot",
+            "create",
+            "-vserver",
+            &plan.svm,
+            "-volume",
+            &plan.volume,
+            "-snapshot",
+            &plan.snapshot,
+            "-comment",
+            &plan.owner_comment,
+        ])
+        .map(drop)
+    }
+
+    fn delete_snapshot(&mut self, plan: &Plan) -> Result<(), String> {
+        self.run(&[
+            "volume",
+            "snapshot",
+            "delete",
+            "-vserver",
+            &plan.svm,
+            "-volume",
+            &plan.volume,
+            "-snapshot",
+            &plan.snapshot,
             "-foreground",
             "true",
         ])

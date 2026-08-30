@@ -15,7 +15,7 @@ use smb_fscc::{
     FileAccessMask, FileAttributes, FileBasicInformation, FileDirectoryInformation,
     FileDispositionInformation, FileRenameInformation, FileStandardInformation, NotifyAction,
 };
-use smb_msg::{AdditionalInfo, CreateOptions, NotifyFilter};
+use smb_msg::{AdditionalInfo, CreateOptions, NotifyFilter, SrvEnumerateSnapshotsRequest};
 use sspi::{AuthIdentity, Secret, Username};
 
 use crate::{
@@ -163,6 +163,22 @@ impl RuntimeShare {
             LegacyResource::File(file) => Ok(RuntimeFile { inner: file }),
             _ => Err(Error::InvalidState(
                 "server returned a non-file resource".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn open_file_at_version(
+        &self,
+        path: &str,
+        timestamp: u64,
+    ) -> crate::Result<RuntimeFile> {
+        let args =
+            FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true))
+                .with_timewarp(smb_dtyp::binrw_util::prelude::FileTime::from(timestamp));
+        match self.inner.create(path, &args).await? {
+            LegacyResource::File(file) => Ok(RuntimeFile { inner: file }),
+            _ => Err(Error::InvalidState(
+                "server returned a non-file Previous Version".into(),
             )),
         }
     }
@@ -412,6 +428,13 @@ pub(crate) struct RuntimeFile {
 }
 
 impl RuntimeFile {
+    pub(crate) async fn previous_versions(&self) -> crate::Result<Vec<String>> {
+        let response = self
+            .inner
+            .fsctl_with_options(SrvEnumerateSnapshotsRequest::new(()), 64 * 1024)
+            .await?;
+        Ok(response.snap_shots.into_iter().collect())
+    }
     pub(crate) async fn query_security(&self, dacl: bool) -> crate::Result<SecurityDescriptor> {
         query_security(&self.inner, dacl).await
     }

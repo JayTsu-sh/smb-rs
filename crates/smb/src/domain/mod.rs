@@ -137,6 +137,58 @@ pub struct FileOpenOptions {
     mode: OpenMode,
 }
 
+/// A validated server Previous Versions token.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreviousVersion {
+    gmt_token: String,
+    timestamp: u64,
+}
+
+impl PreviousVersion {
+    pub fn from_gmt_token(token: impl Into<String>) -> crate::Result<Self> {
+        let token = token.into();
+        let fields = token
+            .strip_prefix("@GMT-")
+            .ok_or_else(|| Error::InvalidArgument("invalid Previous Version token".into()))?;
+        if fields.len() != 19
+            || fields.as_bytes()[4] != b'.'
+            || fields.as_bytes()[7] != b'.'
+            || fields.as_bytes()[10] != b'-'
+            || fields.as_bytes()[13] != b'.'
+            || fields.as_bytes()[16] != b'.'
+        {
+            return Err(Error::InvalidArgument(
+                "invalid Previous Version token".into(),
+            ));
+        }
+        let number = |range: std::ops::Range<usize>| {
+            fields[range]
+                .parse::<u8>()
+                .map_err(|_| Error::InvalidArgument("invalid Previous Version token".into()))
+        };
+        let year = fields[..4]
+            .parse::<i32>()
+            .map_err(|_| Error::InvalidArgument("invalid Previous Version token".into()))?;
+        let month = time::Month::try_from(number(5..7)?)
+            .map_err(|_| Error::InvalidArgument("invalid Previous Version token".into()))?;
+        let date = time::Date::from_calendar_date(year, month, number(8..10)?)
+            .map_err(|_| Error::InvalidArgument("invalid Previous Version token".into()))?;
+        let time = time::Time::from_hms(number(11..13)?, number(14..16)?, number(17..19)?)
+            .map_err(|_| Error::InvalidArgument("invalid Previous Version token".into()))?;
+        let timestamp = *smb_dtyp::binrw_util::prelude::FileTime::from(
+            time::PrimitiveDateTime::new(date, time),
+        );
+        Ok(Self {
+            gmt_token: token,
+            timestamp,
+        })
+    }
+
+    pub fn gmt_token(&self) -> &str {
+        &self.gmt_token
+    }
+}
+
 impl FileOpenOptions {
     pub const fn create_new() -> Self {
         Self {
@@ -374,6 +426,33 @@ impl Share {
         })
     }
 
+    pub fn open_file_at_version<'a>(
+        &'a self,
+        path: &SharePath,
+        version: &PreviousVersion,
+    ) -> Operation<'a, File> {
+        let path = path.clone();
+        let timestamp = version.timestamp;
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                if context.replay != ReplayPolicy::Never {
+                    return Err(Error::UnsupportedOperation(
+                        "Previous Version open permits only ReplayPolicy::Never".into(),
+                    ));
+                }
+                let inner = self
+                    .inner
+                    .open_file_at_version(path.as_str(), timestamp)
+                    .await?;
+                Ok(File {
+                    inner,
+                    close_authority: FileCloseAuthority::new(),
+                })
+            })
+        })
+    }
+
     pub fn open_directory<'a>(
         &'a self,
         path: &SharePath,
@@ -552,6 +631,19 @@ impl FileCloseAuthority {
 }
 
 impl File {
+    pub fn previous_versions(&self) -> Operation<'_, Vec<PreviousVersion>> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                self.inner
+                    .previous_versions()
+                    .await?
+                    .into_iter()
+                    .map(PreviousVersion::from_gmt_token)
+                    .collect()
+            })
+        })
+    }
     pub fn metadata(&self) -> Operation<'_, ResourceMetadata> {
         Operation::new(move |context| {
             Box::pin(async move {
