@@ -11,8 +11,8 @@ use bytes::Bytes;
 use futures_core::Stream;
 use futures_util::TryStreamExt;
 use smb_fscc::{
-    FileAccessMask, FileAttributes, FileDirectoryInformation, FileDispositionInformation,
-    FileRenameInformation, FileStandardInformation, NotifyAction,
+    FileAccessMask, FileAttributes, FileBasicInformation, FileDirectoryInformation,
+    FileDispositionInformation, FileRenameInformation, FileStandardInformation, NotifyAction,
 };
 use smb_msg::{CreateOptions, NotifyFilter};
 use sspi::{AuthIdentity, Secret, Username};
@@ -90,7 +90,38 @@ pub(crate) struct RuntimeShare {
     inner: Arc<LegacyShare>,
 }
 
+pub(crate) enum RuntimeResource {
+    File(RuntimeFile),
+    Directory(RuntimeDirectory),
+    Pipe(RuntimePipe),
+}
+
+pub(crate) struct RuntimeMetadata {
+    pub(crate) created: std::time::SystemTime,
+    pub(crate) accessed: std::time::SystemTime,
+    pub(crate) written: std::time::SystemTime,
+    pub(crate) changed: std::time::SystemTime,
+    pub(crate) len: u64,
+}
+
 impl RuntimeShare {
+    pub(crate) async fn open_resource(&self, path: &str) -> crate::Result<RuntimeResource> {
+        let resource = self
+            .inner
+            .create(
+                path,
+                &FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true)),
+            )
+            .await?;
+        Ok(match resource {
+            LegacyResource::File(file) => RuntimeResource::File(RuntimeFile { inner: file }),
+            LegacyResource::Directory(directory) => RuntimeResource::Directory(RuntimeDirectory {
+                inner: Arc::new(directory),
+            }),
+            LegacyResource::Pipe(pipe) => RuntimeResource::Pipe(RuntimePipe { inner: pipe }),
+        })
+    }
+
     pub(crate) async fn open_file(&self, path: &str, mode: OpenMode) -> crate::Result<RuntimeFile> {
         let args = match mode {
             OpenMode::CreateNew => {
@@ -260,6 +291,10 @@ pub(crate) struct RuntimeDirectory {
 }
 
 impl RuntimeDirectory {
+    pub(crate) async fn metadata(&self) -> crate::Result<RuntimeMetadata> {
+        metadata(&self.inner).await
+    }
+
     pub(crate) fn entries<'a>(
         &'a self,
         pattern: &'a str,
@@ -331,6 +366,10 @@ pub(crate) struct RuntimeFile {
 }
 
 impl RuntimeFile {
+    pub(crate) async fn metadata(&self) -> crate::Result<RuntimeMetadata> {
+        metadata(&self.inner).await
+    }
+
     pub(crate) fn opened_len(&self) -> u64 {
         self.inner.end_of_file()
     }
@@ -415,4 +454,16 @@ impl RuntimeFile {
     pub(crate) async fn close(&self) -> crate::Result<()> {
         self.inner.close().await
     }
+}
+
+async fn metadata(resource: &crate::resource::ResourceHandle) -> crate::Result<RuntimeMetadata> {
+    let basic = resource.query_info::<FileBasicInformation>().await?;
+    let standard = resource.query_info::<FileStandardInformation>().await?;
+    Ok(RuntimeMetadata {
+        created: basic.creation_time.into(),
+        accessed: basic.last_access_time.into(),
+        written: basic.last_write_time.into(),
+        changed: basic.change_time.into(),
+        len: standard.end_of_file,
+    })
 }

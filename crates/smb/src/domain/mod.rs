@@ -27,7 +27,9 @@ use zeroize::Zeroizing;
 
 use crate::{
     Error,
-    runtime::port::{OpenMode, RuntimeClient, RuntimeFile, RuntimeSession, RuntimeShare},
+    runtime::port::{
+        OpenMode, RuntimeClient, RuntimeFile, RuntimeResource, RuntimeSession, RuntimeShare,
+    },
 };
 
 /// Authentication material for establishing a logical SMB Session.
@@ -281,6 +283,34 @@ pub struct Share {
 }
 
 impl Share {
+    pub fn open<'a>(&'a self, path: &SharePath) -> Operation<'a, Resource> {
+        let path = path.clone();
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                if context.replay != ReplayPolicy::Never {
+                    return Err(Error::UnsupportedOperation(
+                        "resource open permits only ReplayPolicy::Never".into(),
+                    ));
+                }
+                Ok(match self.inner.open_resource(path.as_str()).await? {
+                    RuntimeResource::File(inner) => Resource::File(Box::new(File {
+                        inner,
+                        close_authority: FileCloseAuthority::new(),
+                    })),
+                    RuntimeResource::Directory(inner) => Resource::Directory(Directory {
+                        inner,
+                        close_authority: FileCloseAuthority::new(),
+                    }),
+                    RuntimeResource::Pipe(inner) => Resource::Pipe(Pipe {
+                        inner,
+                        close_authority: FileCloseAuthority::new(),
+                    }),
+                })
+            })
+        })
+    }
+
     pub fn open_file<'a>(
         &'a self,
         path: &SharePath,
@@ -360,6 +390,71 @@ pub enum Resource {
     Pipe(Pipe),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResourceMetadata {
+    created: std::time::SystemTime,
+    accessed: std::time::SystemTime,
+    written: std::time::SystemTime,
+    changed: std::time::SystemTime,
+    len: u64,
+}
+
+impl ResourceMetadata {
+    fn from_runtime(value: crate::runtime::port::RuntimeMetadata) -> Self {
+        Self {
+            created: value.created,
+            accessed: value.accessed,
+            written: value.written,
+            changed: value.changed,
+            len: value.len,
+        }
+    }
+
+    pub const fn created(&self) -> std::time::SystemTime {
+        self.created
+    }
+
+    pub const fn accessed(&self) -> std::time::SystemTime {
+        self.accessed
+    }
+
+    pub const fn written(&self) -> std::time::SystemTime {
+        self.written
+    }
+
+    pub const fn changed(&self) -> std::time::SystemTime {
+        self.changed
+    }
+
+    pub const fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Resource {
+    pub fn metadata(&self) -> Operation<'_, ResourceMetadata> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                let value = match self {
+                    Resource::File(file) => file.inner.metadata().await?,
+                    Resource::Directory(directory) => directory.inner.metadata().await?,
+                    Resource::Pipe(_) => {
+                        return Err(Error::UnsupportedOperation(
+                            "Pipe metadata is not a domain operation".into(),
+                        ));
+                    }
+                };
+                Ok(ResourceMetadata::from_runtime(value))
+            })
+        })
+    }
+}
+
 /// Non-cloneable positioned file handle.
 pub struct File {
     inner: RuntimeFile,
@@ -417,6 +512,15 @@ impl FileCloseAuthority {
 }
 
 impl File {
+    pub fn metadata(&self) -> Operation<'_, ResourceMetadata> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                Ok(ResourceMetadata::from_runtime(self.inner.metadata().await?))
+            })
+        })
+    }
+
     pub fn cursor(&self) -> FileCursor<'_> {
         FileCursor::new(self)
     }
@@ -752,6 +856,15 @@ fn pair_directory_event(
 }
 
 impl Directory {
+    pub fn metadata(&self) -> Operation<'_, ResourceMetadata> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                Ok(ResourceMetadata::from_runtime(self.inner.metadata().await?))
+            })
+        })
+    }
+
     pub fn entries<'a>(&'a self, pattern: &'a str) -> DirectoryEntries<'a> {
         Box::pin(self.inner.entries(pattern).map(|result| {
             result.map(|entry| DirectoryEntry {

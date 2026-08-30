@@ -8,7 +8,7 @@ use smb::{
 };
 use smb::{
     Client, ClientConfig, CloseOutcome, Credentials, Directory, DirectoryOpenOptions, File,
-    FileCursor, FileOpenOptions, Pipe, PipeName, ReplayPolicy, Session, Share, SharePath,
+    FileCursor, FileOpenOptions, Pipe, PipeName, ReplayPolicy, Resource, Session, Share, SharePath,
     ShareTarget, Transfer, TransferEvents,
 };
 use std::time::{Duration, Instant};
@@ -46,6 +46,49 @@ fn public_spine_types_are_send_sync_and_domain_named() {
     );
     assert_eq!(PipeName::new("srvsvc").unwrap().as_str(), "srvsvc");
     assert!(PipeName::new("dir/pipe").is_err());
+}
+
+#[cfg(feature = "real-server-tests")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[ignore = "requires an isolated writable real-server share"]
+async fn domain_resource_open_and_metadata() -> smb::Result<()> {
+    let client = Client::new(ClientConfig::default());
+    let share = client
+        .connect_share(
+            &ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?,
+            common::smb_test_credentials(),
+        )
+        .await?;
+    let path = SharePath::new(format!("domain-metadata-{}.bin", std::process::id()))?;
+    tracing::info!("metadata-stage=create");
+    let file = share
+        .open_file(&path, FileOpenOptions::create_new())
+        .await?;
+    tracing::info!("metadata-stage=write");
+    file.write_all_at(0, Bytes::from_static(b"domain-metadata"))
+        .await?;
+    tracing::info!("metadata-stage=first-close");
+    file.close().await?;
+
+    tracing::info!("metadata-stage=generic-open");
+    let resource = share.open(&path).await?;
+    let Resource::File(file) = resource else {
+        panic!("created file reopened as a non-file Resource");
+    };
+    tracing::info!("metadata-stage=query");
+    let metadata = file.metadata().await?;
+    assert_eq!(metadata.len(), b"domain-metadata".len() as u64);
+    assert!(!metadata.is_empty());
+    tracing::info!("metadata-stage=second-close");
+    file.close().await?;
+    tracing::info!("metadata-stage=delete");
+    let file = share
+        .open_file(&path, FileOpenOptions::open_existing())
+        .await?;
+    file.delete().await?;
+    file.close().await?;
+    share.close().await?;
+    client.close().await
 }
 
 #[allow(dead_code)]
@@ -384,7 +427,11 @@ async fn domain_batch_and_concurrent_transfer() -> smb::Result<()> {
     let marker = Bytes::from_static(b"batch-marker");
     let mut batch = Batch::new();
     let write = batch.push(destination.batch_write_at(0, marker.clone()));
-    let read = batch.push(destination.batch_read_at(0, marker.len() as u32).after(write));
+    let read = batch.push(
+        destination
+            .batch_read_at(0, marker.len() as u32)
+            .after(write),
+    );
     let outcomes = batch.execute().await?;
     assert!(matches!(
         outcomes.outcome(write),
