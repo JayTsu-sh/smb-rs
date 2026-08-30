@@ -1,114 +1,61 @@
 # SMB
 
-the `smb` crate is a pure rust SMB client, supports the SMB2 protocol (including SMB3).
+The `smb` crate is an asynchronous, pure-Rust SMB2/SMB3 client. Its public
+object hierarchy follows the lifetime of remote objects:
+
+`Client` → `Session` → `Share` → `File` / `Directory` / `Pipe`
 
 ## Basic usage
 
-The most basic functionality that an SMB client should provide is the ability to
-connect to an SMB server, authenticate, and perform simple file operations.
-
-The [`Client`] struct provides a simple interface for interacting with an SMB server. Let's see how we use it.
-
 ```rust,no_run
-use smb::{Client, ClientConfig, UncPath, FileCreateArgs, FileAccessMask};
-use std::str::FromStr;
+use bytes::Bytes;
+use smb::{
+    Client, ClientConfig, Credentials, FileOpenOptions, SharePath, ShareTarget,
+};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // instantiate the client
+async fn main() -> smb::Result<()> {
     let client = Client::new(ClientConfig::default());
+    let target = ShareTarget::new("server", "share")?;
+    let share = client
+        .connect_share(&target, Credentials::ntlm("username", "password"))
+        .await?;
 
-    // Connect to a share
-    let target_path = UncPath::from_str(r"\\server\share").unwrap();
-    client.share_connect(&target_path, "username", "password".to_string()).await?;
+    let path = SharePath::new("file.txt")?;
+    let file = share
+        .open_file(&path, FileOpenOptions::open_existing())
+        .await?;
 
-    // And open a file on the server
-    let file_to_open = target_path.with_path("file.txt");
-    let file_open_args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
-    let file = client.create_file(&file_to_open, &file_open_args).await?;
-    // now, you can do a bunch of operations against `file`, and close it at the end.
-    Ok(())
+    let contents = file.read_at(0, 4096).await?;
+    file.write_all_at(contents.len() as u64, Bytes::from_static(b"\n"))
+        .await?;
+    file.close().await?;
+    share.close().await?;
+    client.close().await
 }
 ```
 
-Cool! we got ourselves a live connection to an SMB server, and we also got a file open.
+Operations are lazy futures. Deadlines, cancellation, and replay policy are
+configured on the returned operation before it is awaited. File payloads use
+`bytes::Bytes`, so slicing and handoff do not copy the underlying buffer.
 
-But wait... How do we know it's actually a file? Well, we don't. The [`Client::create_file`] method returns the [`Resource`] struct, which is a union to a file, directory, or a pipe - the supported SMB resources in this crate (printers are currently not implemented specifically). What we need to do next, is to find out what type of resource we've got:
-
-```rust,no_run
-# use smb::*;
-# #[tokio::main]
-# async fn main() -> Result<()> {
-# let client = Client::default();
-# let mut file = client.create_file(&UncPath::new("")?, &FileCreateArgs::default()).await?;
-match &file {
-    Resource::File(file) => {
-        // We have a file
-    }
-    Resource::Directory(dir) => {
-        // We have a directory
-    }
-    Resource::Pipe(pipe) => {
-        // We have a pipe
-    }
-}
-// Note: we could also use `.unwrap_file()` here,
-// or similar method provided by Resource to find out what kind of resource this is!
-# Ok(())}
-```
-
-Cool! Let's assume we got ourselves a file. Then, we can do the obvious operation of reading or writing a block of data from or to the file:
-
-```rust,no_run
-# use smb::*;
-# #[tokio::main]
-# async fn main() -> Result<()> {
-# let client = Client::default();
-# let mut file = client.create_file(&UncPath::new("")?, &FileCreateArgs::default()).await?;
-let file: File = file.unwrap_file();
-
-let mut data: [u8; 1024] = [0; 1024];
-file.read_at(&mut data, 0).await?;
-file.write_at(&data, 0).await?;
-# Ok(())}
-```
-
-At the end, close the file.
-
-```rust,no_run
-# use smb::*;
-# #[tokio::main]
-# async fn main() -> Result<()> {
-# let client = Client::default();
-# let mut file = client.create_file(&UncPath::new("")?, &FileCreateArgs::default()).await?;
-# let file: File = file.unwrap_file();
-file.close().await?;
-# Ok(())}
-```
+Use explicit extensions for less common capabilities such as security
+descriptors and typed RPC pipes; ordinary file and directory code remains on
+the object hierarchy above.
 
 ## Feature flags
 
-| Type            | Algorithm           | Feature Name           |
-| --------------- | ------------------- | ---------------------- |
-| Authentication  | Kerberos            | `kerberos`             |
-| Transport       | QUIC                | `quic`                 |
-| **Signing**     | *                   | `sign`                 |
-| Signing         | HMAC_SHA256         | `sign_hmac`            |
-| Signing         | AES-128-GCM         | `sign_gmac`            |
-| Signing         | AES-128-CCM         | `sign_cmac`            |
-| **Encryption**  | *                   | `encrypt`              |
-| Encryption      | AES-128-CCM         | `encrypt_aes128ccm`    |
-| Encryption      | AES-128-GCM         | `encrypt_aes128gcm`    |
-| Encryption      | AES-256-CCM         | `encrypt_aes256ccm`    |
-| Encryption      | AES-256-GCM         | `encrypt_aes256gcm`    |
-| **Compression** | *                   | `compress`             |
-| Compression     | LZ4                 | `compress_lz4`         |
-| Compression     | Pattern_V1          | `compress_pattern_v1`* |
-| Compression     | LZNT1/LZ77/+Huffman | -                      |
-
-* The Pattern_V1 compression algorithm currently supports in-bound decompression only.
-
-## Advanced documentation
-<!-- markdownlint-disable reference-links-images -->
-* [Performing parallel file operations][docs::parallelize]
-<!-- markdownlint-enable reference-links-images -->
+| Type | Algorithm | Feature |
+| --- | --- | --- |
+| Authentication | Kerberos | `kerberos` |
+| Transport | QUIC | `quic` |
+| Signing | all supported | `sign` |
+| Signing | HMAC-SHA256 | `sign_hmac` |
+| Signing | AES-GMAC | `sign_gmac` |
+| Signing | AES-CMAC | `sign_cmac` |
+| Encryption | all supported | `encrypt` |
+| Encryption | AES-CCM | `encrypt_aesccm` |
+| Encryption | AES-GCM | `encrypt_aesgcm` |
+| Compression | all supported | `compress` |
+| Compression | LZ4 | `compress_lz4` |
+| Compression | Pattern V1 | `compress_pattern_v1` |
