@@ -76,6 +76,10 @@ pub(crate) struct RuntimeSession {
 }
 
 impl RuntimeSession {
+    pub(crate) fn object_identity(&self) -> crate::Result<(u64, u64, u64)> {
+        Ok(self.inner.object_token()?.identity())
+    }
+
     pub(crate) async fn connect_share(&self, share: &str) -> crate::Result<RuntimeShare> {
         let target = UncPath::new(&self.server)?.with_share(share)?;
         let share = Arc::new(self.inner.tree_connect(&target).await?);
@@ -106,6 +110,10 @@ pub(crate) struct RuntimeMetadata {
 }
 
 impl RuntimeShare {
+    pub(crate) fn object_identity(&self) -> (u64, u64, u64) {
+        self.inner.object_token().identity()
+    }
+
     pub(crate) async fn open_resource(&self, path: &str) -> crate::Result<RuntimeResource> {
         let resource = self
             .inner
@@ -439,6 +447,10 @@ pub(crate) struct RuntimeFile {
 }
 
 impl RuntimeFile {
+    pub(crate) async fn flush(&self) -> crate::Result<()> {
+        self.inner.flush().await.map_err(Error::IoError)
+    }
+
     pub(crate) fn persistent_granted(&self) -> bool {
         self.inner
             .durable_granted()

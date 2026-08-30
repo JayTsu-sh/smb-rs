@@ -16,7 +16,6 @@ impl GenerationId {
         }
     }
 
-    #[cfg(feature = "test-support")]
     pub(crate) const fn value(self) -> u64 {
         self.0
     }

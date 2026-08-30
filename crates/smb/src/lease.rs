@@ -135,6 +135,8 @@ pub(crate) struct ResourceProto {
     pub context: Arc<TreeContext>,
     /// Runtime-owned identity shared by every cache-hit handle for this open.
     pub object: crate::runtime::ObjectToken,
+    /// Share generation that owns `object`.
+    pub share: crate::runtime::ObjectToken,
     /// Snapshot of the connection's negotiated info at create time; the
     /// same instance every resulting ResourceHandle reads from. Cheap to
     /// clone (Arc).

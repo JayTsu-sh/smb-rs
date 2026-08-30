@@ -50,10 +50,10 @@ pub use domain::{
     Batch, BatchCommand, BatchOutcome, BatchRef, BatchResult, CancelToken, CloseOutcome,
     Credentials, Deadline, Directory, DirectoryEntries, DirectoryEntry, DirectoryEvent,
     DirectoryEvents, DirectoryOpenOptions, DirectoryWatchOptions, File, FileCursor,
-    FileOpenOptions, IoCapabilities, Operation, Pipe, PipeName, PreviousVersion, ReplayPolicy,
-    Resource, ResourceMetadata, RpcPipeConnection, SecurityDescriptor, SecurityOpenOptions,
-    SecuritySelection, Session, Share, SharePath, ShareTarget, Transfer, TransferEvents,
-    TransferOptions, TransferProgress, TransferReport, TransferStrategy,
+    FileOpenOptions, IoCapabilities, ObjectGeneration, Operation, Pipe, PipeName, PreviousVersion,
+    ReplayPolicy, Resource, ResourceMetadata, RpcPipeConnection, SecurityDescriptor,
+    SecurityOpenOptions, SecuritySelection, Session, Share, SharePath, ShareTarget, Transfer,
+    TransferEvents, TransferOptions, TransferProgress, TransferReport, TransferStrategy,
 };
 pub use error::Error;
 pub use facade::{Client, ClientConfig, RemoteShare, ShareKind};

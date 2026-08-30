@@ -346,7 +346,8 @@ impl Resource {
         // defaults to None; if a lease was granted and the higher-level
         // client opts in, [`Client::_create_file`] will attach a slot via
         // [`Resource::attach_lease_slot`] after this function returns.
-        let object = upstream.create_resource_object().await?;
+        let share = upstream.current_share_object().await?;
+        let object = upstream.create_resource_object_for(share).await?;
         let oplock_slot = if matches!(
             response.oplock_level,
             OplockLevel::II | OplockLevel::Exclusive | OplockLevel::Batch
@@ -368,6 +369,7 @@ impl Resource {
             generation: arc_swap::ArcSwap::from_pointee(ResourceGeneration {
                 file_id: response.file_id,
                 object,
+                share,
             }),
             open: AtomicBool::new(true),
             recovery: tokio::sync::Mutex::new(()),
@@ -477,6 +479,7 @@ impl Resource {
             generation: arc_swap::ArcSwap::from_pointee(ResourceGeneration {
                 file_id: slot.file_id,
                 object: proto.object,
+                share: proto.share,
             }),
             open: AtomicBool::new(true),
             recovery: tokio::sync::Mutex::new(()),
@@ -540,6 +543,7 @@ impl Resource {
         Some(Arc::new(ResourceProto {
             context: upstream.clone(),
             object: h.generation.load().object,
+            share: h.generation.load().share,
             conn_info: h.conn_info.clone(),
             created: h.created,
             modified: h.modified,
@@ -667,6 +671,13 @@ impl LeaseGrant {
 struct ResourceGeneration {
     file_id: FileId,
     object: crate::runtime::ObjectToken,
+    share: crate::runtime::ObjectToken,
+}
+
+impl ResourceGeneration {
+    fn belongs_to(&self, share: crate::runtime::ObjectToken) -> bool {
+        self.share == share
+    }
 }
 
 pub struct ResourceHandle {
@@ -782,7 +793,7 @@ impl ResourceHandle {
 
     async fn ensure_current(&self) -> crate::Result<()> {
         let share = self.context.current_share_object().await?;
-        if self.generation.load().object.generation() == share.generation() {
+        if self.generation.load().belongs_to(share) {
             return Ok(());
         }
         let grant = self.durable_granted.ok_or_else(|| {
@@ -804,7 +815,7 @@ impl ResourceHandle {
             let previous = self.generation.load_full();
             let future = async {
                 let share = self.context.current_share_object().await?;
-                if previous.object.generation() == share.generation() {
+                if previous.belongs_to(share) {
                     return crate::Result::Ok(None);
                 }
                 let contexts: Vec<CreateContextRequest> = vec![
@@ -847,6 +858,7 @@ impl ResourceHandle {
                 crate::Result::Ok(Some(ResourceGeneration {
                     file_id: response.file_id,
                     object,
+                    share,
                 }))
             };
             match crate::session::recovery_attempt::run_bounded_attempt(
@@ -1577,9 +1589,10 @@ impl Drop for ResourceHandle {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{
-        DurableOpenRequest, FileCreateArgs, LeaseGrant, requested_oplock_level,
+        DurableOpenRequest, FileCreateArgs, LeaseGrant, ResourceGeneration, requested_oplock_level,
         validate_durable_request,
     };
+    use crate::runtime::{GenerationId, ObjectEffect, ObjectKind, ObjectRegistry};
     use smb_dtyp::Guid;
     use smb_fscc::FileAccessMask;
     use smb_msg::{
@@ -1688,5 +1701,35 @@ mod tests {
             requested_oplock_level(&FileCreateArgs::default()),
             OplockLevel::None
         );
+    }
+
+    #[test]
+    fn resource_detects_share_epoch_replacement_within_same_connection_generation() {
+        let mut objects = ObjectRegistry::new(GenerationId::new(7));
+        let connection = objects.connection();
+        let session = objects
+            .create_child(connection, ObjectKind::Session)
+            .unwrap();
+        let share = objects.create_child(session, ObjectKind::Share).unwrap();
+        let object = objects.create_child(share, ObjectKind::Resource).unwrap();
+        let resource = ResourceGeneration {
+            file_id: Default::default(),
+            object,
+            share,
+        };
+
+        objects.begin_recovery(session).unwrap();
+        let ObjectEffect::ReplacementPublished {
+            replacement: replacement_session,
+            ..
+        } = objects.publish_replacement(session).unwrap()
+        else {
+            panic!("expected replacement session")
+        };
+        let replacement_share = objects
+            .create_child(replacement_session, ObjectKind::Share)
+            .unwrap();
+        assert_eq!(share.generation(), replacement_share.generation());
+        assert!(!resource.belongs_to(replacement_share));
     }
 }

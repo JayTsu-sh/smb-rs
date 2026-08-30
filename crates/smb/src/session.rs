@@ -169,6 +169,10 @@ impl Session {
         self.session_context.clone()
     }
 
+    pub(crate) fn object_token(&self) -> crate::Result<crate::runtime::ObjectToken> {
+        self.session_context.session_object()
+    }
+
     /// Binds an existing session to a new connection.
     ///
     /// Returns the channel ID (in the scope of the current session) of the newly created channel.

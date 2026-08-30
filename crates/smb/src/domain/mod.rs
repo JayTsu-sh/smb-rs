@@ -332,7 +332,19 @@ pub struct Session {
     inner: Arc<RuntimeSession>,
 }
 
+/// Opaque identity of one published Session or Share generation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ObjectGeneration {
+    identity: (u64, u64, u64),
+}
+
 impl Session {
+    pub fn generation(&self) -> crate::Result<ObjectGeneration> {
+        Ok(ObjectGeneration {
+            identity: self.inner.object_identity()?,
+        })
+    }
+
     pub async fn connect_share(&self, name: &str) -> crate::Result<Share> {
         let inner = self.inner.connect_share(name).await?;
         Ok(Share {
@@ -354,6 +366,12 @@ pub struct Share {
 }
 
 impl Share {
+    pub fn generation(&self) -> ObjectGeneration {
+        ObjectGeneration {
+            identity: self.inner.object_identity(),
+        }
+    }
+
     pub fn open<'a>(&'a self, path: &SharePath) -> Operation<'a, Resource> {
         let path = path.clone();
         Operation::new(move |context| {
@@ -681,6 +699,15 @@ impl File {
             maximum_read_chunk: self.inner.maximum_read_size(),
             maximum_write_chunk: self.inner.maximum_write_size(),
         }
+    }
+
+    pub fn flush(&self) -> Operation<'_, ()> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                self.inner.flush().await
+            })
+        })
     }
 
     pub fn persistent_granted(&self) -> bool {

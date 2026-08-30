@@ -8,8 +8,8 @@ use smb::{
 };
 use smb::{
     Client, ClientConfig, CloseOutcome, Credentials, Directory, DirectoryOpenOptions, File,
-    FileCursor, FileOpenOptions, IoCapabilities, Pipe, PipeName, PreviousVersion, ReplayPolicy,
-    Session, Share, SharePath, ShareTarget, Transfer, TransferEvents,
+    FileCursor, FileOpenOptions, IoCapabilities, ObjectGeneration, Pipe, PipeName, PreviousVersion,
+    ReplayPolicy, Session, Share, SharePath, ShareTarget, Transfer, TransferEvents,
 };
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
@@ -45,6 +45,7 @@ fn public_spine_types_are_send_sync_and_domain_named() {
     assert_send_sync::<Share>();
     assert_send_sync::<File>();
     assert_send_sync::<IoCapabilities>();
+    assert_send_sync::<ObjectGeneration>();
     assert_send_sync::<Directory>();
     assert_send_sync::<Pipe>();
     assert_clone::<Client>();
@@ -448,6 +449,7 @@ async fn previous_versions_prepare_version_a() -> smb::Result<()> {
     let file = share.open_file(&path, FileOpenOptions::overwrite()).await?;
     file.write_all_at(0, Bytes::from_static(b"version-a"))
         .await?;
+    file.flush().await?;
     file.close().await?;
     share.close().await?;
     client.close().await
@@ -471,14 +473,45 @@ async fn previous_versions_read_snapshot_and_active_version() -> smb::Result<()>
     active
         .write_all_at(0, Bytes::from_static(b"version-b"))
         .await?;
+    active.flush().await?;
     let versions = active.previous_versions().await?;
     let version = versions
         .last()
         .ok_or_else(|| Error::InvalidState("server returned no Previous Versions".into()))?;
+    if let Ok(path) = std::env::var("SMB_RUST_PREVIOUS_VERSION_TOKEN_PATH") {
+        std::fs::write(path, version.gmt_token()).map_err(std::io::Error::other)?;
+    }
     let previous = share.open_file_at_version(&path, version).await?;
     assert_eq!(previous.read_exact_at(0, 9).await?, b"version-a"[..]);
     assert_eq!(active.read_exact_at(0, 9).await?, b"version-b"[..]);
     previous.close().await?;
+    active.close().await?;
+    share.close().await?;
+    client.close().await
+}
+
+#[cfg(feature = "real-server-tests")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[ignore = "requires the manifest-owned ONTAP Snapshot to have been deleted"]
+async fn previous_version_no_longer_opens_after_snapshot_delete() -> smb::Result<()> {
+    let token_path = std::env::var("SMB_RUST_PREVIOUS_VERSION_TOKEN_PATH")
+        .map_err(|_| Error::InvalidArgument("missing Previous Version token path".into()))?;
+    let version = PreviousVersion::from_gmt_token(
+        std::fs::read_to_string(token_path).map_err(std::io::Error::other)?,
+    )?;
+    let client = Client::new(ClientConfig::default());
+    let share = client
+        .connect_share(
+            &ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?,
+            common::smb_test_credentials(),
+        )
+        .await?;
+    let path = SharePath::new("w6-previous-version.bin")?;
+    assert!(share.open_file_at_version(&path, &version).await.is_err());
+    let active = share
+        .open_file(&path, FileOpenOptions::open_existing())
+        .await?;
+    assert_eq!(active.read_exact_at(0, 9).await?, b"version-b"[..]);
     active.delete().await?;
     active.close().await?;
     share.close().await?;
@@ -514,41 +547,89 @@ async fn persistent_handle_is_granted_on_ca_share() -> smb::Result<()> {
 
 #[cfg(feature = "real-server-tests")]
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-#[ignore = "requires exact management closure of the test CIFS session"]
-async fn automatic_reconnect_replaces_share_and_revokes_ordinary_file() -> smb::Result<()> {
+#[ignore = "requires exact management closure on a continuously available share"]
+async fn persistent_handle_recovers_after_exact_session_close() -> smb::Result<()> {
     let client = Client::new(ClientConfig::default());
     let target = ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?;
-    let share = client
-        .connect_share(&target, common::smb_test_credentials())
+    let session = client
+        .authenticate(target.server(), common::smb_test_credentials())
         .await?;
-    let stale_path = SharePath::new(format!("w6-stale-{}.bin", std::process::id()))?;
-    let stale = share
-        .open_file(&stale_path, FileOpenOptions::overwrite())
+    let share = session.connect_share(target.share()).await?;
+    let path = SharePath::new(format!("w6-persistent-recovery-{}.bin", std::process::id()))?;
+    let created = share.open_file(&path, FileOpenOptions::overwrite()).await?;
+    created.close().await?;
+    let file = share
+        .open_file(&path, FileOpenOptions::open_existing().persistent(0))
         .await?;
-    stale
-        .write_all_at(0, Bytes::from_static(b"ordinary"))
+    assert!(file.persistent_granted());
+    file.write_all_at(0, Bytes::from_static(b"persistent-before"))
         .await?;
+    let session_before = session.generation()?;
+    let share_before = share.generation();
 
     common::close_exact_ontap_session(target.share()).map_err(Error::InvalidState)?;
-
     assert!(
-        stale
-            .read_at(0, 8)
+        file.write_all_at(0, Bytes::from_static(b"trigger-recovery"))
             .timeout(Duration::from_secs(30))
             .await
             .is_err()
     );
+    assert_eq!(
+        file.read_exact_at(0, b"persistent-before".len() as u32)
+            .timeout(Duration::from_secs(30))
+            .await?,
+        b"persistent-before"[..]
+    );
+    assert_ne!(session.generation()?, session_before);
+    assert_ne!(share.generation(), share_before);
+    assert!(file.persistent_granted());
+    file.delete().await?;
+    file.close().await?;
+    share.close().await?;
+    client.close().await
+}
 
-    let recovered_path = SharePath::new(format!("w6-recovered-{}.bin", std::process::id()))?;
-    let recovered = share
-        .open_file(&recovered_path, FileOpenOptions::overwrite())
-        .timeout(Duration::from_secs(30))
+#[cfg(feature = "real-server-tests")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[ignore = "requires exact management closure of the test CIFS session"]
+async fn automatic_reconnect_replaces_share_and_revokes_ordinary_file() -> smb::Result<()> {
+    let client = Client::new(ClientConfig::default());
+    let target = ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?;
+    let session = client
+        .authenticate(target.server(), common::smb_test_credentials())
         .await?;
-    recovered
-        .write_all_at(0, Bytes::from_static(b"new-generation"))
-        .await?;
-    recovered.delete().await?;
-    recovered.close().await?;
+    let share = session.connect_share(target.share()).await?;
+    for cycle in 0..10 {
+        let path = SharePath::new(format!("w6-recovery-{}-{cycle}.bin", std::process::id()))?;
+        let stale = share.open_file(&path, FileOpenOptions::overwrite()).await?;
+        stale
+            .write_all_at(0, Bytes::from_static(b"ordinary"))
+            .await?;
+        let session_before = session.generation()?;
+        let share_before = share.generation();
+
+        common::close_exact_ontap_session(target.share()).map_err(Error::InvalidState)?;
+        assert!(
+            stale
+                .write_all_at(0, Bytes::from_static(b"sent-side-effect"))
+                .timeout(Duration::from_secs(30))
+                .await
+                .is_err()
+        );
+
+        let recovered = share
+            .open_file(&path, FileOpenOptions::overwrite())
+            .timeout(Duration::from_secs(30))
+            .await?;
+        assert_ne!(session.generation()?, session_before);
+        assert_ne!(share.generation(), share_before);
+        assert!(stale.read_at(0, 8).await.is_err());
+        recovered
+            .write_all_at(0, Bytes::from_static(b"new-generation"))
+            .await?;
+        recovered.delete().await?;
+        recovered.close().await?;
+    }
     share.close().await?;
     client.close().await
 }

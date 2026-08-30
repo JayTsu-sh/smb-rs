@@ -20,6 +20,10 @@ impl ObjectToken {
     pub(crate) const fn generation(self) -> GenerationId {
         self.generation
     }
+
+    pub(crate) const fn identity(self) -> (u64, u64, u64) {
+        (self.generation.value(), self.id, self.epoch)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
