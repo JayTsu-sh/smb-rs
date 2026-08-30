@@ -160,6 +160,7 @@ make_status! {
     WrongPassword = 0xC000006A: "Wrong Password",
     LogonFailure = 0xC000006D: "Logon Failure",
     NotMapped = 0xC0000073: "Not Mapped",
+    DiskFull = 0xC000007F: "Disk Full",
     BadImpersonationLevel = 0xC00000A5: "Bad Impersonation Level",
     IoTimeout = 0xC00000B5: "I/O Timeout",
     FileIsADirectory = 0xC00000BA: "File is a Directory",
@@ -273,6 +274,11 @@ mod tests {
     use smb_tests::*;
 
     use super::*;
+
+    #[test]
+    fn maps_ontap_disk_full_status() {
+        assert_eq!(Status::try_from(0xc000_007f).unwrap(), Status::DiskFull);
+    }
 
     test_binrw! {
         Header => async: Header {
