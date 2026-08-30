@@ -224,7 +224,7 @@ impl CompressionMethod for ChainedCompression {
             if len_after > compressed.original_size as usize {
                 return Err(CompressionError::ChainedCompressionFailed(
                     "Decompressed size exceeds the expected size".to_string(),
-                ))?;
+                ));
             }
             if let Some(original_size) = item.original_size {
                 if len_after - len_before != original_size as usize {
