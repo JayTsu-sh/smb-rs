@@ -8,6 +8,5 @@ The owner creates exactly two transport tasks: one read pump and one write
 pump. Domain-facing code submits typed operations through `RuntimeHandle` and
 never owns transport halves or pending-response registries.
 
-`RuntimeWorker` is a temporary outer-shape facade for callers that still use
-separate send and receive methods. It contains no request authority and is
-removed when those callers move directly to typed operations.
+Legacy wire mechanics remain behind `runtime::port`; no production caller can
+submit separate send/receive pairs or obtain a worker handle.

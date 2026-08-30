@@ -154,10 +154,7 @@ test-support = ["smb-msg/server", "smb-transport/test-support", "dep:serde"]
 real-server-tests = []
 
 # Tests
-test-multichannel = []
 test-ndr64 = []
-test-quic = []
-test-rdma = []
 
 [package.metadata.docs.rs]
 features = ["sign", "encrypt", "compress", "kerberos", "quic"]

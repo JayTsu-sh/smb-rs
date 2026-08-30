@@ -30,15 +30,6 @@ async fn _main() -> Result<(), Box<dyn Error>> {
 
     let cli = Cli::parse();
 
-    // In macOS, we need to attach, since local network connections are problematic when
-    // the debugger starts the process.
-    #[cfg(all(feature = "profiling", target_os = "macos"))]
-    {
-        println!("Profiling enabled on macOS. Attach profiler, and Enter to begin running.");
-        let mut s = String::new();
-        std::io::stdin().read_line(&mut s)?;
-    }
-
     match &cli.command {
         Commands::Copy(cmd) => {
             tracing::info!("Copying {:?} to {:?}", cmd.from, cmd.to);

@@ -28,12 +28,3 @@ clap = { version = "4.5.27", features = ["derive"] }
 ctrlc = { version = "3.5" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-
-[features]
-default = []
-
-netbios-transport = []
-quic = []
-rdma = []
-
-profiling = []
