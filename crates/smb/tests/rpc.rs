@@ -11,6 +11,7 @@ use smb_rpc::{
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[serial]
+#[ignore = "requires a real server exposing the standard IPC service pipes"]
 async fn test_shares_enum_through_domain_pipe() -> smb::Result<()> {
     let server = common::smb_tests_server();
     let client = Client::new(ClientConfig::default());
