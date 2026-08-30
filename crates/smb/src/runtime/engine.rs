@@ -283,6 +283,15 @@ impl RuntimeHandle {
         result.await.unwrap_or(Err(RuntimeError::OwnerTerminated))
     }
 
+    pub(crate) async fn reset_preauth_to_negotiate(&self) -> Result<(), RuntimeError> {
+        let (reply, result) = oneshot::channel();
+        self.control
+            .send(ControlCommand::ResetPreauthToNegotiate { reply })
+            .await
+            .map_err(|_| RuntimeError::Closed)?;
+        result.await.unwrap_or(Err(RuntimeError::OwnerTerminated))
+    }
+
     pub(crate) fn install_notifications(
         &self,
         sender: mpsc::Sender<crate::command::CommandResponse>,
@@ -569,6 +578,9 @@ enum ControlCommand {
     },
     PreauthSnapshot {
         reply: oneshot::Sender<Result<Option<PreauthHashValue>, RuntimeError>>,
+    },
+    ResetPreauthToNegotiate {
+        reply: oneshot::Sender<Result<(), RuntimeError>>,
     },
     AwaitOperation {
         key: RequestKey,
@@ -1326,6 +1338,14 @@ async fn handle_control(
             let _ = reply.send(result);
             false
         }
+        ControlCommand::ResetPreauthToNegotiate { reply } => {
+            let result = wire
+                .reset_preauth_to_negotiate()
+                .await
+                .map_err(|_| RuntimeError::Wire("preauth-reset"));
+            let _ = reply.send(result);
+            false
+        }
         ControlCommand::AwaitOperation { key, reply } => {
             let Some(pending) = authority.operation_pending.get_mut(&key) else {
                 let _ = reply.send(Err(RuntimeError::UnknownRequest(key)));
@@ -1614,8 +1634,12 @@ fn process_decoded_response(
         });
         return;
     }
+    let session_invalidated = matches!(
+        status,
+        smb_msg::Status::UserSessionDeleted | smb_msg::Status::NetworkSessionExpired
+    );
     if message.message.header.command != pending.response.wire_command()
-        || !pending.response.accepts_status(status)
+        || (!session_invalidated && !pending.response.accepts_status(status))
     {
         *fatal = Some(RuntimeError::Wire("operation-response-contract"));
         return;

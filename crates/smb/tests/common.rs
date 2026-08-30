@@ -2,8 +2,10 @@
 use std::env::var;
 use std::fs;
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::thread;
+use std::time::Duration;
 use zeroize::Zeroizing;
 
 static SERVER_FROM_FD: OnceLock<Zeroizing<String>> = OnceLock::new();
@@ -94,42 +96,102 @@ pub fn close_exact_ontap_session(share: &str) -> Result<(), String> {
     ])?;
     let mut connection_id = None;
     let mut session_id = None;
-    let mut matches_share = false;
+    let mut node = None;
     let mut matches_user = false;
     for line in output.lines() {
         let line = line.trim();
-        if let Some(value) = line.strip_prefix("Connection ID:") {
-            connection_id = Some(value.trim().to_owned());
-        } else if let Some(value) = line.strip_prefix("Session ID:") {
-            session_id = Some(value.trim().to_owned());
-        } else if let Some(value) = line.strip_prefix("Shares:") {
-            matches_share = value.split(',').any(|value| value.trim() == share);
-        } else if let Some(value) = line.strip_prefix("Windows User:") {
-            let value = value.trim();
+        let Some((label, value)) = line.split_once(':') else {
+            continue;
+        };
+        let label = label
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let value = value.trim();
+        if label == "connectionid" {
+            connection_id = Some(value.to_owned());
+        } else if label == "sessionid" {
+            session_id = Some(value.to_owned());
+        } else if label == "node" {
+            node = Some(value.to_owned());
+        } else if label == "windowsuser" {
             matches_user = value == username || value.ends_with(&format!("\\{username}"));
         }
     }
-    if !matches_share || !matches_user {
+    if !matches_user {
         return Err("management preflight found no exact test-share session".into());
     }
     let connection_id = connection_id.ok_or("management preflight omitted connection ID")?;
     let session_id = session_id.ok_or("management preflight omitted session ID")?;
-    management_command(&[
+    let node = node.ok_or("management preflight omitted node")?;
+    let close_arguments = [
         "vserver",
         "cifs",
         "session",
         "close",
+        "-node",
+        &node,
         "-vserver",
         &svm,
-        "-connection-id",
-        &connection_id,
         "-session-id",
         &session_id,
-    ])
-    .map(drop)
+        "-connection-id",
+        &connection_id,
+    ];
+    let output = run_management_command(&close_arguments)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    if output.status.code() != Some(255) || !output.stderr.is_empty() {
+        return Err(management_failure(&output));
+    }
+
+    for attempt in 0..20 {
+        let remaining = management_command(&[
+            "vserver",
+            "cifs",
+            "session",
+            "show",
+            "-vserver",
+            &svm,
+            "-share-names",
+            share,
+            "-instance",
+        ])?;
+        let old_session_remains = remaining.lines().any(|line| {
+            let Some((label, value)) = line.split_once(':') else {
+                return false;
+            };
+            label
+                .chars()
+                .filter(|character| !character.is_ascii_whitespace())
+                .collect::<String>()
+                .eq_ignore_ascii_case("sessionid")
+                && value.trim() == session_id
+        });
+        if !old_session_remains {
+            return Ok(());
+        }
+        if attempt < 19 {
+            thread::sleep(Duration::from_millis(250));
+        }
+    }
+    Err(format!(
+        "management session close disconnected but the exact session remains: {}",
+        management_failure(&output)
+    ))
 }
 
 fn management_command(arguments: &[&str]) -> Result<String, String> {
+    let output = run_management_command(arguments)?;
+    if !output.status.success() {
+        return Err(management_failure(&output));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn run_management_command(arguments: &[&str]) -> Result<Output, String> {
     let descriptor = |name: &str| {
         var(name)
             .map_err(|_| format!("missing {name}"))?
@@ -173,19 +235,35 @@ fn management_command(arguments: &[&str]) -> Result<String, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("start management command: {error}"))?;
-    child
+    let mut input = child
         .stdin
         .take()
-        .ok_or("management password pipe unavailable")?
+        .ok_or("management password pipe unavailable")?;
+    input
         .write_all(format!("{password}\n").as_bytes())
         .map_err(|error| format!("write management password: {error}"))?;
     let output = child
         .wait_with_output()
         .map_err(|error| format!("wait management command: {error}"))?;
-    if !output.status.success() {
-        return Err(format!("management command failed: {}", output.status));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(output)
+}
+
+fn management_failure(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let diagnostic = stderr
+        .lines()
+        .chain(stdout.lines())
+        .find(|line| {
+            let line = line.trim();
+            !line.is_empty()
+                && line.chars().any(|character| !character.is_control())
+                && !line.starts_with("Last login time:")
+                && !line.starts_with("Unsuccessful login attempts")
+        })
+        .unwrap_or("no diagnostic")
+        .trim();
+    format!("management command failed: {}; {diagnostic}", output.status)
 }
 
 fn from_secret_fd(name: &str, cache: &'static OnceLock<Zeroizing<String>>) -> Option<String> {

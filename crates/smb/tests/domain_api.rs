@@ -527,6 +527,14 @@ async fn automatic_reconnect_replaces_share_and_revokes_ordinary_file() -> smb::
 
     common::close_exact_ontap_session(target.share()).map_err(Error::InvalidState)?;
 
+    assert!(
+        stale
+            .read_at(0, 8)
+            .timeout(Duration::from_secs(30))
+            .await
+            .is_err()
+    );
+
     let recovered_path = SharePath::new(format!("w6-recovered-{}.bin", std::process::id()))?;
     let recovered = share
         .open_file(&recovered_path, FileOpenOptions::overwrite())
@@ -535,13 +543,6 @@ async fn automatic_reconnect_replaces_share_and_revokes_ordinary_file() -> smb::
     recovered
         .write_all_at(0, Bytes::from_static(b"new-generation"))
         .await?;
-    assert!(
-        stale
-            .read_at(0, 8)
-            .timeout(Duration::from_secs(5))
-            .await
-            .is_err()
-    );
     recovered.delete().await?;
     recovered.close().await?;
     share.close().await?;

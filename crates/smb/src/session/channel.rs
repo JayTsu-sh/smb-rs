@@ -175,6 +175,12 @@ impl ChannelContext {
             }
             Err(error) => return Err(error),
         };
+        if let Err(error @ Error::SessionInvalidated) = self._verify_incoming(&result.1).await {
+            if let Err(recovery_error) = self.upstream.recover_session(self.session_id).await {
+                tracing::warn!(?recovery_error, "session invalidation recovery failed");
+            }
+            return Err(error);
+        }
         self._verify_incoming(&result.1).await?;
         Ok(result)
     }
@@ -244,6 +250,12 @@ impl ChannelContext {
     /// # Returns
     /// An empty [`crate::Result`] if the message is valid, or an error if the message is invalid.
     async fn _verify_incoming(&self, incoming: &CommandResponse) -> crate::Result<()> {
+        if matches!(
+            incoming.message.header.status()?,
+            smb_msg::Status::UserSessionDeleted | smb_msg::Status::NetworkSessionExpired
+        ) {
+            return Err(Error::SessionInvalidated);
+        }
         // allow unsigned messages only if the session is anonymous or guest.
         // this is enforced against configuration when setting up the session.
         let (unsigned_allowed, encryption_required) = {

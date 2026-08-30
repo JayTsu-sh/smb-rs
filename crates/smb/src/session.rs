@@ -543,6 +543,7 @@ impl SessionContext {
         let provider = self.credential_provider.as_ref().ok_or_else(|| {
             Error::InvalidState("Session has no reauthentication capability".into())
         })?;
+        generation_runtime.reset_preauth_to_negotiate().await?;
         let mut last_error = None;
         let mut candidate = None;
         for _attempt in 1..=policy.max_attempts {

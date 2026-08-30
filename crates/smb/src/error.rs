@@ -80,6 +80,9 @@ pub enum Error {
     #[error("Operation outcome is unknown because the request may have committed")]
     OutcomeUnknown,
 
+    #[error("The server invalidated the authenticated session")]
+    SessionInvalidated,
+
     #[error("Operation admission is backpressured: {0}")]
     Backpressure(&'static str),
 

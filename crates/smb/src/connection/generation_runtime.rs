@@ -247,6 +247,13 @@ impl GenerationRuntime {
             .map_err(|error| self.map_runtime_error(error))
     }
 
+    pub(crate) async fn reset_preauth_to_negotiate(&self) -> Result<()> {
+        self.runtime
+            .reset_preauth_to_negotiate()
+            .await
+            .map_err(|error| self.map_runtime_error(error))
+    }
+
     pub(crate) fn start_notify_channel(
         self: &Arc<Self>,
         sender: tokio::sync::mpsc::Sender<CommandResponse>,

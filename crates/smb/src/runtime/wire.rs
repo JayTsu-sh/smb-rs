@@ -116,6 +116,21 @@ impl WirePipeline {
         }
     }
 
+    pub async fn reset_preauth_to_negotiate(&self) -> crate::Result<()> {
+        let baseline = self
+            .config
+            .read()
+            .await
+            .conn_info
+            .as_ref()
+            .ok_or_else(|| crate::Error::InvalidState("connection is not negotiated".into()))?
+            .preauth_hash
+            .clone();
+        *self.preauth_hash.lock().await = baseline;
+        self.setup_signers.lock().await.clear();
+        Ok(())
+    }
+
     /// Cached `ConnectionInfo` captured by `negotiated`. None before
     /// negotiation completes. Used by the setup-phase signing path
     /// (S4-T3) to derive the dialect / signing algorithm without
@@ -767,6 +782,16 @@ impl WirePipeline {
         raw: &[u8],
         form: &mut MessageForm,
     ) -> crate::Result<()> {
+        // A server cannot sign a session-invalidated response with a key it has
+        // already discarded. Treat these two statuses only as unauthenticated
+        // recovery signals; their payload is never consumed as business data.
+        if matches!(
+            message.header.status,
+            value if value == Status::UserSessionDeleted as u32
+                || value == Status::NetworkSessionExpired as u32
+        ) {
+            return Ok(());
+        }
         // Check if signing check is required.
         if form.encrypted
             || message.header.message_id == u64::MAX
