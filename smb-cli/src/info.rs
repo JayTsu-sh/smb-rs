@@ -3,10 +3,10 @@ use std::{collections::VecDeque, error::Error, fmt::Display};
 use clap::{Parser, ValueEnum};
 use smb::{
     Client, ClientConfig, Credentials, Directory, DirectoryOpenOptions, Resource, Share, SharePath,
-    ShareTarget, UncPath,
+    ShareTarget,
 };
 
-use crate::Cli;
+use crate::{Cli, path::RemotePath};
 
 #[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RecursiveMode {
@@ -27,7 +27,7 @@ impl Display for RecursiveMode {
 #[derive(Parser, Debug)]
 pub struct InfoCmd {
     /// The UNC path to the server, share, file, or directory to query.
-    pub path: UncPath,
+    pub path: RemotePath,
 
     #[arg(short, long, default_value_t = RecursiveMode::NonRecursive)]
     pub recursive: RecursiveMode,

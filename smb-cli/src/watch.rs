@@ -1,16 +1,17 @@
 use crate::Cli;
+use crate::path::RemotePath;
 use clap::Parser;
 use futures_util::StreamExt;
 use smb::{
     CancelToken, Client, ClientConfig, Credentials, Directory, DirectoryOpenOptions,
-    DirectoryWatchOptions, SharePath, ShareTarget, UncPath,
+    DirectoryWatchOptions, SharePath, ShareTarget,
 };
 use std::error::Error;
 
 #[derive(Parser, Debug)]
 pub struct WatchCmd {
     /// The UNC path to the share, file, or directory to query.
-    pub path: UncPath,
+    pub path: RemotePath,
 
     /// Whether to watch recursively in all subdirectories.
     #[arg(short, long, default_value_t = false)]
@@ -26,9 +27,11 @@ pub async fn watch(cmd: &WatchCmd, cli: &Cli) -> Result<(), Box<dyn Error>> {
         return Err("Path must include a share name".into());
     }
 
-    let share_name = cmd.path.share().filter(|share| !share.is_empty()).ok_or(
-        "Path must include a share name",
-    )?;
+    let share_name = cmd
+        .path
+        .share()
+        .filter(|share| !share.is_empty())
+        .ok_or("Path must include a share name")?;
     let relative_path = cmd
         .path
         .path()
@@ -49,12 +52,7 @@ pub async fn watch(cmd: &WatchCmd, cli: &Cli) -> Result<(), Box<dyn Error>> {
         .await?;
 
     tracing::info!("Watching directory: {}", cmd.path);
-    watch_dir(
-        &directory,
-        cmd.recursive,
-        cmd.number.unwrap_or(usize::MAX),
-    )
-    .await?;
+    watch_dir(&directory, cmd.recursive, cmd.number.unwrap_or(usize::MAX)).await?;
 
     directory.close().await?;
     share.close().await?;

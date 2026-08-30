@@ -5,13 +5,15 @@ use clap::{Parser, Subcommand};
 use smb::protocol::*;
 use smb::{
     Client, ClientConfig, Credentials, Resource, SecurityOpenOptions, SecuritySelection, Share,
-    SharePath, ShareTarget, UncPath,
+    SharePath, ShareTarget,
 };
+
+use crate::path::RemotePath;
 
 #[derive(Parser, Debug)]
 pub struct SecurityCmd {
     /// The path of the object to work on
-    pub path: UncPath,
+    pub path: RemotePath,
     #[command(subcommand)]
     pub subcommand: SecuritySubCommand,
 }
