@@ -483,6 +483,33 @@ async fn previous_versions_read_snapshot_and_active_version() -> smb::Result<()>
 
 #[cfg(feature = "real-server-tests")]
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[ignore = "requires a manifest-owned continuously available share"]
+async fn persistent_handle_is_granted_on_ca_share() -> smb::Result<()> {
+    let client = Client::new(ClientConfig::default());
+    let share = client
+        .connect_share(
+            &ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?,
+            common::smb_test_credentials(),
+        )
+        .await?;
+    let path = SharePath::new(format!("w6-persistent-{}.bin", std::process::id()))?;
+    let created = share.open_file(&path, FileOpenOptions::overwrite()).await?;
+    created.close().await?;
+    let file = share
+        .open_file(&path, FileOpenOptions::open_existing().persistent(0))
+        .await?;
+    assert!(file.persistent_granted());
+    file.write_all_at(0, Bytes::from_static(b"persistent-data"))
+        .await?;
+    assert_eq!(file.read_exact_at(0, 15).await?, b"persistent-data"[..]);
+    file.delete().await?;
+    file.close().await?;
+    share.close().await?;
+    client.close().await
+}
+
+#[cfg(feature = "real-server-tests")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore = "requires an isolated writable real-server share"]
 async fn domain_batch_and_concurrent_transfer() -> smb::Result<()> {
     let target = ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?;
