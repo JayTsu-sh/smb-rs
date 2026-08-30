@@ -526,14 +526,16 @@ impl SessionContext {
         let previous_state = previous_channel.session_state().clone();
         let previous_object = previous_state.object()?;
         let upstream = previous_channel.upstream();
-        let worker = upstream.worker().ok_or_else(|| {
-            Error::InvalidState("Worker is unavailable for reauthentication".into())
+        let generation_runtime = upstream.generation_runtime().ok_or_else(|| {
+            Error::InvalidState("Generation runtime is unavailable for reauthentication".into())
         })?;
-        let connection = worker.connection_object();
+        let connection = generation_runtime.connection_object();
         let same_generation = previous_object.generation() == connection.generation();
 
         if same_generation {
-            worker.begin_object_recovery(previous_object).await?;
+            generation_runtime
+                .begin_object_recovery(previous_object)
+                .await?;
         }
 
         let policy = previous.conn_info.config.auto_reconnect;
@@ -577,14 +579,18 @@ impl SessionContext {
         }
         let Some((setup_result, conn_info)) = candidate else {
             if same_generation {
-                let _ = worker.fail_object_recovery(previous_object).await;
+                let _ = generation_runtime
+                    .fail_object_recovery(previous_object)
+                    .await;
             }
             return Err(last_error.unwrap_or_else(|| {
                 Error::InvalidState("Session reauthentication is disabled".into())
             }));
         };
         if same_generation {
-            let replacement = worker.publish_object_replacement(previous_object).await?;
+            let replacement = generation_runtime
+                .publish_object_replacement(previous_object)
+                .await?;
             setup_result.set_object(replacement)?;
         }
         let channel = Channel::new(&upstream, &conn_info, &setup_result).await?;
@@ -602,7 +608,7 @@ impl SessionContext {
         }
         previous_state.session.write().await.invalidate();
         if same_generation {
-            let _ = worker.session_ended(&previous_state).await;
+            let _ = generation_runtime.session_ended(&previous_state).await;
         }
         drop(recovering);
         self.recover_shares().await;

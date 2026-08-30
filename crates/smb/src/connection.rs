@@ -66,13 +66,14 @@ struct ConnectionRecoveryBootstrap {
 
 struct ConnectionGenerationPublication {
     context: Arc<ConnectionCore>,
-    worker: Arc<GenerationRuntime>,
+    generation_runtime: Arc<GenerationRuntime>,
     info: Arc<ConnectionInfo>,
 }
 
 impl GenerationPublication for ConnectionGenerationPublication {
     fn publish(self: Box<Self>) {
-        self.context.publish_generation(self.worker, self.info);
+        self.context
+            .publish_generation(self.generation_runtime, self.info);
     }
 }
 
@@ -107,26 +108,29 @@ impl GenerationBootstrap for ConnectionRecoveryBootstrap {
             let remote_address = transport
                 .remote_address()
                 .map_err(|_| RuntimeError::Transport("recovery-remote-address"))?;
-            let worker = connection
+            let generation_runtime = connection
                 ._negotiate_switch_to_smb2(transport, config.smb2_only_negotiate, generation)
                 .await
                 .map_err(|_| RuntimeError::Wire("recovery-negotiate-switch"))?;
-            let info = match connection._negotiate_smb2(remote_address, &worker).await {
+            let info = match connection
+                ._negotiate_smb2(remote_address, &generation_runtime)
+                .await
+            {
                 Ok(info) => Arc::new(info),
                 Err(_) => {
-                    let _ = worker.stop().await;
+                    let _ = generation_runtime.stop().await;
                     return Err(RuntimeError::Wire("recovery-negotiate"));
                 }
             };
-            if worker.negotaite_complete(&info).await.is_err() {
-                let _ = worker.stop().await;
+            if generation_runtime.negotaite_complete(&info).await.is_err() {
+                let _ = generation_runtime.stop().await;
                 return Err(RuntimeError::Wire("recovery-negotiate-commit"));
             }
             Ok(PreparedGeneration::new(
-                worker.runtime_handle(),
+                generation_runtime.runtime_handle(),
                 Box::new(ConnectionGenerationPublication {
                     context,
-                    worker,
+                    generation_runtime,
                     info,
                 }),
             ))
@@ -202,7 +206,7 @@ impl Connection {
     /// Connects to the specified server, if it is not already connected, and negotiates the connection.
     #[tracing::instrument(level = "debug", skip_all, fields(server = %self.server_name))]
     pub async fn connect(&self) -> crate::Result<()> {
-        if self.context.worker().is_some() {
+        if self.context.generation_runtime().is_some() {
             return Err(Error::InvalidState("Already connected".into()));
         }
 
@@ -273,14 +277,14 @@ impl Connection {
     #[tracing::instrument(level = "debug", skip_all, fields(server = %self.server_name))]
     pub async fn close(&self) -> crate::Result<()> {
         self.context.stop_recovery().await;
-        match self.context.worker() {
+        match self.context.generation_runtime() {
             Some(c) => c.stop().await,
             None => Ok(()),
         }
     }
 
     /// Switches the protocol to SMB2 against the server if required,
-    /// and wraps the transport in a SMB2 worker.
+    /// and wraps the transport in a SMB2 generation_runtime.
     async fn _negotiate_switch_to_smb2(
         &self,
         mut transport: Box<dyn SmbTransport>,
@@ -344,7 +348,7 @@ impl Connection {
     async fn _negotiate_smb2(
         &self,
         server_address: std::net::SocketAddr,
-        worker: &Arc<GenerationRuntime>,
+        generation_runtime: &Arc<GenerationRuntime>,
     ) -> crate::Result<ConnectionInfo> {
         tracing::debug!("Negotiating SMB2");
 
@@ -373,7 +377,7 @@ impl Connection {
         let (request_status, response) = self
             .context
             .execute_with_worker(
-                worker,
+                generation_runtime,
                 CommandRequest::new(
                     self._make_smb2_neg_request(
                         dialects,
@@ -595,16 +599,19 @@ impl Connection {
 
         let server_address = transport.remote_address()?;
         // Negotiate SMB1, Switch to SMB2
-        let worker = self
+        let generation_runtime = self
             ._negotiate_switch_to_smb2(transport, smb2_only_neg, GenerationId::new(1))
             .await?;
 
         // Negotiate SMB2
-        let info = Arc::new(self._negotiate_smb2(server_address, &worker).await?);
+        let info = Arc::new(
+            self._negotiate_smb2(server_address, &generation_runtime)
+                .await?,
+        );
 
-        worker.negotaite_complete(&info).await?;
+        generation_runtime.negotaite_complete(&info).await?;
         self.context
-            .publish_generation(worker.clone(), info.clone());
+            .publish_generation(generation_runtime.clone(), info.clone());
 
         // Always start the notify task unless the caller explicitly disabled
         // it. `caps.notifications()` is the SMB 3.1.1 ChangeNotify capability
@@ -623,7 +630,7 @@ impl Connection {
 
         if recoverable {
             self.context.start_recovery(
-                worker,
+                generation_runtime,
                 self.config.clone(),
                 self.server_name.clone(),
                 self.server_address,
@@ -701,8 +708,8 @@ impl Connection {
     #[cfg(feature = "test-support")]
     pub fn observed_generation(&self) -> Option<u64> {
         self.context
-            .worker()
-            .map(|worker| worker.generation().value())
+            .generation_runtime()
+            .map(|generation_runtime| generation_runtime.generation().value())
     }
 
     /// Subscribe to lease-break notifications received on this connection.
@@ -772,7 +779,7 @@ impl Connection {
         self.context.sweep_idle_leases(older_than).await
     }
 
-    /// Send an SMB2 compound chain through this connection's worker and
+    /// Send an SMB2 compound chain through this connection's generation_runtime and
     /// receive each member's response.
     ///
     /// For each message in `msgs` (in order) this:
@@ -784,7 +791,7 @@ impl Connection {
     ///    [`crate::connection::generation_runtime::GenerationRuntime::send_compound`] for
     ///    the single TCP write.
     /// 4. Awaits each member's response separately via
-    ///    `Worker::receive` — server splits the compound response into
+    ///    `Generation runtime::receive` — server splits the compound response into
     ///    N parts; our compound-aware incoming-side parser routes each
     ///    part by message_id, and these receives just consume the
     ///    pre-routed entries.
@@ -852,18 +859,22 @@ impl Connection {
             m.message.header.flags = m.message.header.flags.with_priority_mask(priority_value);
         }
 
-        let worker = self
+        let generation_runtime = self
             .context
-            .worker()
-            .ok_or(Error::InvalidState("Worker is uninitialized".into()))?;
-        let send_results = worker.send_compound_for(msgs, dependency).await?;
+            .generation_runtime()
+            .ok_or(Error::InvalidState(
+                "Generation runtime is uninitialized".into(),
+            ))?;
+        let send_results = generation_runtime
+            .send_compound_for(msgs, dependency)
+            .await?;
 
         let mut responses = Vec::with_capacity(send_results.len());
         for r in send_results {
             let mut opts = ResponseOptions::new();
             opts.msg_id = r.msg_id;
             opts.allow_async = true;
-            let incoming = worker.receive(&opts).await?;
+            let incoming = generation_runtime.receive(&opts).await?;
             responses.push(incoming);
         }
         Ok(responses)
@@ -912,14 +923,14 @@ pub(crate) struct ConnectionCore {
 }
 
 struct ConnectionGeneration {
-    worker: Arc<GenerationRuntime>,
+    generation_runtime: Arc<GenerationRuntime>,
     conn_info: Arc<ConnectionInfo>,
 }
 
 impl ConnectionCore {
     pub(crate) fn connection_object(&self) -> crate::Result<crate::runtime::ObjectToken> {
         Ok(self
-            .worker()
+            .generation_runtime()
             .ok_or_else(|| Error::InvalidState("Runtime is uninitialized".into()))?
             .connection_object())
     }
@@ -930,7 +941,7 @@ impl ConnectionCore {
         kind: crate::runtime::ObjectKind,
     ) -> crate::Result<crate::runtime::ObjectToken> {
         let parent = self.resolve_dependency(parent, None, None).await?;
-        self.worker()
+        self.generation_runtime()
             .ok_or_else(|| Error::InvalidState("Runtime is uninitialized".into()))?
             .create_object(parent, kind)
             .await
@@ -953,8 +964,8 @@ impl ConnectionCore {
         self.prepare_outgoing(&mut msg).await?;
         options.channel_id = channel_id;
         let result = self
-            .worker()
-            .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?
+            .generation_runtime()
+            .ok_or_else(|| Error::InvalidState("Generation runtime is uninitialized.".to_string()))?
             .execute_for_with_replay(msg, &options, dependency, replay)
             .await?;
         if !result.1.message.header.flags.server_to_redir() {
@@ -973,7 +984,7 @@ impl ConnectionCore {
         let timeout = self.conn_info().map(|info| info.config.timeout());
         let dependency = self.resolve_dependency(dependency, timeout, None).await?;
         self.prepare_outgoing(&mut message).await?;
-        self.worker()
+        self.generation_runtime()
             .ok_or_else(|| Error::InvalidState("Runtime is uninitialized".into()))?
             .send_for(message, dependency)
             .await
@@ -981,18 +992,18 @@ impl ConnectionCore {
 
     async fn execute_with_worker(
         &self,
-        worker: &Arc<GenerationRuntime>,
+        generation_runtime: &Arc<GenerationRuntime>,
         mut message: CommandRequest,
     ) -> crate::Result<(CommandSubmission, CommandResponse)> {
         let command = message.message.content.associated_cmd();
         // Candidate Connection negotiation must not inherit header policy
         // from the currently published generation.
         message.message.header.flags.set_priority_mask(0);
-        let result = worker
+        let result = generation_runtime
             .execute_for(
                 message,
                 &ResponseOptions::new().with_cmd(Some(command)),
-                worker.connection_object(),
+                generation_runtime.connection_object(),
             )
             .await?;
         if !result.1.message.header.flags.server_to_redir() {
@@ -1008,8 +1019,10 @@ impl ConnectionCore {
         options: ResponseOptions<'_>,
     ) -> crate::Result<CommandResponse> {
         Self::validate_incoming(
-            self.worker()
-                .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?
+            self.generation_runtime()
+                .ok_or_else(|| {
+                    Error::InvalidState("Generation runtime is uninitialized.".to_string())
+                })?
                 .receive(&options)
                 .await?,
             &options,
@@ -1093,9 +1106,9 @@ impl ConnectionCore {
                 // by Arc clone, but NOT this
                 // ConnectionCore itself. If the Connection
                 // races into Drop before the spawn runs, its
-                // `worker.stop()` (in Connection::Drop) will complete
+                // `generation_runtime.stop()` (in Connection::Drop) will complete
                 // first and send_close_external will see a stopped
-                // worker — at worst we lose this displaced FileId,
+                // generation_runtime — at worst we lose this displaced FileId,
                 // which the session-disconnect garbage-collects anyway.
                 // The spawn does *not* extend the Connection's lifetime;
                 // tying it to Connection would require Arc'ing the
@@ -1247,10 +1260,10 @@ impl ConnectionCore {
         self.oplock_event_tx.subscribe()
     }
 
-    pub fn worker(&self) -> Option<Arc<GenerationRuntime>> {
+    pub fn generation_runtime(&self) -> Option<Arc<GenerationRuntime>> {
         self.generation
             .load_full()
-            .map(|generation| generation.worker.clone())
+            .map(|generation| generation.generation_runtime.clone())
     }
 
     pub(crate) fn conn_info(&self) -> Option<Arc<ConnectionInfo>> {
@@ -1259,14 +1272,20 @@ impl ConnectionCore {
             .map(|generation| generation.conn_info.clone())
     }
 
-    fn publish_generation(&self, worker: Arc<GenerationRuntime>, conn_info: Arc<ConnectionInfo>) {
-        self.generation
-            .store(Some(Arc::new(ConnectionGeneration { worker, conn_info })));
+    fn publish_generation(
+        &self,
+        generation_runtime: Arc<GenerationRuntime>,
+        conn_info: Arc<ConnectionInfo>,
+    ) {
+        self.generation.store(Some(Arc::new(ConnectionGeneration {
+            generation_runtime,
+            conn_info,
+        })));
     }
 
     fn start_recovery(
         self: &Arc<Self>,
-        worker: Arc<GenerationRuntime>,
+        generation_runtime: Arc<GenerationRuntime>,
         config: ConnectionConfig,
         server_name: String,
         server_address: SocketAddr,
@@ -1279,7 +1298,7 @@ impl ConnectionCore {
             server_address,
         });
         let driver = Arc::new(RecoveryDriver::new(
-            worker.connection_object(),
+            generation_runtime.connection_object(),
             config.auto_reconnect.runtime_policy(),
             clock,
             bootstrap,
@@ -1292,7 +1311,7 @@ impl ConnectionCore {
             .map_err(|_| Error::InvalidState("Recovery coordinator already started".into()))?;
         let context = Arc::downgrade(self);
         tokio::spawn(async move {
-            let mut current = worker;
+            let mut current = generation_runtime;
             loop {
                 let exit = current.exited().await;
                 match driver.recover(exit).await {
@@ -1301,7 +1320,7 @@ impl ConnectionCore {
                             driver.close().await;
                             break;
                         };
-                        let Some(replacement) = context.worker() else {
+                        let Some(replacement) = context.generation_runtime() else {
                             driver.close().await;
                             break;
                         };
@@ -1392,7 +1411,7 @@ impl ConnectionCore {
         Ok(())
     }
 
-    /// Hand a fully-prepared [`CommandRequest`] to the worker for
+    /// Hand a fully-prepared [`CommandRequest`] to the generation_runtime for
     /// transformation (sign/compress/encrypt) and transmission.
     /// Callers must have invoked [`Self::prepare_outgoing`] first.
     /// [`Self::submit`] is the public, all-in-one entry point that
@@ -1404,8 +1423,10 @@ impl ConnectionCore {
         let dependency = self.connection_object()?;
         let timeout = self.conn_info().map(|info| info.config.timeout());
         let dependency = self.resolve_dependency(dependency, timeout, None).await?;
-        self.worker()
-            .ok_or(Error::InvalidState("Worker is uninitialized".into()))?
+        self.generation_runtime()
+            .ok_or(Error::InvalidState(
+                "Generation runtime is uninitialized".into(),
+            ))?
             .send_for(msg, dependency)
             .await
     }
@@ -1427,13 +1448,13 @@ impl ConnectionCore {
     }
 
     async fn start_notify(self: &Arc<Self>) -> crate::Result<()> {
-        let worker = self
-            .worker()
-            .ok_or_else(|| Error::InvalidState("Worker is uninitialized.".to_string()))?;
-        let worker = worker.clone();
+        let generation_runtime = self.generation_runtime().ok_or_else(|| {
+            Error::InvalidState("Generation runtime is uninitialized.".to_string())
+        })?;
+        let generation_runtime = generation_runtime.clone();
         const CHANNEL_BUFFER_SIZE: usize = 10;
         let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_BUFFER_SIZE);
-        worker.start_notify_channel(tx)?;
+        generation_runtime.start_notify_channel(tx)?;
         let stop_notification = self.stop_notifications.clone();
         let self_clone = self.clone();
         tokio::spawn(async move {
@@ -1558,10 +1579,10 @@ impl ConnectionCore {
             tracing::warn!(file_id = ?notify.file_id(), "Unknown oplock break owner");
             return Ok(());
         };
-        let Some(worker) = self.worker() else {
+        let Some(generation_runtime) = self.generation_runtime() else {
             return Err(Error::InvalidState("Runtime is uninitialized".into()));
         };
-        if slot.object().generation() != worker.connection_object().generation() {
+        if slot.object().generation() != generation_runtime.connection_object().generation() {
             tracing::debug!(file_id = ?notify.file_id(), "Ignoring stale-generation oplock break");
             return Ok(());
         }
@@ -1737,7 +1758,7 @@ impl Drop for ConnectionCore {
             if let Some(recovery) = recovery {
                 recovery.close().await;
             }
-            generation.worker.stop().await.ok();
+            generation.generation_runtime.stop().await.ok();
         });
     }
 }

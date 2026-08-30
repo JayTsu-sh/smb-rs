@@ -322,8 +322,8 @@ where
     }
 
     /// Run on the `Err` exit of [`Self::_setup_loop`]. New-session
-    /// cleanup invalidates the session before notifying the worker;
-    /// bind cleanup only notifies the worker (the primary session
+    /// cleanup invalidates the session before notifying the generation_runtime;
+    /// bind cleanup only notifies the generation_runtime (the primary session
     /// stays usable on its original channel).
     async fn error_cleanup(&mut self) -> crate::Result<()> {
         let session = match self.result.as_ref() {
@@ -343,8 +343,8 @@ where
         }
 
         self.upstream
-            .worker()
-            .ok_or_else(|| Error::InvalidState("Worker not available!".to_string()))?
+            .generation_runtime()
+            .ok_or_else(|| Error::InvalidState("Generation runtime not available!".to_string()))?
             .session_ended(session)
             .await
     }
@@ -362,8 +362,8 @@ where
         self.context = Some(setup_handler);
 
         self.upstream
-            .worker()
-            .ok_or_else(|| Error::InvalidState("Worker not available!".to_string()))?
+            .generation_runtime()
+            .ok_or_else(|| Error::InvalidState("Generation runtime not available!".to_string()))?
             .session_started(&session)
             .await?;
 
@@ -497,7 +497,7 @@ where
         let request = request.into_signed();
         // The SnapshotKdfSign Protection set above is what the
         // wire pipeline dispatches on; `into_signed` just flips the
-        // wire-protocol signed flag so worker bookkeeping that still
+        // wire-protocol signed flag so generation_runtime bookkeeping that still
         // inspects `flags.signed` sees a consistent state.
 
         tracing::trace!(
@@ -562,8 +562,8 @@ where
     /// (S4-T1).
     async fn preauth_hash_snapshot(&self) -> crate::Result<Option<PreauthHashValue>> {
         self.upstream
-            .worker()
-            .ok_or_else(|| Error::InvalidState("Worker not available!".to_string()))?
+            .generation_runtime()
+            .ok_or_else(|| Error::InvalidState("Generation runtime not available!".to_string()))?
             .preauth_snapshot()
             .await
     }

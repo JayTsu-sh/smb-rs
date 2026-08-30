@@ -61,7 +61,7 @@ impl Channel {
     /// session enforces signing iff `allow_unsigned()` is `false` after
     /// it reaches `is_ready()`. Exposed publicly for callers that build
     /// SMB2 compound chains (P2.b) and need to set the `signed` flag on
-    /// each chained header before going through the worker directly.
+    /// each chained header before going through the generation_runtime directly.
     pub async fn allow_unsigned(&self) -> crate::Result<bool> {
         let session = self.context.session_state.session.read().await;
         session.allow_unsigned()
@@ -317,8 +317,8 @@ impl ChannelContext {
     /// Assures the sessions may not be used anymore.
     async fn _invalidate(&self) -> crate::Result<()> {
         self.upstream
-            .worker()
-            .ok_or_else(|| Error::InvalidState("Worker not available!".to_string()))?
+            .generation_runtime()
+            .ok_or_else(|| Error::InvalidState("Generation runtime not available!".to_string()))?
             .session_ended(&self.session_state)
             .await
     }

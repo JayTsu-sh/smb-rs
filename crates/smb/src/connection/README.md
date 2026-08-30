@@ -9,4 +9,4 @@ pump. Domain-facing code submits typed operations through `RuntimeHandle` and
 never owns transport halves or pending-response registries.
 
 Legacy wire mechanics remain behind `runtime::port`; no production caller can
-submit separate send/receive pairs or obtain a worker handle.
+submit separate send/receive pairs or obtain a generation_runtime handle.

@@ -1,6 +1,6 @@
 use crate::connection::preauth_hash::{PreauthHashState, PreauthHashValue};
 use crate::session::{MessageDecryptor, MessageEncryptor, MessageSigner, SessionAndChannel};
-use crate::{compression::*, command::*};
+use crate::{command::*, compression::*};
 use binrw::prelude::*;
 use bytes::Bytes;
 use smb_msg::*;
@@ -56,7 +56,7 @@ struct WirePipelineConfig {
     /// Cached snapshot of the negotiated dialect/signing/encryption
     /// parameters. Populated by [`WirePipeline::negotiated`] and read by
     /// the setup-phase signing path so the wire pipeline doesn't need to
-    /// re-borrow `ConnectionInfo` from the worker on every send.
+    /// re-borrow `ConnectionInfo` from the generation_runtime on every send.
     conn_info: Option<Arc<ConnectionInfo>>,
 }
 
@@ -119,7 +119,7 @@ impl WirePipeline {
     /// Cached `ConnectionInfo` captured by `negotiated`. None before
     /// negotiation completes. Used by the setup-phase signing path
     /// (S4-T3) to derive the dialect / signing algorithm without
-    /// re-borrowing from the worker on every send.
+    /// re-borrowing from the generation_runtime on every send.
     #[allow(dead_code)] // wired up in S4-T3
     async fn conn_info(&self) -> crate::Result<Option<Arc<ConnectionInfo>>> {
         Ok(self.config.read().await.conn_info.clone())
@@ -197,7 +197,7 @@ impl WirePipeline {
             .insert(session_id, session.clone());
 
         tracing::trace!(
-            "Session {} started and inserted to worker {:p}.",
+            "Session {} started and inserted to generation_runtime {:p}.",
             session_id,
             self
         );
@@ -217,7 +217,7 @@ impl WirePipeline {
             )))?;
 
         tracing::trace!(
-            "Session {} ended and removed from worker {:p}.",
+            "Session {} ended and removed from generation_runtime {:p}.",
             session_id,
             self
         );
