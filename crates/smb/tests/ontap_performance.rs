@@ -154,9 +154,9 @@ fn payload_from_env() -> smb::Result<usize> {
         .transpose()
         .map_err(|_| smb::Error::InvalidArgument("invalid performance payload size".into()))?
         .unwrap_or(DEFAULT_BYTES_PER_CONNECTION);
-    if bytes == 0 || bytes % CHUNK_SIZE != 0 {
+    if bytes == 0 || bytes % bytes.min(CHUNK_SIZE) != 0 {
         return Err(smb::Error::InvalidArgument(
-            "performance payload must be a non-zero multiple of 1 MiB".into(),
+            "performance payload must be non-zero and 1 MiB-aligned above 1 MiB".into(),
         ));
     }
     Ok(bytes)
@@ -181,7 +181,8 @@ async fn run_sample(
             std::process::id()
         ))?;
         let file = share.open_file(&path, FileOpenOptions::overwrite()).await?;
-        let pattern = Bytes::from(vec![(connection as u8).wrapping_mul(37); CHUNK_SIZE]);
+        let chunk_size = bytes_per_connection.min(CHUNK_SIZE);
+        let pattern = Bytes::from(vec![(connection as u8).wrapping_mul(37); chunk_size]);
         streams.push(Stream {
             client,
             file,
@@ -243,9 +244,10 @@ async fn write_windowed(
     bytes_per_connection: usize,
     inflight: usize,
 ) -> smb::Result<()> {
-    for first in (0..bytes_per_connection).step_by(CHUNK_SIZE * inflight) {
-        let last = (first + CHUNK_SIZE * inflight).min(bytes_per_connection);
-        try_join_all((first..last).step_by(CHUNK_SIZE).map(|offset| {
+    let chunk_size = stream.pattern.len();
+    for first in (0..bytes_per_connection).step_by(chunk_size * inflight) {
+        let last = (first + chunk_size * inflight).min(bytes_per_connection);
+        try_join_all((first..last).step_by(chunk_size).map(|offset| {
             stream
                 .file
                 .write_all_at(offset as u64, stream.pattern.clone())
@@ -261,14 +263,15 @@ async fn read_windowed(
     bytes_per_connection: usize,
     inflight: usize,
 ) -> smb::Result<()> {
-    for first in (0..bytes_per_connection).step_by(CHUNK_SIZE * inflight) {
-        let last = (first + CHUNK_SIZE * inflight).min(bytes_per_connection);
+    let chunk_size = stream.pattern.len();
+    for first in (0..bytes_per_connection).step_by(chunk_size * inflight) {
+        let last = (first + chunk_size * inflight).min(bytes_per_connection);
         let pending = (first..last)
-            .step_by(CHUNK_SIZE)
+            .step_by(chunk_size)
             .map(|offset| {
                 stream
                     .file
-                    .read_exact_at(offset as u64, CHUNK_SIZE as u32)
+                    .read_exact_at(offset as u64, chunk_size as u32)
                     .timeout(Duration::from_secs(30))
             })
             .collect::<FuturesUnordered<_>>();
