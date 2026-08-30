@@ -4,9 +4,20 @@
 
 The final fresh manifest was created from and cryptographically bound to
 implementation `ee306e4`, the appliance preflight state, an anonymized test
-identity, and one unique validation run. Runtime inputs were supplied through
-one-shot file descriptors. This document retains no endpoint, account,
-credential, manifest, plan hash, or generated appliance object name.
+identity, and one unique validation run. The plan hash was
+`b3b5607e5f5d8602a784dafdabf4f209dbc0a48920b23cb48915734915dc1a4e` and the
+anonymous target identity was
+`afd7d49a973e4271b2cdcc61b7ff430435bab6b5ff04e1b6dd0a0cbb4da9fc89`.
+Runtime inputs were supplied through one-shot file descriptors. This document
+retains no endpoint, account, credential, manifest, run identifier, or
+generated appliance object name.
+
+The final encrypted matrix ran from 2026-08-30T09:12:02Z through
+2026-08-30T09:30:51Z with rustc 1.95.0 (59807616e 2026-04-14). Appliance
+preflight identified ONTAP 9.19.1. Authentication traces identify NTLM and the
+encrypted Share exercises the SMB transform path. The current public evidence
+seam does not emit the negotiated dialect, signing algorithm, or cipher, so
+those values are deliberately not inferred here.
 
 The run owned three independent volumes: 2 GiB functional, 16 GiB performance,
 and 2 GiB CA. It owned plain and encrypted functional Shares, plain and
@@ -93,11 +104,27 @@ limit of the shared 1 GbE management path. These results validate asynchronous
 in-flight execution and bounded memory; they are not a claim about a dedicated
 storage-front-end network.
 
-Earlier encrypted characterization on the same appliance established that
-64 KiB payloads do not benefit from concurrency, while 1 MiB and 1 GiB payloads
-do. The client VM exposes no AES acceleration, so encrypted throughput is
-software-crypto limited. This explains the environment constraint without
-weakening the plain hard gate.
+## Fresh encrypted performance matrix
+
+The final isolated manifest also ran every encrypted payload/window pair in
+release mode. Each row used one warm-up, five measured samples, complete
+byte-for-byte read-back, and a 10% CV hard limit. Small logical payloads were
+repeated to transfer at least 16 MiB per sample. Every row negotiated a 1 MiB
+maximum read chunk and a 1 MiB maximum write chunk.
+
+| Payload | In-flight | Write median | Write p95 | Write CV | Read median | Read p95 | Read CV | Peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 KiB | 1 | 16.44 MiB/s | 16.75 | 4.52% | 15.61 MiB/s | 17.09 | 6.80% | 11,044 KiB |
+| 64 KiB | 16 | 15.74 MiB/s | 16.10 | 2.58% | 17.00 MiB/s | 17.93 | 8.98% | 17,556 KiB |
+| 1 MiB | 1 | 20.16 MiB/s | 20.44 | 0.99% | 19.86 MiB/s | 20.07 | 2.04% | 20,272 KiB |
+| 1 MiB | 16 | 23.32 MiB/s | 23.64 | 2.38% | 26.16 MiB/s | 27.45 | 2.19% | 13,884 KiB |
+| 1 GiB | 1 | 19.96 MiB/s | 20.13 | 0.53% | 19.44 MiB/s | 19.65 | 0.63% | 20,004 KiB |
+| 1 GiB | 16 | 27.06 MiB/s | 27.79 | 1.49% | 26.70 MiB/s | 27.11 | 2.94% | 52,732 KiB |
+
+Concurrency is neutral at 64 KiB but materially helps larger transfers. At
+1 GiB, 16 in-flight operations improve median write throughput by 35.6% and
+read throughput by 37.3%. The client VM exposes no AES acceleration, so the
+encrypted figures are software-crypto limited.
 
 ## Local total gates
 
@@ -109,4 +136,6 @@ prove that `Bytes` payload ownership survives sealing, slice writes make their
 single copy at the API boundary, and each protection transform allocates one
 final contiguous arena.
 
-The final secret and endpoint scan is required before checkpoint acceptance.
+The final secret and endpoint scan passed with no matches. Manifest cleanup
+passed, the pre-existing appliance state hash was unchanged, and retained
+run-owned inventory was zero.
