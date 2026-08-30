@@ -1,7 +1,12 @@
 use crate::Cli;
 use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
-use smb::{UncPath, client::Client, protocol::{FileAccessMask, FileBasicInformation, QueryQuotaInfo}, resource::*};
+use smb::{
+    Client as DomainClient, ClientConfig as DomainClientConfig, Credentials, UncPath,
+    client::Client as LegacyClient,
+    protocol::{FileAccessMask, FileBasicInformation, QueryQuotaInfo},
+    resource::*,
+};
 use std::collections::VecDeque;
 use std::fmt::Display;
 use std::{error::Error, sync::Arc};
@@ -49,19 +54,23 @@ pub struct InfoCmd {
 }
 
 pub async fn info(cmd: &InfoCmd, cli: &Cli) -> Result<(), Box<dyn Error>> {
-    let client = Client::new(cli.make_smb_client_config()?);
-
     if cmd.path.share().is_none() || cmd.path.share().unwrap().is_empty() {
-        client
-            .ipc_connect(cmd.path.server(), &cli.username, cli.password.clone())
+        let client = DomainClient::new(DomainClientConfig::default());
+        let shares = client
+            .enumerate_shares(
+                cmd.path.server(),
+                Credentials::ntlm(cli.username.clone(), cli.password.clone()),
+            )
             .await?;
-        let shares_info = client.list_shares(cmd.path.server()).await?;
         tracing::info!("Available shares on {}: ", cmd.path.server());
-        for share in shares_info {
-            tracing::info!("  - {}", **share.netname.as_ref().unwrap());
+        for share in shares {
+            tracing::info!("  - {} ({:?})", share.name(), share.kind());
         }
+        client.close().await?;
         return Ok(());
     }
+
+    let client = LegacyClient::new(cli.make_smb_client_config()?);
 
     client
         .share_connect(&cmd.path, cli.username.as_ref(), cli.password.clone())
@@ -84,7 +93,9 @@ pub async fn info(cmd: &InfoCmd, cli: &Cli) -> Result<(), Box<dyn Error>> {
             tracing::info!("  - Last access time: {}", info.last_access_time);
             if cmd.show_ea {
                 tracing::info!("  - Extended Attributes (EA):");
-                let basic_ea_info = file.query_info::<smb::protocol::FileEaInformation>().await?;
+                let basic_ea_info = file
+                    .query_info::<smb::protocol::FileEaInformation>()
+                    .await?;
                 if basic_ea_info.ea_size > 0 {
                     let ea_info = file
                         .query_full_ea_info_with_options(
@@ -182,7 +193,7 @@ fn get_size_string(size_bytes: u64) -> String {
 }
 
 struct IterateParams<'a> {
-    client: &'a Client,
+    client: &'a LegacyClient,
     recursive: RecursiveMode,
     show_quota: bool,
 }

@@ -49,7 +49,7 @@ pub use domain::{
     TransferReport, TransferStrategy,
 };
 pub use error::Error;
-pub use facade::{Client, ClientConfig};
+pub use facade::{Client, ClientConfig, RemoteShare, ShareKind};
 pub use lease::{LeaseBreakAckOutcome, LeaseBreakEvent, OplockBreakEvent};
 pub use resource::{
     DurableOpenGrant, DurableOpenRequest, FileCreateArgs, GetLen, LeaseGrant, PipeRpcConnection,
