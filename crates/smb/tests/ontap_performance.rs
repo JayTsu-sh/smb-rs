@@ -3,7 +3,7 @@
 mod common;
 
 use bytes::Bytes;
-use futures_util::future::try_join_all;
+use futures_util::{StreamExt, future::try_join_all, stream::FuturesUnordered};
 use serde_json::json;
 use smb::{Client, ClientConfig, File, FileOpenOptions, SharePath, ShareTarget};
 use std::time::{Duration, Instant};
@@ -263,17 +263,22 @@ async fn read_windowed(
 ) -> smb::Result<()> {
     for first in (0..bytes_per_connection).step_by(CHUNK_SIZE * inflight) {
         let last = (first + CHUNK_SIZE * inflight).min(bytes_per_connection);
-        let actual = try_join_all((first..last).step_by(CHUNK_SIZE).map(|offset| {
-            stream
-                .file
-                .read_exact_at(offset as u64, CHUNK_SIZE as u32)
-                .timeout(Duration::from_secs(30))
-        }))
-        .await?;
-        if actual.iter().any(|bytes| bytes != &stream.pattern) {
-            return Err(smb::Error::InvalidMessage(
-                "performance read-back mismatch".into(),
-            ));
+        let pending = (first..last)
+            .step_by(CHUNK_SIZE)
+            .map(|offset| {
+                stream
+                    .file
+                    .read_exact_at(offset as u64, CHUNK_SIZE as u32)
+                    .timeout(Duration::from_secs(30))
+            })
+            .collect::<FuturesUnordered<_>>();
+        futures_util::pin_mut!(pending);
+        while let Some(actual) = pending.next().await {
+            if actual? != stream.pattern {
+                return Err(smb::Error::InvalidMessage(
+                    "performance read-back mismatch".into(),
+                ));
+            }
         }
     }
     Ok(())
