@@ -144,8 +144,13 @@ impl RuntimeShare {
         })
     }
 
-    pub(crate) async fn open_file(&self, path: &str, mode: OpenMode) -> crate::Result<RuntimeFile> {
-        let args = match mode {
+    pub(crate) async fn open_file(
+        &self,
+        path: &str,
+        mode: OpenMode,
+        persistent_timeout_millis: Option<u32>,
+    ) -> crate::Result<RuntimeFile> {
+        let mut args = match mode {
             OpenMode::CreateNew => {
                 FileCreateArgs::make_create_new(Default::default(), Default::default())
             }
@@ -159,6 +164,12 @@ impl RuntimeShare {
                 FileCreateArgs::make_overwrite(Default::default(), Default::default())
             }
         };
+        if let Some(timeout) = persistent_timeout_millis {
+            args = args.with_durable(crate::resource::DurableOpenRequest::persistent(
+                timeout,
+                smb_dtyp::Guid::generate(),
+            ));
+        }
         match self.inner.create(path, &args).await? {
             LegacyResource::File(file) => Ok(RuntimeFile { inner: file }),
             _ => Err(Error::InvalidState(
@@ -428,6 +439,11 @@ pub(crate) struct RuntimeFile {
 }
 
 impl RuntimeFile {
+    pub(crate) fn persistent_granted(&self) -> bool {
+        self.inner
+            .durable_granted()
+            .is_some_and(|grant| grant.persistent)
+    }
     pub(crate) async fn previous_versions(&self) -> crate::Result<Vec<String>> {
         let response = self
             .inner

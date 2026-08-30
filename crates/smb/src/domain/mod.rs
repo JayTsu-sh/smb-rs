@@ -135,6 +135,7 @@ impl PipeName {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileOpenOptions {
     mode: OpenMode,
+    persistent_timeout_millis: Option<u32>,
 }
 
 /// A validated server Previous Versions token.
@@ -193,19 +194,35 @@ impl FileOpenOptions {
     pub const fn create_new() -> Self {
         Self {
             mode: OpenMode::CreateNew,
+            persistent_timeout_millis: None,
         }
     }
 
     pub const fn open_existing() -> Self {
         Self {
             mode: OpenMode::OpenExisting,
+            persistent_timeout_millis: None,
         }
     }
 
     pub const fn overwrite() -> Self {
         Self {
             mode: OpenMode::Overwrite,
+            persistent_timeout_millis: None,
         }
+    }
+
+    pub const fn persistent(mut self, timeout_millis: u32) -> Self {
+        self.persistent_timeout_millis = Some(timeout_millis);
+        self
+    }
+
+    pub const fn requests_persistent_handle(&self) -> bool {
+        self.persistent_timeout_millis.is_some()
+    }
+
+    pub const fn durable_timeout_millis(&self) -> Option<u32> {
+        self.persistent_timeout_millis
     }
 }
 
@@ -417,7 +434,14 @@ impl Share {
                         "file open currently permits only ReplayPolicy::Never".into(),
                     ));
                 }
-                let inner = self.inner.open_file(path.as_str(), options.mode).await?;
+                let inner = self
+                    .inner
+                    .open_file(
+                        path.as_str(),
+                        options.mode,
+                        options.persistent_timeout_millis,
+                    )
+                    .await?;
                 Ok(File {
                     inner,
                     close_authority: FileCloseAuthority::new(),
@@ -631,6 +655,9 @@ impl FileCloseAuthority {
 }
 
 impl File {
+    pub fn persistent_granted(&self) -> bool {
+        self.inner.persistent_granted()
+    }
     pub fn previous_versions(&self) -> Operation<'_, Vec<PreviousVersion>> {
         Operation::new(move |context| {
             Box::pin(async move {

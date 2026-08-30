@@ -31,6 +31,14 @@ fn previous_version_tokens_are_validated_at_the_domain_boundary() {
 }
 
 #[test]
+fn persistent_open_intent_is_explicit_at_the_domain_boundary() {
+    let options = FileOpenOptions::open_existing().persistent(30_000);
+    assert!(options.requests_persistent_handle());
+    assert_eq!(options.durable_timeout_millis(), Some(30_000));
+    assert!(!FileOpenOptions::open_existing().requests_persistent_handle());
+}
+
+#[test]
 fn public_spine_types_are_send_sync_and_domain_named() {
     assert_send_sync::<Client>();
     assert_send_sync::<Session>();
