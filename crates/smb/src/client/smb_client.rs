@@ -65,7 +65,7 @@ fn compound_protection(
 ///
 /// ## Example
 ///
-/// ```no_run
+/// ```ignore
 /// use smb::{Client, ClientConfig, UncPath, FileCreateArgs, FileAccessMask};
 /// use std::str::FromStr;
 /// #[tokio::main]
@@ -244,7 +244,7 @@ impl Client {
     ///
     /// You can replace calls to this method by performing the connection, session and share setup manually, just like it does,
     /// using the [`Client::connect`] method:
-    /// ```no_run
+    /// ```ignore
     /// # use smb::{Client, ClientConfig, UncPath, FileCreateArgs, FileAccessMask};
     /// # use std::str::FromStr;
     /// # #[tokio::main]

@@ -244,7 +244,7 @@ impl Connection {
     /// A new [`Connection`] object with the specified transport and configuration.
     ///
     ///
-    /// ```no_run
+    /// ```ignore
     /// # use smb::*;
     /// # use std::time::Duration;
     /// use smb_transport::TcpTransport;

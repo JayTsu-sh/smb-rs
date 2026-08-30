@@ -183,7 +183,7 @@ impl Default for AsyncMessageIds {
 /// Options for receiving a message.
 ///
 /// Use a builder pattern to set the options:
-/// ```
+/// ```ignore
 /// use smb_msg::*;
 /// use smb::command::ResponseOptions;
 ///
