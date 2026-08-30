@@ -31,7 +31,6 @@ mod share_recovery;
 // W4-5 starts with the pure durable/persistent Resource reconnect authority.
 #[allow(dead_code)]
 mod durable_recovery;
-#[path = "domain_bridge.rs"]
 pub(crate) mod port;
 // W4-6 starts with the pure asynchronous server-event authority.
 #[allow(dead_code)]

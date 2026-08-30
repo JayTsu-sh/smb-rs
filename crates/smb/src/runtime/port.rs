@@ -2,8 +2,8 @@
 //!
 //! This module owns no lifecycle state. It is the single crate-private
 //! boundary that keeps protocol and runtime implementation types out of the
-//! domain API. The physical file retains its temporary name until W5-6 removes
-//! the remaining legacy implementation dependencies atomically.
+//! domain API. Legacy protocol mechanics remain an implementation detail behind
+//! this stable port while callers use the domain object hierarchy.
 
 use std::{pin::Pin, sync::Arc};
 

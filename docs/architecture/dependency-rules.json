@@ -66,11 +66,5 @@
       "activation": "activated"
     }
   ],
-  "temporary_adapters": [
-    {
-      "path": "crates/smb/src/runtime/domain_bridge.rs",
-      "owner_wave": "W5",
-      "remove_by": "W6"
-    }
-  ]
+  "temporary_adapters": []
 }
