@@ -31,7 +31,7 @@ async fn main() -> smb::Result<()> {
         .await?;
     file.close().await?;
     share.close().await?;
-    client.close().await
+    client.close().await.map(|_| ())
 }
 ```
 

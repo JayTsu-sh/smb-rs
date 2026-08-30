@@ -3,7 +3,8 @@
 use smb_rpc::interface::{ShareKind as RpcShareKind, SrvSvc};
 
 use crate::domain::{
-    Credentials, DomainClient, Operation, PipeName, RpcPipeConnection, Session, Share, ShareTarget,
+    CloseReport, Credentials, DomainClient, Operation, PipeName, RpcPipeConnection, Session, Share,
+    ShareTarget,
 };
 
 /// Root handle for the domain-first async API.
@@ -140,17 +141,17 @@ impl Client {
                 match (result, close) {
                     (Err(error), _) => Err(error),
                     (Ok(_), Err(error)) => Err(error),
-                    (Ok(shares), Ok(())) => Ok(shares),
+                    (Ok(shares), Ok(_)) => Ok(shares),
                 }
             })
         })
     }
 
-    pub fn close(&self) -> Operation<'_, ()> {
+    pub fn close(&self) -> Operation<'_, CloseReport> {
         Operation::new(move |context| {
             Box::pin(async move {
                 context.remaining()?;
-                self.domain.close().await
+                Ok(self.domain.close().await)
             })
         })
     }

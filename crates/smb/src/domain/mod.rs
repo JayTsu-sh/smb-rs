@@ -15,14 +15,17 @@ pub use transfer::{Transfer, TransferEvents, TransferOptions, TransferProgress, 
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use bytes::Bytes;
 use futures_core::Stream;
 use futures_util::{StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -41,6 +44,48 @@ pub enum Credentials {
         password: Zeroizing<String>,
     },
     Anonymous,
+}
+
+/// Aggregate result of closing a logical parent handle and its descendants.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CloseReport {
+    sessions: usize,
+    shares: usize,
+    resources: usize,
+    first_teardown_cause: Option<String>,
+}
+
+impl CloseReport {
+    pub const fn sessions(&self) -> usize {
+        self.sessions
+    }
+
+    pub const fn shares(&self) -> usize {
+        self.shares
+    }
+
+    pub const fn resources(&self) -> usize {
+        self.resources
+    }
+
+    pub fn first_teardown_cause(&self) -> Option<&str> {
+        self.first_teardown_cause.as_deref()
+    }
+
+    fn record_error(&mut self, error: Error) {
+        if self.first_teardown_cause.is_none() {
+            self.first_teardown_cause = Some(error.to_string());
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.sessions += other.sessions;
+        self.shares += other.shares;
+        self.resources += other.resources;
+        if self.first_teardown_cause.is_none() {
+            self.first_teardown_cause = other.first_teardown_cause;
+        }
+    }
 }
 
 impl Credentials {
@@ -247,10 +292,11 @@ pub(crate) struct DomainClient {
 struct DomainClientInner {
     runtime: RuntimeClient,
     sessions: Mutex<SessionCache>,
+    close_report: OnceCell<CloseReport>,
 }
 
 type SessionCacheKey = (String, [u8; 32]);
-type SessionCache = HashMap<SessionCacheKey, Weak<RuntimeSession>>;
+type SessionCache = HashMap<SessionCacheKey, Weak<SessionInner>>;
 
 impl DomainClient {
     pub(crate) fn new() -> Self {
@@ -258,6 +304,7 @@ impl DomainClient {
             inner: Arc::new(DomainClientInner {
                 runtime: RuntimeClient::new(),
                 sessions: Mutex::new(HashMap::new()),
+                close_report: OnceCell::new(),
             }),
         }
     }
@@ -289,12 +336,18 @@ impl DomainClient {
         {
             return Ok(Session { inner });
         }
-        let inner = Arc::new(
+        let runtime = Arc::new(
             self.inner
                 .runtime
                 .authenticate(server, username.as_str(), password.to_string())
                 .await?,
         );
+        let inner = Arc::new(SessionInner {
+            runtime,
+            close_report: OnceCell::new(),
+            shares: AtomicUsize::new(0),
+            resources: AtomicUsize::new(0),
+        });
         self.inner
             .sessions
             .lock()
@@ -303,31 +356,63 @@ impl DomainClient {
         Ok(Session { inner })
     }
 
-    pub(crate) async fn close(&self) -> crate::Result<()> {
-        let sessions = {
-            let mut cache = self.inner.sessions.lock().await;
-            let sessions = cache.values().filter_map(Weak::upgrade).collect::<Vec<_>>();
-            cache.clear();
-            sessions
-        };
-        let mut first_error = None;
-        for session in sessions {
-            if let Err(error) = session.close().await {
-                first_error.get_or_insert(error);
-            }
-        }
-        let runtime_close = self.inner.runtime.close().await;
-        match (first_error, runtime_close) {
-            (Some(error), _) => Err(error),
-            (None, result) => result,
-        }
+    pub(crate) async fn close(&self) -> CloseReport {
+        self.inner
+            .close_report
+            .get_or_init(|| async {
+                let sessions = {
+                    let mut cache = self.inner.sessions.lock().await;
+                    let sessions = cache.values().filter_map(Weak::upgrade).collect::<Vec<_>>();
+                    cache.clear();
+                    sessions
+                };
+                let mut report = CloseReport {
+                    sessions: sessions.len(),
+                    ..CloseReport::default()
+                };
+                for session in sessions {
+                    report.merge(session.close().await);
+                }
+                if let Err(error) = self.inner.runtime.close().await {
+                    report.record_error(error);
+                }
+                report
+            })
+            .await
+            .clone()
     }
 }
 
 /// Stable logical authenticated Session handle.
 #[derive(Clone)]
 pub struct Session {
-    inner: Arc<RuntimeSession>,
+    inner: Arc<SessionInner>,
+}
+
+struct SessionInner {
+    runtime: Arc<RuntimeSession>,
+    close_report: OnceCell<CloseReport>,
+    shares: AtomicUsize,
+    resources: AtomicUsize,
+}
+
+impl SessionInner {
+    async fn close(&self) -> CloseReport {
+        self.close_report
+            .get_or_init(|| async {
+                let mut report = CloseReport {
+                    shares: self.shares.load(Ordering::Acquire),
+                    resources: self.resources.load(Ordering::Acquire),
+                    ..CloseReport::default()
+                };
+                if let Err(error) = self.runtime.close().await {
+                    report.record_error(error);
+                }
+                report
+            })
+            .await
+            .clone()
+    }
 }
 
 /// Opaque identity of one published Session or Share generation.
@@ -339,7 +424,7 @@ pub struct ObjectGeneration {
 impl Session {
     pub fn generation(&self) -> crate::Result<ObjectGeneration> {
         Ok(ObjectGeneration {
-            identity: self.inner.object_identity()?,
+            identity: self.inner.runtime.object_identity()?,
         })
     }
 
@@ -347,20 +432,25 @@ impl Session {
         Operation::new(move |context| {
             Box::pin(async move {
                 context.remaining()?;
-                let inner = self.inner.connect_share(name).await?;
+                let runtime = self.inner.runtime.connect_share(name).await?;
+                self.inner.shares.fetch_add(1, Ordering::AcqRel);
                 Ok(Share {
-                    inner: Arc::new(inner),
+                    inner: Arc::new(ShareInner {
+                        runtime,
+                        close_report: OnceCell::new(),
+                        resources: AtomicUsize::new(0),
+                    }),
                     _session: self.inner.clone(),
                 })
             })
         })
     }
 
-    pub fn close(&self) -> Operation<'_, ()> {
+    pub fn close(&self) -> Operation<'_, CloseReport> {
         Operation::new(move |context| {
             Box::pin(async move {
                 context.remaining()?;
-                self.inner.close().await
+                Ok(self.inner.close().await)
             })
         })
     }
@@ -369,14 +459,43 @@ impl Session {
 /// Stable logical Share handle. Wire-level Tree identity remains internal.
 #[derive(Clone)]
 pub struct Share {
-    inner: Arc<RuntimeShare>,
-    _session: Arc<RuntimeSession>,
+    inner: Arc<ShareInner>,
+    _session: Arc<SessionInner>,
+}
+
+struct ShareInner {
+    runtime: RuntimeShare,
+    close_report: OnceCell<CloseReport>,
+    resources: AtomicUsize,
+}
+
+impl ShareInner {
+    async fn close(&self) -> CloseReport {
+        self.close_report
+            .get_or_init(|| async {
+                let mut report = CloseReport {
+                    resources: self.resources.load(Ordering::Acquire),
+                    ..CloseReport::default()
+                };
+                if let Err(error) = self.runtime.close().await {
+                    report.record_error(error);
+                }
+                report
+            })
+            .await
+            .clone()
+    }
 }
 
 impl Share {
+    fn record_resource_open(&self) {
+        self.inner.resources.fetch_add(1, Ordering::AcqRel);
+        self._session.resources.fetch_add(1, Ordering::AcqRel);
+    }
+
     pub fn generation(&self) -> ObjectGeneration {
         ObjectGeneration {
-            identity: self.inner.object_identity(),
+            identity: self.inner.runtime.object_identity(),
         }
     }
 
@@ -390,7 +509,9 @@ impl Share {
                         "resource open permits only ReplayPolicy::Never".into(),
                     ));
                 }
-                Ok(match self.inner.open_resource(path.as_str()).await? {
+                let resource = self.inner.runtime.open_resource(path.as_str()).await?;
+                self.record_resource_open();
+                Ok(match resource {
                     RuntimeResource::File(inner) => Resource::File(Box::new(File {
                         inner,
                         close_authority: FileCloseAuthority::new(),
@@ -422,26 +543,26 @@ impl Share {
                         "security open permits only ReplayPolicy::Never".into(),
                     ));
                 }
-                Ok(
-                    match self
-                        .inner
-                        .open_security_resource(path.as_str(), options.writes_dacl())
-                        .await?
-                    {
-                        RuntimeResource::File(inner) => Resource::File(Box::new(File {
-                            inner,
-                            close_authority: FileCloseAuthority::new(),
-                        })),
-                        RuntimeResource::Directory(inner) => Resource::Directory(Directory {
-                            inner,
-                            close_authority: FileCloseAuthority::new(),
-                        }),
-                        RuntimeResource::Pipe(inner) => Resource::Pipe(Pipe {
-                            inner,
-                            close_authority: FileCloseAuthority::new(),
-                        }),
-                    },
-                )
+                let resource = self
+                    .inner
+                    .runtime
+                    .open_security_resource(path.as_str(), options.writes_dacl())
+                    .await?;
+                self.record_resource_open();
+                Ok(match resource {
+                    RuntimeResource::File(inner) => Resource::File(Box::new(File {
+                        inner,
+                        close_authority: FileCloseAuthority::new(),
+                    })),
+                    RuntimeResource::Directory(inner) => Resource::Directory(Directory {
+                        inner,
+                        close_authority: FileCloseAuthority::new(),
+                    }),
+                    RuntimeResource::Pipe(inner) => Resource::Pipe(Pipe {
+                        inner,
+                        close_authority: FileCloseAuthority::new(),
+                    }),
+                })
             })
         })
     }
@@ -462,12 +583,14 @@ impl Share {
                 }
                 let inner = self
                     .inner
+                    .runtime
                     .open_file(
                         path.as_str(),
                         options.mode,
                         options.persistent_timeout_millis,
                     )
                     .await?;
+                self.record_resource_open();
                 Ok(File {
                     inner,
                     close_authority: FileCloseAuthority::new(),
@@ -493,8 +616,10 @@ impl Share {
                 }
                 let inner = self
                     .inner
+                    .runtime
                     .open_file_at_version(path.as_str(), timestamp)
                     .await?;
+                self.record_resource_open();
                 Ok(File {
                     inner,
                     close_authority: FileCloseAuthority::new(),
@@ -519,8 +644,10 @@ impl Share {
                 }
                 let inner = self
                     .inner
+                    .runtime
                     .open_directory(path.as_str(), options.create)
                     .await?;
+                self.record_resource_open();
                 Ok(Directory {
                     inner,
                     close_authority: FileCloseAuthority::new(),
@@ -539,19 +666,21 @@ impl Share {
                         "pipe open permits only ReplayPolicy::Never".into(),
                     ));
                 }
+                let inner = self.inner.runtime.open_pipe(name.as_str()).await?;
+                self.record_resource_open();
                 Ok(Pipe {
-                    inner: self.inner.open_pipe(name.as_str()).await?,
+                    inner,
                     close_authority: FileCloseAuthority::new(),
                 })
             })
         })
     }
 
-    pub fn close(&self) -> Operation<'_, ()> {
+    pub fn close(&self) -> Operation<'_, CloseReport> {
         Operation::new(move |context| {
             Box::pin(async move {
                 context.remaining()?;
-                self.inner.close().await
+                Ok(self.inner.close().await)
             })
         })
     }

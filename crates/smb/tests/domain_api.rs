@@ -7,9 +7,10 @@ use smb::{
     SecurityOpenOptions, SecuritySelection, TransferOptions, TransferProgress,
 };
 use smb::{
-    Client, CloseOutcome, Credentials, Directory, DirectoryOpenOptions, File, FileCursor,
-    FileOpenOptions, IoCapabilities, ObjectGeneration, Operation, Pipe, PipeName, PreviousVersion,
-    ReplayPolicy, Session, Share, SharePath, ShareTarget, Transfer, TransferEvents,
+    Client, CloseOutcome, CloseReport, Credentials, Directory, DirectoryOpenOptions, File,
+    FileCursor, FileOpenOptions, IoCapabilities, ObjectGeneration, Operation, Pipe, PipeName,
+    PreviousVersion, ReplayPolicy, Session, Share, SharePath, ShareTarget, Transfer,
+    TransferEvents,
 };
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
@@ -29,11 +30,11 @@ fn session_connect_is_lazy<'a>(session: &'a Session, name: &'a str) -> Operation
     session.connect_share(name)
 }
 
-fn session_close_is_lazy(session: &Session) -> Operation<'_, ()> {
+fn session_close_is_lazy(session: &Session) -> Operation<'_, CloseReport> {
     session.close()
 }
 
-fn share_close_is_lazy(share: &Share) -> Operation<'_, ()> {
+fn share_close_is_lazy(share: &Share) -> Operation<'_, CloseReport> {
     share.close()
 }
 
@@ -50,10 +51,26 @@ fn public_spine_defers_async_work_to_lazy_operations() {
     assert_lazy(client.connect_share(&target, Credentials::ntlm("user", "secret")));
     assert_lazy(client.close());
 
+    let empty = CloseReport::default();
+    assert_eq!(empty.sessions(), 0);
+    assert_eq!(empty.shares(), 0);
+    assert_eq!(empty.resources(), 0);
+    assert_eq!(empty.first_teardown_cause(), None);
+
     let _ = session_connect_is_lazy;
     let _ = session_close_is_lazy;
     let _ = share_close_is_lazy;
     let _ = file_delete_is_lazy;
+}
+
+#[tokio::test]
+async fn concurrent_client_close_calls_share_one_aggregate_result() {
+    let client = Client::new();
+    let peer = client.clone();
+
+    let (left, right) = tokio::join!(client.close(), peer.close());
+
+    assert_eq!(left.unwrap(), right.unwrap());
 }
 
 #[test]
@@ -143,7 +160,7 @@ async fn domain_resource_open_and_metadata() -> smb::Result<()> {
     file.delete().await?;
     file.close().await?;
     share.close().await?;
-    client.close().await
+    client.close().await.map(|_| ())
 }
 
 #[cfg(feature = "real-server-tests")]
@@ -181,7 +198,7 @@ async fn domain_security_query_and_idempotent_set() -> smb::Result<()> {
     file.delete().await?;
     file.close().await?;
     share.close().await?;
-    client.close().await
+    client.close().await.map(|_| ())
 }
 
 #[allow(dead_code)]
@@ -245,7 +262,7 @@ async fn common_and_explicit_session_paths_compile(
     assert_eq!(file.close().await?, CloseOutcome::Confirmed);
     share.close().await?;
     session.close().await?;
-    client.close().await
+    client.close().await.map(|_| ())
 }
 
 #[cfg(feature = "real-server-tests")]
@@ -417,7 +434,7 @@ async fn domain_spine_roundtrips_without_protocol_escape_hatches() -> smb::Resul
     assert_eq!(file.close().await?, CloseOutcome::Confirmed);
     share.close().await?;
     session.close().await?;
-    client.close().await
+    client.close().await.map(|_| ())
 }
 
 #[cfg(feature = "real-server-tests")]
@@ -444,7 +461,7 @@ async fn domain_named_pipe_open_cancel_and_close() -> smb::Result<()> {
     assert_eq!(pipe.close().await?, CloseOutcome::AlreadyClosed);
     ipc.close().await?;
     session.close().await?;
-    client.close().await
+    client.close().await.map(|_| ())
 }
 
 #[cfg(feature = "real-server-tests")]
@@ -465,7 +482,7 @@ async fn domain_directory_query_only() -> smb::Result<()> {
     directory.delete().await?;
     directory.close().await?;
     share.close().await?;
-    client.close().await
+    client.close().await.map(|_| ())
 }
 
 #[cfg(feature = "real-server-tests")]
@@ -486,7 +503,7 @@ async fn previous_versions_prepare_version_a() -> smb::Result<()> {
     file.flush().await?;
     file.close().await?;
     share.close().await?;
-    client.close().await
+    client.close().await.map(|_| ())
 }
 
 #[cfg(feature = "real-server-tests")]
@@ -521,7 +538,7 @@ async fn previous_versions_read_snapshot_and_active_version() -> smb::Result<()>
     previous.close().await?;
     active.close().await?;
     share.close().await?;
-    client.close().await
+    client.close().await.map(|_| ())
 }
 
 #[cfg(feature = "real-server-tests")]
@@ -566,7 +583,7 @@ async fn previous_version_no_longer_opens_after_snapshot_delete() -> smb::Result
     active.delete().await?;
     active.close().await?;
     share.close().await?;
-    client.close().await
+    client.close().await.map(|_| ())
 }
 
 #[cfg(feature = "real-server-tests")]
@@ -593,7 +610,7 @@ async fn persistent_handle_is_granted_on_ca_share() -> smb::Result<()> {
     file.delete().await?;
     file.close().await?;
     share.close().await?;
-    client.close().await
+    client.close().await.map(|_| ())
 }
 
 #[cfg(feature = "real-server-tests")]
@@ -638,7 +655,7 @@ async fn automatic_reconnect_replaces_share_and_revokes_ordinary_file() -> smb::
         recovered.close().await?;
     }
     share.close().await?;
-    client.close().await
+    client.close().await.map(|_| ())
 }
 
 #[cfg(feature = "real-server-tests")]
@@ -762,5 +779,5 @@ async fn domain_batch_and_concurrent_transfer() -> smb::Result<()> {
     destination.close().await?;
     single.close().await?;
     share.close().await?;
-    client.close().await
+    client.close().await.map(|_| ())
 }

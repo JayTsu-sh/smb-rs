@@ -49,7 +49,7 @@ async fn main() -> smb::Result<()> {
     println!("read {} bytes", data.len());
     file.close().await?;
     share.close().await?;
-    client.close().await
+    client.close().await.map(|_| ())
 }
 ```
 

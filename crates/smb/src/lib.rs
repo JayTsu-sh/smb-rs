@@ -66,8 +66,8 @@ pub mod test_support {
 
 pub use domain::{
     Batch, BatchCommand, BatchOutcome, BatchRef, BatchResult, CancelToken, CloseOutcome,
-    Credentials, Deadline, Directory, DirectoryEntries, DirectoryEntry, DirectoryEvent,
-    DirectoryEvents, DirectoryOpenOptions, DirectoryWatchOptions, File, FileCursor,
+    CloseReport, Credentials, Deadline, Directory, DirectoryEntries, DirectoryEntry,
+    DirectoryEvent, DirectoryEvents, DirectoryOpenOptions, DirectoryWatchOptions, File, FileCursor,
     FileOpenOptions, IoCapabilities, ObjectGeneration, Operation, Pipe, PipeName, PreviousVersion,
     ReplayPolicy, Resource, ResourceMetadata, RpcPipeConnection, SecurityDescriptor,
     SecurityOpenOptions, SecuritySelection, Session, Share, SharePath, ShareTarget, Transfer,
