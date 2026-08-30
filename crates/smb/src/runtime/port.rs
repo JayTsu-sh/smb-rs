@@ -8,7 +8,7 @@
 use std::{pin::Pin, sync::Arc};
 
 use bytes::Bytes;
-use futures_core::Stream;
+use futures_core::{Stream, future::BoxFuture};
 use futures_util::TryStreamExt;
 use smb_dtyp::SecurityDescriptor;
 use smb_fscc::{
@@ -17,11 +17,11 @@ use smb_fscc::{
 };
 use smb_msg::{AdditionalInfo, CreateOptions, NotifyFilter, SrvEnumerateSnapshotsRequest};
 use sspi::{AuthIdentity, Secret, Username};
+use zeroize::Zeroizing;
 
 use crate::{
     Error,
     client::{Client as LegacyClient, ClientConfig as LegacyClientConfig, UncPath},
-    domain::{CredentialProvider, Credentials},
     resource::{
         Directory as LegacyDirectory, File as LegacyFile, FileCreateArgs, Pipe as LegacyPipe,
         Resource as LegacyResource, file::FileOperationOptions,
@@ -33,26 +33,28 @@ use crate::{
     tree::Tree as LegacyShare,
 };
 
+pub(crate) struct RuntimeCredentials {
+    pub(crate) username: Zeroizing<String>,
+    pub(crate) password: Zeroizing<String>,
+}
+
+pub(crate) trait RuntimeCredentialProvider: Send + Sync {
+    fn credentials(&self) -> BoxFuture<'_, crate::Result<RuntimeCredentials>>;
+}
+
 struct RefreshingCredentialAdapter {
-    provider: Arc<dyn CredentialProvider>,
+    provider: Arc<dyn RuntimeCredentialProvider>,
 }
 
 impl SessionCredentialProvider for RefreshingCredentialAdapter {
     fn identity(&self) -> futures_core::future::BoxFuture<'_, crate::Result<AuthIdentity>> {
         Box::pin(async move {
-            match self.provider.credentials().await? {
-                Credentials::Ntlm { username, password } => Ok(AuthIdentity {
-                    username: Username::parse(username.as_str())
-                        .map_err(|error| Error::SspiError(error.into()))?,
-                    password: Secret::from(password.to_string()),
-                }),
-                Credentials::Anonymous => Err(Error::UnsupportedOperation(
-                    "anonymous authentication is not activated".into(),
-                )),
-                Credentials::Provider(_) => Err(Error::InvalidArgument(
-                    "credential providers must return concrete credentials".into(),
-                )),
-            }
+            let credentials = self.provider.credentials().await?;
+            Ok(AuthIdentity {
+                username: Username::parse(credentials.username.as_str())
+                    .map_err(|error| Error::SspiError(error.into()))?,
+                password: Secret::from(credentials.password.to_string()),
+            })
         })
     }
 }
@@ -96,7 +98,7 @@ impl RuntimeClient {
     pub(crate) async fn authenticate_with_provider(
         &self,
         server: &str,
-        provider: Arc<dyn CredentialProvider>,
+        provider: Arc<dyn RuntimeCredentialProvider>,
     ) -> crate::Result<RuntimeSession> {
         let connection = self.inner.connect(server).await?;
         let provider: SharedCredentialProvider = Arc::new(RefreshingCredentialAdapter { provider });

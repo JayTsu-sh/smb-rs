@@ -31,7 +31,8 @@ use zeroize::Zeroizing;
 use crate::{
     Error,
     runtime::port::{
-        OpenMode, RuntimeClient, RuntimeFile, RuntimeResource, RuntimeSession, RuntimeShare,
+        OpenMode, RuntimeClient, RuntimeCredentialProvider, RuntimeCredentials, RuntimeFile,
+        RuntimeResource, RuntimeSession, RuntimeShare,
     },
 };
 
@@ -54,6 +55,28 @@ pub trait CredentialProvider: Send + Sync {
 
     /// Obtain fresh authentication material for one SessionSetup attempt.
     fn credentials(&self) -> BoxFuture<'_, crate::Result<Credentials>>;
+}
+
+struct DomainCredentialAdapter {
+    provider: Arc<dyn CredentialProvider>,
+}
+
+impl RuntimeCredentialProvider for DomainCredentialAdapter {
+    fn credentials(&self) -> BoxFuture<'_, crate::Result<RuntimeCredentials>> {
+        Box::pin(async move {
+            match self.provider.credentials().await? {
+                Credentials::Ntlm { username, password } => {
+                    Ok(RuntimeCredentials { username, password })
+                }
+                Credentials::Anonymous => Err(Error::UnsupportedOperation(
+                    "anonymous authentication is not activated".into(),
+                )),
+                Credentials::Provider(_) => Err(Error::InvalidArgument(
+                    "credential providers must return concrete credentials".into(),
+                )),
+            }
+        })
+    }
 }
 
 /// Aggregate result of closing a logical parent handle and its descendants.
@@ -423,7 +446,10 @@ impl DomainClient {
             Credentials::Provider(provider) => {
                 self.inner
                     .runtime
-                    .authenticate_with_provider(server, provider)
+                    .authenticate_with_provider(
+                        server,
+                        Arc::new(DomainCredentialAdapter { provider }),
+                    )
                     .await?
             }
             Credentials::Anonymous => unreachable!("anonymous credentials were rejected above"),
