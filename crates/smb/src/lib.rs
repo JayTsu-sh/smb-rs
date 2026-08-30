@@ -71,7 +71,7 @@ pub use domain::{
     FileOpenOptions, IoCapabilities, ObjectGeneration, Operation, Pipe, PipeName, PreviousVersion,
     ReplayPolicy, Resource, ResourceMetadata, RpcPipeConnection, SecurityDescriptor,
     SecurityOpenOptions, SecuritySelection, Session, Share, SharePath, ShareTarget, Transfer,
-    TransferEvents, TransferOptions, TransferProgress, TransferReport, TransferStrategy,
+    TransferEvents, TransferOptions, TransferProgress, TransferReport,
 };
 pub use error::Error;
 pub use facade::{Client, ClientConfig, RemoteShare, ShareKind};

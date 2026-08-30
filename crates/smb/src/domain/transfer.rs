@@ -14,21 +14,12 @@ use tokio::sync::broadcast;
 use super::{CancelToken, File, Operation, ReplayPolicy};
 use crate::Error;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum TransferStrategy {
-    #[default]
-    Auto,
-    ClientSide,
-    ServerSide,
-}
-
 #[derive(Clone)]
 pub struct TransferOptions {
     concurrency: usize,
     chunk_size: u32,
     deadline: Option<Instant>,
     cancellation: Option<CancelToken>,
-    strategy: TransferStrategy,
     progress_capacity: usize,
 }
 
@@ -39,7 +30,6 @@ impl Default for TransferOptions {
             chunk_size: 1024 * 1024,
             deadline: None,
             cancellation: None,
-            strategy: TransferStrategy::Auto,
             progress_capacity: 64,
         }
     }
@@ -68,11 +58,6 @@ impl TransferOptions {
 
     pub fn cancellation(mut self, cancellation: CancelToken) -> Self {
         self.cancellation = Some(cancellation);
-        self
-    }
-
-    pub const fn strategy(mut self, strategy: TransferStrategy) -> Self {
-        self.strategy = strategy;
         self
     }
 
@@ -111,7 +96,6 @@ impl Stream for TransferEvents {
 pub struct TransferReport {
     bytes: u64,
     chunks: u64,
-    strategy: TransferStrategy,
 }
 
 impl TransferReport {
@@ -123,9 +107,6 @@ impl TransferReport {
         self.chunks
     }
 
-    pub const fn strategy(&self) -> TransferStrategy {
-        self.strategy
-    }
 }
 
 #[must_use = "transfers do nothing until polled or awaited"]
@@ -235,12 +216,6 @@ where
             "transfer concurrency and chunk size must be non-zero".into(),
         ));
     }
-    if options.strategy == TransferStrategy::ServerSide {
-        return Err(Error::UnsupportedOperation(
-            "server-side transfer is unavailable for this File pair".into(),
-        ));
-    }
-
     let mut pending = FuturesUnordered::new();
     let mut ready: BTreeMap<u64, Bytes> = BTreeMap::new();
     let mut next_read = 0_u64;
@@ -322,7 +297,6 @@ where
     Ok(TransferReport {
         bytes: transferred,
         chunks,
-        strategy: TransferStrategy::ClientSide,
     })
 }
 

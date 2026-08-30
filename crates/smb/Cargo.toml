@@ -104,15 +104,15 @@ name = "lifecycle_scenario"
 required-features = ["test-support"]
 
 [[test]]
-name = "rpc"
-required-features = ["real-server-tests"]
-
-[[test]]
 name = "ontap_performance"
 required-features = ["real-server-tests"]
 
+[[test]]
+name = "transform_copy_budget"
+required-features = ["compress"]
+
 [features]
-default = ["sign", "encrypt", "compress", "std-fs-impls", "netbios-transport"]
+default = ["sign", "encrypt", "netbios-transport"]
 
 # Compression
 compress_pattern_v1 = []
@@ -136,18 +136,10 @@ sign_hmac = []
 sign = ["sign_gmac", "sign_cmac", "sign_hmac"]
 
 # Transport
-quic = ["smb-transport/quic"]
-rdma = ["smb-transport/rdma"]
 netbios-transport = ["smb-transport/netbios-transport"]
 
 # Kerberos requires reqwest for HTTP transport, for kerberos
 kerberos = ["reqwest", "dep:byteorder"]
-
-# Implement traits for std::fs::File/tokio::fs::File
-std-fs-impls = ["tokio/fs"]
-
-# Debugging
-__debug-dump-keys = []
 
 # Test-only API surface: exposes session-setup internals (GssState,
 # authenticate_with_gss) and pulls in the smb-msg `server` feature so
@@ -157,9 +149,6 @@ __debug-dump-keys = []
 test-support = ["smb-msg/server", "smb-transport/test-support", "dep:serde"]
 real-server-tests = []
 
-# Tests
-test-ndr64 = []
-
 [package.metadata.docs.rs]
-features = ["sign", "encrypt", "compress", "kerberos", "quic"]
+features = ["sign", "encrypt", "compress", "kerberos"]
 no-default-features = true

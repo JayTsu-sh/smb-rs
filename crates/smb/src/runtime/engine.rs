@@ -1969,10 +1969,6 @@ fn transport_error_code(error: &TransportError) -> &'static str {
         TransportError::Timeout(_) => "timeout",
         TransportError::InvalidAddress(_) => "invalid-address",
         TransportError::IoError(_) => "io",
-        #[cfg(feature = "quic")]
-        TransportError::QuicError(_) => "quic",
-        #[cfg(feature = "rdma")]
-        TransportError::RdmaError(_) => "rdma",
     }
 }
 

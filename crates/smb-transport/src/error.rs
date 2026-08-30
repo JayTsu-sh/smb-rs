@@ -27,14 +27,6 @@ pub enum TransportError {
     InvalidAddress(String),
     #[error("IO Error: {0}")]
     IoError(#[from] std::io::Error),
-
-    #[cfg(feature = "quic")]
-    #[error("QUIC error: {0}")]
-    QuicError(#[from] crate::quic::QuicError),
-
-    #[cfg(feature = "rdma")]
-    #[error("RDMA error: {0}")]
-    RdmaError(#[from] crate::rdma::RdmaError),
 }
 
 pub type Result<T> = std::result::Result<T, TransportError>;

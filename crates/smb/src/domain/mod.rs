@@ -12,7 +12,7 @@ pub use operation::{CancelToken, Deadline, Operation, ReplayPolicy};
 pub use rpc::RpcPipeConnection;
 pub use security::{SecurityDescriptor, SecurityOpenOptions, SecuritySelection};
 pub use transfer::{
-    Transfer, TransferEvents, TransferOptions, TransferProgress, TransferReport, TransferStrategy,
+    Transfer, TransferEvents, TransferOptions, TransferProgress, TransferReport,
 };
 
 use std::{

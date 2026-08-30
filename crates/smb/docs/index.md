@@ -48,7 +48,6 @@ the object hierarchy above.
 | Type | Algorithm | Feature |
 | --- | --- | --- |
 | Authentication | Kerberos | `kerberos` |
-| Transport | QUIC | `quic` |
 | Signing | all supported | `sign` |
 | Signing | HMAC-SHA256 | `sign_hmac` |
 | Signing | AES-GMAC | `sign_gmac` |

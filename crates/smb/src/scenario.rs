@@ -122,10 +122,6 @@ impl From<smb_transport::TransportError> for ScenarioTaskError {
             smb_transport::TransportError::Timeout(_) => "transport-timeout",
             smb_transport::TransportError::InvalidAddress(_) => "transport-invalid-address",
             smb_transport::TransportError::IoError(_) => "transport-io",
-            #[cfg(feature = "quic")]
-            smb_transport::TransportError::QuicError(_) => "transport-quic",
-            #[cfg(feature = "rdma")]
-            smb_transport::TransportError::RdmaError(_) => "transport-rdma",
         };
         Self::failed(code)
     }

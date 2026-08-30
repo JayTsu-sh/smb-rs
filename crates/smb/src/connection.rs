@@ -499,27 +499,6 @@ impl Connection {
                 compression_algorithms,
                 signing_algorithms,
             );
-            // QUIC
-            #[cfg(feature = "quic")]
-            if matches!(self.config.transport, TransportConfig::Quic(_)) {
-                ctx_list.push(NegotiateContext {
-                    context_type: NegotiateContextType::TransportCapabilities,
-                    data: NegotiateContextValue::TransportCapabilities(
-                        TransportCapabilities::new().with_accept_transport_layer_security(true),
-                    ),
-                });
-            }
-            // TODO: Add to config
-            if cfg!(feature = "rdma") {
-                ctx_list.push(NegotiateContext {
-                    context_type: NegotiateContextType::RdmaTransformCapabilities,
-                    data: NegotiateContextValue::RdmaTransformCapabilities(
-                        RdmaTransformCapabilities {
-                            transforms: vec![RdmaTransformId::None],
-                        },
-                    ),
-                });
-            }
             Some(ctx_list)
         } else {
             None

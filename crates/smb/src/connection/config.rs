@@ -87,9 +87,6 @@ pub enum MultiChannelConfig {
     /// interfaces. This is the recommended default for code that wants
     /// Multi-Channel where it is available.
     Auto,
-    /// Multi-channel is enabled only if using RDMA transport, and if supported by the server and client.
-    #[cfg(feature = "rdma")]
-    RdmaOnly,
 }
 
 impl MultiChannelConfig {
@@ -97,18 +94,8 @@ impl MultiChannelConfig {
     pub fn is_enabled(&self) -> bool {
         match self {
             MultiChannelConfig::Auto => true,
-            #[cfg(feature = "rdma")]
-            MultiChannelConfig::RdmaOnly => true,
             MultiChannelConfig::Disabled => false,
         }
-    }
-
-    /// Returns whether multichannel is enabled only for RDMA transport.
-    pub fn is_rdma_only(&self) -> bool {
-        #[cfg(feature = "rdma")]
-        return matches!(self, MultiChannelConfig::RdmaOnly);
-        #[cfg(not(feature = "rdma"))]
-        return false;
     }
 }
 
@@ -182,7 +169,7 @@ pub struct ConnectionConfig {
     /// Whether to enable compression, if supported by the server and specified connection dialects.
     ///
     /// Note: you must also have compression features enabled when building the crate, otherwise compression
-    /// would not be available. *The compression feature is enabled by default.*
+    /// would not be available. Compression is disabled in the default build.
     pub compression_enabled: bool,
 
     /// Multi-channel configuration
@@ -238,16 +225,6 @@ impl ConnectionConfig {
                 ));
             }
         }
-        // Make sure transport is supported by the dialects.
-        #[cfg(feature = "quic")]
-        if let Some(min) = self.min_dialect {
-            if min < Dialect::Smb0311 && matches!(self.transport, TransportConfig::Quic(_)) {
-                return Err(crate::Error::InvalidConfiguration(
-                    "SMB over QUIC is not supported by the selected dialect".to_string(),
-                ));
-            }
-        }
-
         if let Some(default_transaction_size) = self.default_transaction_size {
             if default_transaction_size == 0 {
                 return Err(crate::Error::InvalidConfiguration(

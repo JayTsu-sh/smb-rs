@@ -9,15 +9,13 @@ rust-version.workspace = true
 
 [dependencies]
 smb = { workspace = true, features = [
-    "compress",
     "encrypt",
     "netbios-transport",
     "sign",
-    "std-fs-impls",
 ] }
 bytes = { workspace = true }
 
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
 tokio-util = { workspace = true }
 futures-util = { workspace = true }
 futures = { workspace = true }

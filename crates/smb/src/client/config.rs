@@ -46,9 +46,6 @@ pub struct ClientConfig {
     /// different salts so they don't accidentally share lease state on
     /// the server side.
     pub lease_key_salt: u64,
-
-    #[cfg(feature = "rdma")]
-    pub rdma_type: Option<crate::transport::RdmaType>,
 }
 
 impl Default for ClientConfig {
@@ -59,8 +56,6 @@ impl Default for ClientConfig {
             client_guid: Guid::generate(),
             default_lease_state: None,
             lease_key_salt: rand::random(),
-            #[cfg(feature = "rdma")]
-            rdma_type: None,
         }
     }
 }

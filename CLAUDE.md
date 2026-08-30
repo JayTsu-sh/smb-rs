@@ -100,4 +100,4 @@ Threading models (mutually exclusive):
 - `single_threaded` — single-thread sync
 
 Crypto: `sign`, `encrypt`, `compress` (each with sub-features)
-Transport: `netbios-transport`, `quic`, `rdma`
+Transport: `netbios-transport`

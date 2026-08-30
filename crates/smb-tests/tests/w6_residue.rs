@@ -59,18 +59,49 @@ fn activation_ledger_is_at_w6_without_temporary_adapters() {
 #[test]
 fn removed_dead_features_cannot_return() {
     let smb_manifest = read("crates/smb/Cargo.toml");
-    for feature in ["test-multichannel", "test-quic", "test-rdma"] {
+    for feature in [
+        "test-multichannel",
+        "test-quic",
+        "test-rdma",
+        "quic =",
+        "rdma =",
+        "std-fs-impls",
+        "test-ndr64",
+        "__debug-dump-keys",
+    ] {
         assert!(
             !smb_manifest.contains(feature),
             "dead feature returned: {feature}"
         );
     }
 
+    let default_features = smb_manifest
+        .lines()
+        .find(|line| line.starts_with("default ="))
+        .expect("smb default feature declaration exists");
+    assert!(
+        !default_features.contains("compress"),
+        "compression returned to the default FAS-oriented build"
+    );
+
     let cli_manifest = read("smb-cli/Cargo.toml");
     for feature in ["profiling =", "quic =", "rdma =", "netbios-transport ="] {
         assert!(
             !cli_manifest.contains(feature),
             "dead CLI feature returned: {feature}"
+        );
+    }
+
+    for path in [
+        "crates/smb-transport/src/quic.rs",
+        "crates/smb-transport/src/quic",
+        "crates/smb-transport/src/rdma.rs",
+        "crates/smb-transport/src/rdma",
+        "crates/smb-transport/README.rdma.md",
+    ] {
+        assert!(
+            !workspace_root().join(path).exists(),
+            "dead transport returned: {path}"
         );
     }
 }
