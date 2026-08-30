@@ -1,0 +1,76 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("smb-tests lives under workspace/crates")
+        .to_owned()
+}
+
+fn read(relative: &str) -> String {
+    fs::read_to_string(workspace_root().join(relative))
+        .unwrap_or_else(|error| panic!("read {relative}: {error}"))
+}
+
+#[test]
+fn legacy_public_spine_and_temporary_adapter_cannot_return() {
+    let lib = read("crates/smb/src/lib.rs");
+    for declaration in [
+        "pub mod client;",
+        "pub mod command;",
+        "pub mod connection;",
+        "pub mod resource;",
+        "pub mod session;",
+        "pub mod tree;",
+    ] {
+        assert!(
+            !lib.contains(declaration),
+            "legacy API returned: {declaration}"
+        );
+    }
+
+    for path in [
+        "crates/smb/src/runtime/domain_bridge.rs",
+        "crates/smb/src/connection/worker.rs",
+        "crates/smb/src/connection/worker/runtime_worker.rs",
+        "docs/architecture/current-architecture-audit.md",
+    ] {
+        assert!(
+            !workspace_root().join(path).exists(),
+            "residue returned: {path}"
+        );
+    }
+}
+
+#[test]
+fn activation_ledger_is_at_w6_without_temporary_adapters() {
+    let rules: serde_json::Value =
+        serde_json::from_str(&read("docs/architecture/dependency-rules.json"))
+            .expect("dependency rules remain valid JSON");
+    assert_eq!(rules["current_wave"], "W6");
+    assert_eq!(
+        rules["temporary_adapters"].as_array().map(Vec::len),
+        Some(0)
+    );
+}
+
+#[test]
+fn removed_dead_features_cannot_return() {
+    let smb_manifest = read("crates/smb/Cargo.toml");
+    for feature in ["test-multichannel", "test-quic", "test-rdma"] {
+        assert!(
+            !smb_manifest.contains(feature),
+            "dead feature returned: {feature}"
+        );
+    }
+
+    let cli_manifest = read("smb-cli/Cargo.toml");
+    for feature in ["profiling =", "quic =", "rdma =", "netbios-transport ="] {
+        assert!(
+            !cli_manifest.contains(feature),
+            "dead CLI feature returned: {feature}"
+        );
+    }
+}

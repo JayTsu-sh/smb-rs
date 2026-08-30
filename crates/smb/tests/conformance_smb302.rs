@@ -5,7 +5,7 @@
 //! without a Negotiate context list, so:
 //!
 //! - `PreauthHashState` stays `Unsupported` on the connection,
-//! - `Transformer::transform_outgoing` / `transform_incoming`'s
+//! - the runtime wire pipeline's outgoing/incoming transform path
 //!   auto-ingest is a noop (the `Unsupported.next(_)` branch),
 //! - `snapshot_preauth_finalized` returns `Ok(None)`,
 //! - `ChannelInfo::new` derives the SigningKey using the static
