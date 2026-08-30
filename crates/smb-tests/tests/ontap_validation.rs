@@ -1,6 +1,6 @@
 use smb_tests::ontap::{
     ApplyAuthorization, Inventory, Lifecycle, Mutation, OntapAdapter, Plan, ProvisioningRun,
-    ResourceKind, RunManifest, ShareRole,
+    ResourceKind, RunManifest, ShareRole, VolumeRole,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -29,7 +29,7 @@ fn temp_manifest(name: &str) -> PathBuf {
 fn plan_uses_exact_run_owned_names_and_secret_free_commands() {
     let plan = fixture();
     assert_eq!(
-        plan.volume_name(),
+        plan.volume_name(VolumeRole::Functional),
         "smbrs_0123456789abcdef0123456789abcdef_functional"
     );
     assert_eq!(
@@ -203,16 +203,19 @@ impl ScriptedOntap {
 }
 
 impl OntapAdapter for ScriptedOntap {
-    fn create_volume(&mut self, _: &Plan) -> Result<(), String> {
-        self.action("create-volume")
-    }
-    fn create_ca_volume(&mut self, _: &Plan) -> Result<(), String> {
-        self.action("create-ca-volume")
+    fn create_volume(&mut self, _: &Plan, role: VolumeRole) -> Result<(), String> {
+        self.action(match role {
+            VolumeRole::Functional => "create-volume",
+            VolumeRole::Performance => "create-performance-volume",
+            VolumeRole::Ca => "create-ca-volume",
+        })
     }
     fn create_share(&mut self, _: &Plan, role: ShareRole) -> Result<(), String> {
         self.action(match role {
             ShareRole::Plain => "create-plain-share",
             ShareRole::Encrypted => "create-encrypted-share",
+            ShareRole::PerformancePlain => "create-performance-plain-share",
+            ShareRole::PerformanceEncrypted => "create-performance-encrypted-share",
             ShareRole::Ca => "create-ca-share",
         })
     }
@@ -220,6 +223,8 @@ impl OntapAdapter for ScriptedOntap {
         self.action(match role {
             ShareRole::Plain => "remove-plain-everyone-acl",
             ShareRole::Encrypted => "remove-encrypted-everyone-acl",
+            ShareRole::PerformancePlain => "remove-performance-plain-everyone-acl",
+            ShareRole::PerformanceEncrypted => "remove-performance-encrypted-everyone-acl",
             ShareRole::Ca => "remove-ca-everyone-acl",
         })
     }
@@ -227,6 +232,8 @@ impl OntapAdapter for ScriptedOntap {
         self.action(match role {
             ShareRole::Plain => "grant-plain-test-acl",
             ShareRole::Encrypted => "grant-encrypted-test-acl",
+            ShareRole::PerformancePlain => "grant-performance-plain-test-acl",
+            ShareRole::PerformanceEncrypted => "grant-performance-encrypted-test-acl",
             ShareRole::Ca => "grant-ca-test-acl",
         })
     }
@@ -236,6 +243,9 @@ impl OntapAdapter for ScriptedOntap {
             ResourceKind::PlainShare => "verify-plain-share-ready",
             ResourceKind::EncryptedShare => "verify-encrypted-share-ready",
             ResourceKind::Snapshot => "verify-snapshot-ready",
+            ResourceKind::PerformanceVolume => "verify-performance-volume-ready",
+            ResourceKind::PerformancePlainShare => "verify-performance-plain-share-ready",
+            ResourceKind::PerformanceEncryptedShare => "verify-performance-encrypted-share-ready",
             ResourceKind::CaVolume => "verify-ca-volume-ready",
             ResourceKind::CaShare => "verify-ca-share-ready",
         });
@@ -247,6 +257,9 @@ impl OntapAdapter for ScriptedOntap {
             ResourceKind::PlainShare => "verify-plain-share-owned",
             ResourceKind::EncryptedShare => "verify-encrypted-share-owned",
             ResourceKind::Snapshot => "verify-snapshot-owned",
+            ResourceKind::PerformanceVolume => "verify-performance-volume-owned",
+            ResourceKind::PerformancePlainShare => "verify-performance-plain-share-owned",
+            ResourceKind::PerformanceEncryptedShare => "verify-performance-encrypted-share-owned",
             ResourceKind::CaVolume => "verify-ca-volume-owned",
             ResourceKind::CaShare => "verify-ca-share-owned",
         });
@@ -256,26 +269,31 @@ impl OntapAdapter for ScriptedOntap {
         self.action(match role {
             ShareRole::Plain => "delete-plain-share",
             ShareRole::Encrypted => "delete-encrypted-share",
+            ShareRole::PerformancePlain => "delete-performance-plain-share",
+            ShareRole::PerformanceEncrypted => "delete-performance-encrypted-share",
             ShareRole::Ca => "delete-ca-share",
         })
     }
-    fn unmount_volume(&mut self, _: &Plan) -> Result<(), String> {
-        self.action("unmount-volume")
+    fn unmount_volume(&mut self, _: &Plan, role: VolumeRole) -> Result<(), String> {
+        self.action(match role {
+            VolumeRole::Functional => "unmount-volume",
+            VolumeRole::Performance => "unmount-performance-volume",
+            VolumeRole::Ca => "unmount-ca-volume",
+        })
     }
-    fn offline_volume(&mut self, _: &Plan) -> Result<(), String> {
-        self.action("offline-volume")
+    fn offline_volume(&mut self, _: &Plan, role: VolumeRole) -> Result<(), String> {
+        self.action(match role {
+            VolumeRole::Functional => "offline-volume",
+            VolumeRole::Performance => "offline-performance-volume",
+            VolumeRole::Ca => "offline-ca-volume",
+        })
     }
-    fn delete_volume(&mut self, _: &Plan) -> Result<(), String> {
-        self.action("delete-volume")
-    }
-    fn unmount_ca_volume(&mut self, _: &Plan) -> Result<(), String> {
-        self.action("unmount-ca-volume")
-    }
-    fn offline_ca_volume(&mut self, _: &Plan) -> Result<(), String> {
-        self.action("offline-ca-volume")
-    }
-    fn delete_ca_volume(&mut self, _: &Plan) -> Result<(), String> {
-        self.action("delete-ca-volume")
+    fn delete_volume(&mut self, _: &Plan, role: VolumeRole) -> Result<(), String> {
+        self.action(match role {
+            VolumeRole::Functional => "delete-volume",
+            VolumeRole::Performance => "delete-performance-volume",
+            VolumeRole::Ca => "delete-ca-volume",
+        })
     }
     fn create_snapshot(&mut self, _: &Plan) -> Result<(), String> {
         self.action("create-snapshot")
@@ -336,6 +354,18 @@ fn provisioning_persists_ready_resources_in_dependency_order() {
         Some(Lifecycle::Ready)
     );
     assert_eq!(
+        recovered.state(ResourceKind::PerformanceVolume),
+        Some(Lifecycle::Ready)
+    );
+    assert_eq!(
+        recovered.state(ResourceKind::PerformancePlainShare),
+        Some(Lifecycle::Ready)
+    );
+    assert_eq!(
+        recovered.state(ResourceKind::PerformanceEncryptedShare),
+        Some(Lifecycle::Ready)
+    );
+    assert_eq!(
         recovered.state(ResourceKind::CaVolume),
         Some(Lifecycle::Ready)
     );
@@ -347,19 +377,29 @@ fn provisioning_persists_ready_resources_in_dependency_order() {
         adapter.calls,
         vec![
             "create-volume",
+            "create-performance-volume",
+            "create-ca-volume",
             "create-plain-share",
             "remove-plain-everyone-acl",
             "grant-plain-test-acl",
             "create-encrypted-share",
             "remove-encrypted-everyone-acl",
             "grant-encrypted-test-acl",
-            "create-ca-volume",
+            "create-performance-plain-share",
+            "remove-performance-plain-everyone-acl",
+            "grant-performance-plain-test-acl",
+            "create-performance-encrypted-share",
+            "remove-performance-encrypted-everyone-acl",
+            "grant-performance-encrypted-test-acl",
             "create-ca-share",
             "remove-ca-everyone-acl",
             "grant-ca-test-acl",
             "verify-volume-ready",
             "verify-plain-share-ready",
             "verify-encrypted-share-ready",
+            "verify-performance-volume-ready",
+            "verify-performance-plain-share-ready",
+            "verify-performance-encrypted-share-ready",
             "verify-ca-volume-ready",
             "verify-ca-share-ready",
         ]
@@ -395,20 +435,34 @@ fn provisioning_failure_runs_owned_reverse_cleanup_and_persists_it() {
     assert_eq!(
         recovered.mutations(),
         &[
-            Mutation::PlainEveryoneAclRemoved,
-            Mutation::VolumeUnmounted,
-            Mutation::VolumeOfflined
+            Mutation::EveryoneAclRemoved(ShareRole::Plain),
+            Mutation::VolumeUnmounted(VolumeRole::Ca),
+            Mutation::VolumeOfflined(VolumeRole::Ca),
+            Mutation::VolumeUnmounted(VolumeRole::Performance),
+            Mutation::VolumeOfflined(VolumeRole::Performance),
+            Mutation::VolumeUnmounted(VolumeRole::Functional),
+            Mutation::VolumeOfflined(VolumeRole::Functional)
         ]
     );
     assert_eq!(
         adapter.calls,
         vec![
             "create-volume",
+            "create-performance-volume",
+            "create-ca-volume",
             "create-plain-share",
             "remove-plain-everyone-acl",
             "grant-plain-test-acl",
             "verify-plain-share-owned",
             "delete-plain-share",
+            "verify-ca-volume-owned",
+            "unmount-ca-volume",
+            "offline-ca-volume",
+            "delete-ca-volume",
+            "verify-performance-volume-owned",
+            "unmount-performance-volume",
+            "offline-performance-volume",
+            "delete-performance-volume",
             "verify-volume-owned",
             "unmount-volume",
             "offline-volume",

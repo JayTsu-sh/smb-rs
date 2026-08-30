@@ -25,6 +25,10 @@ pub struct Plan {
     encrypted_share: String,
     snapshot: String,
     junction: String,
+    performance_volume: String,
+    performance_plain_share: String,
+    performance_encrypted_share: String,
+    performance_junction: String,
     ca_volume: String,
     ca_share: String,
     ca_junction: String,
@@ -69,6 +73,10 @@ impl Plan {
             encrypted_share: format!("{stem}_encrypted"),
             snapshot: format!("{stem}_previous"),
             junction: format!("/{stem}_functional"),
+            performance_volume: format!("{stem}_performance"),
+            performance_plain_share: format!("{stem}_perf_plain"),
+            performance_encrypted_share: format!("{stem}_perf_encrypted"),
+            performance_junction: format!("/{stem}_performance"),
             ca_volume: format!("{stem}_ca"),
             ca_share: format!("{stem}_ca"),
             ca_junction: format!("/{stem}_ca"),
@@ -77,13 +85,26 @@ impl Plan {
         })
     }
 
-    pub fn volume_name(&self) -> &str {
-        &self.volume
+    pub fn volume_name(&self, role: VolumeRole) -> &str {
+        match role {
+            VolumeRole::Functional => &self.volume,
+            VolumeRole::Performance => &self.performance_volume,
+            VolumeRole::Ca => &self.ca_volume,
+        }
+    }
+    pub fn junction(&self, role: VolumeRole) -> &str {
+        match role {
+            VolumeRole::Functional => &self.junction,
+            VolumeRole::Performance => &self.performance_junction,
+            VolumeRole::Ca => &self.ca_junction,
+        }
     }
     pub fn share_name(&self, role: ShareRole) -> &str {
         match role {
             ShareRole::Plain => &self.plain_share,
             ShareRole::Encrypted => &self.encrypted_share,
+            ShareRole::PerformancePlain => &self.performance_plain_share,
+            ShareRole::PerformanceEncrypted => &self.performance_encrypted_share,
             ShareRole::Ca => &self.ca_share,
         }
     }
@@ -126,41 +147,45 @@ impl Plan {
     }
 
     pub fn provision_commands(&self) -> Vec<Vec<String>> {
-        let mut commands = vec![args(&[
-            "volume",
-            "create",
-            "-vserver",
-            &self.svm,
-            "-volume",
-            &self.volume,
-            "-aggregate",
-            &self.aggregate,
-            "-size",
-            "2GB",
-            "-security-style",
-            "unix",
-            "-unix-permissions",
-            "0770",
-            "-junction-path",
-            &self.junction,
-            "-comment",
-            &self.owner_comment,
-            "-autosize-mode",
-            "off",
-            "-space-guarantee",
-            "none",
-            "-snapshot-policy",
-            "none",
-        ])];
-        for role in [ShareRole::Plain, ShareRole::Encrypted] {
+        let mut commands = Vec::new();
+        for role in [
+            VolumeRole::Functional,
+            VolumeRole::Performance,
+            VolumeRole::Ca,
+        ] {
+            let mut command = args(&[
+                "volume",
+                "create",
+                "-vserver",
+                &self.svm,
+                "-volume",
+                self.volume_name(role),
+                "-aggregate",
+                &self.aggregate,
+                "-size",
+                role.size(),
+                "-security-style",
+                role.security_style(),
+            ]);
+            if role != VolumeRole::Ca {
+                command.extend(args(&["-unix-permissions", "0770"]));
+            }
+            command.extend(args(&[
+                "-junction-path",
+                self.junction(role),
+                "-comment",
+                &self.owner_comment,
+                "-autosize-mode",
+                "off",
+                "-space-guarantee",
+                "none",
+                "-snapshot-policy",
+                "none",
+            ]));
+            commands.push(command);
+        }
+        for role in ShareRole::ALL {
             let share = self.share_name(role);
-            let properties = match role {
-                ShareRole::Plain => "oplocks,browsable,changenotify,show-previous-versions",
-                ShareRole::Encrypted => {
-                    "oplocks,browsable,changenotify,show-previous-versions,encrypt-data"
-                }
-                ShareRole::Ca => unreachable!("CA uses its independent volume"),
-            };
             commands.push(args(&[
                 "vserver",
                 "cifs",
@@ -171,9 +196,9 @@ impl Plan {
                 "-share-name",
                 share,
                 "-path",
-                &self.junction,
+                self.junction(role.volume_role()),
                 "-share-properties",
-                properties,
+                role.properties(),
                 "-comment",
                 &self.owner_comment,
             ]));
@@ -206,30 +231,6 @@ impl Plan {
                 "Full_Control",
             ]));
         }
-        commands.push(args(&[
-            "volume",
-            "create",
-            "-vserver",
-            &self.svm,
-            "-volume",
-            &self.ca_volume,
-            "-aggregate",
-            &self.aggregate,
-            "-size",
-            "2GB",
-            "-security-style",
-            "ntfs",
-            "-junction-path",
-            &self.ca_junction,
-            "-comment",
-            &self.owner_comment,
-            "-autosize-mode",
-            "off",
-            "-space-guarantee",
-            "none",
-            "-snapshot-policy",
-            "none",
-        ]));
         commands
     }
 
@@ -268,6 +269,9 @@ pub enum ResourceKind {
     PlainShare,
     EncryptedShare,
     Snapshot,
+    PerformanceVolume,
+    PerformancePlainShare,
+    PerformanceEncryptedShare,
     CaVolume,
     CaShare,
 }
@@ -276,15 +280,80 @@ pub enum ResourceKind {
 pub enum ShareRole {
     Plain,
     Encrypted,
+    PerformancePlain,
+    PerformanceEncrypted,
     Ca,
 }
 
 impl ShareRole {
+    const ALL: [Self; 5] = [
+        Self::Plain,
+        Self::Encrypted,
+        Self::PerformancePlain,
+        Self::PerformanceEncrypted,
+        Self::Ca,
+    ];
+
     fn resource(self) -> ResourceKind {
         match self {
             Self::Plain => ResourceKind::PlainShare,
             Self::Encrypted => ResourceKind::EncryptedShare,
+            Self::PerformancePlain => ResourceKind::PerformancePlainShare,
+            Self::PerformanceEncrypted => ResourceKind::PerformanceEncryptedShare,
             Self::Ca => ResourceKind::CaShare,
+        }
+    }
+
+    const fn volume_role(self) -> VolumeRole {
+        match self {
+            Self::Plain | Self::Encrypted => VolumeRole::Functional,
+            Self::PerformancePlain | Self::PerformanceEncrypted => VolumeRole::Performance,
+            Self::Ca => VolumeRole::Ca,
+        }
+    }
+
+    const fn properties(self) -> &'static str {
+        match self {
+            Self::Plain | Self::PerformancePlain => {
+                "oplocks,browsable,changenotify,show-previous-versions"
+            }
+            Self::Encrypted | Self::PerformanceEncrypted => {
+                "oplocks,browsable,changenotify,show-previous-versions,encrypt-data"
+            }
+            Self::Ca => "oplocks,browsable,changenotify,continuously-available",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum VolumeRole {
+    Functional,
+    Performance,
+    Ca,
+}
+
+impl VolumeRole {
+    const ALL: [Self; 3] = [Self::Functional, Self::Performance, Self::Ca];
+
+    const fn resource(self) -> ResourceKind {
+        match self {
+            Self::Functional => ResourceKind::Volume,
+            Self::Performance => ResourceKind::PerformanceVolume,
+            Self::Ca => ResourceKind::CaVolume,
+        }
+    }
+
+    const fn size(self) -> &'static str {
+        match self {
+            Self::Functional | Self::Ca => "2GB",
+            Self::Performance => "16GB",
+        }
+    }
+
+    const fn security_style(self) -> &'static str {
+        match self {
+            Self::Functional | Self::Performance => "unix",
+            Self::Ca => "ntfs",
         }
     }
 }
@@ -300,12 +369,10 @@ pub enum Lifecycle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mutation {
-    PlainEveryoneAclRemoved,
-    PlainTestIdentityAclGranted,
-    EncryptedEveryoneAclRemoved,
-    EncryptedTestIdentityAclGranted,
-    VolumeUnmounted,
-    VolumeOfflined,
+    EveryoneAclRemoved(ShareRole),
+    TestIdentityAclGranted(ShareRole),
+    VolumeUnmounted(VolumeRole),
+    VolumeOfflined(VolumeRole),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,6 +390,9 @@ impl Inventory {
                 (ResourceKind::PlainShare, Lifecycle::Planned),
                 (ResourceKind::EncryptedShare, Lifecycle::Planned),
                 (ResourceKind::Snapshot, Lifecycle::Planned),
+                (ResourceKind::PerformanceVolume, Lifecycle::Planned),
+                (ResourceKind::PerformancePlainShare, Lifecycle::Planned),
+                (ResourceKind::PerformanceEncryptedShare, Lifecycle::Planned),
                 (ResourceKind::CaVolume, Lifecycle::Planned),
                 (ResourceKind::CaShare, Lifecycle::Planned),
             ]),
@@ -365,9 +435,12 @@ impl Inventory {
         [
             ResourceKind::Snapshot,
             ResourceKind::CaShare,
+            ResourceKind::PerformanceEncryptedShare,
+            ResourceKind::PerformancePlainShare,
             ResourceKind::EncryptedShare,
             ResourceKind::PlainShare,
             ResourceKind::CaVolume,
+            ResourceKind::PerformanceVolume,
             ResourceKind::Volume,
         ]
         .into_iter()
@@ -384,15 +457,19 @@ impl Inventory {
         if self.state(kind) == Some(Lifecycle::OwnershipMismatch) {
             return Err("resource ownership does not match the manifest".into());
         }
-        if matches!(kind, ResourceKind::Volume | ResourceKind::CaVolume)
-            && [
-                ResourceKind::PlainShare,
-                ResourceKind::EncryptedShare,
-                ResourceKind::Snapshot,
-                ResourceKind::CaShare,
-            ]
-            .into_iter()
-            .any(|share| self.state(share) == Some(Lifecycle::OwnershipMismatch))
+        if matches!(
+            kind,
+            ResourceKind::Volume | ResourceKind::PerformanceVolume | ResourceKind::CaVolume
+        ) && [
+            ResourceKind::PlainShare,
+            ResourceKind::EncryptedShare,
+            ResourceKind::Snapshot,
+            ResourceKind::PerformancePlainShare,
+            ResourceKind::PerformanceEncryptedShare,
+            ResourceKind::CaShare,
+        ]
+        .into_iter()
+        .any(|share| self.state(share) == Some(Lifecycle::OwnershipMismatch))
         {
             return Err("child ownership mismatch blocks parent deletion".into());
         }
@@ -427,6 +504,9 @@ impl Inventory {
             ResourceKind::PlainShare,
             ResourceKind::EncryptedShare,
             ResourceKind::Snapshot,
+            ResourceKind::PerformanceVolume,
+            ResourceKind::PerformancePlainShare,
+            ResourceKind::PerformanceEncryptedShare,
             ResourceKind::CaVolume,
             ResourceKind::CaShare,
         ];
@@ -678,20 +758,16 @@ fn io_error(operation: &'static str) -> impl FnOnce(io::Error) -> String {
 /// Adapter at the true-external ONTAP seam. Implementations perform one exact
 /// appliance mutation or verification per method.
 pub trait OntapAdapter {
-    fn create_volume(&mut self, plan: &Plan) -> Result<(), String>;
-    fn create_ca_volume(&mut self, plan: &Plan) -> Result<(), String>;
+    fn create_volume(&mut self, plan: &Plan, role: VolumeRole) -> Result<(), String>;
     fn create_share(&mut self, plan: &Plan, role: ShareRole) -> Result<(), String>;
     fn remove_everyone_acl(&mut self, plan: &Plan, role: ShareRole) -> Result<(), String>;
     fn grant_test_acl(&mut self, plan: &Plan, role: ShareRole) -> Result<(), String>;
     fn verify_ready(&mut self, plan: &Plan, kind: ResourceKind) -> Result<bool, String>;
     fn verify_owned(&mut self, plan: &Plan, kind: ResourceKind) -> Result<bool, String>;
     fn delete_share(&mut self, plan: &Plan, role: ShareRole) -> Result<(), String>;
-    fn unmount_volume(&mut self, plan: &Plan) -> Result<(), String>;
-    fn offline_volume(&mut self, plan: &Plan) -> Result<(), String>;
-    fn delete_volume(&mut self, plan: &Plan) -> Result<(), String>;
-    fn unmount_ca_volume(&mut self, plan: &Plan) -> Result<(), String>;
-    fn offline_ca_volume(&mut self, plan: &Plan) -> Result<(), String>;
-    fn delete_ca_volume(&mut self, plan: &Plan) -> Result<(), String>;
+    fn unmount_volume(&mut self, plan: &Plan, role: VolumeRole) -> Result<(), String>;
+    fn offline_volume(&mut self, plan: &Plan, role: VolumeRole) -> Result<(), String>;
+    fn delete_volume(&mut self, plan: &Plan, role: VolumeRole) -> Result<(), String>;
     fn create_snapshot(&mut self, plan: &Plan) -> Result<(), String>;
     fn delete_snapshot(&mut self, plan: &Plan) -> Result<(), String>;
 }
@@ -764,34 +840,27 @@ impl<'a, A: OntapAdapter> ProvisioningRun<'a, A> {
 
     fn provision(&mut self) -> Result<(), String> {
         let plan = self.manifest.plan.clone();
-        self.adapter.create_volume(&plan)?;
-        self.manifest.record_created(ResourceKind::Volume)?;
-        for role in [ShareRole::Plain, ShareRole::Encrypted] {
+        for role in VolumeRole::ALL {
+            self.adapter.create_volume(&plan, role)?;
+            self.manifest.record_created(role.resource())?;
+        }
+        for role in ShareRole::ALL {
             self.adapter.create_share(&plan, role)?;
             self.manifest.record_created(role.resource())?;
             self.adapter.remove_everyone_acl(&plan, role)?;
-            self.manifest.record_mutation(match role {
-                ShareRole::Plain => Mutation::PlainEveryoneAclRemoved,
-                ShareRole::Encrypted => Mutation::EncryptedEveryoneAclRemoved,
-                ShareRole::Ca => unreachable!(),
-            })?;
+            self.manifest
+                .record_mutation(Mutation::EveryoneAclRemoved(role))?;
             self.adapter.grant_test_acl(&plan, role)?;
-            self.manifest.record_mutation(match role {
-                ShareRole::Plain => Mutation::PlainTestIdentityAclGranted,
-                ShareRole::Encrypted => Mutation::EncryptedTestIdentityAclGranted,
-                ShareRole::Ca => unreachable!(),
-            })?;
+            self.manifest
+                .record_mutation(Mutation::TestIdentityAclGranted(role))?;
         }
-        self.adapter.create_ca_volume(&plan)?;
-        self.manifest.record_created(ResourceKind::CaVolume)?;
-        self.adapter.create_share(&plan, ShareRole::Ca)?;
-        self.manifest.record_created(ResourceKind::CaShare)?;
-        self.adapter.remove_everyone_acl(&plan, ShareRole::Ca)?;
-        self.adapter.grant_test_acl(&plan, ShareRole::Ca)?;
         for kind in [
             ResourceKind::Volume,
             ResourceKind::PlainShare,
             ResourceKind::EncryptedShare,
+            ResourceKind::PerformanceVolume,
+            ResourceKind::PerformancePlainShare,
+            ResourceKind::PerformanceEncryptedShare,
             ResourceKind::CaVolume,
             ResourceKind::CaShare,
         ] {
@@ -830,38 +899,57 @@ impl<'a, A: OntapAdapter> ProvisioningRun<'a, A> {
                 ResourceKind::EncryptedShare => {
                     self.adapter.delete_share(&plan, ShareRole::Encrypted)
                 }
-                ResourceKind::Volume => {
-                    if !self.manifest.mutations.contains(&Mutation::VolumeUnmounted) {
-                        if let Err(error) = self.adapter.unmount_volume(&plan) {
+                ResourceKind::PerformancePlainShare => self
+                    .adapter
+                    .delete_share(&plan, ShareRole::PerformancePlain),
+                ResourceKind::PerformanceEncryptedShare => self
+                    .adapter
+                    .delete_share(&plan, ShareRole::PerformanceEncrypted),
+                ResourceKind::Volume | ResourceKind::PerformanceVolume | ResourceKind::CaVolume => {
+                    let role = match kind {
+                        ResourceKind::Volume => VolumeRole::Functional,
+                        ResourceKind::PerformanceVolume => VolumeRole::Performance,
+                        ResourceKind::CaVolume => VolumeRole::Ca,
+                        _ => unreachable!(),
+                    };
+                    if !self
+                        .manifest
+                        .mutations
+                        .contains(&Mutation::VolumeUnmounted(role))
+                    {
+                        if let Err(error) = self.adapter.unmount_volume(&plan, role) {
                             errors.push(error);
                             continue;
                         }
-                        if let Err(error) = self.manifest.record_mutation(Mutation::VolumeUnmounted)
+                        if let Err(error) = self
+                            .manifest
+                            .record_mutation(Mutation::VolumeUnmounted(role))
                         {
                             errors.push(error);
                             continue;
                         }
                     }
-                    if !self.manifest.mutations.contains(&Mutation::VolumeOfflined) {
-                        if let Err(error) = self.adapter.offline_volume(&plan) {
+                    if !self
+                        .manifest
+                        .mutations
+                        .contains(&Mutation::VolumeOfflined(role))
+                    {
+                        if let Err(error) = self.adapter.offline_volume(&plan, role) {
                             errors.push(error);
                             continue;
                         }
-                        if let Err(error) = self.manifest.record_mutation(Mutation::VolumeOfflined)
+                        if let Err(error) = self
+                            .manifest
+                            .record_mutation(Mutation::VolumeOfflined(role))
                         {
                             errors.push(error);
                             continue;
                         }
                     }
-                    self.adapter.delete_volume(&plan)
+                    self.adapter.delete_volume(&plan, role)
                 }
                 ResourceKind::Snapshot => self.adapter.delete_snapshot(&plan),
                 ResourceKind::CaShare => self.adapter.delete_share(&plan, ShareRole::Ca),
-                ResourceKind::CaVolume => self
-                    .adapter
-                    .unmount_ca_volume(&plan)
-                    .and_then(|()| self.adapter.offline_ca_volume(&plan))
-                    .and_then(|()| self.adapter.delete_ca_volume(&plan)),
             };
             match deletion {
                 Ok(()) => {
