@@ -32,9 +32,8 @@ cargo clippy --workspace
 | `smb-dtyp-derive` | Derive macros for data types (mbitfield) |
 | `smb-fscc` | MS-FSCC file system control codes |
 | `smb-rpc` | MS-RPCE (DCE/RPC) over SMB |
-| `smb-transport` | Transport layer: TCP, NetBios, QUIC, RDMA |
+| `smb-transport` | Transport layer: TCP and NetBIOS |
 | `smb-tests` | Shared test utilities |
-| `smb-cli` | Command-line interface |
 
 ## Code Style
 

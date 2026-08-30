@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*", "smb-cli"]
+members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
@@ -40,10 +40,6 @@ pastey = "0.1.1"
 time = { version = "0.3.37", features = ["macros"] }
 rand = "0.8.5"
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = [
-    "env-filter",
-    "tracing-log",
-] }
 # Tests
 const_format = "0.2"
 

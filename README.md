@@ -7,32 +7,14 @@
 This project is the first rust implementation of
 [SMB2 & 3](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/5606ad47-5ee0-437a-817e-70c366052962) client --
 the protocol that powers Windows file sharing and remote services.
-The project is designed to be used as a crate, but also includes a CLI tool for basic operations.
+The project is designed as a Rust library crate with an asynchronous domain interface.
 
 While most current implementations are mostly bindings to C libraries (such as libsmb2, samba, or windows' own libraries), this project is a full implementation in Rust, with no _direct_ dependencies on C libraries.
 
 ## Getting started
 
-Running the project's CLI is as simple as executing:
-
-```sh
-cargo run -- --help
-```
-
-Check out the `info` and the `copy` sub-commands for more information.
-
-### Logging
-
-`smb-cli` uses [`tracing`](https://crates.io/crates/tracing) with a `tracing-subscriber` `fmt` layer.
-Logging is controlled via the `RUST_LOG` environment variable (default `info`):
-
-```sh
-# show debug logs from the smb crate and trace logs from smb-transport
-RUST_LOG=smb=debug,smb_transport=trace cargo run -- info \\\\server\\share
-```
-
-Records emitted by third-party crates that still use the `log` crate (e.g. `rustls`)
-are forwarded to `tracing` via the `tracing-log` bridge, so the same `RUST_LOG` filter applies.
+Add the `smb` crate to an asynchronous Rust application and use the public
+`Client -> Session -> Share -> File / Directory / Pipe` object hierarchy.
 
 ## Features
 
@@ -40,7 +22,7 @@ are forwarded to `tracing` via the `tracing-log` bridge, so the same `RUST_LOG` 
 - ✅ Wire message parsing is fully safe, using the `binrw` crate.
 - ✅ Async (`tokio`), Multi-threaded, or Single-threaded client.
 - ✅ Compression & Encryption support.
-- ✅ Transport using SMB over TCP (445), over NetBIOS (139), and over QUIC (443).
+- ✅ Transport using SMB over TCP (445) and NetBIOS (139).
 - ✅ NTLM & Kerberos authentication (using the [`sspi`](https://crates.io/crates/sspi) crate).
 - ✅ Cross-platform (Windows, Linux, MacOS).
 
@@ -51,31 +33,23 @@ You are welcome to see the project's roadmap in the [GitHub Project](https://git
 Check out the `Client` struct, exported from the `smb` crate, to initiate a connection to an SMB server:
 
 ```rust,no_run
-use smb::{Client, ClientConfig, UncPath, FileCreateArgs, FileAccessMask, ReadAtChannel};
-use std::str::FromStr;
+use smb::{Client, ClientConfig, Credentials, FileOpenOptions, SharePath, ShareTarget};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // instantiate the client
+async fn main() -> smb::Result<()> {
     let client = Client::new(ClientConfig::default());
-
-    // Connect to a share
-    let target_path = UncPath::from_str(r"\\server\share").unwrap();
-    client.share_connect(&target_path, "username", "password".to_string()).await?;
-
-    // And open a file on the server
-    let file_to_open = target_path.with_path("file.txt");
-    let file_open_args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
-    let resource = client.create_file(&file_to_open, &file_open_args).await?;
-
-    // now, you can do a bunch of operations against `file`, and close it at the end.
-    let file = resource.unwrap_file();
-    let mut data: [u8; 1024] = [0; 1024];
-    file.read_at(&mut data, 0).await?;
-
-    // and close
+    let target = ShareTarget::new("server", "share")?;
+    let share = client
+        .connect_share(&target, Credentials::ntlm("username", "password"))
+        .await?;
+    let file = share
+        .open_file(&SharePath::new("file.txt")?, FileOpenOptions::open_existing())
+        .await?;
+    let data = file.read_at(0, 4096).await?;
+    println!("read {} bytes", data.len());
     file.close().await?;
-    Ok(())
+    share.close().await?;
+    client.close().await
 }
 ```
 

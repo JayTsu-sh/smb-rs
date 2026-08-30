@@ -84,13 +84,10 @@ fn removed_dead_features_cannot_return() {
         "compression returned to the default FAS-oriented build"
     );
 
-    let cli_manifest = read("smb-cli/Cargo.toml");
-    for feature in ["profiling =", "quic =", "rdma =", "netbios-transport ="] {
-        assert!(
-            !cli_manifest.contains(feature),
-            "dead CLI feature returned: {feature}"
-        );
-    }
+    assert!(
+        !workspace_root().join("smb-cli").exists(),
+        "deleted command-line application returned"
+    );
 
     for path in [
         "crates/smb-transport/src/quic.rs",
