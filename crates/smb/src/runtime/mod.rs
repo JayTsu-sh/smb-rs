@@ -4,13 +4,37 @@
 //! reducer is deliberately independent of transport I/O so every race can be
 //! checked deterministically before the owner task and pumps are connected.
 
+#[allow(
+    dead_code,
+    reason = "deterministic fixture controls are wider than the production interface"
+)]
 mod engine;
+#[allow(
+    dead_code,
+    reason = "deterministic lifecycle transitions are fixture-observable"
+)]
 mod object_state;
+#[allow(
+    dead_code,
+    reason = "contract validation helpers are fixture-observable"
+)]
 mod operation;
 pub(crate) mod port;
 mod recovery;
+#[allow(
+    dead_code,
+    reason = "deterministic recovery inspection is fixture-only"
+)]
 mod recovery_driver;
+#[allow(
+    dead_code,
+    reason = "reducer observations are retained for deterministic assertions"
+)]
 mod reducer;
+#[allow(
+    dead_code,
+    reason = "state observations are retained for deterministic assertions"
+)]
 mod state;
 pub(crate) mod wire;
 

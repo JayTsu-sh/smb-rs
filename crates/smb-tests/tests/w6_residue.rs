@@ -76,6 +76,34 @@ fn removed_dead_features_cannot_return() {
 }
 
 #[test]
+fn post_acceptance_internal_residue_cannot_return() {
+    for path in [
+        "crates/smb/src/resource/file_util.rs",
+        "crates/smb/src/runtime/session_recovery.rs",
+        "crates/smb/src/runtime/share_recovery.rs",
+        "crates/smb/src/runtime/durable_recovery.rs",
+        "crates/smb/src/runtime/event_authority.rs",
+        "crates/smb/src/tree/dfs_tree.rs",
+        "crates/smb/src/tree/ipc_tree.rs",
+    ] {
+        assert!(
+            !workspace_root().join(path).exists(),
+            "obsolete internal layer returned: {path}"
+        );
+    }
+
+    let wire = read("crates/smb/src/runtime/wire.rs");
+    assert!(
+        !wire.contains("compatibility branch") && !wire.contains("legacy `encrypt: bool`"),
+        "wire protection compatibility fallback returned"
+    );
+    assert!(
+        wire.contains("wire protection policy is not sealed"),
+        "wire seam must reject unsealed protection policy"
+    );
+}
+
+#[test]
 fn drop_implementations_cannot_spawn_unowned_cleanup_tasks() {
     for path in [
         "crates/smb/src/connection.rs",
