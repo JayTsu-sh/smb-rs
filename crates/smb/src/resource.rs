@@ -877,8 +877,14 @@ impl ResourceHandle {
                     return Ok(());
                 }
                 Ok(Ok(None)) => return Ok(()),
-                Ok(Err(error)) => last_error = Some(error),
-                Err(_) => last_error = Some(Error::ResourceRecoveryWaitTimedOut),
+                Ok(Err(error)) => {
+                    tracing::warn!(attempt, ?error, "durable reconnect attempt failed");
+                    last_error = Some(error);
+                }
+                Err(_) => {
+                    tracing::warn!(attempt, "durable reconnect attempt timed out");
+                    last_error = Some(Error::ResourceRecoveryWaitTimedOut);
+                }
             }
         }
         Err(last_error

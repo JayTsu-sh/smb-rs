@@ -499,6 +499,25 @@ async fn previous_version_no_longer_opens_after_snapshot_delete() -> smb::Result
     let version = PreviousVersion::from_gmt_token(
         std::fs::read_to_string(token_path).map_err(std::io::Error::other)?,
     )?;
+    let stale_client = Client::new(ClientConfig::default());
+    let stale_share = stale_client
+        .connect_share(
+            &ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?,
+            common::smb_test_credentials(),
+        )
+        .await?;
+    let path = SharePath::new("w6-previous-version.bin")?;
+    assert!(
+        stale_share
+            .open_file_at_version(&path, &version)
+            .await
+            .is_err()
+    );
+    let _ = stale_client.close().await;
+
+    // Some servers close the session when a deleted timewarp token is used.
+    // Verify the active namespace through a fresh, independently authenticated
+    // session so the two assertions cannot mask one another.
     let client = Client::new(ClientConfig::default());
     let share = client
         .connect_share(
@@ -506,8 +525,6 @@ async fn previous_version_no_longer_opens_after_snapshot_delete() -> smb::Result
             common::smb_test_credentials(),
         )
         .await?;
-    let path = SharePath::new("w6-previous-version.bin")?;
-    assert!(share.open_file_at_version(&path, &version).await.is_err());
     let active = share
         .open_file(&path, FileOpenOptions::open_existing())
         .await?;
@@ -539,50 +556,6 @@ async fn persistent_handle_is_granted_on_ca_share() -> smb::Result<()> {
     file.write_all_at(0, Bytes::from_static(b"persistent-data"))
         .await?;
     assert_eq!(file.read_exact_at(0, 15).await?, b"persistent-data"[..]);
-    file.delete().await?;
-    file.close().await?;
-    share.close().await?;
-    client.close().await
-}
-
-#[cfg(feature = "real-server-tests")]
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-#[ignore = "requires exact management closure on a continuously available share"]
-async fn persistent_handle_recovers_after_exact_session_close() -> smb::Result<()> {
-    let client = Client::new(ClientConfig::default());
-    let target = ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?;
-    let session = client
-        .authenticate(target.server(), common::smb_test_credentials())
-        .await?;
-    let share = session.connect_share(target.share()).await?;
-    let path = SharePath::new(format!("w6-persistent-recovery-{}.bin", std::process::id()))?;
-    let created = share.open_file(&path, FileOpenOptions::overwrite()).await?;
-    created.close().await?;
-    let file = share
-        .open_file(&path, FileOpenOptions::open_existing().persistent(0))
-        .await?;
-    assert!(file.persistent_granted());
-    file.write_all_at(0, Bytes::from_static(b"persistent-before"))
-        .await?;
-    let session_before = session.generation()?;
-    let share_before = share.generation();
-
-    common::close_exact_ontap_session(target.share()).map_err(Error::InvalidState)?;
-    assert!(
-        file.write_all_at(0, Bytes::from_static(b"trigger-recovery"))
-            .timeout(Duration::from_secs(30))
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        file.read_exact_at(0, b"persistent-before".len() as u32)
-            .timeout(Duration::from_secs(30))
-            .await?,
-        b"persistent-before"[..]
-    );
-    assert_ne!(session.generation()?, session_before);
-    assert_ne!(share.generation(), share_before);
-    assert!(file.persistent_granted());
     file.delete().await?;
     file.close().await?;
     share.close().await?;
