@@ -2,9 +2,11 @@ use std::str::FromStr;
 
 use super::Cli;
 use clap::{Parser, Subcommand};
-use smb::*;
-use smb::{client::Client, resource::Resource};
 use smb::protocol::*;
+use smb::{
+    Client, ClientConfig, Credentials, Resource, SecurityOpenOptions, SecuritySelection, Share,
+    SharePath, ShareTarget, UncPath,
+};
 
 #[derive(Parser, Debug)]
 pub struct SecurityCmd {
@@ -96,36 +98,42 @@ pub async fn security(
 async fn open_resource(
     security_cmd: &SecurityCmd,
     cli: &Cli,
-    access: FileAccessMask,
-) -> std::result::Result<Resource, Box<dyn std::error::Error>> {
-    let client = Client::new(cli.make_smb_client_config()?);
+    write_dacl: bool,
+) -> std::result::Result<(Client, Share, Resource), Box<dyn std::error::Error>> {
+    let client = Client::new(ClientConfig::default());
 
     if security_cmd.path.share().is_none() || security_cmd.path.share().unwrap().is_empty() {
         return Err("Specified path must include a share".into());
     }
 
-    client
-        .share_connect(
-            &security_cmd.path,
-            cli.username.as_ref(),
-            cli.password.clone(),
+    let share = client
+        .connect_share(
+            &ShareTarget::new(
+                security_cmd.path.server(),
+                security_cmd.path.share().expect("validated Share name"),
+            )?,
+            Credentials::ntlm(cli.username.clone(), cli.password.clone()),
         )
         .await?;
-    let resource = client
-        .create_file(
-            &security_cmd.path,
-            &FileCreateArgs::make_open_existing(access),
+    let relative = security_cmd
+        .path
+        .path()
+        .filter(|path| !path.is_empty())
+        .ok_or("Specified path must identify a resource below the Share")?;
+    let resource = share
+        .open_security(
+            &SharePath::new(relative)?,
+            SecurityOpenOptions::default().write_dacl(write_dacl),
         )
         .await?;
-    Ok(resource)
+    Ok((client, share, resource))
 }
 
-#[inline]
-fn resource_handle(resource: &Resource) -> &ResourceHandle {
+async fn close_resource(resource: Resource) -> smb::Result<()> {
     match resource {
-        Resource::File(f) => f.handle(),
-        Resource::Directory(d) => d.handle(),
-        Resource::Pipe(p) => p.handle(),
+        Resource::File(file) => file.close().await.map(|_| ()),
+        Resource::Directory(directory) => directory.close().await.map(|_| ()),
+        Resource::Pipe(pipe) => pipe.close().await.map(|_| ()),
     }
 }
 
@@ -134,18 +142,17 @@ pub async fn get_security(
     security_cmd: &SecurityCmd,
     cli: &Cli,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let access = FileAccessMask::new().with_read_control(true);
-    let resource = open_resource(security_cmd, cli, access).await?;
-    let resource_handle = resource_handle(&resource);
-
-    let additional_info = AdditionalInfo::new().with_dacl_security_information(cmd.dacl);
-    let security_info = resource_handle.query_security_info(additional_info).await?;
+    let (client, share, resource) = open_resource(security_cmd, cli, false).await?;
+    let selection = SecuritySelection::default().dacl(cmd.dacl);
+    let security_info = resource.query_security(selection).await?;
 
     tracing::info!("Security info for {}:", security_cmd.path);
     // TODO: pretty print
     tracing::info!("{:#?}", security_info);
 
-    resource_handle.close().await?;
+    close_resource(resource).await?;
+    share.close().await?;
+    client.close().await?;
     Ok(())
 }
 
@@ -156,22 +163,19 @@ pub async fn set_security(
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let write_dacl = !cmd.add_dacl.is_empty() || !cmd.remove_dacl.is_empty();
 
-    let access = FileAccessMask::new()
-        .with_read_control(true)
-        .with_write_dacl(write_dacl);
-
-    let resource = open_resource(security_cmd, cli, access).await?;
-    let resource_handle = resource_handle(&resource);
+    let (client, share, resource) = open_resource(security_cmd, cli, write_dacl).await?;
 
     // Query only the required information ot perform the update
-    let to_set = AdditionalInfo::new().with_dacl_security_information(write_dacl);
-
-    if to_set.into_bytes().iter().all(|f| *f == 0u8) {
+    let selection = SecuritySelection::default().dacl(write_dacl);
+    if !selection.includes_dacl() {
         tracing::debug!("No security information to set.");
+        close_resource(resource).await?;
+        share.close().await?;
+        client.close().await?;
         return Ok(());
     }
 
-    let current_security_info = resource_handle.query_security_info(to_set).await?;
+    let current_security_info = resource.query_security(selection).await?;
     tracing::debug!("Current security info: {:#?}", current_security_info);
 
     let mut new_security_info = current_security_info.clone();
@@ -251,9 +255,9 @@ pub async fn set_security(
     }
 
     tracing::debug!("New security info to set: {:#?}", new_security_info);
-    resource_handle
-        .set_security_info(new_security_info, to_set)
-        .await?;
-    resource_handle.close().await?;
+    resource.set_security(new_security_info, selection).await?;
+    close_resource(resource).await?;
+    share.close().await?;
+    client.close().await?;
     Ok(())
 }

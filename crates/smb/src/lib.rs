@@ -45,8 +45,9 @@ pub use domain::{
     Credentials, Deadline, Directory, DirectoryEntries, DirectoryEntry, DirectoryEvent,
     DirectoryEvents, DirectoryOpenOptions, DirectoryWatchOptions, File, FileCursor,
     FileOpenOptions, Operation, Pipe, PipeName, ReplayPolicy, Resource, ResourceMetadata,
-    RpcPipeConnection, Session, Share, SharePath, ShareTarget, Transfer, TransferEvents,
-    TransferOptions, TransferProgress, TransferReport, TransferStrategy,
+    RpcPipeConnection, SecurityDescriptor, SecurityOpenOptions, SecuritySelection, Session, Share,
+    SharePath, ShareTarget, Transfer, TransferEvents, TransferOptions, TransferProgress,
+    TransferReport, TransferStrategy,
 };
 pub use error::Error;
 pub use facade::{Client, ClientConfig, RemoteShare, ShareKind};

@@ -10,11 +10,12 @@ use std::{pin::Pin, sync::Arc};
 use bytes::Bytes;
 use futures_core::Stream;
 use futures_util::TryStreamExt;
+use smb_dtyp::SecurityDescriptor;
 use smb_fscc::{
     FileAccessMask, FileAttributes, FileBasicInformation, FileDirectoryInformation,
     FileDispositionInformation, FileRenameInformation, FileStandardInformation, NotifyAction,
 };
-use smb_msg::{CreateOptions, NotifyFilter};
+use smb_msg::{AdditionalInfo, CreateOptions, NotifyFilter};
 use sspi::{AuthIdentity, Secret, Username};
 
 use crate::{
@@ -122,6 +123,27 @@ impl RuntimeShare {
         })
     }
 
+    pub(crate) async fn open_security_resource(
+        &self,
+        path: &str,
+        write_dacl: bool,
+    ) -> crate::Result<RuntimeResource> {
+        let access = FileAccessMask::new()
+            .with_read_control(true)
+            .with_write_dacl(write_dacl);
+        let resource = self
+            .inner
+            .create(path, &FileCreateArgs::make_open_existing(access))
+            .await?;
+        Ok(match resource {
+            LegacyResource::File(file) => RuntimeResource::File(RuntimeFile { inner: file }),
+            LegacyResource::Directory(directory) => RuntimeResource::Directory(RuntimeDirectory {
+                inner: Arc::new(directory),
+            }),
+            LegacyResource::Pipe(pipe) => RuntimeResource::Pipe(RuntimePipe { inner: pipe }),
+        })
+    }
+
     pub(crate) async fn open_file(&self, path: &str, mode: OpenMode) -> crate::Result<RuntimeFile> {
         let args = match mode {
             OpenMode::CreateNew => {
@@ -199,6 +221,18 @@ pub(crate) struct RuntimePipe {
 }
 
 impl RuntimePipe {
+    pub(crate) async fn query_security(&self, dacl: bool) -> crate::Result<SecurityDescriptor> {
+        query_security(&self.inner, dacl).await
+    }
+
+    pub(crate) async fn set_security(
+        &self,
+        descriptor: SecurityDescriptor,
+        dacl: bool,
+    ) -> crate::Result<()> {
+        set_security(&self.inner, descriptor, dacl).await
+    }
+
     pub(crate) async fn read(
         &self,
         max_len: u32,
@@ -291,6 +325,18 @@ pub(crate) struct RuntimeDirectory {
 }
 
 impl RuntimeDirectory {
+    pub(crate) async fn query_security(&self, dacl: bool) -> crate::Result<SecurityDescriptor> {
+        query_security(&self.inner, dacl).await
+    }
+
+    pub(crate) async fn set_security(
+        &self,
+        descriptor: SecurityDescriptor,
+        dacl: bool,
+    ) -> crate::Result<()> {
+        set_security(&self.inner, descriptor, dacl).await
+    }
+
     pub(crate) async fn metadata(&self) -> crate::Result<RuntimeMetadata> {
         metadata(&self.inner).await
     }
@@ -366,6 +412,18 @@ pub(crate) struct RuntimeFile {
 }
 
 impl RuntimeFile {
+    pub(crate) async fn query_security(&self, dacl: bool) -> crate::Result<SecurityDescriptor> {
+        query_security(&self.inner, dacl).await
+    }
+
+    pub(crate) async fn set_security(
+        &self,
+        descriptor: SecurityDescriptor,
+        dacl: bool,
+    ) -> crate::Result<()> {
+        set_security(&self.inner, descriptor, dacl).await
+    }
+
     pub(crate) async fn metadata(&self) -> crate::Result<RuntimeMetadata> {
         metadata(&self.inner).await
     }
@@ -466,4 +524,25 @@ async fn metadata(resource: &crate::resource::ResourceHandle) -> crate::Result<R
         changed: basic.change_time.into(),
         len: standard.end_of_file,
     })
+}
+
+fn security_selection(dacl: bool) -> AdditionalInfo {
+    AdditionalInfo::new().with_dacl_security_information(dacl)
+}
+
+async fn query_security(
+    resource: &crate::resource::ResourceHandle,
+    dacl: bool,
+) -> crate::Result<SecurityDescriptor> {
+    resource.query_security_info(security_selection(dacl)).await
+}
+
+async fn set_security(
+    resource: &crate::resource::ResourceHandle,
+    descriptor: SecurityDescriptor,
+    dacl: bool,
+) -> crate::Result<()> {
+    resource
+        .set_security_info(descriptor, security_selection(dacl))
+        .await
 }

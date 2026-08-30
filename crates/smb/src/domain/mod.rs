@@ -4,11 +4,13 @@ mod batch;
 mod cursor;
 mod operation;
 mod rpc;
+mod security;
 mod transfer;
 pub use batch::{Batch, BatchCommand, BatchOutcome, BatchRef, BatchResult};
 pub use cursor::FileCursor;
 pub use operation::{CancelToken, Deadline, Operation, ReplayPolicy};
 pub use rpc::RpcPipeConnection;
+pub use security::{SecurityDescriptor, SecurityOpenOptions, SecuritySelection};
 pub use transfer::{
     Transfer, TransferEvents, TransferOptions, TransferProgress, TransferReport, TransferStrategy,
 };
@@ -307,6 +309,44 @@ impl Share {
                         close_authority: FileCloseAuthority::new(),
                     }),
                 })
+            })
+        })
+    }
+
+    pub fn open_security<'a>(
+        &'a self,
+        path: &SharePath,
+        options: SecurityOpenOptions,
+    ) -> Operation<'a, Resource> {
+        let path = path.clone();
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                if context.replay != ReplayPolicy::Never {
+                    return Err(Error::UnsupportedOperation(
+                        "security open permits only ReplayPolicy::Never".into(),
+                    ));
+                }
+                Ok(
+                    match self
+                        .inner
+                        .open_security_resource(path.as_str(), options.writes_dacl())
+                        .await?
+                    {
+                        RuntimeResource::File(inner) => Resource::File(Box::new(File {
+                            inner,
+                            close_authority: FileCloseAuthority::new(),
+                        })),
+                        RuntimeResource::Directory(inner) => Resource::Directory(Directory {
+                            inner,
+                            close_authority: FileCloseAuthority::new(),
+                        }),
+                        RuntimeResource::Pipe(inner) => Resource::Pipe(Pipe {
+                            inner,
+                            close_authority: FileCloseAuthority::new(),
+                        }),
+                    },
+                )
             })
         })
     }

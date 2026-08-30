@@ -8,8 +8,8 @@ use smb::{
 };
 use smb::{
     Client, ClientConfig, CloseOutcome, Credentials, Directory, DirectoryOpenOptions, File,
-    FileCursor, FileOpenOptions, Pipe, PipeName, ReplayPolicy, Resource, Session, Share, SharePath,
-    ShareTarget, Transfer, TransferEvents,
+    FileCursor, FileOpenOptions, Pipe, PipeName, ReplayPolicy, Resource, SecurityOpenOptions,
+    SecuritySelection, Session, Share, SharePath, ShareTarget, Transfer, TransferEvents,
 };
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
@@ -82,6 +82,44 @@ async fn domain_resource_open_and_metadata() -> smb::Result<()> {
     tracing::info!("metadata-stage=second-close");
     file.close().await?;
     tracing::info!("metadata-stage=delete");
+    let file = share
+        .open_file(&path, FileOpenOptions::open_existing())
+        .await?;
+    file.delete().await?;
+    file.close().await?;
+    share.close().await?;
+    client.close().await
+}
+
+#[cfg(feature = "real-server-tests")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[ignore = "requires an isolated writable real-server share"]
+async fn domain_security_query_and_idempotent_set() -> smb::Result<()> {
+    let client = Client::new(ClientConfig::default());
+    let share = client
+        .connect_share(
+            &ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?,
+            common::smb_test_credentials(),
+        )
+        .await?;
+    let path = SharePath::new(format!("domain-security-{}.bin", std::process::id()))?;
+    let file = share
+        .open_file(&path, FileOpenOptions::create_new())
+        .await?;
+    file.close().await?;
+
+    let resource = share
+        .open_security(&path, SecurityOpenOptions::default().write_dacl(true))
+        .await?;
+    let selection = SecuritySelection::default().dacl(true);
+    let descriptor = resource.query_security(selection).await?;
+    resource.set_security(descriptor, selection).await?;
+    match resource {
+        Resource::File(file) => file.close().await?,
+        Resource::Directory(directory) => directory.close().await?,
+        Resource::Pipe(pipe) => pipe.close().await?,
+    };
+
     let file = share
         .open_file(&path, FileOpenOptions::open_existing())
         .await?;
