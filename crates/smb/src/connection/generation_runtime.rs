@@ -15,19 +15,18 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Temporary outer-shape facade over the W3 generation runtime.
+/// Per-generation capability used by protocol mechanics behind `runtime::port`.
 ///
 /// It owns no transport, pending registry, credit ledger, MessageId counter,
-/// or background task. All authoritative work is delegated to RuntimeHandle;
-/// this type disappears when domain callers adopt typed operations directly.
-pub(crate) struct RuntimeWorker {
+/// or background task. All authoritative work is delegated to `RuntimeHandle`.
+pub(crate) struct GenerationRuntime {
     runtime: RuntimeHandle,
     clock: Arc<TokioClock>,
     generation: GenerationId,
     timeout: Duration,
 }
 
-impl RuntimeWorker {
+impl GenerationRuntime {
     pub(crate) const fn connection_object(&self) -> ObjectToken {
         self.runtime.connection_object()
     }
@@ -306,10 +305,10 @@ fn map_runtime_error_value(error: RuntimeError, timeout: std::time::Duration) ->
     }
 }
 
-impl fmt::Debug for RuntimeWorker {
+impl fmt::Debug for GenerationRuntime {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("RuntimeWorker")
+            .debug_struct("GenerationRuntime")
             .field("generation", &self.generation)
             .field("timeout", &self.timeout)
             .finish_non_exhaustive()

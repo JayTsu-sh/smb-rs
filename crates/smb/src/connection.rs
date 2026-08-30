@@ -1,28 +1,29 @@
 pub mod config;
 pub mod connection_info;
+mod generation_runtime;
 pub mod preauth_hash;
 mod registry;
-pub mod worker;
 
-use crate::compression;
 use crate::clock::TokioClock;
+use crate::compression;
 use crate::connection::preauth_hash::PreauthHashState;
 use crate::dialects::DialectImpl;
 use crate::lease::{
     LeaseBreakAckOutcome, LeaseBreakEvent, LeaseSlot, OplockBreakEvent, OplockSlot,
 };
-use crate::runtime::{
-    GenerationBootstrap, GenerationId, GenerationPublication, RandomRecoveryJitter,
-    PreparedGeneration, RecoveryDriver, RecoveryError, RuntimeError,
-};
 pub use crate::runtime::wire::TransformError;
-use crate::{Error, crypto, command::*, session::Session};
+use crate::runtime::{
+    GenerationBootstrap, GenerationId, GenerationPublication, PreparedGeneration,
+    RandomRecoveryJitter, RecoveryDriver, RecoveryError, RuntimeError,
+};
+use crate::{Error, command::*, crypto, session::Session};
 use arc_swap::ArcSwapOption;
 use binrw::prelude::*;
-use futures_core::future::BoxFuture;
-use futures_util::FutureExt;
 pub use config::*;
 use connection_info::{ConnectionInfo, NegotiatedProperties};
+use futures_core::future::BoxFuture;
+use futures_util::FutureExt;
+use generation_runtime::GenerationRuntime;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use registry::ConnectionRegistry;
@@ -33,12 +34,11 @@ use smb_msg::{
 };
 use smb_transport::*;
 use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock};
 use std::sync::Weak;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::select;
 use tokio_util::sync::CancellationToken;
-use worker::WorkerImpl;
 
 /// Capacity of the per-connection lease-break broadcast. A handful of slow
 /// subscribers wouldn't trail behind by more than this many events. Internal
@@ -66,7 +66,7 @@ struct ConnectionRecoveryBootstrap {
 
 struct ConnectionGenerationPublication {
     context: Arc<ConnectionCore>,
-    worker: Arc<WorkerImpl>,
+    worker: Arc<GenerationRuntime>,
     info: Arc<ConnectionInfo>,
 }
 
@@ -108,11 +108,7 @@ impl GenerationBootstrap for ConnectionRecoveryBootstrap {
                 .remote_address()
                 .map_err(|_| RuntimeError::Transport("recovery-remote-address"))?;
             let worker = connection
-                ._negotiate_switch_to_smb2(
-                    transport,
-                    config.smb2_only_negotiate,
-                    generation,
-                )
+                ._negotiate_switch_to_smb2(transport, config.smb2_only_negotiate, generation)
                 .await
                 .map_err(|_| RuntimeError::Wire("recovery-negotiate-switch"))?;
             let info = match connection._negotiate_smb2(remote_address, &worker).await {
@@ -290,7 +286,7 @@ impl Connection {
         mut transport: Box<dyn SmbTransport>,
         smb2_only_neg: bool,
         generation: GenerationId,
-    ) -> crate::Result<Arc<WorkerImpl>> {
+    ) -> crate::Result<Arc<GenerationRuntime>> {
         let mut initial_message_id = 0;
         // Multi-protocol negotiation: Begin with SMB1, expect SMB2.
         if !smb2_only_neg {
@@ -334,7 +330,7 @@ impl Connection {
             initial_message_id = 1;
         }
 
-        WorkerImpl::start_generation_at(
+        GenerationRuntime::start_generation_at(
             transport,
             self.config.timeout(),
             initial_message_id,
@@ -348,7 +344,7 @@ impl Connection {
     async fn _negotiate_smb2(
         &self,
         server_address: std::net::SocketAddr,
-        worker: &Arc<WorkerImpl>,
+        worker: &Arc<GenerationRuntime>,
     ) -> crate::Result<ConnectionInfo> {
         tracing::debug!("Negotiating SMB2");
 
@@ -607,7 +603,8 @@ impl Connection {
         let info = Arc::new(self._negotiate_smb2(server_address, &worker).await?);
 
         worker.negotaite_complete(&info).await?;
-        self.context.publish_generation(worker.clone(), info.clone());
+        self.context
+            .publish_generation(worker.clone(), info.clone());
 
         // Always start the notify task unless the caller explicitly disabled
         // it. `caps.notifications()` is the SMB 3.1.1 ChangeNotify capability
@@ -622,7 +619,6 @@ impl Connection {
             );
             self.context.start_notify().await?;
             tracing::debug!("Notification job started.");
-
         }
 
         if recoverable {
@@ -656,12 +652,7 @@ impl Connection {
             .context
             .conn_info()
             .ok_or_else(|| Error::InvalidState("Connection not negotiated.".to_string()))?;
-        let session = Session::create(
-            identity,
-            &self.context,
-            &conn_info,
-        )
-        .await?;
+        let session = Session::create(identity, &self.context, &conn_info).await?;
         let session_context = Arc::downgrade(&session.recovery_context());
         self.context
             .registry
@@ -691,12 +682,7 @@ impl Connection {
             .context
             .conn_info()
             .ok_or_else(|| Error::InvalidState("Connection not negotiated.".to_string()))?;
-        let session = Session::create_with_gss(
-            gss,
-            &self.context,
-            &conn_info,
-        )
-        .await?;
+        let session = Session::create_with_gss(gss, &self.context, &conn_info).await?;
         let session_context = Arc::downgrade(&session.recovery_context());
         self.context
             .registry
@@ -795,7 +781,7 @@ impl Connection {
     /// 2. Submits the entire typed batch atomically; the runtime owner
     ///    allocates MessageIds and credit charge/request values.
     /// 3. After all members are prepared, hands the whole batch to
-    ///    [`crate::connection::worker::WorkerImpl::send_compound`] for
+    ///    [`crate::connection::generation_runtime::GenerationRuntime::send_compound`] for
     ///    the single TCP write.
     /// 4. Awaits each member's response separately via
     ///    `Worker::receive` — server splits the compound response into
@@ -926,7 +912,7 @@ pub(crate) struct ConnectionCore {
 }
 
 struct ConnectionGeneration {
-    worker: Arc<WorkerImpl>,
+    worker: Arc<GenerationRuntime>,
     conn_info: Arc<ConnectionInfo>,
 }
 
@@ -995,7 +981,7 @@ impl ConnectionCore {
 
     async fn execute_with_worker(
         &self,
-        worker: &Arc<WorkerImpl>,
+        worker: &Arc<GenerationRuntime>,
         mut message: CommandRequest,
     ) -> crate::Result<(CommandSubmission, CommandResponse)> {
         let command = message.message.content.associated_cmd();
@@ -1115,13 +1101,12 @@ impl ConnectionCore {
                 // tying it to Connection would require Arc'ing the
                 // context chain back up, which we explicitly avoid.
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        crate::resource::ResourceHandle::send_close_external(
-                            file_id,
-                            &context,
-                            prev.proto.object,
-                        )
-                        .await
+                    if let Err(e) = crate::resource::ResourceHandle::send_close_external(
+                        file_id,
+                        &context,
+                        prev.proto.object,
+                    )
+                    .await
                     {
                         tracing::warn!(
                             file_id = ?file_id,
@@ -1262,7 +1247,7 @@ impl ConnectionCore {
         self.oplock_event_tx.subscribe()
     }
 
-    pub fn worker(&self) -> Option<Arc<WorkerImpl>> {
+    pub fn worker(&self) -> Option<Arc<GenerationRuntime>> {
         self.generation
             .load_full()
             .map(|generation| generation.worker.clone())
@@ -1274,14 +1259,14 @@ impl ConnectionCore {
             .map(|generation| generation.conn_info.clone())
     }
 
-    fn publish_generation(&self, worker: Arc<WorkerImpl>, conn_info: Arc<ConnectionInfo>) {
+    fn publish_generation(&self, worker: Arc<GenerationRuntime>, conn_info: Arc<ConnectionInfo>) {
         self.generation
             .store(Some(Arc::new(ConnectionGeneration { worker, conn_info })));
     }
 
     fn start_recovery(
         self: &Arc<Self>,
-        worker: Arc<WorkerImpl>,
+        worker: Arc<GenerationRuntime>,
         config: ConnectionConfig,
         server_name: String,
         server_address: SocketAddr,
@@ -1347,12 +1332,13 @@ impl ConnectionCore {
 
     async fn recover_sessions(&self) {
         let sessions = self.registry.recoverable_sessions().await;
-        let results = futures_util::future::join_all(sessions.into_iter().map(|session| async move {
-            let previous = session.session_id();
-            let result = session.reauthenticate(previous).await;
-            (session, result)
-        }))
-        .await;
+        let results =
+            futures_util::future::join_all(sessions.into_iter().map(|session| async move {
+                let previous = session.session_id();
+                let result = session.reauthenticate(previous).await;
+                (session, result)
+            }))
+            .await;
         for (session, result) in results {
             match result {
                 Ok((previous, replacement)) => {
@@ -1591,11 +1577,8 @@ impl ConnectionCore {
         let ack_required = previous_level != OplockLevel::II;
         let ack_outcome = if ack_required {
             const ACK_DEADLINE: Duration = Duration::from_secs(35);
-            match tokio::time::timeout(
-                ACK_DEADLINE,
-                self.send_oplock_break_ack(&slot, new_level),
-            )
-            .await
+            match tokio::time::timeout(ACK_DEADLINE, self.send_oplock_break_ack(&slot, new_level))
+                .await
             {
                 Ok(Ok(())) => LeaseBreakAckOutcome::Accepted,
                 Ok(Err(error)) => {
@@ -1727,8 +1710,7 @@ impl ConnectionCore {
             lease_key: notify.lease_key,
             lease_state: notify.new_lease_state,
         };
-        slot
-            .proto
+        slot.proto
             .context
             .send_recv(RequestContent::LeaseBreakAck(ack))
             .await?;
