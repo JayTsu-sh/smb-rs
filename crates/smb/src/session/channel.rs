@@ -167,9 +167,9 @@ impl ChannelContext {
             .await
         {
             Ok(result) => result,
-            Err(error @ Error::SignatureVerificationFailed) => {
+            Err(error @ (Error::SignatureVerificationFailed | Error::SessionInvalidated)) => {
                 if let Err(recovery_error) = self.upstream.recover_session(self.session_id).await {
-                    tracing::warn!(?recovery_error, "session integrity recovery failed");
+                    tracing::warn!(?recovery_error, "session recovery failed");
                 }
                 return Err(error);
             }
