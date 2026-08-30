@@ -206,22 +206,28 @@ impl OntapAdapter for ScriptedOntap {
     fn create_volume(&mut self, _: &Plan) -> Result<(), String> {
         self.action("create-volume")
     }
+    fn create_ca_volume(&mut self, _: &Plan) -> Result<(), String> {
+        self.action("create-ca-volume")
+    }
     fn create_share(&mut self, _: &Plan, role: ShareRole) -> Result<(), String> {
         self.action(match role {
             ShareRole::Plain => "create-plain-share",
             ShareRole::Encrypted => "create-encrypted-share",
+            ShareRole::Ca => "create-ca-share",
         })
     }
     fn remove_everyone_acl(&mut self, _: &Plan, role: ShareRole) -> Result<(), String> {
         self.action(match role {
             ShareRole::Plain => "remove-plain-everyone-acl",
             ShareRole::Encrypted => "remove-encrypted-everyone-acl",
+            ShareRole::Ca => "remove-ca-everyone-acl",
         })
     }
     fn grant_test_acl(&mut self, _: &Plan, role: ShareRole) -> Result<(), String> {
         self.action(match role {
             ShareRole::Plain => "grant-plain-test-acl",
             ShareRole::Encrypted => "grant-encrypted-test-acl",
+            ShareRole::Ca => "grant-ca-test-acl",
         })
     }
     fn verify_ready(&mut self, _: &Plan, kind: ResourceKind) -> Result<bool, String> {
@@ -230,6 +236,8 @@ impl OntapAdapter for ScriptedOntap {
             ResourceKind::PlainShare => "verify-plain-share-ready",
             ResourceKind::EncryptedShare => "verify-encrypted-share-ready",
             ResourceKind::Snapshot => "verify-snapshot-ready",
+            ResourceKind::CaVolume => "verify-ca-volume-ready",
+            ResourceKind::CaShare => "verify-ca-share-ready",
         });
         Ok(self.mismatch != Some(kind))
     }
@@ -239,6 +247,8 @@ impl OntapAdapter for ScriptedOntap {
             ResourceKind::PlainShare => "verify-plain-share-owned",
             ResourceKind::EncryptedShare => "verify-encrypted-share-owned",
             ResourceKind::Snapshot => "verify-snapshot-owned",
+            ResourceKind::CaVolume => "verify-ca-volume-owned",
+            ResourceKind::CaShare => "verify-ca-share-owned",
         });
         Ok(self.mismatch != Some(kind))
     }
@@ -246,6 +256,7 @@ impl OntapAdapter for ScriptedOntap {
         self.action(match role {
             ShareRole::Plain => "delete-plain-share",
             ShareRole::Encrypted => "delete-encrypted-share",
+            ShareRole::Ca => "delete-ca-share",
         })
     }
     fn unmount_volume(&mut self, _: &Plan) -> Result<(), String> {
@@ -256,6 +267,15 @@ impl OntapAdapter for ScriptedOntap {
     }
     fn delete_volume(&mut self, _: &Plan) -> Result<(), String> {
         self.action("delete-volume")
+    }
+    fn unmount_ca_volume(&mut self, _: &Plan) -> Result<(), String> {
+        self.action("unmount-ca-volume")
+    }
+    fn offline_ca_volume(&mut self, _: &Plan) -> Result<(), String> {
+        self.action("offline-ca-volume")
+    }
+    fn delete_ca_volume(&mut self, _: &Plan) -> Result<(), String> {
+        self.action("delete-ca-volume")
     }
     fn create_snapshot(&mut self, _: &Plan) -> Result<(), String> {
         self.action("create-snapshot")
@@ -316,6 +336,14 @@ fn provisioning_persists_ready_resources_in_dependency_order() {
         Some(Lifecycle::Ready)
     );
     assert_eq!(
+        recovered.state(ResourceKind::CaVolume),
+        Some(Lifecycle::Ready)
+    );
+    assert_eq!(
+        recovered.state(ResourceKind::CaShare),
+        Some(Lifecycle::Ready)
+    );
+    assert_eq!(
         adapter.calls,
         vec![
             "create-volume",
@@ -325,9 +353,15 @@ fn provisioning_persists_ready_resources_in_dependency_order() {
             "create-encrypted-share",
             "remove-encrypted-everyone-acl",
             "grant-encrypted-test-acl",
+            "create-ca-volume",
+            "create-ca-share",
+            "remove-ca-everyone-acl",
+            "grant-ca-test-acl",
             "verify-volume-ready",
             "verify-plain-share-ready",
             "verify-encrypted-share-ready",
+            "verify-ca-volume-ready",
+            "verify-ca-share-ready",
         ]
     );
     fs::remove_file(path).unwrap();

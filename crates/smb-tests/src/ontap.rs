@@ -25,6 +25,9 @@ pub struct Plan {
     encrypted_share: String,
     snapshot: String,
     junction: String,
+    ca_volume: String,
+    ca_share: String,
+    ca_junction: String,
     owner_comment: String,
     preflight_state_hash: Option<String>,
 }
@@ -66,6 +69,9 @@ impl Plan {
             encrypted_share: format!("{stem}_encrypted"),
             snapshot: format!("{stem}_previous"),
             junction: format!("/{stem}_functional"),
+            ca_volume: format!("{stem}_ca"),
+            ca_share: format!("{stem}_ca"),
+            ca_junction: format!("/{stem}_ca"),
             owner_comment: format!("smb-rs-validation:{run_id}"),
             preflight_state_hash: None,
         })
@@ -78,6 +84,7 @@ impl Plan {
         match role {
             ShareRole::Plain => &self.plain_share,
             ShareRole::Encrypted => &self.encrypted_share,
+            ShareRole::Ca => &self.ca_share,
         }
     }
     pub fn snapshot_name(&self) -> &str {
@@ -152,6 +159,7 @@ impl Plan {
                 ShareRole::Encrypted => {
                     "oplocks,browsable,changenotify,show-previous-versions,encrypt-data"
                 }
+                ShareRole::Ca => unreachable!("CA uses its independent volume"),
             };
             commands.push(args(&[
                 "vserver",
@@ -198,6 +206,30 @@ impl Plan {
                 "Full_Control",
             ]));
         }
+        commands.push(args(&[
+            "volume",
+            "create",
+            "-vserver",
+            &self.svm,
+            "-volume",
+            &self.ca_volume,
+            "-aggregate",
+            &self.aggregate,
+            "-size",
+            "2GB",
+            "-security-style",
+            "ntfs",
+            "-junction-path",
+            &self.ca_junction,
+            "-comment",
+            &self.owner_comment,
+            "-autosize-mode",
+            "off",
+            "-space-guarantee",
+            "none",
+            "-snapshot-policy",
+            "none",
+        ]));
         commands
     }
 
@@ -236,12 +268,15 @@ pub enum ResourceKind {
     PlainShare,
     EncryptedShare,
     Snapshot,
+    CaVolume,
+    CaShare,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShareRole {
     Plain,
     Encrypted,
+    Ca,
 }
 
 impl ShareRole {
@@ -249,6 +284,7 @@ impl ShareRole {
         match self {
             Self::Plain => ResourceKind::PlainShare,
             Self::Encrypted => ResourceKind::EncryptedShare,
+            Self::Ca => ResourceKind::CaShare,
         }
     }
 }
@@ -287,6 +323,8 @@ impl Inventory {
                 (ResourceKind::PlainShare, Lifecycle::Planned),
                 (ResourceKind::EncryptedShare, Lifecycle::Planned),
                 (ResourceKind::Snapshot, Lifecycle::Planned),
+                (ResourceKind::CaVolume, Lifecycle::Planned),
+                (ResourceKind::CaShare, Lifecycle::Planned),
             ]),
         }
     }
@@ -326,8 +364,10 @@ impl Inventory {
     pub fn cleanup_order(&self) -> Vec<ResourceKind> {
         [
             ResourceKind::Snapshot,
+            ResourceKind::CaShare,
             ResourceKind::EncryptedShare,
             ResourceKind::PlainShare,
+            ResourceKind::CaVolume,
             ResourceKind::Volume,
         ]
         .into_iter()
@@ -344,11 +384,12 @@ impl Inventory {
         if self.state(kind) == Some(Lifecycle::OwnershipMismatch) {
             return Err("resource ownership does not match the manifest".into());
         }
-        if kind == ResourceKind::Volume
+        if matches!(kind, ResourceKind::Volume | ResourceKind::CaVolume)
             && [
                 ResourceKind::PlainShare,
                 ResourceKind::EncryptedShare,
                 ResourceKind::Snapshot,
+                ResourceKind::CaShare,
             ]
             .into_iter()
             .any(|share| self.state(share) == Some(Lifecycle::OwnershipMismatch))
@@ -386,6 +427,8 @@ impl Inventory {
             ResourceKind::PlainShare,
             ResourceKind::EncryptedShare,
             ResourceKind::Snapshot,
+            ResourceKind::CaVolume,
+            ResourceKind::CaShare,
         ];
         if self.resources.len() != expected.len()
             || expected
@@ -636,6 +679,7 @@ fn io_error(operation: &'static str) -> impl FnOnce(io::Error) -> String {
 /// appliance mutation or verification per method.
 pub trait OntapAdapter {
     fn create_volume(&mut self, plan: &Plan) -> Result<(), String>;
+    fn create_ca_volume(&mut self, plan: &Plan) -> Result<(), String>;
     fn create_share(&mut self, plan: &Plan, role: ShareRole) -> Result<(), String>;
     fn remove_everyone_acl(&mut self, plan: &Plan, role: ShareRole) -> Result<(), String>;
     fn grant_test_acl(&mut self, plan: &Plan, role: ShareRole) -> Result<(), String>;
@@ -645,6 +689,9 @@ pub trait OntapAdapter {
     fn unmount_volume(&mut self, plan: &Plan) -> Result<(), String>;
     fn offline_volume(&mut self, plan: &Plan) -> Result<(), String>;
     fn delete_volume(&mut self, plan: &Plan) -> Result<(), String>;
+    fn unmount_ca_volume(&mut self, plan: &Plan) -> Result<(), String>;
+    fn offline_ca_volume(&mut self, plan: &Plan) -> Result<(), String>;
+    fn delete_ca_volume(&mut self, plan: &Plan) -> Result<(), String>;
     fn create_snapshot(&mut self, plan: &Plan) -> Result<(), String>;
     fn delete_snapshot(&mut self, plan: &Plan) -> Result<(), String>;
 }
@@ -726,17 +773,27 @@ impl<'a, A: OntapAdapter> ProvisioningRun<'a, A> {
             self.manifest.record_mutation(match role {
                 ShareRole::Plain => Mutation::PlainEveryoneAclRemoved,
                 ShareRole::Encrypted => Mutation::EncryptedEveryoneAclRemoved,
+                ShareRole::Ca => unreachable!(),
             })?;
             self.adapter.grant_test_acl(&plan, role)?;
             self.manifest.record_mutation(match role {
                 ShareRole::Plain => Mutation::PlainTestIdentityAclGranted,
                 ShareRole::Encrypted => Mutation::EncryptedTestIdentityAclGranted,
+                ShareRole::Ca => unreachable!(),
             })?;
         }
+        self.adapter.create_ca_volume(&plan)?;
+        self.manifest.record_created(ResourceKind::CaVolume)?;
+        self.adapter.create_share(&plan, ShareRole::Ca)?;
+        self.manifest.record_created(ResourceKind::CaShare)?;
+        self.adapter.remove_everyone_acl(&plan, ShareRole::Ca)?;
+        self.adapter.grant_test_acl(&plan, ShareRole::Ca)?;
         for kind in [
             ResourceKind::Volume,
             ResourceKind::PlainShare,
             ResourceKind::EncryptedShare,
+            ResourceKind::CaVolume,
+            ResourceKind::CaShare,
         ] {
             if !self.adapter.verify_ready(&plan, kind)? {
                 return Err(format!("{kind:?} did not match the ready plan"));
@@ -799,6 +856,12 @@ impl<'a, A: OntapAdapter> ProvisioningRun<'a, A> {
                     self.adapter.delete_volume(&plan)
                 }
                 ResourceKind::Snapshot => self.adapter.delete_snapshot(&plan),
+                ResourceKind::CaShare => self.adapter.delete_share(&plan, ShareRole::Ca),
+                ResourceKind::CaVolume => self
+                    .adapter
+                    .unmount_ca_volume(&plan)
+                    .and_then(|()| self.adapter.offline_ca_volume(&plan))
+                    .and_then(|()| self.adapter.delete_ca_volume(&plan)),
             };
             match deletion {
                 Ok(()) => {

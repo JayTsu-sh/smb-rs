@@ -68,8 +68,10 @@ impl SshOntapAdapter {
             return Err("preflight did not find the configured online aggregate".into());
         }
         if self.volume_owned(plan, false)?
+            || self.ca_volume_owned(plan, false)?
             || self.share_owned(plan, ShareRole::Plain, false)?
             || self.share_owned(plan, ShareRole::Encrypted, false)?
+            || self.share_owned(plan, ShareRole::Ca, false)?
         {
             return Err("preflight run-owned resource names are not absent".into());
         }
@@ -170,7 +172,14 @@ impl SshOntapAdapter {
             &plan.owner_comment,
         ];
         if ready {
-            args.extend(["-path", &plan.junction]);
+            args.extend([
+                "-path",
+                if role == ShareRole::Ca {
+                    &plan.ca_junction
+                } else {
+                    &plan.junction
+                },
+            ]);
         }
         args.extend([
             "-fields",
@@ -185,15 +194,12 @@ impl SshOntapAdapter {
         if !ready || !share_matches {
             return Ok(share_matches);
         }
-        let required_properties = [
-            "oplocks",
-            "browsable",
-            "changenotify",
-            "show-previous-versions",
-        ];
+        let required_properties = ["oplocks", "browsable", "changenotify"];
         if required_properties
             .into_iter()
             .any(|property| !has_list_item(&share_output, property))
+            || (role != ShareRole::Ca && !has_list_item(&share_output, "show-previous-versions"))
+            || (role == ShareRole::Ca && !has_list_item(&share_output, "continuously-available"))
             || (role == ShareRole::Encrypted && !has_list_item(&share_output, "encrypt-data"))
             || (role == ShareRole::Plain && has_list_item(&share_output, "encrypt-data"))
         {
@@ -232,6 +238,34 @@ impl SshOntapAdapter {
             && !has_exact_token(&everyone, "Everyone"))
     }
 
+    fn ca_volume_owned(&self, plan: &Plan, ready: bool) -> Result<bool, String> {
+        let mut args = vec![
+            "volume",
+            "show",
+            "-vserver",
+            &plan.svm,
+            "-volume",
+            &plan.ca_volume,
+            "-comment",
+            &plan.owner_comment,
+        ];
+        if ready {
+            args.extend([
+                "-aggregate",
+                &plan.aggregate,
+                "-state",
+                "online",
+                "-security-style",
+                "ntfs",
+                "-junction-path",
+                &plan.ca_junction,
+            ]);
+        }
+        args.extend(["-fields", "volume"]);
+        self.run(&args)
+            .map(|output| has_exact_token(&output, &plan.ca_volume))
+    }
+
     fn snapshot_owned(&self, plan: &Plan) -> Result<bool, String> {
         let output = self.run(&[
             "volume",
@@ -256,11 +290,58 @@ impl OntapAdapter for SshOntapAdapter {
     fn create_volume(&mut self, plan: &Plan) -> Result<(), String> {
         self.run_refs(&plan.provision_commands()[0])
     }
+    fn create_ca_volume(&mut self, plan: &Plan) -> Result<(), String> {
+        self.run(&[
+            "volume",
+            "create",
+            "-vserver",
+            &plan.svm,
+            "-volume",
+            &plan.ca_volume,
+            "-aggregate",
+            &plan.aggregate,
+            "-size",
+            "2GB",
+            "-security-style",
+            "ntfs",
+            "-junction-path",
+            &plan.ca_junction,
+            "-comment",
+            &plan.owner_comment,
+            "-autosize-mode",
+            "off",
+            "-space-guarantee",
+            "none",
+            "-snapshot-policy",
+            "none",
+        ])
+        .map(drop)
+    }
 
     fn create_share(&mut self, plan: &Plan, role: ShareRole) -> Result<(), String> {
         let index = match role {
             ShareRole::Plain => 1,
             ShareRole::Encrypted => 4,
+            ShareRole::Ca => {
+                return self
+                    .run(&[
+                        "vserver",
+                        "cifs",
+                        "share",
+                        "create",
+                        "-vserver",
+                        &plan.svm,
+                        "-share-name",
+                        &plan.ca_share,
+                        "-path",
+                        &plan.ca_junction,
+                        "-share-properties",
+                        "oplocks,browsable,changenotify,continuously-available",
+                        "-comment",
+                        &plan.owner_comment,
+                    ])
+                    .map(drop);
+            }
         };
         self.run_refs(&plan.provision_commands()[index])
     }
@@ -269,6 +350,23 @@ impl OntapAdapter for SshOntapAdapter {
         let index = match role {
             ShareRole::Plain => 2,
             ShareRole::Encrypted => 5,
+            ShareRole::Ca => {
+                return self
+                    .run(&[
+                        "vserver",
+                        "cifs",
+                        "share",
+                        "access-control",
+                        "delete",
+                        "-vserver",
+                        &plan.svm,
+                        "-share",
+                        &plan.ca_share,
+                        "-user-or-group",
+                        "Everyone",
+                    ])
+                    .map(drop);
+            }
         };
         self.run_refs(&plan.provision_commands()[index])
     }
@@ -299,6 +397,8 @@ impl OntapAdapter for SshOntapAdapter {
             ResourceKind::PlainShare => self.share_owned(plan, ShareRole::Plain, true),
             ResourceKind::EncryptedShare => self.share_owned(plan, ShareRole::Encrypted, true),
             ResourceKind::Snapshot => self.snapshot_owned(plan),
+            ResourceKind::CaVolume => self.ca_volume_owned(plan, true),
+            ResourceKind::CaShare => self.share_owned(plan, ShareRole::Ca, true),
         }
     }
 
@@ -308,6 +408,8 @@ impl OntapAdapter for SshOntapAdapter {
             ResourceKind::PlainShare => self.share_owned(plan, ShareRole::Plain, false),
             ResourceKind::EncryptedShare => self.share_owned(plan, ShareRole::Encrypted, false),
             ResourceKind::Snapshot => self.snapshot_owned(plan),
+            ResourceKind::CaVolume => self.ca_volume_owned(plan, false),
+            ResourceKind::CaShare => self.share_owned(plan, ShareRole::Ca, false),
         }
     }
 
@@ -359,6 +461,43 @@ impl OntapAdapter for SshOntapAdapter {
             &plan.svm,
             "-volume",
             &plan.volume,
+            "-foreground",
+            "true",
+        ])
+        .map(drop)
+    }
+    fn unmount_ca_volume(&mut self, plan: &Plan) -> Result<(), String> {
+        self.run(&[
+            "volume",
+            "unmount",
+            "-vserver",
+            &plan.svm,
+            "-volume",
+            &plan.ca_volume,
+        ])
+        .map(drop)
+    }
+    fn offline_ca_volume(&mut self, plan: &Plan) -> Result<(), String> {
+        self.run(&[
+            "volume",
+            "offline",
+            "-vserver",
+            &plan.svm,
+            "-volume",
+            &plan.ca_volume,
+            "-foreground",
+            "true",
+        ])
+        .map(drop)
+    }
+    fn delete_ca_volume(&mut self, plan: &Plan) -> Result<(), String> {
+        self.run(&[
+            "volume",
+            "delete",
+            "-vserver",
+            &plan.svm,
+            "-volume",
+            &plan.ca_volume,
             "-foreground",
             "true",
         ])
