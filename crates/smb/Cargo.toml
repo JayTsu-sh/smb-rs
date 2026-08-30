@@ -104,55 +104,7 @@ name = "lifecycle_scenario"
 required-features = ["test-support"]
 
 [[test]]
-name = "basic"
-required-features = ["real-server-tests"]
-
-[[test]]
-name = "closes"
-required-features = ["real-server-tests"]
-
-[[test]]
-name = "dialects"
-required-features = ["real-server-tests"]
-
-[[test]]
-name = "info_query"
-required-features = ["real-server-tests"]
-
-[[test]]
-name = "lease"
-required-features = ["real-server-tests"]
-
-[[test]]
-name = "long_dir"
-required-features = ["real-server-tests"]
-
-[[test]]
-name = "multichannel"
-required-features = ["real-server-tests"]
-
-[[test]]
-name = "notify"
-required-features = ["real-server-tests"]
-
-[[test]]
-name = "ontap_baseline"
-required-features = ["real-server-tests"]
-
-[[test]]
-name = "ontap_events"
-required-features = ["real-server-tests"]
-
-[[test]]
-name = "ontap_recovery"
-required-features = ["real-server-tests", "test-support"]
-
-[[test]]
 name = "rpc"
-required-features = ["real-server-tests"]
-
-[[test]]
-name = "wire_data"
 required-features = ["real-server-tests"]
 
 [features]

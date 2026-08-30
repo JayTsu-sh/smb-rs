@@ -1222,6 +1222,7 @@ impl Client {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod compound_protection_tests {
     use super::*;
 

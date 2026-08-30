@@ -3,13 +3,13 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 #[cfg(feature = "real-server-tests")]
 use smb::{
-    Batch, BatchOutcome, CancelToken, DirectoryEvent, DirectoryWatchOptions, Error,
-    TransferOptions, TransferProgress,
+    Batch, BatchOutcome, CancelToken, DirectoryEvent, DirectoryWatchOptions, Error, Resource,
+    SecurityOpenOptions, SecuritySelection, TransferOptions, TransferProgress,
 };
 use smb::{
     Client, ClientConfig, CloseOutcome, Credentials, Directory, DirectoryOpenOptions, File,
-    FileCursor, FileOpenOptions, Pipe, PipeName, ReplayPolicy, Resource, SecurityOpenOptions,
-    SecuritySelection, Session, Share, SharePath, ShareTarget, Transfer, TransferEvents,
+    FileCursor, FileOpenOptions, Pipe, PipeName, ReplayPolicy, Session, Share, SharePath,
+    ShareTarget, Transfer, TransferEvents,
 };
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
