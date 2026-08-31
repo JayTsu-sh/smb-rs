@@ -1240,7 +1240,22 @@ impl File {
                         "file rename permits only ReplayPolicy::Never".into(),
                     ));
                 }
-                self.inner.rename(destination.as_str()).await
+                self.inner.rename(destination.as_str(), false).await
+            })
+        })
+    }
+
+    /// Renames this file and atomically replaces an existing destination.
+    pub fn rename_replace<'a>(&'a self, destination: &'a SharePath) -> Operation<'a, ()> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                if context.replay != ReplayPolicy::Never {
+                    return Err(Error::UnsupportedOperation(
+                        "file replace permits only ReplayPolicy::Never".into(),
+                    ));
+                }
+                self.inner.rename(destination.as_str(), true).await
             })
         })
     }

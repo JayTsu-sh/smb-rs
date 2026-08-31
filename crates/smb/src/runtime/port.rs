@@ -596,10 +596,10 @@ impl RuntimeFile {
             .await
     }
 
-    pub(crate) async fn rename(&self, path: &str) -> crate::Result<()> {
+    pub(crate) async fn rename(&self, path: &str, replace: bool) -> crate::Result<()> {
         self.inner
             .set_info(FileRenameInformation {
-                replace_if_exists: false.into(),
+                replace_if_exists: replace.into(),
                 root_directory: 0,
                 file_name: path.into(),
             })

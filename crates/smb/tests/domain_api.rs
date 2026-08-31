@@ -63,6 +63,10 @@ fn file_delete_is_lazy(file: &File) -> Operation<'_, ()> {
     file.delete()
 }
 
+fn file_replace_is_lazy<'a>(file: &'a File, destination: &'a SharePath) -> Operation<'a, ()> {
+    file.rename_replace(destination)
+}
+
 fn session_info_is_redacted_snapshot(session: &Session) -> SessionInfo {
     session.info()
 }
@@ -102,6 +106,7 @@ fn public_spine_defers_async_work_to_lazy_operations() {
     let _ = session_close_is_lazy;
     let _ = share_close_is_lazy;
     let _ = file_delete_is_lazy;
+    let _ = file_replace_is_lazy;
     let _ = session_info_is_redacted_snapshot;
     let _ = share_info_is_redacted_snapshot;
     let _ = file_info_is_open_snapshot;
