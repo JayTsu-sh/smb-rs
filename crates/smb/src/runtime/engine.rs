@@ -1976,15 +1976,22 @@ fn transport_error_code(error: &TransportError) -> &'static str {
 mod tests {
     use super::*;
     use crate::clock::ManualClock;
+    use crate::command::{CommandRequest, Protection};
     use binrw::{BinRead, BinWrite};
     use bytes::Bytes;
     use futures_core::future::BoxFuture;
     use futures_util::FutureExt;
-    use smb_transport::test_support::ScriptedTransport;
+    use smb_transport::test_support::{ScriptedTransport, ScriptedTransportControl};
     use std::io::Cursor;
     use std::io::ErrorKind;
     use std::net::SocketAddr;
+    use std::ops::Range;
     use tokio::sync::Notify;
+
+    const SMB2_HEADER_SIZE: usize = 64;
+    const SMB2_STATUS_RANGE: Range<usize> = 8..12;
+    const SMB2_COMMAND_RANGE: Range<usize> = 12..14;
+    const SMB2_EMPTY_ERROR_RESPONSE: [u8; 9] = [9, 0, 0, 0, 0, 0, 0, 0, 0];
 
     #[derive(Clone)]
     struct GateControl {
@@ -2335,26 +2342,33 @@ mod tests {
     }
 
     fn session_setup_operation(return_raw: bool) -> TypedOperation {
-        let mut outgoing = crate::command::CommandRequest::new(
-            smb_msg::RequestContent::SessionSetup(smb_msg::SessionSetupRequest::new(
+        session_setup_operation_accepting(
+            return_raw,
+            &[
+                smb_msg::Status::MoreProcessingRequired,
+                smb_msg::Status::Success,
+            ],
+        )
+    }
+
+    fn session_setup_operation_accepting(
+        return_raw: bool,
+        statuses: &[smb_msg::Status],
+    ) -> TypedOperation {
+        let mut outgoing = CommandRequest::new(smb_msg::RequestContent::SessionSetup(
+            smb_msg::SessionSetupRequest::new(
                 vec![9, 8, 7],
                 smb_msg::SessionSecurityMode::new(),
                 smb_msg::SetupRequestFlags::new(),
                 smb_msg::NegotiateCapabilities::new(),
-            )),
-        )
+            ),
+        ))
         .with_return_raw_data(return_raw);
-        outgoing.security = Some(crate::command::Protection::None);
+        outgoing.security = Some(Protection::None);
         TypedOperation::new(
             outgoing,
-            ResponsePolicy::one_of(
-                smb_msg::Command::SessionSetup,
-                [
-                    smb_msg::Status::MoreProcessingRequired,
-                    smb_msg::Status::Success,
-                ],
-            )
-            .unwrap(),
+            ResponsePolicy::one_of(smb_msg::Command::SessionSetup, statuses.iter().copied())
+                .unwrap(),
         )
         .unwrap()
     }
@@ -2375,15 +2389,154 @@ mod tests {
         Bytes::from(encoded)
     }
 
-    #[test]
-    fn same_command_server_error_is_accepted_for_caller_classification() {
-        let policy =
-            ResponsePolicy::one_of(smb_msg::Command::Create, [smb_msg::Status::Success]).unwrap();
-        assert!(response_status_is_admissible(
-            &policy,
-            smb_msg::Status::AccessDenied,
-            true,
+    #[tokio::test]
+    async fn same_command_server_error_is_returned_and_generation_remains_usable() {
+        let (control, clock, handle, mut events) = test_runtime();
+
+        let denied = handle
+            .submit_operation(create_operation(), None)
+            .await
+            .unwrap();
+        wait_for_write(&mut events, denied.key).await;
+        control.push_server_frame(create_error_response(denied.key.message_id));
+        let denied_result = denied.completion().await.unwrap();
+        assert_eq!(
+            denied_result.response.message.header.status().unwrap(),
+            smb_msg::Status::AccessDenied
+        );
+        assert!(matches!(
+            denied_result.response.message.content,
+            smb_msg::ResponseContent::Error(_)
         ));
+
+        let follow_up = handle
+            .submit_operation(echo_operation(), None)
+            .await
+            .unwrap();
+        let follow_up_key = follow_up.key;
+        wait_for_write(&mut events, follow_up_key).await;
+        control.push_server_frame(echo_response(follow_up_key.message_id));
+        assert_eq!(follow_up.completion().await.unwrap().key, follow_up_key);
+        handle
+            .close(clock.now().saturating_add(Duration::from_secs(1)))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn wrong_command_server_error_remains_fatal() {
+        let (control, _clock, handle, mut events) = test_runtime();
+        let ticket = handle
+            .submit_operation(create_operation(), None)
+            .await
+            .unwrap();
+        wait_for_write(&mut events, ticket.key).await;
+        let mut response = create_error_response(ticket.key.message_id).to_vec();
+        set_wire_command(&mut response, smb_msg::Command::TreeConnect);
+        control.push_server_frame(Bytes::from(response));
+
+        assert!(ticket.completion().await.is_err());
+        assert!(matches!(
+            handle.exited().await.cause,
+            GenerationExitCause::Transport(RuntimeError::Wire("operation-response-contract"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn same_command_non_error_unexpected_status_remains_fatal() {
+        let (control, _clock, handle, mut events) = test_runtime();
+        let operation = session_setup_operation_accepting(false, &[smb_msg::Status::Success]);
+        let ticket = handle.submit_operation(operation, None).await.unwrap();
+        wait_for_write(&mut events, ticket.key).await;
+        control.push_server_frame(session_setup_response(ticket.key.message_id));
+
+        assert!(ticket.completion().await.is_err());
+        assert!(matches!(
+            handle.exited().await.cause,
+            GenerationExitCause::Transport(RuntimeError::Wire("operation-response-contract"))
+        ));
+    }
+
+    async fn wait_for_write(events: &mut RuntimeEvents, expected: RequestKey) {
+        loop {
+            if matches!(
+                events.recv().await,
+                Some(RuntimeEvent::WriteComplete { key }) if key == expected
+            ) {
+                return;
+            }
+        }
+    }
+
+    fn test_runtime() -> (
+        ScriptedTransportControl,
+        Arc<ManualClock>,
+        RuntimeHandle,
+        RuntimeEvents,
+    ) {
+        let (transport, control) = ScriptedTransport::new();
+        let clock = Arc::new(ManualClock::new());
+        let (handle, events) = start_generation(transport, clock.clone(), config());
+        (control, clock, handle, events)
+    }
+
+    fn create_operation() -> TypedOperation {
+        let mut outgoing = CommandRequest::new(
+            smb_msg::CreateRequest {
+                requested_oplock_level: smb_msg::OplockLevel::None,
+                impersonation_level: smb_msg::ImpersonationLevel::Impersonation,
+                desired_access: smb_fscc::FileAccessMask::new().with_generic_read(true),
+                file_attributes: smb_fscc::FileAttributes::new(),
+                share_access: smb_msg::ShareAccessFlags::new().with_read(true),
+                create_disposition: smb_msg::CreateDisposition::Open,
+                create_options: smb_msg::CreateOptions::new(),
+                name: "denied.bin".into(),
+                contexts: Vec::<smb_msg::CreateContextRequest>::new().into(),
+            }
+            .into(),
+        );
+        outgoing.security = Some(Protection::None);
+        TypedOperation::new(
+            outgoing,
+            ResponsePolicy::one_of(smb_msg::Command::Create, [smb_msg::Status::Success]).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn create_error_response(message_id: u64) -> Bytes {
+        let mut encoded = session_setup_response(message_id).to_vec();
+        encoded.truncate(SMB2_HEADER_SIZE);
+        encoded[SMB2_STATUS_RANGE]
+            .copy_from_slice(&(smb_msg::Status::AccessDenied as u32).to_le_bytes());
+        set_wire_command(&mut encoded, smb_msg::Command::Create);
+        encoded.extend_from_slice(&SMB2_EMPTY_ERROR_RESPONSE);
+        Bytes::from(encoded)
+    }
+
+    fn set_wire_command(encoded: &mut [u8], command: smb_msg::Command) {
+        encoded[SMB2_COMMAND_RANGE].copy_from_slice(&(command as u16).to_le_bytes());
+    }
+
+    fn echo_operation() -> TypedOperation {
+        let mut outgoing =
+            CommandRequest::new(smb_msg::RequestContent::Echo(smb_msg::EchoRequest {}));
+        outgoing.security = Some(Protection::None);
+        TypedOperation::new(
+            outgoing,
+            ResponsePolicy::one_of(smb_msg::Command::Echo, [smb_msg::Status::Success]).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn echo_response(message_id: u64) -> Bytes {
+        let mut response =
+            smb_msg::PlainResponse::new(smb_msg::ResponseContent::Echo(smb_msg::EchoResponse {}));
+        response.header.credit_request = 1;
+        response.header.flags.set_server_to_redir(true);
+        response.header.message_id = message_id;
+        let mut encoded = Vec::new();
+        response.write(&mut Cursor::new(&mut encoded)).unwrap();
+        Bytes::from(encoded)
     }
 
     fn pending_session_setup_response(message_id: u64, async_id: u64) -> Bytes {
