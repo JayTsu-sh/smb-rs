@@ -95,27 +95,33 @@ impl FileCreateArgs {
         }
     }
 
-    /// Returns arguments for creating a new file,
-    /// with the default access set to Generic All.
+    /// Returns arguments for creating a new file with the data-mutation access needed by
+    /// ordinary share `Change` permissions.  Do not request `GenericAll`: that also asks for
+    /// ACL/ownership rights that a data mover neither needs nor receives from ONTAP shares.
     pub fn make_create_new(attributes: FileAttributes, options: CreateOptions) -> FileCreateArgs {
         FileCreateArgs {
             disposition: CreateDisposition::Create,
             attributes,
             options,
-            desired_access: FileAccessMask::new().with_generic_all(true),
+            desired_access: FileAccessMask::new()
+                .with_generic_read(true)
+                .with_generic_write(true)
+                .with_delete(true),
             ..Default::default()
         }
     }
 
-    /// Returns arguments for creating a new file,
-    /// with the default access set to Generic All.
-    /// overwrites existing file, if it exists.
+    /// Returns arguments for replacing a file with the data-mutation access needed by ordinary
+    /// share `Change` permissions.  It overwrites an existing file when present.
     pub fn make_overwrite(attributes: FileAttributes, options: CreateOptions) -> FileCreateArgs {
         FileCreateArgs {
             disposition: CreateDisposition::OverwriteIf,
             attributes,
             options,
-            desired_access: FileAccessMask::new().with_generic_all(true),
+            desired_access: FileAccessMask::new()
+                .with_generic_read(true)
+                .with_generic_write(true)
+                .with_delete(true),
             ..Default::default()
         }
     }
