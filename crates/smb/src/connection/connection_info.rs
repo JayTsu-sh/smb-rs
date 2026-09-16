@@ -14,6 +14,9 @@ pub struct NegotiatedProperties {
     /// From the server's negotiation response.
     pub server_guid: Guid,
 
+    /// Server signing requirement from NEGOTIATE, refreshed on reconnect.
+    pub signing_required: bool,
+
     /// From the server's negotiation response.
     pub caps: GlobalCapabilities,
 

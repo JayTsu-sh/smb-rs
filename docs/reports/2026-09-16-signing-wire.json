@@ -1,0 +1,134 @@
+[
+  {
+    "server": "10.128.61.200",
+    "policy": "required",
+    "negotiate_security_mode": {
+      "response": 1,
+      "request": 3
+    },
+    "wire": {
+      "0:response:unsigned": 2,
+      "0:request:unsigned": 1,
+      "1:request:unsigned": 1,
+      "1:response:unsigned": 1,
+      "1:request:signed": 1,
+      "1:response:signed": 1,
+      "3:request:signed": 1,
+      "3:response:signed": 1,
+      "5:request:signed": 1,
+      "5:response:signed": 1,
+      "9:request:signed": 5,
+      "9:response:signed": 5,
+      "7:request:signed": 1,
+      "7:response:signed": 1,
+      "8:request:signed": 5,
+      "8:response:signed": 5,
+      "17:request:signed": 1,
+      "17:response:signed": 1,
+      "6:request:signed": 1,
+      "6:response:signed": 1,
+      "2:request:signed": 1,
+      "2:response:signed": 1
+    },
+    "result": "\nrunning 1 test\npolicy=Required bytes=4198400 elapsed_ms=896.343 content=verified\ntest negotiated_signing_roundtrip ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.92s\n\n"
+  },
+  {
+    "server": "10.128.61.200",
+    "policy": "when-required",
+    "negotiate_security_mode": {
+      "response": 1,
+      "request": 1
+    },
+    "wire": {
+      "0:response:unsigned": 2,
+      "0:request:unsigned": 1,
+      "1:request:unsigned": 1,
+      "1:response:unsigned": 1,
+      "1:request:signed": 1,
+      "1:response:signed": 1,
+      "3:request:signed": 1,
+      "3:response:signed": 1,
+      "5:request:unsigned": 1,
+      "5:response:unsigned": 1,
+      "9:request:unsigned": 5,
+      "9:response:unsigned": 5,
+      "7:request:unsigned": 1,
+      "7:response:unsigned": 1,
+      "8:request:unsigned": 5,
+      "8:response:unsigned": 5,
+      "17:request:unsigned": 1,
+      "17:response:unsigned": 1,
+      "6:request:unsigned": 1,
+      "6:response:unsigned": 1,
+      "2:request:unsigned": 1,
+      "2:response:unsigned": 1
+    },
+    "result": "\nrunning 1 test\npolicy=WhenRequired bytes=4198400 elapsed_ms=192.945 content=verified\ntest negotiated_signing_roundtrip ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s\n\n"
+  },
+  {
+    "server": "10.128.61.201",
+    "policy": "required",
+    "negotiate_security_mode": {
+      "response": 1,
+      "request": 3
+    },
+    "wire": {
+      "0:response:unsigned": 2,
+      "0:request:unsigned": 1,
+      "1:request:unsigned": 1,
+      "1:response:unsigned": 1,
+      "1:request:signed": 1,
+      "1:response:signed": 1,
+      "3:request:signed": 1,
+      "3:response:signed": 1,
+      "5:request:signed": 1,
+      "5:response:signed": 1,
+      "9:request:signed": 5,
+      "9:response:signed": 5,
+      "7:request:signed": 1,
+      "7:response:signed": 1,
+      "8:request:signed": 5,
+      "8:response:signed": 5,
+      "17:request:signed": 1,
+      "17:response:signed": 1,
+      "6:request:signed": 1,
+      "6:response:signed": 1,
+      "2:request:signed": 1,
+      "2:response:signed": 1
+    },
+    "result": "\nrunning 1 test\npolicy=Required bytes=4198400 elapsed_ms=887.083 content=verified\ntest negotiated_signing_roundtrip ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.94s\n\n"
+  },
+  {
+    "server": "10.128.61.201",
+    "policy": "when-required",
+    "negotiate_security_mode": {
+      "response": 1,
+      "request": 1
+    },
+    "wire": {
+      "0:response:unsigned": 2,
+      "0:request:unsigned": 1,
+      "1:request:unsigned": 1,
+      "1:response:unsigned": 1,
+      "1:request:signed": 1,
+      "1:response:signed": 1,
+      "3:request:signed": 1,
+      "3:response:signed": 1,
+      "5:request:unsigned": 1,
+      "5:response:unsigned": 1,
+      "9:request:unsigned": 5,
+      "9:response:unsigned": 5,
+      "7:request:unsigned": 1,
+      "7:response:unsigned": 1,
+      "8:request:unsigned": 5,
+      "8:response:unsigned": 5,
+      "17:request:unsigned": 1,
+      "17:response:unsigned": 1,
+      "6:request:unsigned": 1,
+      "6:response:unsigned": 1,
+      "2:request:unsigned": 1,
+      "2:response:unsigned": 1
+    },
+    "result": "\nrunning 1 test\npolicy=WhenRequired bytes=4198400 elapsed_ms=170.303 content=verified\ntest negotiated_signing_roundtrip ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s\n\n"
+  }
+]

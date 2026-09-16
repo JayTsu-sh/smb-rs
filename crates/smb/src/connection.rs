@@ -408,6 +408,7 @@ impl Connection {
         let dialect_impl = DialectImpl::new(dialect_rev);
         let mut negotiation = NegotiatedProperties {
             server_guid: smb2_negotiate_response.server_guid,
+            signing_required: smb2_negotiate_response.security_mode.signing_required(),
             caps: smb2_negotiate_response.capabilities,
             max_transact_size: smb2_negotiate_response.max_transact_size,
             max_read_size: smb2_negotiate_response.max_read_size,
@@ -532,7 +533,7 @@ impl Connection {
 
         let security_mode = NegotiateSecurityMode::new()
             .with_signing_enabled(has_signing)
-            .with_signing_required(has_signing);
+            .with_signing_required(has_signing && self.config.signing_policy.required(false));
 
         NegotiateRequest {
             security_mode,
@@ -1780,6 +1781,33 @@ impl Drop for ConnectionCore {
 #[cfg(test)]
 mod negotiate_context_tests {
     use super::*;
+
+    #[test]
+    fn negotiation_advertises_support_without_requiring_optional_signing() {
+        for (policy, required) in [
+            (crate::SigningPolicy::Required, true),
+            (crate::SigningPolicy::WhenRequired, false),
+        ] {
+            let connection = Connection::build(
+                "signing.test",
+                "127.0.0.1:445".parse().unwrap(),
+                Guid::generate(),
+                ConnectionConfig {
+                    signing_policy: policy,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let request = connection._make_smb2_neg_request(
+                vec![Dialect::Smb0311],
+                vec![SigningAlgorithmId::AesCmac],
+                vec![],
+                vec![],
+            );
+            assert!(request.security_mode.signing_enabled());
+            assert_eq!(request.security_mode.signing_required(), required);
+        }
+    }
 
     #[test]
     fn disabled_algorithms_do_not_emit_empty_capability_contexts() {

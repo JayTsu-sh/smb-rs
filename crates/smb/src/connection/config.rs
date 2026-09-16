@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use crate::SigningPolicy;
 use smb_msg::Dialect;
 use smb_transport::config::*;
 
@@ -162,6 +163,9 @@ pub struct ConnectionConfig {
     /// Sets the encryption mode for the connection.
     /// See [EncryptionMode] for more information.
     pub encryption_mode: EncryptionMode,
+
+    /// Client policy combined with the server signing requirement.
+    pub signing_policy: SigningPolicy,
 
     /// Sets whether signing may be skipped for guest or anonymous access.
     pub allow_unsigned_guest_access: bool,

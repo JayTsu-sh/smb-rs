@@ -241,7 +241,14 @@ where
         let mut msg = CommandRequest::new(
             SessionSetupRequest::new(
                 buffer,
-                SessionSecurityMode::new().with_signing_enabled(true),
+                SessionSecurityMode::new()
+                    .with_signing_enabled(true)
+                    .with_signing_required(
+                        self.conn_info
+                            .config
+                            .signing_policy
+                            .required(self.conn_info.negotiation.signing_required),
+                    ),
                 SetupRequestFlags::new(),
                 NegotiateCapabilities::new().with_dfs(has_dfs),
             )

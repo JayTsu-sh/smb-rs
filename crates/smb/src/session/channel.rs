@@ -1,4 +1,5 @@
 use crate::command::Protection;
+use smb_msg::{Command, Dialect};
 
 use super::*;
 
@@ -111,7 +112,9 @@ impl ChannelContext {
             if session.is_ready() || session.is_setting_up() {
                 msg.security = Some(if session.is_ready() && session.should_encrypt()? {
                     Protection::Encrypt
-                } else if !session.allow_unsigned()? {
+                } else if !session.allow_unsigned()?
+                    || self.requires_signing(&session, msg.message.header.command)?
+                {
                     Protection::SignWithChannel
                 } else {
                     Protection::None
@@ -128,6 +131,18 @@ impl ChannelContext {
         }
         msg.message.header.session_id = self.session_id;
         Ok(msg)
+    }
+
+    fn requires_signing(&self, session: &SessionInfo, command: Command) -> crate::Result<bool> {
+        let info = self
+            .upstream
+            .conn_info()
+            .ok_or_else(|| Error::InvalidState("Connection not negotiated".into()))?;
+        Ok(info.negotiation.signing_required
+            || (session.is_ready()
+                && !session.is_guest_or_anonymous()?
+                && info.negotiation.dialect_rev == Dialect::Smb0311
+                && command == Command::TreeConnect))
     }
 
     pub(crate) async fn execute(
@@ -256,12 +271,15 @@ impl ChannelContext {
         ) {
             return Err(Error::SessionInvalidated);
         }
-        // allow unsigned messages only if the session is anonymous or guest.
-        // this is enforced against configuration when setting up the session.
+        // Enforce the negotiated session policy and command-specific protection.
         let (unsigned_allowed, encryption_required) = {
             let session = self.session_state.session.read().await;
             let encryption_required = session.is_ready() && session.should_encrypt()?;
-            (session.allow_unsigned()?, encryption_required)
+            (
+                session.allow_unsigned()?
+                    && !self.requires_signing(&session, incoming.message.header.command)?,
+                encryption_required,
+            )
         };
 
         // Make sure that it's our session.

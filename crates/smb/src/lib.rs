@@ -24,6 +24,8 @@ pub mod docs;
 pub mod domain;
 pub mod error;
 pub mod facade;
+mod signing;
+pub use signing::SigningPolicy;
 #[allow(dead_code, reason = "conditional lease and oplock server-event paths")]
 pub(crate) mod lease;
 #[allow(

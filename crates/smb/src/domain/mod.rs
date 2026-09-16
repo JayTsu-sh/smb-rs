@@ -394,9 +394,13 @@ type SessionCache = HashMap<SessionCacheKey, Weak<SessionInner>>;
 
 impl DomainClient {
     pub(crate) fn new() -> Self {
+        Self::with_signing_policy(crate::SigningPolicy::default())
+    }
+
+    pub(crate) fn with_signing_policy(policy: crate::SigningPolicy) -> Self {
         Self {
             inner: Arc::new(DomainClientInner {
-                runtime: RuntimeClient::new(),
+                runtime: RuntimeClient::with_signing_policy(policy),
                 sessions: Mutex::new(HashMap::new()),
                 close_report: OnceCell::new(),
             }),

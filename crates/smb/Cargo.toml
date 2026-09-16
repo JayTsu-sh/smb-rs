@@ -104,6 +104,10 @@ name = "lifecycle_scenario"
 required-features = ["test-support"]
 
 [[test]]
+name = "signing_policy_live"
+required-features = ["real-server-tests"]
+
+[[test]]
 name = "ontap_performance"
 required-features = ["real-server-tests"]
 

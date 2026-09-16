@@ -43,6 +43,31 @@ Use explicit extensions for less common capabilities such as security
 descriptors and typed RPC pipes; ordinary file and directory code remains on
 the object hierarchy above.
 
+## Negotiated signing policy
+
+`Client::new()` retains the default `SigningPolicy::Required`: authenticated
+traffic must be signed or encrypted. To omit ordinary message signing when
+neither endpoint requires it:
+
+```rust
+use smb::{Client, SigningPolicy};
+
+let client = Client::with_signing_policy(SigningPolicy::WhenRequired);
+```
+
+`WhenRequired` advertises signing support without requiring it. The client's
+policy and the server's NEGOTIATE signing requirement determine the session
+policy. Server-required signing always wins, including after reconnect.
+Unsigned ordinary responses do not run signature verification; signed responses
+are still verified and corrupted signatures are rejected. Authentication,
+multichannel binding, SMB 3.1.1 TREE_CONNECT and encryption integrity protection
+are not disabled. The policy belongs to the client, so its cached connections
+and sessions cannot accidentally mix different policies.
+
+Without SMB encryption, omitted signing means ordinary traffic has no SMB
+message integrity protection. This option is not a general “ignore invalid
+signatures” switch.
+
 ## Feature flags
 
 | Type | Algorithm | Feature |
