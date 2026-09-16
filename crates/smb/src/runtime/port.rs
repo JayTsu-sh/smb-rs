@@ -5,7 +5,7 @@
 //! domain API. Legacy protocol mechanics remain an implementation detail behind
 //! this stable port while callers use the domain object hierarchy.
 
-use std::{pin::Pin, sync::Arc};
+use std::{pin::Pin, sync::Arc, time::SystemTime};
 
 use bytes::Bytes;
 use futures_core::{Stream, future::BoxFuture};
@@ -19,6 +19,7 @@ use smb_msg::{AdditionalInfo, CreateOptions, NotifyFilter, SrvEnumerateSnapshots
 use sspi::{AuthIdentity, Secret, Username};
 use zeroize::Zeroizing;
 
+use super::metadata;
 use crate::{
     Error,
     client::{Client as LegacyClient, ClientConfig as LegacyClientConfig, UncPath},
@@ -150,10 +151,10 @@ pub(crate) enum RuntimeResource {
 }
 
 pub(crate) struct RuntimeMetadata {
-    pub(crate) created: std::time::SystemTime,
-    pub(crate) accessed: std::time::SystemTime,
-    pub(crate) written: std::time::SystemTime,
-    pub(crate) changed: std::time::SystemTime,
+    pub(crate) created: SystemTime,
+    pub(crate) accessed: SystemTime,
+    pub(crate) written: SystemTime,
+    pub(crate) changed: SystemTime,
     pub(crate) len: u64,
 }
 
@@ -193,7 +194,7 @@ impl RuntimeShare {
         };
         let resource = self.inner.create(path, &args).await?;
         if let Some(handle) = resource.handle() {
-            if let Err(error) = super::metadata::reject_reparse(handle).await {
+            if let Err(error) = metadata::reject_reparse(handle).await {
                 let _ = handle.close().await;
                 return Err(error);
             }
@@ -438,11 +439,11 @@ pub(crate) struct RuntimeDirectory {
 impl RuntimeDirectory {
     pub(crate) async fn set_metadata(
         &self,
-        created: Option<std::time::SystemTime>,
-        accessed: Option<std::time::SystemTime>,
-        written: Option<std::time::SystemTime>,
+        created: Option<SystemTime>,
+        accessed: Option<SystemTime>,
+        written: Option<SystemTime>,
     ) -> crate::Result<()> {
-        super::metadata::set_metadata(&self.inner, created, accessed, written).await
+        metadata::set_metadata(&self.inner, created, accessed, written).await
     }
 
     pub(crate) async fn query_security(&self, dacl: bool) -> crate::Result<SecurityDescriptor> {
@@ -534,11 +535,11 @@ pub(crate) struct RuntimeFile {
 impl RuntimeFile {
     pub(crate) async fn set_metadata(
         &self,
-        created: Option<std::time::SystemTime>,
-        accessed: Option<std::time::SystemTime>,
-        written: Option<std::time::SystemTime>,
+        created: Option<SystemTime>,
+        accessed: Option<SystemTime>,
+        written: Option<SystemTime>,
     ) -> crate::Result<()> {
-        super::metadata::set_metadata(&self.inner, created, accessed, written).await
+        metadata::set_metadata(&self.inner, created, accessed, written).await
     }
 
     pub(crate) async fn flush(&self) -> crate::Result<()> {
