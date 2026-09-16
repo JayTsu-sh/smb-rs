@@ -261,7 +261,6 @@ struct ParsedDomain {
 /// Output for LsarLookupSids - parsed manually because the NDR structures
 /// are complex (RPC_UNICODE_STRING arrays with deferred pointers).
 #[derive(Debug)]
-#[allow(dead_code)]
 struct LsarLookupSidsOut {
     domains: Vec<ParsedDomain>,
     names: Vec<ParsedTranslatedName>,
@@ -573,6 +572,13 @@ where
         if !output.status.is_success() && output.status != NtStatus::NONE_MAPPED {
             return Err(crate::SmbRpcError::InvalidResponseData(
                 "LsarLookupSids failed",
+            ));
+        }
+        // MS-LSAT 3.1.4.11: MappedCount counts entries of TranslatedNames that
+        // resolved, so it can never exceed the array the server returned.
+        if usize::try_from(output.mapped_count).unwrap_or(usize::MAX) > output.names.len() {
+            return Err(crate::SmbRpcError::InvalidResponseData(
+                "LsarLookupSids mapped_count exceeds translated names",
             ));
         }
 
