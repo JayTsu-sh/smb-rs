@@ -403,10 +403,7 @@ impl DomainClient {
         Self::with_policies(policy, crate::GuestPolicy::default())
     }
 
-    pub(crate) fn with_policies(
-        signing: crate::SigningPolicy,
-        guest: crate::GuestPolicy,
-    ) -> Self {
+    pub(crate) fn with_policies(signing: crate::SigningPolicy, guest: crate::GuestPolicy) -> Self {
         Self {
             inner: Arc::new(DomainClientInner {
                 runtime: RuntimeClient::with_policies(signing, guest),

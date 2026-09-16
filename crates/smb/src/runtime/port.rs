@@ -22,16 +22,16 @@ use zeroize::Zeroizing;
 use super::metadata;
 use crate::{
     Error,
-    client::{Client as LegacyClient, ClientConfig as LegacyClientConfig, UncPath},
+    client::{Client as ProtocolClient, ClientConfig as ProtocolClientConfig, UncPath},
     resource::{
-        Directory as LegacyDirectory, File as LegacyFile, FileCreateArgs, Pipe as LegacyPipe,
-        Resource as LegacyResource, file::FileOperationOptions,
+        Directory as ProtocolDirectory, File as ProtocolFile, FileCreateArgs, Pipe as ProtocolPipe,
+        Resource as ProtocolResource, file::FileOperationOptions,
     },
     session::{
-        Session as LegacySession,
+        Session as ProtocolSession,
         credential::{SessionCredentialProvider, SharedCredentialProvider},
     },
-    tree::Tree as LegacyShare,
+    tree::Tree as ProtocolShare,
 };
 
 pub(crate) struct RuntimeCredentials {
@@ -68,19 +68,16 @@ pub(crate) enum OpenMode {
 }
 
 pub(crate) struct RuntimeClient {
-    inner: Arc<LegacyClient>,
+    inner: Arc<ProtocolClient>,
 }
 
 impl RuntimeClient {
-    pub(crate) fn with_policies(
-        signing: crate::SigningPolicy,
-        guest: crate::GuestPolicy,
-    ) -> Self {
-        let mut config = LegacyClientConfig::default();
+    pub(crate) fn with_policies(signing: crate::SigningPolicy, guest: crate::GuestPolicy) -> Self {
+        let mut config = ProtocolClientConfig::default();
         config.connection.signing_policy = signing;
         config.connection.allow_unsigned_guest_access = guest.allows_unsigned();
         Self {
-            inner: Arc::new(LegacyClient::new(config)),
+            inner: Arc::new(ProtocolClient::new(config)),
         }
     }
 
@@ -124,7 +121,7 @@ impl RuntimeClient {
 }
 
 pub(crate) struct RuntimeSession {
-    inner: Arc<LegacySession>,
+    inner: Arc<ProtocolSession>,
     server: String,
 }
 
@@ -145,7 +142,7 @@ impl RuntimeSession {
 }
 
 pub(crate) struct RuntimeShare {
-    inner: Arc<LegacyShare>,
+    inner: Arc<ProtocolShare>,
 }
 
 pub(crate) enum RuntimeResource {
@@ -176,11 +173,13 @@ impl RuntimeShare {
             )
             .await?;
         Ok(match resource {
-            LegacyResource::File(file) => RuntimeResource::File(RuntimeFile { inner: file }),
-            LegacyResource::Directory(directory) => RuntimeResource::Directory(RuntimeDirectory {
-                inner: Arc::new(directory),
-            }),
-            LegacyResource::Pipe(pipe) => RuntimeResource::Pipe(RuntimePipe { inner: pipe }),
+            ProtocolResource::File(file) => RuntimeResource::File(RuntimeFile { inner: file }),
+            ProtocolResource::Directory(directory) => {
+                RuntimeResource::Directory(RuntimeDirectory {
+                    inner: Arc::new(directory),
+                })
+            }
+            ProtocolResource::Pipe(pipe) => RuntimeResource::Pipe(RuntimePipe { inner: pipe }),
         })
     }
 
@@ -204,11 +203,13 @@ impl RuntimeShare {
             }
         }
         Ok(match resource {
-            LegacyResource::File(file) => RuntimeResource::File(RuntimeFile { inner: file }),
-            LegacyResource::Directory(directory) => RuntimeResource::Directory(RuntimeDirectory {
-                inner: Arc::new(directory),
-            }),
-            LegacyResource::Pipe(pipe) => RuntimeResource::Pipe(RuntimePipe { inner: pipe }),
+            ProtocolResource::File(file) => RuntimeResource::File(RuntimeFile { inner: file }),
+            ProtocolResource::Directory(directory) => {
+                RuntimeResource::Directory(RuntimeDirectory {
+                    inner: Arc::new(directory),
+                })
+            }
+            ProtocolResource::Pipe(pipe) => RuntimeResource::Pipe(RuntimePipe { inner: pipe }),
         })
     }
 
@@ -225,11 +226,13 @@ impl RuntimeShare {
             .create(path, &FileCreateArgs::make_open_existing(access))
             .await?;
         Ok(match resource {
-            LegacyResource::File(file) => RuntimeResource::File(RuntimeFile { inner: file }),
-            LegacyResource::Directory(directory) => RuntimeResource::Directory(RuntimeDirectory {
-                inner: Arc::new(directory),
-            }),
-            LegacyResource::Pipe(pipe) => RuntimeResource::Pipe(RuntimePipe { inner: pipe }),
+            ProtocolResource::File(file) => RuntimeResource::File(RuntimeFile { inner: file }),
+            ProtocolResource::Directory(directory) => {
+                RuntimeResource::Directory(RuntimeDirectory {
+                    inner: Arc::new(directory),
+                })
+            }
+            ProtocolResource::Pipe(pipe) => RuntimeResource::Pipe(RuntimePipe { inner: pipe }),
         })
     }
 
@@ -260,7 +263,7 @@ impl RuntimeShare {
             ));
         }
         match self.inner.create(path, &args).await? {
-            LegacyResource::File(file) => Ok(RuntimeFile { inner: file }),
+            ProtocolResource::File(file) => Ok(RuntimeFile { inner: file }),
             _ => Err(Error::InvalidState(
                 "server returned a non-file resource".into(),
             )),
@@ -276,7 +279,7 @@ impl RuntimeShare {
             FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true))
                 .with_timewarp(smb_dtyp::binrw_util::prelude::FileTime::from(timestamp));
         match self.inner.create(path, &args).await? {
-            LegacyResource::File(file) => Ok(RuntimeFile { inner: file }),
+            ProtocolResource::File(file) => Ok(RuntimeFile { inner: file }),
             _ => Err(Error::InvalidState(
                 "server returned a non-file Previous Version".into(),
             )),
@@ -305,7 +308,7 @@ impl RuntimeShare {
             }
         };
         match self.inner.create(path, &args).await? {
-            LegacyResource::Directory(directory) => Ok(RuntimeDirectory {
+            ProtocolResource::Directory(directory) => Ok(RuntimeDirectory {
                 inner: Arc::new(directory),
             }),
             _ => Err(Error::InvalidState(
@@ -320,7 +323,7 @@ impl RuntimeShare {
             .create(name, &FileCreateArgs::make_pipe())
             .await?
         {
-            LegacyResource::Pipe(pipe) => Ok(RuntimePipe { inner: pipe }),
+            ProtocolResource::Pipe(pipe) => Ok(RuntimePipe { inner: pipe }),
             _ => Err(Error::InvalidState(
                 "server returned a non-pipe resource".into(),
             )),
@@ -333,7 +336,7 @@ impl RuntimeShare {
 }
 
 pub(crate) struct RuntimePipe {
-    inner: LegacyPipe,
+    inner: ProtocolPipe,
 }
 
 impl RuntimePipe {
@@ -437,7 +440,7 @@ pub(crate) struct RuntimeDirectoryEvent {
 }
 
 pub(crate) struct RuntimeDirectory {
-    inner: Arc<LegacyDirectory>,
+    inner: Arc<ProtocolDirectory>,
 }
 
 impl RuntimeDirectory {
@@ -472,7 +475,7 @@ impl RuntimeDirectory {
     ) -> Pin<Box<dyn Stream<Item = crate::Result<RuntimeDirectoryEntry>> + Send + 'a>> {
         Box::pin(
             futures_util::stream::once(async move {
-                LegacyDirectory::query::<FileDirectoryInformation>(&self.inner, pattern).await
+                ProtocolDirectory::query::<FileDirectoryInformation>(&self.inner, pattern).await
             })
             .try_flatten()
             .map_ok(|entry| RuntimeDirectoryEntry {
@@ -490,7 +493,7 @@ impl RuntimeDirectory {
     ) -> Pin<Box<dyn Stream<Item = crate::Result<RuntimeDirectoryEvent>> + Send + 'a>> {
         Box::pin(
             futures_util::stream::once(async move {
-                LegacyDirectory::watch_stream_cancellable(
+                ProtocolDirectory::watch_stream_cancellable(
                     &self.inner,
                     NotifyFilter::all(),
                     recursive,
@@ -544,7 +547,7 @@ impl RuntimeDirectory {
 }
 
 pub(crate) struct RuntimeFile {
-    inner: LegacyFile,
+    inner: ProtocolFile,
 }
 
 impl RuntimeFile {

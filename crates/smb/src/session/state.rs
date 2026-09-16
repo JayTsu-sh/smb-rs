@@ -280,10 +280,6 @@ impl ChannelInfo {
         Ok(&self.algos.signer)
     }
 
-    pub fn invalidate(&mut self) {
-        self.valid = false;
-    }
-
     pub fn id(&self) -> u32 {
         self.id
     }

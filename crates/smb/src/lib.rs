@@ -1,22 +1,10 @@
 #![doc = include_str!("../docs/index.md")]
 #![forbid(unsafe_code)]
 
-#[allow(
-    dead_code,
-    reason = "crate-private protocol implementation exercised through the domain interface"
-)]
 pub(crate) mod client;
 mod clock;
-#[allow(
-    dead_code,
-    reason = "crate-private wire model includes protocol-fixture observations"
-)]
 pub(crate) mod command;
 pub mod compression;
-#[allow(
-    dead_code,
-    reason = "optional protocol paths are exercised by deterministic fixtures"
-)]
 pub(crate) mod connection;
 pub mod crypto;
 pub mod dialects;
@@ -26,25 +14,12 @@ pub mod error;
 pub mod facade;
 mod signing;
 pub use signing::{GuestPolicy, SigningPolicy};
-#[allow(dead_code, reason = "conditional lease and oplock server-event paths")]
 pub(crate) mod lease;
-#[allow(
-    dead_code,
-    reason = "crate-private implementation consumed through runtime::port"
-)]
 pub(crate) mod resource;
 pub(crate) mod runtime;
 #[cfg(feature = "test-support")]
 mod scenario;
-#[allow(
-    dead_code,
-    reason = "crate-private implementation consumed through runtime::port"
-)]
 pub(crate) mod session;
-#[allow(
-    dead_code,
-    reason = "crate-private implementation consumed through runtime::port"
-)]
 pub(crate) mod tree;
 
 /// Test-only API surface.

@@ -8,9 +8,7 @@ use crate::clock::TokioClock;
 use crate::compression;
 use crate::connection::preauth_hash::PreauthHashState;
 use crate::dialects::DialectImpl;
-use crate::lease::{
-    LeaseBreakAckOutcome, LeaseBreakEvent, LeaseSlot, OplockBreakEvent, OplockSlot,
-};
+use crate::lease::OplockSlot;
 pub use crate::runtime::wire::TransformError;
 use crate::runtime::{
     GenerationBootstrap, GenerationId, GenerationPublication, PreparedGeneration,
@@ -29,21 +27,16 @@ use rand::rngs::OsRng;
 use registry::ConnectionRegistry;
 use smb_dtyp::*;
 use smb_msg::{
-    OplockLevel, RequestContent, Response, ResponseContent, negotiate::*, oplock::LeaseBreakAck,
+    OplockLevel, RequestContent, Response, ResponseContent, negotiate::*,
     smb1::SMB1NegotiateMessage,
 };
 use smb_transport::*;
 use std::net::SocketAddr;
 use std::sync::Weak;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
-
-/// Capacity of the per-connection lease-break broadcast. A handful of slow
-/// subscribers wouldn't trail behind by more than this many events. Internal
-/// cache invalidation is authoritative and does not depend on this channel.
-const LEASE_BREAK_CHANNEL_CAPACITY: usize = 64;
 
 /// Represents an SMB connection.
 ///
@@ -105,17 +98,11 @@ impl GenerationBootstrap for ConnectionRecoveryBootstrap {
                 .connect(&server_name, address)
                 .await
                 .map_err(|_| RuntimeError::Transport("recovery-connect"))?;
-            let remote_address = transport
-                .remote_address()
-                .map_err(|_| RuntimeError::Transport("recovery-remote-address"))?;
             let generation_runtime = connection
                 ._negotiate_switch_to_smb2(transport, config.smb2_only_negotiate, generation)
                 .await
                 .map_err(|_| RuntimeError::Wire("recovery-negotiate-switch"))?;
-            let info = match connection
-                ._negotiate_smb2(remote_address, &generation_runtime)
-                .await
-            {
+            let info = match connection._negotiate_smb2(&generation_runtime).await {
                 Ok(info) => Arc::new(info),
                 Err(_) => {
                     let _ = generation_runtime.stop().await;
@@ -157,52 +144,6 @@ impl Connection {
         })
     }
 
-    /// Creates a SMB connection for an alternate channel,
-    /// for the specified existing, primary connection.
-    ///
-    /// Returns the ID of the channel in the existing session.
-    #[tracing::instrument(level = "debug", skip_all, fields(server = %self.server_name, user = %identity.username.account_name()))]
-    pub async fn bind_session(
-        &self,
-        primary_session: &Session,
-        identity: sspi::AuthIdentity,
-    ) -> crate::Result<u32> {
-        tracing::debug!("Binding alternate session to new connection");
-
-        if self.conn_info().is_none() {
-            return Err(Error::InvalidState(
-                "Connection must be negotiated before binding a session.".to_string(),
-            ));
-        }
-
-        if !self
-            .conn_info()
-            .as_ref()
-            .ok_or_else(|| {
-                Error::InvalidState(
-                    "Connection info not available after negotiation check.".to_string(),
-                )
-            })?
-            .negotiation
-            .caps
-            .multi_channel()
-        {
-            return Err(Error::InvalidState(
-                "Server does not support multichannel.".to_string(),
-            ));
-        }
-
-        primary_session
-            .bind(
-                identity,
-                &self.context,
-                &self.context.conn_info().ok_or_else(|| {
-                    Error::InvalidState("Connection info not available.".to_string())
-                })?,
-            )
-            .await
-    }
-
     /// Connects to the specified server, if it is not already connected, and negotiates the connection.
     #[tracing::instrument(level = "debug", skip_all, fields(server = %self.server_name))]
     pub async fn connect(&self) -> crate::Result<()> {
@@ -228,44 +169,6 @@ impl Connection {
             .await?;
 
         Ok(())
-    }
-
-    /// Starts a new connection from an existing, connected transport.
-    ///
-    /// This is especially useful when you want to use a custom transport - otherwise,
-    /// You should create a connection using the [`Client`][`crate::Client`] API.
-    ///
-    /// # Arguments
-    /// * `transport` - The transport to use for the connection.
-    /// * `server` - The name or address of the server to connect to.
-    /// * `config` - The connection configuration. Note that the [`ConnectionConfig::transport`] field is NOT used when
-    ///   creating the connection.
-    /// # Returns
-    /// A new [`Connection`] object with the specified transport and configuration.
-    ///
-    ///
-    /// ```ignore
-    /// # use smb::*;
-    /// # use std::time::Duration;
-    /// use smb_transport::TcpTransport;
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<()> {
-    /// let custom_tcp_transport = Box::new(TcpTransport::new(Duration::from_millis(10))); // you may also implement you own transport!
-    /// let my_connection_config = ConnectionConfig { ..Default::default() };
-    /// let connection = Connection::from_transport(custom_tcp_transport, "server", Guid::generate(), my_connection_config).await?;
-    /// # Ok(())}
-    /// ```
-    #[tracing::instrument(level = "debug", skip_all, fields(server = %server))]
-    pub async fn from_transport(
-        transport: Box<dyn SmbTransport>,
-        server: &str,
-        client_guid: Guid,
-        config: ConnectionConfig,
-    ) -> crate::Result<Self> {
-        let conn = Self::build(server, transport.remote_address()?, client_guid, config)?;
-        conn._negotiate(transport, conn.config.smb2_only_negotiate, false)
-            .await?;
-        Ok(conn)
     }
 
     /// Closes the connection, and all of it's managed resources.
@@ -347,10 +250,32 @@ impl Connection {
         .await
     }
 
+    /// Negotiated connection information for conformance fixtures.
+    #[cfg(feature = "test-support")]
+    pub fn conn_info(&self) -> Option<Arc<ConnectionInfo>> {
+        self.context.conn_info()
+    }
+
+    /// Builds a connection over a caller-supplied transport (transcript
+    /// replay and conformance fixtures); production code goes through
+    /// [`Client`](crate::client::Client).
+    #[cfg(feature = "test-support")]
+    #[tracing::instrument(level = "debug", skip_all, fields(server = %server))]
+    pub async fn from_transport(
+        transport: Box<dyn SmbTransport>,
+        server: &str,
+        client_guid: Guid,
+        config: ConnectionConfig,
+    ) -> crate::Result<Self> {
+        let conn = Self::build(server, transport.remote_address()?, client_guid, config)?;
+        conn._negotiate(transport, conn.config.smb2_only_negotiate, false)
+            .await?;
+        Ok(conn)
+    }
+
     /// This method perofrms the SMB2 negotiation.
     async fn _negotiate_smb2(
         &self,
-        server_address: std::net::SocketAddr,
         generation_runtime: &Arc<GenerationRuntime>,
     ) -> crate::Result<ConnectionInfo> {
         tracing::debug!("Negotiating SMB2");
@@ -457,8 +382,6 @@ impl Connection {
             config: self.config.clone(),
             server_name: self.server_name.clone(),
             preauth_hash,
-            client_guid: self.context.client_guid,
-            server_address,
         })
     }
 
@@ -583,17 +506,13 @@ impl Connection {
             return Err(Error::InvalidState("Already negotiated".into()));
         }
 
-        let server_address = transport.remote_address()?;
         // Negotiate SMB1, Switch to SMB2
         let generation_runtime = self
             ._negotiate_switch_to_smb2(transport, smb2_only_neg, GenerationId::new(1))
             .await?;
 
         // Negotiate SMB2
-        let info = Arc::new(
-            self._negotiate_smb2(server_address, &generation_runtime)
-                .await?,
-        );
+        let info = Arc::new(self._negotiate_smb2(&generation_runtime).await?);
 
         generation_runtime.negotaite_complete(&info).await?;
         self.context
@@ -701,12 +620,6 @@ impl Connection {
         Ok(session)
     }
 
-    /// Returns the connection information, if the connection has been negotiated.
-    /// Otherwise, returns `None`.
-    pub fn conn_info(&self) -> Option<Arc<ConnectionInfo>> {
-        self.context.conn_info()
-    }
-
     /// Test-only observation of the opaque runtime generation identity.
     #[cfg(feature = "test-support")]
     pub fn observed_generation(&self) -> Option<u64> {
@@ -714,194 +627,6 @@ impl Connection {
             .generation_runtime()
             .map(|generation_runtime| generation_runtime.generation().value())
     }
-
-    /// Subscribe to lease-break notifications received on this connection.
-    /// See [`ConnectionCore::subscribe_lease_breaks`] for semantics.
-    pub fn subscribe_lease_breaks(&self) -> tokio::sync::broadcast::Receiver<LeaseBreakEvent> {
-        self.context.subscribe_lease_breaks()
-    }
-
-    pub fn subscribe_oplock_breaks(&self) -> tokio::sync::broadcast::Receiver<OplockBreakEvent> {
-        self.context.subscribe_oplock_breaks()
-    }
-
-    /// Install a [`crate::lease::LeaseSlot`] into this connection's
-    /// lease cache. See [`ConnectionCore::insert_lease_slot`].
-    pub async fn insert_lease_slot(&self, slot: Arc<LeaseSlot>) -> crate::Result<()> {
-        self.context.insert_lease_slot(slot).await
-    }
-
-    /// Return the current number of cached lease slots.
-    pub async fn lease_slot_count(&self) -> crate::Result<usize> {
-        self.context.lease_slot_count().await
-    }
-
-    /// Look up a cached lease slot by path; `None` when absent.
-    pub async fn peek_lease_slot(&self, path: &str) -> crate::Result<Option<Arc<LeaseSlot>>> {
-        self.context.peek_lease_slot(path).await
-    }
-
-    /// Atomic cache-hit acquire: peek a slot and bump its refcount inside
-    /// the `lease_table` lock. See
-    /// [`ConnectionCore::try_acquire_lease`] for semantics and
-    /// the rationale around lock ordering vs eviction.
-    pub async fn try_acquire_lease(
-        &self,
-        path: &str,
-        requested_access: smb_fscc::FileAccessMask,
-        requested_disposition: smb_msg::CreateDisposition,
-        wants_directory: bool,
-    ) -> crate::Result<Option<Arc<LeaseSlot>>> {
-        self.context
-            .try_acquire_lease(
-                path,
-                requested_access,
-                requested_disposition,
-                wants_directory,
-            )
-            .await
-    }
-
-    /// Phase C.5: tombstone a lease slot and remove it from the table.
-    /// See [`ConnectionCore::take_lease_for_evict`] for the
-    /// race-free contract.
-    pub async fn take_lease_for_evict(&self, path: &str) -> crate::Result<Option<LeaseEviction>> {
-        self.context.take_lease_for_evict(path).await
-    }
-
-    /// Phase C.5: scan the connection's lease table and tombstone any
-    /// slot whose `last_used` is older than `older_than`. Slots whose
-    /// refcount is zero at sweep time are removed from the table and
-    /// returned for the caller to flush the wire Close. Live-ref slots
-    /// stay in the table tombstoned; their last release_one will send
-    /// the deferred Close through the regular path.
-    pub async fn sweep_idle_leases(
-        &self,
-        older_than: std::time::Duration,
-    ) -> crate::Result<Vec<LeaseEviction>> {
-        self.context.sweep_idle_leases(older_than).await
-    }
-
-    /// Send an SMB2 compound chain through this connection's generation_runtime and
-    /// receive each member's response.
-    ///
-    /// For each message in `msgs` (in order) this:
-    /// 1. Sets `priority_mask` per the negotiated dialect, matching the
-    ///    single-command execution path.
-    /// 2. Submits the entire typed batch atomically; the runtime owner
-    ///    allocates MessageIds and credit charge/request values.
-    /// 3. After all members are prepared, hands the whole batch to
-    ///    [`crate::connection::generation_runtime::GenerationRuntime::send_compound`] for
-    ///    the single TCP write.
-    /// 4. Awaits each member's response separately via
-    ///    `Generation runtime::receive` — server splits the compound response into
-    ///    N parts; our compound-aware incoming-side parser routes each
-    ///    part by message_id, and these receives just consume the
-    ///    pre-routed entries.
-    /// 5. The runtime owner applies every response grant before publishing
-    ///    the corresponding typed result.
-    ///
-    /// The caller owns everything semantic: setting
-    /// `flags.related_operations` on members 2..N to chain off the
-    /// previous command's FileId/TreeId/SessionId, setting
-    /// `FileId::FULL` on commands that should reuse the prior result,
-    /// and validating each response's status code.
-    ///
-    /// On success returns `responses.len() == msgs.len()` in input order.
-    ///
-    /// **Size budget:** the whole chain (headers + bodies + 8-byte
-    /// alignment padding between members) goes out as one transport
-    /// write, which the server's NetBIOS-layer reader caps at the
-    /// negotiated `max_transact_size`. Callers should keep the sum of
-    /// per-member serialized sizes well below
-    /// `conn.conn_info().unwrap().negotiation.max_transact_size`
-    /// (typically 1 MiB on modern Windows / NetApp / Samba). Going
-    /// over yields `STATUS_INVALID_PARAMETER` or a torn connection
-    /// depending on the server. There is no client-side enforcement
-    /// today — adding one would require pre-serializing each member
-    /// twice, which defeats the point of the single-write path.
-    pub async fn send_compound(
-        &self,
-        msgs: Vec<CommandRequest>,
-    ) -> crate::Result<Vec<CommandResponse>> {
-        self.send_compound_for(msgs, self.context.connection_object()?)
-            .await
-    }
-
-    pub(crate) async fn send_compound_for(
-        &self,
-        mut msgs: Vec<CommandRequest>,
-        dependency: crate::runtime::ObjectToken,
-    ) -> crate::Result<Vec<CommandResponse>> {
-        let dependency = self
-            .context
-            .resolve_dependency(dependency, Some(self.config.timeout()), None)
-            .await?;
-        // CancelRequest has its own bespoke path inside the single-message
-        // `submit` (it reuses an already-allocated message_id and skips
-        // owner admission). Bundling it into a compound chain
-        // would either re-allocate its message_id — silently breaking the
-        // cancel target — or skip the per-member accounting we run below.
-        // Reject up front rather than letting either failure mode bite.
-        for (i, m) in msgs.iter().enumerate() {
-            if m.message.content.as_cancel().is_ok() {
-                return Err(Error::InvalidArgument(format!(
-                    "send_compound: member {i} is a CancelRequest, which is not \
-                     supported in compound chains; cancel must be sent on its own"
-                )));
-            }
-        }
-        let priority_value = match self.context.conn_info() {
-            Some(neg_info) => match neg_info.negotiation.dialect_rev {
-                Dialect::Smb0311 => 1,
-                _ => 0,
-            },
-            None => 0,
-        };
-        for m in msgs.iter_mut() {
-            m.message.header.flags = m.message.header.flags.with_priority_mask(priority_value);
-        }
-
-        let generation_runtime = self
-            .context
-            .generation_runtime()
-            .ok_or(Error::InvalidState(
-                "Generation runtime is uninitialized".into(),
-            ))?;
-        let send_results = generation_runtime
-            .send_compound_for(msgs, dependency)
-            .await?;
-
-        let mut responses = Vec::with_capacity(send_results.len());
-        for r in send_results {
-            let mut opts = ResponseOptions::new();
-            opts.msg_id = r.msg_id;
-            opts.allow_async = true;
-            let incoming = generation_runtime.receive(&opts).await?;
-            responses.push(incoming);
-        }
-        Ok(responses)
-    }
-}
-
-/// Phase C.5: a slot that was just removed from the per-connection lease
-/// table because either an explicit `evict_lease` or an idle-sweep
-/// decided to flush it. The caller — `Client::evict_lease` /
-/// `Client::flush_idle_leases` — is responsible for sending the wire
-/// `Close` when `needs_wire_close` is true.
-pub struct LeaseEviction {
-    /// The slot that was removed from the table. Held as `Arc` since
-    /// live `ResourceHandle`s may still reference it; their close()/Drop
-    /// will see `tombstoned == true` and become no-ops on the table
-    /// (we already removed the entry).
-    pub slot: Arc<LeaseSlot>,
-    /// `true` when this eviction owns the wire `Close`: at removal time
-    /// the slot had zero live handles, so no `release_one` path will
-    /// fire it. The caller must send `CloseRequest` against
-    /// `slot.file_id` through `slot.proto.context`. `false` when at
-    /// least one live handle was present; that handle's
-    /// `release_one` -> `CloseAndEvict` path will own the wire Close.
-    pub needs_wire_close: bool,
 }
 
 /// This struct is the internal message context for the SMB client.
@@ -916,11 +641,6 @@ pub(crate) struct ConnectionCore {
 
     /// Cancellation token for stopping notifications.
     stop_notifications: CancellationToken,
-
-    /// Broadcasts [`LeaseBreakEvent`] to any [`crate::Client::subscribe_lease_breaks`]
-    /// consumers when the server sends a `LeaseBreakNotify`.
-    lease_event_tx: tokio::sync::broadcast::Sender<LeaseBreakEvent>,
-    oplock_event_tx: tokio::sync::broadcast::Sender<OplockBreakEvent>,
 
     /// Domain-only lease/session registry. It owns no task and no request or
     /// transport authority; every lock is released before wire I/O.
@@ -985,20 +705,6 @@ impl ConnectionCore {
             ));
         }
         Ok(result)
-    }
-
-    pub(crate) async fn submit_for(
-        &self,
-        mut message: CommandRequest,
-        dependency: crate::runtime::ObjectToken,
-    ) -> crate::Result<CommandSubmission> {
-        let timeout = self.conn_info().map(|info| info.config.timeout());
-        let dependency = self.resolve_dependency(dependency, timeout, None).await?;
-        self.prepare_outgoing(&mut message).await?;
-        self.generation_runtime()
-            .ok_or_else(|| Error::InvalidState("Runtime is uninitialized".into()))?
-            .send_for(message, dependency)
-            .await
     }
 
     async fn execute_with_worker(
@@ -1071,193 +777,18 @@ impl ConnectionCore {
     }
 
     fn new(client_guid: Guid) -> ConnectionCore {
-        let (lease_event_tx, _) = tokio::sync::broadcast::channel(LEASE_BREAK_CHANNEL_CAPACITY);
-        let (oplock_event_tx, _) = tokio::sync::broadcast::channel(LEASE_BREAK_CHANNEL_CAPACITY);
-
         ConnectionCore {
             client_guid,
             generation: ArcSwapOption::empty(),
             recovery: OnceLock::new(),
             tasks: std::sync::Mutex::new(ConnectionTasks::default()),
             stop_notifications: Default::default(),
-            lease_event_tx,
-            oplock_event_tx,
             registry: ConnectionRegistry::new(),
         }
     }
 
-    /// Install a [`LeaseSlot`] into the per-connection cache. Called from
-    /// [`crate::Client::create_file`] after a successful Create that
-    /// carried an `RqLs` grant. Overwrites any prior entry for the same
-    /// path — a stale slot (e.g., a previous open that was closed by the
-    /// other side) is logically equivalent to no cache hit.
-    pub async fn insert_lease_slot(&self, slot: Arc<LeaseSlot>) -> crate::Result<()> {
-        use std::sync::atomic::Ordering;
-        let displaced = self.registry.insert_lease(slot).await;
-        if let Some(prev) = displaced {
-            // Tombstone the displaced slot. If a live ResourceHandle is
-            // still holding it (refcount > 0), its eventual close/Drop
-            // will see `CloseAndEvict` on release_one and send the wire
-            // `Close`. If the handle has already been dropped (refcount
-            // == 0 at displacement time), nobody will call release_one
-            // ever again, so we must send the wire Close ourselves —
-            // otherwise the server-side FileId leaks until session
-            // disconnect.
-            prev.tombstoned.store(true, Ordering::Release);
-            let live = prev.refcount.load(Ordering::Acquire);
-            tracing::debug!(
-                path = %prev.path,
-                live_refs = live,
-                "Replaced existing lease slot in cache; old slot tombstoned",
-            );
-            if live == 0 && prev.file_id != smb_msg::FileId::EMPTY {
-                let file_id = prev.file_id;
-                let context = prev.proto.context.clone();
-                // Close synchronously within the caller's owned operation;
-                // detached cleanup tasks are forbidden.
-                if let Err(e) = crate::resource::ResourceHandle::send_close_external(
-                    file_id,
-                    &context,
-                    prev.proto.object,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        file_id = ?file_id,
-                        error = ?e,
-                        "Displaced-slot wire Close failed (FileId leaked until session end)",
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
     pub(crate) async fn insert_oplock_slot(&self, slot: &Arc<OplockSlot>) {
         self.registry.insert_oplock(slot).await;
-    }
-
-    /// Return the current number of cached lease slots. Primarily for
-    /// observability and tests; not in any hot path.
-    pub async fn lease_slot_count(&self) -> crate::Result<usize> {
-        Ok(self.registry.lease_slot_count().await)
-    }
-
-    /// Look up a cached lease slot by path. Returns `None` when there is
-    /// no entry. Used by tests and the break-listener task; the cache-hit
-    /// fast path in `Client::_create_file` goes through
-    /// [`Self::try_acquire_lease`] instead so the bump is atomic with the
-    /// lookup against concurrent evictions.
-    pub async fn peek_lease_slot(&self, path: &str) -> crate::Result<Option<Arc<LeaseSlot>>> {
-        Ok(self.registry.peek_lease(path).await)
-    }
-
-    /// Phase C.5 race-free acquire: look up `path` and call
-    /// [`LeaseSlot::try_acquire_for_reuse`] *while still holding the
-    /// `lease_table` lock*. This serializes the refcount bump against
-    /// concurrent [`Self::take_lease_for_evict`] / [`Self::sweep_idle_leases`]
-    /// callers that also take the lock; without the lock the evict path
-    /// could observe `refcount == 0`, send a wire Close, and remove the
-    /// slot between an acquirer's `peek` and `fetch_add`, leaving the
-    /// acquirer with a stale FileId. Returns `Some(slot)` on a successful
-    /// bump, `None` for any non-hit reason.
-    pub async fn try_acquire_lease(
-        &self,
-        path: &str,
-        requested_access: smb_fscc::FileAccessMask,
-        requested_disposition: smb_msg::CreateDisposition,
-        wants_directory: bool,
-    ) -> crate::Result<Option<Arc<LeaseSlot>>> {
-        Ok(self
-            .registry
-            .try_acquire_lease(
-                path,
-                requested_access,
-                requested_disposition,
-                wants_directory,
-            )
-            .await)
-    }
-
-    /// Phase C.5: atomically tombstone a slot keyed by `path`, remove it
-    /// from the table, and report whether the caller owes a wire Close.
-    /// The lock is held across the tombstone-store and the
-    /// `refcount.load`, so an `Acquire`-ordered `try_acquire_for_reuse`
-    /// running on another task either finishes its bump before this
-    /// function reads `refcount` (so we observe > 0 and yield the
-    /// close to that holder's `release_one`) or finds the slot gone
-    /// from the table and falls back to the wire Create path.
-    ///
-    /// Returns `None` when `path` had no entry.
-    pub async fn take_lease_for_evict(&self, path: &str) -> crate::Result<Option<LeaseEviction>> {
-        Ok(self.registry.take_lease_for_evict(path).await)
-    }
-
-    /// Phase C.5 idle sweep: walk the lease table, tombstone every slot
-    /// whose `last_used` predates `now - older_than`, and remove those
-    /// entries from the table. Slots with zero refcount at sweep time
-    /// are returned in the result so the caller can flush the wire
-    /// Close; slots with live handles stay tombstoned and rely on the
-    /// regular `release_one` -> `CloseAndEvict` path.
-    pub async fn sweep_idle_leases(
-        &self,
-        older_than: std::time::Duration,
-    ) -> crate::Result<Vec<LeaseEviction>> {
-        Ok(self.registry.sweep_idle_leases(older_than).await)
-    }
-
-    /// Apply a single [`LeaseBreakEvent`] to the connection's lease table.
-    /// All slots whose `lease_key` matches the event are tombstoned,
-    /// removed from the table, and their `granted_state` snapshot
-    /// updated to the server's new state.
-    ///
-    /// The tombstone-store, granted_state update, and table removal all
-    /// happen inside one registry critical section so a concurrent `try_acquire_lease`
-    /// either runs strictly before (and gets a still-valid slot for
-    /// which the wire I/O may racily fail — recoverable) or strictly
-    /// after (and finds the slot gone, falling back to a fresh wire
-    /// Create). Without this fence the in-flight acquirer could observe
-    /// `tombstoned == false`, bump refcount, and hand out a FileId the
-    /// server has already revoked.
-    async fn apply_lease_break(&self, event: &LeaseBreakEvent) -> Vec<Arc<LeaseSlot>> {
-        let event_key = event.lease_key.as_u128();
-        let matching = self
-            .registry
-            .apply_lease_break(event_key, event.new_state)
-            .await;
-
-        if matching.is_empty() {
-            tracing::trace!(
-                lease_key = ?event.lease_key,
-                "Break event has no matching slot in this connection's cache",
-            );
-            return matching;
-        }
-        for slot in &matching {
-            tracing::debug!(
-                path = %slot.path,
-                lease_key = %slot.lease_key,
-                new_state = ?event.new_state,
-                "Lease slot tombstoned + removed by server break",
-            );
-        }
-        matching
-    }
-
-    /// Subscribe to lease-break notifications received on this connection.
-    ///
-    /// Each call returns a fresh `Receiver`; sending is broadcast, so multiple
-    /// subscribers each see every event. Lagging subscribers may receive
-    /// `RecvError::Lagged` and skip older events — the connection task has
-    /// already sent the ack by that point, so missing the event only means
-    /// the subscriber's cache invalidation is delayed, never that the
-    /// protocol is left in a bad state.
-    pub fn subscribe_lease_breaks(&self) -> tokio::sync::broadcast::Receiver<LeaseBreakEvent> {
-        self.lease_event_tx.subscribe()
-    }
-
-    pub fn subscribe_oplock_breaks(&self) -> tokio::sync::broadcast::Receiver<OplockBreakEvent> {
-        self.oplock_event_tx.subscribe()
     }
 
     pub fn generation_runtime(&self) -> Option<Arc<GenerationRuntime>> {
@@ -1622,29 +1153,17 @@ impl ConnectionCore {
             *level = new_level;
             previous
         };
-        let ack_required = previous_level != OplockLevel::II;
-        let ack_outcome = if ack_required {
+        // Level II breaks need no acknowledgement (MS-SMB2 3.2.5.19.1).
+        if previous_level != OplockLevel::II {
             const ACK_DEADLINE: Duration = Duration::from_secs(35);
             match tokio::time::timeout(ACK_DEADLINE, self.send_oplock_break_ack(&slot, new_level))
                 .await
             {
-                Ok(Ok(())) => LeaseBreakAckOutcome::Accepted,
-                Ok(Err(error)) => {
-                    tracing::warn!(?error, "OplockBreakAck failed");
-                    LeaseBreakAckOutcome::Failed
-                }
-                Err(_) => LeaseBreakAckOutcome::TimedOut,
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(?error, "OplockBreakAck failed"),
+                Err(_) => tracing::warn!("OplockBreakAck timed out"),
             }
-        } else {
-            LeaseBreakAckOutcome::NotRequired
-        };
-        let _ = self.oplock_event_tx.send(OplockBreakEvent {
-            file_id: notify.file_id(),
-            previous_level,
-            new_level,
-            ack_outcome,
-            received_at: Instant::now(),
-        });
+        }
         Ok(())
     }
 
@@ -1689,83 +1208,14 @@ impl ConnectionCore {
             }
         };
 
-        let ack_required = notify.ack_required != 0;
+        // This client never requests leases (see `FileCreateArgs`), so a break
+        // cannot target an open it holds; record it and move on.
         tracing::debug!(
             lease_key = ?notify.lease_key,
             current = ?notify.current_lease_state,
             new = ?notify.new_lease_state,
-            ack_required,
-            "LeaseBreakNotify received"
-        );
-
-        let received_at = Instant::now();
-        let mut event = LeaseBreakEvent {
-            lease_key: notify.lease_key,
-            current_state: notify.current_lease_state,
-            new_state: notify.new_lease_state,
-            epoch: notify.new_epoch,
-            ack_required,
-            ack_outcome: LeaseBreakAckOutcome::NotRequired,
-            received_at,
-        };
-
-        // Invalidate under the registry's one critical section before any
-        // acknowledgement can unblock the conflicting server operation.
-        let invalidated = self.apply_lease_break(&event).await;
-        if ack_required {
-            const ACK_DEADLINE: Duration = Duration::from_secs(35);
-            event.ack_outcome = match tokio::time::timeout(
-                ACK_DEADLINE,
-                self.send_lease_break_ack(invalidated.first(), &notify),
-            )
-            .await
-            {
-                Ok(Ok(())) => LeaseBreakAckOutcome::Accepted,
-                Ok(Err(error)) => {
-                    tracing::warn!(?error, "LeaseBreakAck failed");
-                    LeaseBreakAckOutcome::Failed
-                }
-                Err(_) => {
-                    tracing::warn!("LeaseBreakAck deadline elapsed");
-                    LeaseBreakAckOutcome::TimedOut
-                }
-            };
-        }
-
-        // Public consumer lag cannot affect internal cache correctness: the
-        // authoritative invalidation above has already completed.
-        let _ = self.lease_event_tx.send(event);
-
-        Ok(())
-    }
-
-    /// Construct and send a `LeaseBreakAck` for the given notification.
-    ///
-    /// MS-SMB2 requires the acknowledgement to use the SessionId and TreeId
-    /// of the open that owns the lease. Route through the context retained in
-    /// that lease slot so the normal context chain stamps both identifiers and
-    /// applies the tree's signing/encryption policy.
-    async fn send_lease_break_ack(
-        &self,
-        slot: Option<&Arc<LeaseSlot>>,
-        notify: &smb_msg::LeaseBreakNotify,
-    ) -> crate::Result<()> {
-        let slot = slot.ok_or_else(|| {
-            Error::InvalidState("Cannot acknowledge lease break without its owning Resource".into())
-        })?;
-
-        let ack = LeaseBreakAck {
-            lease_key: notify.lease_key,
-            lease_state: notify.new_lease_state,
-        };
-        slot.proto
-            .context
-            .send_recv(RequestContent::LeaseBreakAck(ack))
-            .await?;
-        tracing::debug!(
-            lease_key = ?notify.lease_key,
-            tree_id = slot.tree_id,
-            "LeaseBreakAck accepted",
+            ack_required = notify.ack_required != 0,
+            "LeaseBreakNotify received for a lease this client does not hold"
         );
         Ok(())
     }

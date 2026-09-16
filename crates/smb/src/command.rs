@@ -1,6 +1,5 @@
 use bytes::Bytes;
 use smb_msg::{Command, PlainRequest, PlainResponse, RequestContent, Status};
-use std::sync::{Arc, atomic::AtomicU64};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
@@ -123,18 +122,11 @@ pub struct CommandResponse {
 
     // How did the message arrive?
     pub form: MessageForm,
-
-    pub source_channel_id: Option<u32>,
 }
 
 impl CommandResponse {
     pub fn new(message: PlainResponse, raw: Bytes, form: MessageForm) -> CommandResponse {
-        CommandResponse {
-            message,
-            raw,
-            form,
-            source_channel_id: None,
-        }
+        CommandResponse { message, raw, form }
     }
 }
 
@@ -151,33 +143,6 @@ pub struct MessageForm {
 impl MessageForm {
     pub fn signed_or_encrypted(&self) -> bool {
         self.signed || self.encrypted
-    }
-}
-
-#[derive(Debug)]
-pub struct AsyncMessageIds {
-    pub msg_id: AtomicU64,
-    pub async_id: AtomicU64,
-}
-
-impl AsyncMessageIds {
-    pub fn reset(&self) {
-        self.set(u64::MAX, u64::MAX);
-    }
-    pub fn set(&self, msg_id: u64, async_id: u64) {
-        self.msg_id
-            .store(msg_id, std::sync::atomic::Ordering::Relaxed);
-        self.async_id
-            .store(async_id, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-impl Default for AsyncMessageIds {
-    fn default() -> Self {
-        Self {
-            msg_id: AtomicU64::new(u64::MAX),
-            async_id: AtomicU64::new(u64::MAX),
-        }
     }
 }
 
@@ -222,11 +187,6 @@ pub struct ResponseOptions<'a> {
     /// if it's an async operation.
     pub async_cancel: Option<CancellationToken>,
 
-    /// An optional atomic u64 to update with a message ID + async ID that is being
-    /// waited for. This is useful for tracking the async message ID
-    /// across multiple threads.
-    pub async_msg_ids: Option<Arc<AsyncMessageIds>>,
-
     /// A timeout for the receive operation.
     /// If not set, the default timeout of the connection is used.
     pub timeout: Option<std::time::Duration>,
@@ -262,11 +222,6 @@ impl<'a> ResponseOptions<'a> {
         self
     }
 
-    pub fn with_async_msg_ids(mut self, async_msg_ids: Arc<AsyncMessageIds>) -> Self {
-        self.async_msg_ids = Some(async_msg_ids);
-        self
-    }
-
     pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.timeout = Some(timeout);
         self
@@ -282,7 +237,6 @@ impl<'a> Default for ResponseOptions<'a> {
             allow_async: false,
             channel_id: None,
             async_cancel: None,
-            async_msg_ids: None,
             timeout: None,
         }
     }

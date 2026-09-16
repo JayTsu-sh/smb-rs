@@ -18,7 +18,6 @@ use tokio::sync::RwLock;
 fn connection(policy: SigningPolicy, server_required: bool) -> ConnectionInfo {
     ConnectionInfo {
         server_name: "signing.test".into(),
-        server_address: "127.0.0.1:445".parse().unwrap(),
         negotiation: NegotiatedProperties {
             server_guid: Guid::generate(),
             signing_required: server_required,
@@ -38,7 +37,6 @@ fn connection(policy: SigningPolicy, server_required: bool) -> ConnectionInfo {
             ..Default::default()
         },
         preauth_hash: PreauthHashState::Unsupported,
-        client_guid: Guid::generate(),
     }
 }
 

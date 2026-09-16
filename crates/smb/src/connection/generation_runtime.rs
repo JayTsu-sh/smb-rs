@@ -275,32 +275,6 @@ impl GenerationRuntime {
             .map_err(|error| self.map_runtime_error(error))
     }
 
-    pub(crate) async fn send_compound_for(
-        self: &Arc<Self>,
-        messages: Vec<CommandRequest>,
-        dependency: ObjectToken,
-    ) -> Result<Vec<CommandSubmission>> {
-        let operations = messages
-            .into_iter()
-            .map(|message| TypedOperation::any_status(message).with_dependency(dependency))
-            .collect();
-        self.runtime
-            .submit_compound_detached(
-                operations,
-                Some(self.clock.now().saturating_add(self.timeout)),
-            )
-            .await
-            .map(|submissions| {
-                submissions
-                    .into_iter()
-                    .map(|submission| {
-                        CommandSubmission::new(submission.key.message_id, submission.request_raw)
-                    })
-                    .collect()
-            })
-            .map_err(|error| self.map_runtime_error(error))
-    }
-
     fn map_runtime_error(&self, error: RuntimeError) -> Error {
         map_runtime_error_value(error, self.timeout)
     }

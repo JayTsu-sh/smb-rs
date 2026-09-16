@@ -188,70 +188,6 @@ impl Directory {
         iter_stream::QueryDirectoryStream::new(this, pattern.to_string(), buffer_size).await
     }
 
-    /// Watches the directory for changes.
-    /// # Arguments
-    /// * `filter` - The filter to use for the changes. This is a bitmask of the changes to watch for.
-    /// * `recursive` - Whether to watch the directory recursively or not.
-    /// # Returns
-    /// * A vector of [`FileNotifyInformation`] objects, containing the changes that occurred.
-    /// # Notes
-    /// * This is a long-running operation, and will block until a result is received. See [`watch_timeout`][Self::watch_timeout] for a version that supports a timeout.
-    #[tracing::instrument(level = "debug", skip_all, fields(recursive = recursive))]
-    pub async fn watch(
-        &self,
-        filter: NotifyFilter,
-        recursive: bool,
-    ) -> crate::Result<Vec<FileNotifyInformation>> {
-        self.watch_timeout(filter, recursive, Duration::MAX).await
-    }
-
-    /// Watches the directory for changes, with a specified timeout.
-    /// # Arguments
-    /// * `filter` - The filter to use for the changes. This is a bitmask of the changes to watch for.
-    /// * `recursive` - Whether to watch the directory recursively or not.
-    /// # Returns
-    /// * A vector of [`FileNotifyInformation`] objects, containing the changes that occurred.
-    /// # Notes
-    /// * This is a long-running operation, and will block until a result is received or the provided timeout elapses.
-    ///  If the timeout elapses, an error of type [`Error::OperationTimeout`] is returned.
-    /// * A similar method without timeout is available as [`watch`][Self::watch].
-    #[tracing::instrument(level = "debug", skip_all, fields(recursive = recursive, timeout_ms = timeout.as_millis() as u64))]
-    pub async fn watch_timeout(
-        &self,
-        filter: NotifyFilter,
-        recursive: bool,
-        timeout: std::time::Duration,
-    ) -> crate::Result<Vec<FileNotifyInformation>> {
-        self._watch_options(
-            filter,
-            recursive,
-            ResponseOptions::new().with_timeout(timeout),
-        )
-        .await
-        .into()
-    }
-
-    /// Watches the directory for changes, returning a [`Stream`][`futures_core::Stream`] of notifications.
-    ///
-    /// * See [`watch_stream_cancellable`][Self::watch_stream_cancellable] for a version that supports cancellation,
-    ///   via a [`CancellationToken`].
-    ///
-    /// # Arguments
-    /// * `filter` - The filter to use for the changes. This is a bitmask of the changes to watch for.
-    /// * `recursive` - Whether to watch the directory recursively or not.
-    /// # Returns
-    /// * A stream of [`FileNotifyInformation`] objects, containing the changes that occurred.
-    ///
-    /// # Notes
-    /// Error handling in this stream is done by returning `Result<FileNotifyInformation>`.
-    pub fn watch_stream(
-        this: &Arc<Self>,
-        filter: NotifyFilter,
-        recursive: bool,
-    ) -> crate::Result<impl futures_core::Stream<Item = crate::Result<FileNotifyInformation>>> {
-        Self::watch_stream_cancellable(this, filter, recursive, Default::default())
-    }
-
     pub fn watch_stream_cancellable(
         this: &Arc<Self>,
         filter: NotifyFilter,
@@ -262,7 +198,6 @@ impl Directory {
         let (sender, receiver) = tokio::sync::mpsc::channel(EVENT_CAPACITY);
         let receive_options = ResponseOptions::default()
             .with_timeout(Duration::MAX)
-            .with_async_msg_ids(Default::default())
             .with_cancellation_token(cancel.clone());
 
         tokio::spawn({
@@ -346,7 +281,6 @@ impl Directory {
                 ResponseOptions {
                     allow_async: true,
                     async_cancel: options.async_cancel,
-                    async_msg_ids: options.async_msg_ids,
                     timeout: options.timeout,
                     cmd: Some(Command::ChangeNotify),
                     status: &[
@@ -392,53 +326,6 @@ impl Directory {
         };
 
         DirectoryWatchResult::Notifications(change_notify.buffer.into())
-    }
-
-    /// Queries the quota information for the current file.
-    /// # Arguments
-    /// * `info` - The information to query - a [`QueryQuotaInfo`].
-    pub async fn query_quota_info(
-        &self,
-        info: QueryQuotaInfo,
-    ) -> crate::Result<Vec<FileQuotaInformation>> {
-        self.query_quota_info_with_options(info, None).await
-    }
-    /// Queries the quota information for the current file.
-    /// # Arguments
-    /// * `info` - The information to query - a [`QueryQuotaInfo`].
-    pub async fn query_quota_info_with_options(
-        &self,
-        info: QueryQuotaInfo,
-        output_buffer_length: Option<usize>,
-    ) -> crate::Result<Vec<FileQuotaInformation>> {
-        if output_buffer_length.is_some_and(|x| x < FileQuotaInformation::MIN_SIZE) {
-            return Err(Error::BufferTooSmall {
-                data_type: "FileQuotaInformation",
-                required: FileQuotaInformation::MIN_SIZE.into(),
-                provided: output_buffer_length.unwrap(),
-            });
-        }
-
-        Ok(self
-            .handle
-            .query_common(
-                QueryInfoRequest {
-                    info_type: InfoType::Quota,
-                    info_class: Default::default(),
-                    output_buffer_length: 0,
-                    additional_info: AdditionalInfo::new(),
-                    flags: QueryInfoFlags::new()
-                        .with_restart_scan(info.restart_scan.into())
-                        .with_return_single_entry(info.return_single.into()),
-                    file_id: self.handle.file_id().await?,
-                    data: GetInfoRequestData::Quota(info),
-                },
-                output_buffer_length,
-                std::any::type_name::<FileQuotaInformation>(),
-            )
-            .await?
-            .as_quota()?
-            .into())
     }
 }
 
