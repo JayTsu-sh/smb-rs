@@ -400,9 +400,16 @@ impl DomainClient {
     }
 
     pub(crate) fn with_signing_policy(policy: crate::SigningPolicy) -> Self {
+        Self::with_policies(policy, crate::GuestPolicy::default())
+    }
+
+    pub(crate) fn with_policies(
+        signing: crate::SigningPolicy,
+        guest: crate::GuestPolicy,
+    ) -> Self {
         Self {
             inner: Arc::new(DomainClientInner {
-                runtime: RuntimeClient::with_signing_policy(policy),
+                runtime: RuntimeClient::with_policies(signing, guest),
                 sessions: Mutex::new(HashMap::new()),
                 close_report: OnceCell::new(),
             }),

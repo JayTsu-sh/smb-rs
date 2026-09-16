@@ -16,6 +16,26 @@ pub enum SigningPolicy {
     WhenRequired,
 }
 
+/// Whether a session the server downgraded to guest or anonymous may proceed.
+///
+/// Guest and null sessions carry no session key, so their traffic cannot be signed or
+/// encrypted (MS-SMB2 3.2.5.3.1). Allowing them trades message integrity for access to
+/// shares that map unknown users to a guest account.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GuestPolicy {
+    /// Reject sessions flagged `SMB2_SESSION_FLAG_IS_GUEST` / `IS_NULL`.
+    #[default]
+    Deny,
+    /// Accept unsigned guest or anonymous sessions when the server does not require signing.
+    AllowUnsigned,
+}
+
+impl GuestPolicy {
+    pub(crate) const fn allows_unsigned(self) -> bool {
+        matches!(self, Self::AllowUnsigned)
+    }
+}
+
 impl SigningPolicy {
     pub(crate) const fn required(self, server_requires: bool) -> bool {
         matches!(self, Self::Required) || server_requires

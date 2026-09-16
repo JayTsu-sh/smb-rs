@@ -72,9 +72,13 @@ pub(crate) struct RuntimeClient {
 }
 
 impl RuntimeClient {
-    pub(crate) fn with_signing_policy(policy: crate::SigningPolicy) -> Self {
+    pub(crate) fn with_policies(
+        signing: crate::SigningPolicy,
+        guest: crate::GuestPolicy,
+    ) -> Self {
         let mut config = LegacyClientConfig::default();
-        config.connection.signing_policy = policy;
+        config.connection.signing_policy = signing;
+        config.connection.allow_unsigned_guest_access = guest.allows_unsigned();
         Self {
             inner: Arc::new(LegacyClient::new(config)),
         }
