@@ -523,6 +523,17 @@ impl RuntimeDirectory {
             .await
     }
 
+    /// Renames the open directory through `FileRenameInformation`, exactly like a file.
+    pub(crate) async fn rename(&self, path: &str, replace: bool) -> crate::Result<()> {
+        self.inner
+            .set_info(FileRenameInformation {
+                replace_if_exists: replace.into(),
+                root_directory: 0,
+                file_name: path.into(),
+            })
+            .await
+    }
+
     pub(crate) async fn close(&self) -> crate::Result<()> {
         self.inner.close().await
     }

@@ -1465,6 +1465,38 @@ impl Directory {
         })
     }
 
+    /// Renames this directory; an existing destination fails with
+    /// `STATUS_OBJECT_NAME_COLLISION`.
+    pub fn rename<'a>(&'a self, destination: &'a SharePath) -> Operation<'a, ()> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                if context.replay != ReplayPolicy::Never {
+                    return Err(Error::UnsupportedOperation(
+                        "directory rename permits only ReplayPolicy::Never".into(),
+                    ));
+                }
+                self.inner.rename(destination.as_str(), false).await
+            })
+        })
+    }
+
+    /// Renames this directory and replaces an existing destination when the server
+    /// allows it (NTFS-style servers only replace empty directories).
+    pub fn rename_replace<'a>(&'a self, destination: &'a SharePath) -> Operation<'a, ()> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                if context.replay != ReplayPolicy::Never {
+                    return Err(Error::UnsupportedOperation(
+                        "directory replace permits only ReplayPolicy::Never".into(),
+                    ));
+                }
+                self.inner.rename(destination.as_str(), true).await
+            })
+        })
+    }
+
     pub fn close(&self) -> Operation<'_, CloseOutcome> {
         Operation::new(move |context| {
             Box::pin(async move {
