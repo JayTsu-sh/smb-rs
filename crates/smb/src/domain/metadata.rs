@@ -17,6 +17,7 @@ pub struct MetadataUpdate {
 }
 
 /// Open an existing file or directory with attribute access only.
+/// Reparse points are opened without following and rejected.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MetadataOpenOptions {
     write: bool,

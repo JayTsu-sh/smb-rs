@@ -8,6 +8,16 @@ use crate::{Error, Result, resource::ResourceHandle};
 
 const UNIX_OFFSET_NS: i128 = 11_644_473_600_i128 * 1_000_000_000;
 
+pub(super) async fn reject_reparse(resource: &ResourceHandle) -> Result<()> {
+    let basic = resource.query_info::<FileBasicInformation>().await?;
+    if basic.file_attributes.reparse_point() {
+        return Err(Error::UnsupportedOperation(
+            "metadata open does not support reparse points".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) async fn set_metadata(
     resource: &ResourceHandle,
     created: Option<SystemTime>,

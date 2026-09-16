@@ -187,10 +187,17 @@ impl RuntimeShare {
         let access = FileAccessMask::new()
             .with_file_read_attributes(true)
             .with_file_write_attributes(write_attributes);
-        let resource = self
-            .inner
-            .create(path, &FileCreateArgs::make_open_existing(access))
-            .await?;
+        let args = FileCreateArgs {
+            options: CreateOptions::new().with_open_reparse_point(true),
+            ..FileCreateArgs::make_open_existing(access)
+        };
+        let resource = self.inner.create(path, &args).await?;
+        if let Some(handle) = resource.handle() {
+            if let Err(error) = super::metadata::reject_reparse(handle).await {
+                let _ = handle.close().await;
+                return Err(error);
+            }
+        }
         Ok(match resource {
             LegacyResource::File(file) => RuntimeResource::File(RuntimeFile { inner: file }),
             LegacyResource::Directory(directory) => RuntimeResource::Directory(RuntimeDirectory {
