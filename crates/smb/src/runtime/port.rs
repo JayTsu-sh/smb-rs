@@ -179,6 +179,27 @@ impl RuntimeShare {
         })
     }
 
+    pub(crate) async fn open_metadata_resource(
+        &self,
+        path: &str,
+        write_attributes: bool,
+    ) -> crate::Result<RuntimeResource> {
+        let access = FileAccessMask::new()
+            .with_file_read_attributes(true)
+            .with_file_write_attributes(write_attributes);
+        let resource = self
+            .inner
+            .create(path, &FileCreateArgs::make_open_existing(access))
+            .await?;
+        Ok(match resource {
+            LegacyResource::File(file) => RuntimeResource::File(RuntimeFile { inner: file }),
+            LegacyResource::Directory(directory) => RuntimeResource::Directory(RuntimeDirectory {
+                inner: Arc::new(directory),
+            }),
+            LegacyResource::Pipe(pipe) => RuntimeResource::Pipe(RuntimePipe { inner: pipe }),
+        })
+    }
+
     pub(crate) async fn open_security_resource(
         &self,
         path: &str,
@@ -408,6 +429,15 @@ pub(crate) struct RuntimeDirectory {
 }
 
 impl RuntimeDirectory {
+    pub(crate) async fn set_metadata(
+        &self,
+        created: Option<std::time::SystemTime>,
+        accessed: Option<std::time::SystemTime>,
+        written: Option<std::time::SystemTime>,
+    ) -> crate::Result<()> {
+        super::metadata::set_metadata(&self.inner, created, accessed, written).await
+    }
+
     pub(crate) async fn query_security(&self, dacl: bool) -> crate::Result<SecurityDescriptor> {
         query_security(&self.inner, dacl).await
     }
@@ -495,6 +525,15 @@ pub(crate) struct RuntimeFile {
 }
 
 impl RuntimeFile {
+    pub(crate) async fn set_metadata(
+        &self,
+        created: Option<std::time::SystemTime>,
+        accessed: Option<std::time::SystemTime>,
+        written: Option<std::time::SystemTime>,
+    ) -> crate::Result<()> {
+        super::metadata::set_metadata(&self.inner, created, accessed, written).await
+    }
+
     pub(crate) async fn flush(&self) -> crate::Result<()> {
         self.inner.flush().await.map_err(Error::IoError)
     }

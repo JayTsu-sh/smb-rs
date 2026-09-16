@@ -2,12 +2,14 @@
 
 mod batch;
 mod cursor;
+mod metadata;
 mod operation;
 mod rpc;
 mod security;
 mod transfer;
 pub use batch::{Batch, BatchCommand, BatchOutcome, BatchRef, BatchResult};
 pub use cursor::FileCursor;
+pub use metadata::{MetadataOpenOptions, MetadataUpdate};
 pub use operation::{CancelToken, Deadline, Operation, ReplayPolicy};
 pub use rpc::RpcPipeConnection;
 pub use security::{SecurityDescriptor, SecurityOpenOptions, SecuritySelection};
