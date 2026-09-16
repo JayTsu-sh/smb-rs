@@ -341,7 +341,7 @@ impl Connection {
             transport,
             self.config.timeout(),
             initial_message_id,
-            u32::from(self.config.credits_backlog.unwrap_or(128)),
+            u32::from(self.config.credits_backlog.unwrap_or(512)),
             generation,
         )
         .await

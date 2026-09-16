@@ -199,7 +199,7 @@ pub struct ConnectionConfig {
     pub auth_methods: AuthMethodsConfig,
 
     /// The number of SMB2 credits to request for the connection.
-    /// If not configured, uses a default value.
+    /// If not configured, requests 512 credits. The server controls the granted amount.
     ///
     /// The higher number of credits, the more concurrent requests can be sent on the connection.
     /// However, some servers may not issue such high number of credits.
