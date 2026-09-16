@@ -309,3 +309,7 @@ alone cannot express the constraint.
 - migration/implementation wave order.
 
 Those decisions must respect the module direction and ownership fixed here.
+
+`SigningPolicy` is a shared public configuration value with no runtime dependencies.
+The facade and domain pass it into the runtime; dependency rules permit this exact
+crate-root value type without permitting reverse imports of facade/domain modules.
