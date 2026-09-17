@@ -1,5 +1,6 @@
 //! Public async SMB facade.
 
+use crate::SigningPolicy;
 use smb_rpc::interface::{ShareKind as RpcShareKind, SrvSvc};
 
 use crate::domain::{
@@ -56,6 +57,14 @@ impl Client {
     pub fn new() -> Self {
         Self {
             domain: DomainClient::new(),
+        }
+    }
+
+    /// Create a client with an explicit negotiated signing policy.
+    /// Every connection, cached session and reconnect uses this policy.
+    pub fn with_signing_policy(policy: SigningPolicy) -> Self {
+        Self {
+            domain: DomainClient::with_signing_policy(policy),
         }
     }
 

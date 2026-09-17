@@ -213,6 +213,7 @@ enum SessionInfoState {
         algos: SessionAlgos,
         flags: SessionFlags,
         force_encryption: bool,
+        signing_required: bool,
     },
     /// The session is invalid, and should not be used anymore.
     Invalid,
@@ -365,7 +366,10 @@ impl SessionInfo {
             false
         };
 
-        if !conn_info.config.allow_unsigned_guest_access && flags.is_guest_or_null_session() {
+        if flags.is_guest_or_null_session()
+            && (!conn_info.config.allow_unsigned_guest_access
+                || conn_info.negotiation.signing_required)
+        {
             return Err(crate::Error::InvalidMessage(
                 "Signing may be disabled to allow guest or anonymous logins.".to_string(),
             ));
@@ -376,6 +380,10 @@ impl SessionInfo {
                 algos,
                 flags,
                 force_encryption,
+                signing_required: conn_info
+                    .config
+                    .signing_policy
+                    .required(conn_info.negotiation.signing_required),
             }),
             _ => unreachable!(),
         };
@@ -427,15 +435,26 @@ impl SessionInfo {
         }
     }
 
-    /// Returns whether the session is a guest or anonymous session.
+    /// Returns whether the negotiated session permits unsigned ordinary messages.
     /// If the session is not setting up or ready, it will return an error.
     pub fn allow_unsigned(&self) -> crate::Result<bool> {
         match &self.state {
-            Some(SessionInfoState::Ready { flags, .. }) => Ok(flags.is_guest_or_null_session()),
+            Some(SessionInfoState::Ready {
+                flags,
+                signing_required,
+                ..
+            }) => Ok(flags.is_guest_or_null_session() || !signing_required),
             Some(SessionInfoState::SettingUp { allow_unsigned, .. }) => Ok(*allow_unsigned),
             _ => Err(crate::Error::InvalidState(
                 "Session is not setting up or ready!".to_string(),
             )),
+        }
+    }
+
+    pub fn is_guest_or_anonymous(&self) -> crate::Result<bool> {
+        match &self.state {
+            Some(SessionInfoState::Ready { flags, .. }) => Ok(flags.is_guest_or_null_session()),
+            _ => Err(crate::Error::InvalidState("Session is not ready".into())),
         }
     }
 

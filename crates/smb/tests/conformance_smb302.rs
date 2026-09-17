@@ -26,11 +26,21 @@ use conformance::transcripts::{
     session_setup_response_intermediate,
 };
 use conformance::{MockGss, ScriptedGssStep, ScriptedTransport, assert_signed_final_session_setup};
+use smb::SigningPolicy;
 use smb::test_support::{Connection, ConnectionConfig};
 use smb_dtyp::Guid;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn smb302_signing_required_signs_final_session_setup() {
+    check_server_required(SigningPolicy::Required).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn optional_policy_honors_server_required_signing() {
+    check_server_required(SigningPolicy::WhenRequired).await;
+}
+
+async fn check_server_required(policy: SigningPolicy) {
     const SESSION_ID: u64 = 0x0000_0302_8000_000A;
 
     let (transport, control) = ScriptedTransport::new();
@@ -39,6 +49,7 @@ async fn smb302_signing_required_signs_final_session_setup() {
     control.push_server_frame(session_setup_response_final(SESSION_ID));
 
     let config = ConnectionConfig {
+        signing_policy: policy,
         smb2_only_negotiate: true,
         timeout: Some(std::time::Duration::from_secs(5)),
         ..Default::default()
@@ -47,6 +58,7 @@ async fn smb302_signing_required_signs_final_session_setup() {
         .await
         .expect("Negotiate must succeed against SMB 3.0.2 mock server");
 
+    assert!(conn.conn_info().unwrap().negotiation.signing_required);
     let gss = MockGss::new(
         "bob",
         Some("EXAMPLE"),

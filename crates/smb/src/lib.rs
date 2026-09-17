@@ -24,6 +24,8 @@ pub mod docs;
 pub mod domain;
 pub mod error;
 pub mod facade;
+mod signing;
+pub use signing::SigningPolicy;
 #[allow(dead_code, reason = "conditional lease and oplock server-event paths")]
 pub(crate) mod lease;
 #[allow(
@@ -68,11 +70,11 @@ pub use domain::{
     Batch, BatchCommand, BatchOutcome, BatchRef, BatchResult, CancelToken, CloseOutcome,
     CloseReport, CredentialProvider, Credentials, Deadline, Directory, DirectoryEntries,
     DirectoryEntry, DirectoryEvent, DirectoryEvents, DirectoryOpenOptions, DirectoryWatchOptions,
-    File, FileCursor, FileOpenOptions, IoCapabilities, ObjectGeneration, OpenInfo, OpenKind,
-    Operation, Pipe, PipeName, PreviousVersion, ReplayPolicy, Resource, ResourceMetadata,
-    RpcPipeConnection, SecurityDescriptor, SecurityOpenOptions, SecuritySelection, Session,
-    SessionInfo, Share, ShareInfo, SharePath, ShareTarget, Transfer, TransferEvents,
-    TransferOptions, TransferProgress, TransferReport,
+    File, FileCursor, FileOpenOptions, IoCapabilities, MetadataOpenOptions, MetadataUpdate,
+    ObjectGeneration, OpenInfo, OpenKind, Operation, Pipe, PipeName, PreviousVersion, ReplayPolicy,
+    Resource, ResourceMetadata, RpcPipeConnection, SecurityDescriptor, SecurityOpenOptions,
+    SecuritySelection, Session, SessionInfo, Share, ShareInfo, SharePath, ShareTarget, Transfer,
+    TransferEvents, TransferOptions, TransferProgress, TransferReport,
 };
 pub use error::Error;
 pub use facade::{Client, RemoteShare, ShareKind};

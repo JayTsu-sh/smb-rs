@@ -218,9 +218,9 @@ impl Session {
                     "Cannot bind session that is not ready.".to_string(),
                 ));
             }
-            if session.allow_unsigned()? {
+            if session.is_guest_or_anonymous()? {
                 return Err(Error::InvalidState(
-                    "Cannot bind session that allows unsigned messages.".to_string(),
+                    "Cannot bind guest or anonymous session.".to_string(),
                 ));
             }
         }
@@ -265,7 +265,7 @@ impl Session {
         {
             let session = setup_result.session.read().await;
             tracing::debug!("Session setup complete.");
-            if session.allow_unsigned()? {
+            if session.is_guest_or_anonymous()? {
                 tracing::debug!("Session is guest/anonymous.");
             }
         };

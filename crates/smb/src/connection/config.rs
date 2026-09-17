@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use crate::SigningPolicy;
 use smb_msg::Dialect;
 use smb_transport::config::*;
 
@@ -163,6 +164,9 @@ pub struct ConnectionConfig {
     /// See [EncryptionMode] for more information.
     pub encryption_mode: EncryptionMode,
 
+    /// Client policy combined with the server signing requirement.
+    pub signing_policy: SigningPolicy,
+
     /// Sets whether signing may be skipped for guest or anonymous access.
     pub allow_unsigned_guest_access: bool,
 
@@ -195,7 +199,7 @@ pub struct ConnectionConfig {
     pub auth_methods: AuthMethodsConfig,
 
     /// The number of SMB2 credits to request for the connection.
-    /// If not configured, uses a default value.
+    /// If not configured, requests 512 credits. The server controls the granted amount.
     ///
     /// The higher number of credits, the more concurrent requests can be sent on the connection.
     /// However, some servers may not issue such high number of credits.

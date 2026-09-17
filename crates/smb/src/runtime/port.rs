@@ -5,7 +5,7 @@
 //! domain API. Legacy protocol mechanics remain an implementation detail behind
 //! this stable port while callers use the domain object hierarchy.
 
-use std::{pin::Pin, sync::Arc};
+use std::{pin::Pin, sync::Arc, time::SystemTime};
 
 use bytes::Bytes;
 use futures_core::{Stream, future::BoxFuture};
@@ -19,6 +19,7 @@ use smb_msg::{AdditionalInfo, CreateOptions, NotifyFilter, SrvEnumerateSnapshots
 use sspi::{AuthIdentity, Secret, Username};
 use zeroize::Zeroizing;
 
+use super::metadata;
 use crate::{
     Error,
     client::{Client as LegacyClient, ClientConfig as LegacyClientConfig, UncPath},
@@ -71,9 +72,11 @@ pub(crate) struct RuntimeClient {
 }
 
 impl RuntimeClient {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn with_signing_policy(policy: crate::SigningPolicy) -> Self {
+        let mut config = LegacyClientConfig::default();
+        config.connection.signing_policy = policy;
         Self {
-            inner: Arc::new(LegacyClient::new(LegacyClientConfig::default())),
+            inner: Arc::new(LegacyClient::new(config)),
         }
     }
 
@@ -148,10 +151,10 @@ pub(crate) enum RuntimeResource {
 }
 
 pub(crate) struct RuntimeMetadata {
-    pub(crate) created: std::time::SystemTime,
-    pub(crate) accessed: std::time::SystemTime,
-    pub(crate) written: std::time::SystemTime,
-    pub(crate) changed: std::time::SystemTime,
+    pub(crate) created: SystemTime,
+    pub(crate) accessed: SystemTime,
+    pub(crate) written: SystemTime,
+    pub(crate) changed: SystemTime,
     pub(crate) len: u64,
 }
 
@@ -168,6 +171,34 @@ impl RuntimeShare {
                 &FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true)),
             )
             .await?;
+        Ok(match resource {
+            LegacyResource::File(file) => RuntimeResource::File(RuntimeFile { inner: file }),
+            LegacyResource::Directory(directory) => RuntimeResource::Directory(RuntimeDirectory {
+                inner: Arc::new(directory),
+            }),
+            LegacyResource::Pipe(pipe) => RuntimeResource::Pipe(RuntimePipe { inner: pipe }),
+        })
+    }
+
+    pub(crate) async fn open_metadata_resource(
+        &self,
+        path: &str,
+        write_attributes: bool,
+    ) -> crate::Result<RuntimeResource> {
+        let access = FileAccessMask::new()
+            .with_file_read_attributes(true)
+            .with_file_write_attributes(write_attributes);
+        let args = FileCreateArgs {
+            options: CreateOptions::new().with_open_reparse_point(true),
+            ..FileCreateArgs::make_open_existing(access)
+        };
+        let resource = self.inner.create(path, &args).await?;
+        if let Some(handle) = resource.handle() {
+            if let Err(error) = metadata::reject_reparse(handle).await {
+                let _ = handle.close().await;
+                return Err(error);
+            }
+        }
         Ok(match resource {
             LegacyResource::File(file) => RuntimeResource::File(RuntimeFile { inner: file }),
             LegacyResource::Directory(directory) => RuntimeResource::Directory(RuntimeDirectory {
@@ -406,6 +437,15 @@ pub(crate) struct RuntimeDirectory {
 }
 
 impl RuntimeDirectory {
+    pub(crate) async fn set_metadata(
+        &self,
+        created: Option<SystemTime>,
+        accessed: Option<SystemTime>,
+        written: Option<SystemTime>,
+    ) -> crate::Result<()> {
+        metadata::set_metadata(&self.inner, created, accessed, written).await
+    }
+
     pub(crate) async fn query_security(&self, dacl: bool) -> crate::Result<SecurityDescriptor> {
         query_security(&self.inner, dacl).await
     }
@@ -493,6 +533,15 @@ pub(crate) struct RuntimeFile {
 }
 
 impl RuntimeFile {
+    pub(crate) async fn set_metadata(
+        &self,
+        created: Option<SystemTime>,
+        accessed: Option<SystemTime>,
+        written: Option<SystemTime>,
+    ) -> crate::Result<()> {
+        metadata::set_metadata(&self.inner, created, accessed, written).await
+    }
+
     pub(crate) async fn flush(&self) -> crate::Result<()> {
         self.inner.flush().await.map_err(Error::IoError)
     }

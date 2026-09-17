@@ -51,3 +51,5 @@ pub(crate) use recovery_driver::{
     RecoveryDriver, RecoveryError,
 };
 pub(crate) use reducer::{GenerationId, RequestKey, TerminalOutcome};
+
+mod metadata;
