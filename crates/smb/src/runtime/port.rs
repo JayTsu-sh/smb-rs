@@ -419,6 +419,12 @@ pub(crate) struct RuntimeDirectoryEntry {
     pub(crate) name: String,
     pub(crate) is_directory: bool,
     pub(crate) len: u64,
+    pub(crate) created: SystemTime,
+    pub(crate) accessed: SystemTime,
+    pub(crate) written: SystemTime,
+    pub(crate) changed: SystemTime,
+    pub(crate) readonly: bool,
+    pub(crate) reparse_point: bool,
 }
 
 pub(crate) enum RuntimeDirectoryEventKind {
@@ -482,6 +488,12 @@ impl RuntimeDirectory {
                 name: entry.file_name.to_string(),
                 is_directory: entry.file_attributes.directory(),
                 len: entry.end_of_file,
+                created: entry.creation_time.into(),
+                accessed: entry.last_access_time.into(),
+                written: entry.last_write_time.into(),
+                changed: entry.change_time.into(),
+                readonly: entry.file_attributes.readonly(),
+                reparse_point: entry.file_attributes.reparse_point(),
             }),
         )
     }
