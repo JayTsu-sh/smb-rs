@@ -26,7 +26,7 @@
       "root": "crates/smb/src/facade",
       "import_prefix": "crate::facade",
       "allowed_modules": ["domain"],
-      "allowed_crate_prefixes": ["crate::error", "crate::Result", "crate::SigningPolicy"],
+      "allowed_crate_prefixes": ["crate::error", "crate::Result", "crate::SigningPolicy", "crate::GuestPolicy"],
       "deny_unclassified_crate_imports": true,
       "owner_wave": "W5",
       "activation": "activated"
@@ -36,7 +36,7 @@
       "root": "crates/smb/src/domain",
       "import_prefix": "crate::domain",
       "allowed_modules": ["runtime"],
-      "allowed_crate_prefixes": ["crate::error", "crate::Error", "crate::Result", "crate::SigningPolicy"],
+      "allowed_crate_prefixes": ["crate::error", "crate::Error", "crate::Result", "crate::SigningPolicy", "crate::GuestPolicy"],
       "deny_unclassified_crate_imports": true,
       "owner_wave": "W5",
       "activation": "activated"
@@ -60,7 +60,7 @@
         "crate::tree",
         "crate::Error",
         "crate::Result",
-        "crate::SigningPolicy"
+        "crate::SigningPolicy", "crate::GuestPolicy"
       ],
       "deny_unclassified_crate_imports": true,
       "owner_wave": "W3",

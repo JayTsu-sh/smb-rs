@@ -68,6 +68,33 @@ Without SMB encryption, omitted signing means ordinary traffic has no SMB
 message integrity protection. This option is not a general “ignore invalid
 signatures” switch.
 
+## Guest and anonymous sessions
+
+Servers that map unknown or password-less users to a guest account (ONTAP
+`guest-unix-user`, Samba `map to guest`) answer SessionSetup with
+`SMB2_SESSION_FLAG_IS_GUEST`. Such sessions have no session key, so their
+traffic can be neither signed nor encrypted (MS-SMB2 3.2.5.3.1); by default the
+client rejects them at the final SessionSetup reply. Opt in explicitly:
+
+```rust
+use smb::{Client, GuestPolicy, SigningPolicy};
+
+let client = Client::with_policies(SigningPolicy::WhenRequired, GuestPolicy::AllowUnsigned);
+```
+
+`GuestPolicy::AllowUnsigned` accepts guest and null sessions only when the
+server does not require signing; server-required signing still wins. The NTLM
+layer refuses an empty identity, so anonymous access is reached with a
+placeholder username the server does not know. Guest traffic carries no SMB
+message integrity protection.
+
+## Renaming
+
+`File::rename` / `Directory::rename` move an entry within the share and fail
+with `STATUS_OBJECT_NAME_COLLISION` when the destination exists;
+`File::rename_replace` / `Directory::rename_replace` ask the server to replace
+it (NTFS-style servers only replace files and empty directories).
+
 ## Feature flags
 
 | Type | Algorithm | Feature |
