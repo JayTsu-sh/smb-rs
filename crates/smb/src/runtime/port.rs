@@ -67,17 +67,29 @@ pub(crate) enum OpenMode {
     Overwrite,
 }
 
+/// Protocol configuration behind every facade client.
+///
+/// Negotiation always opens with an SMB2 NEGOTIATE. `ConnectionConfig` defaults
+/// `smb2_only_negotiate` to `false`, which would begin with the legacy SMB1 multi-protocol
+/// NEGOTIATE that advertises the SMB2 dialect string (MS-SMB2 3.2.4.2.2.1). That form costs an
+/// extra round trip and is rejected outright by servers that have SMB1 removed, so the facade
+/// does not use it.
+fn client_config(signing: crate::SigningPolicy, guest: crate::GuestPolicy) -> ProtocolClientConfig {
+    let mut config = ProtocolClientConfig::default();
+    config.connection.signing_policy = signing;
+    config.connection.allow_unsigned_guest_access = guest.allows_unsigned();
+    config.connection.smb2_only_negotiate = true;
+    config
+}
+
 pub(crate) struct RuntimeClient {
     inner: Arc<ProtocolClient>,
 }
 
 impl RuntimeClient {
     pub(crate) fn with_policies(signing: crate::SigningPolicy, guest: crate::GuestPolicy) -> Self {
-        let mut config = ProtocolClientConfig::default();
-        config.connection.signing_policy = signing;
-        config.connection.allow_unsigned_guest_access = guest.allows_unsigned();
         Self {
-            inner: Arc::new(ProtocolClient::new(config)),
+            inner: Arc::new(ProtocolClient::new(client_config(signing, guest))),
         }
     }
 
@@ -721,4 +733,33 @@ async fn set_security(
     resource
         .set_security_info(descriptor, security_selection(dacl))
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::client_config;
+    use crate::{GuestPolicy, SigningPolicy};
+
+    #[test]
+    fn negotiation_never_opens_with_the_smb1_multi_protocol_frame() {
+        for signing in [SigningPolicy::Required, SigningPolicy::WhenRequired] {
+            for guest in [GuestPolicy::Deny, GuestPolicy::AllowUnsigned] {
+                let config = client_config(signing, guest);
+                assert!(
+                    config.connection.smb2_only_negotiate,
+                    "signing={signing:?} guest={guest:?}"
+                );
+                assert_eq!(config.connection.signing_policy, signing);
+            }
+        }
+    }
+
+    #[test]
+    fn the_protocol_default_would_send_smb1_which_is_why_the_facade_overrides_it() {
+        assert!(
+            !super::ProtocolClientConfig::default()
+                .connection
+                .smb2_only_negotiate
+        );
+    }
 }

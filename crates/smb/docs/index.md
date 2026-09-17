@@ -95,6 +95,12 @@ with `STATUS_OBJECT_NAME_COLLISION` when the destination exists;
 `File::rename_replace` / `Directory::rename_replace` ask the server to replace
 it (NTFS-style servers only replace files and empty directories).
 
+## Dialect negotiation
+
+Every client opens negotiation with an SMB2 NEGOTIATE. The legacy SMB1 multi-protocol
+NEGOTIATE that advertises the SMB2 dialect string is never sent: it costs an extra round trip
+and servers with SMB1 removed reject it outright. There is no option to re-enable it.
+
 ## Directory listings
 
 `Directory::entries` / `Directory::collect_entries` yield `DirectoryEntry` values
