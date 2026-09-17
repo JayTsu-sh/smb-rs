@@ -545,7 +545,14 @@ async fn domain_directory_query_only() -> smb::Result<()> {
         .open_directory(&path, DirectoryOpenOptions::create_new())
         .await?;
     let entries = directory.collect_entries("*").await?;
-    assert!(entries.iter().any(|entry| entry.name() == "."));
+    let current = entries
+        .iter()
+        .find(|entry| entry.name() == ".")
+        .ok_or_else(|| smb::Error::InvalidMessage("listing has no '.' entry".into()))?;
+    assert!(current.is_directory());
+    assert!(!current.is_reparse_point());
+    assert!(current.created() > std::time::UNIX_EPOCH);
+    assert!(current.written() >= current.created());
     directory.delete().await?;
     directory.close().await?;
     share.close().await?;

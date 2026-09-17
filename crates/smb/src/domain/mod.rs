@@ -1285,11 +1285,20 @@ impl File {
     }
 }
 
+/// One directory listing entry together with the facts the `QUERY_DIRECTORY`
+/// response already carries, so callers do not need a per-entry metadata open
+/// to learn timestamps or attributes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirectoryEntry {
     name: String,
     is_directory: bool,
     len: u64,
+    created: std::time::SystemTime,
+    accessed: std::time::SystemTime,
+    written: std::time::SystemTime,
+    changed: std::time::SystemTime,
+    readonly: bool,
+    reparse_point: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1347,6 +1356,36 @@ impl DirectoryEntry {
 
     pub const fn is_empty(&self) -> bool {
         self.len == 0
+    }
+    /// Creation time reported by the listing.
+    pub const fn created(&self) -> std::time::SystemTime {
+        self.created
+    }
+
+    /// Last access time reported by the listing.
+    pub const fn accessed(&self) -> std::time::SystemTime {
+        self.accessed
+    }
+
+    /// Last write time reported by the listing.
+    pub const fn written(&self) -> std::time::SystemTime {
+        self.written
+    }
+
+    /// Last metadata change time reported by the listing.
+    pub const fn changed(&self) -> std::time::SystemTime {
+        self.changed
+    }
+
+    /// `FILE_ATTRIBUTE_READONLY` as reported by the listing.
+    pub const fn is_readonly(&self) -> bool {
+        self.readonly
+    }
+
+    /// `FILE_ATTRIBUTE_REPARSE_POINT` as reported by the listing (symbolic links,
+    /// junctions, and other reparse tags).
+    pub const fn is_reparse_point(&self) -> bool {
+        self.reparse_point
     }
 }
 
@@ -1410,6 +1449,12 @@ impl Directory {
                 name: entry.name,
                 is_directory: entry.is_directory,
                 len: entry.len,
+                created: entry.created,
+                accessed: entry.accessed,
+                written: entry.written,
+                changed: entry.changed,
+                readonly: entry.readonly,
+                reparse_point: entry.reparse_point,
             })
         }))
     }

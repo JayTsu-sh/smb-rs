@@ -95,6 +95,14 @@ with `STATUS_OBJECT_NAME_COLLISION` when the destination exists;
 `File::rename_replace` / `Directory::rename_replace` ask the server to replace
 it (NTFS-style servers only replace files and empty directories).
 
+## Directory listings
+
+`Directory::entries` / `Directory::collect_entries` yield `DirectoryEntry` values
+built from the `FILE_DIRECTORY_INFORMATION` records the server already returns:
+name, directory flag, length, the four timestamps (`created` / `accessed` /
+`written` / `changed`) and the read-only / reparse-point attributes. Use them
+directly instead of opening each child for `metadata()`.
+
 ## Feature flags
 
 | Type | Algorithm | Feature |
