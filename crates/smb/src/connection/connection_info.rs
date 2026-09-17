@@ -56,7 +56,6 @@ pub struct ConnectionInfo {
     /// The server name used for the connection.
     pub server_name: String,
     /// The server address used for the connection.
-    pub server_address: std::net::SocketAddr,
 
     /// Contains negotiated properties of the connection.
     pub negotiation: NegotiatedProperties,
@@ -66,6 +65,4 @@ pub struct ConnectionInfo {
     pub config: ConnectionConfig,
     /// Preauthentication hash state, if applicable.
     pub preauth_hash: PreauthHashState,
-    /// The client GUID used for the connection.
-    pub client_guid: Guid,
 }

@@ -6,8 +6,6 @@ use super::*;
 pub(crate) type ChannelUpstream = Arc<ConnectionCore>;
 
 pub struct Channel {
-    channel_id: u32,
-
     pub(crate) context: Arc<ChannelContext>,
     pub(crate) conn_info: Arc<ConnectionInfo>,
 }
@@ -36,7 +34,6 @@ impl Channel {
         }
         let context = ChannelContext::new(session_id, channel_id, upstream, setup_result);
         Ok(Self {
-            channel_id,
             context,
             conn_info: conn_info.clone(),
         })
@@ -49,40 +46,6 @@ impl Channel {
     #[inline]
     pub fn session_id(&self) -> u64 {
         self.context.session_id()
-    }
-
-    #[inline]
-    pub fn channel_id(&self) -> u32 {
-        self.channel_id
-    }
-
-    /// Returns `true` when the session permits unsigned messages.
-    ///
-    /// Mirrors the check used inside [`ChannelContext::submit`]: a
-    /// session enforces signing iff `allow_unsigned()` is `false` after
-    /// it reaches `is_ready()`. Exposed publicly for callers that build
-    /// SMB2 compound chains (P2.b) and need to set the `signed` flag on
-    /// each chained header before going through the generation_runtime directly.
-    pub async fn allow_unsigned(&self) -> crate::Result<bool> {
-        let session = self.context.session_state.session.read().await;
-        session.allow_unsigned()
-    }
-
-    /// Returns `true` when the session requires every outgoing request to be
-    /// encrypted (either the session flags carry `encrypt_data` or the
-    /// connection config forces it).
-    ///
-    /// Mirrors the check used inside [`ChannelContext::submit`]: when
-    /// `should_encrypt()` is `true`, the single-message path sets
-    /// `msg.encrypt = true` instead of merely signing. Callers that build
-    /// SMB2 compound chains directly must use this to select whole-chain
-    /// encryption instead of per-member signing.
-    ///
-    /// Errors with `InvalidState` when the underlying session has not
-    /// reached the Ready state, matching `SessionInfo::should_encrypt`.
-    pub async fn should_encrypt(&self) -> crate::Result<bool> {
-        let session = self.context.session_state.session.read().await;
-        session.should_encrypt()
     }
 }
 
@@ -215,16 +178,6 @@ impl ChannelContext {
         kind: crate::runtime::ObjectKind,
     ) -> crate::Result<crate::runtime::ObjectToken> {
         self.upstream.create_object(parent, kind).await
-    }
-
-    pub(crate) async fn submit_for(
-        &self,
-        message: CommandRequest,
-        dependency: crate::runtime::ObjectToken,
-    ) -> crate::Result<CommandSubmission> {
-        self.upstream
-            .submit_for(self.prepare(message).await?, dependency)
-            .await
     }
 
     fn new(

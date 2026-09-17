@@ -131,11 +131,10 @@ impl WirePipeline {
         Ok(())
     }
 
-    /// Cached `ConnectionInfo` captured by `negotiated`. None before
-    /// negotiation completes. Used by the setup-phase signing path
-    /// (S4-T3) to derive the dialect / signing algorithm without
-    /// re-borrowing from the generation_runtime on every send.
-    #[allow(dead_code)] // wired up in S4-T3
+    /// Cached `ConnectionInfo` captured by `negotiated`; `None` before
+    /// negotiation completes. The setup-phase signing path derives the
+    /// dialect / signing algorithm from it without re-borrowing the
+    /// generation runtime on every send.
     async fn conn_info(&self) -> crate::Result<Option<Arc<ConnectionInfo>>> {
         Ok(self.config.read().await.conn_info.clone())
     }

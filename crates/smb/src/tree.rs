@@ -3,10 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::connection::connection_info::ConnectionInfo;
 use crate::resource::FileCreateArgs;
-use smb_fscc::{FileAccessMask, FileAttributes};
 use smb_msg::{
-    CreateOptions, RequestContent, ShareFlags, ShareType, TreeCapabilities,
-    create::CreateDisposition,
+    RequestContent, ShareFlags, ShareType, TreeCapabilities,
     tree_connect::{TreeConnectRequest, TreeDisconnectRequest},
 };
 
@@ -65,14 +63,6 @@ pub struct Tree {
 }
 
 impl Tree {
-    pub(crate) fn connection_info(&self) -> Arc<ConnectionInfo> {
-        self.context.upstream.conn_info()
-    }
-
-    pub(crate) fn requires_encryption(&self) -> crate::Result<bool> {
-        Ok(self.context.info()?.share_flags.encrypt_data())
-    }
-
     pub(crate) async fn connect(
         name: &str,
         upstream: &Upstream,
@@ -142,80 +132,8 @@ impl Tree {
         .await
     }
 
-    /// A wrapper around [Tree::create] that creates a file on the remote server.
-    /// See [Tree::create] for more information.
-    #[tracing::instrument(level = "debug", skip_all, fields(file_name = %file_name))]
-    pub async fn create_file(
-        &self,
-        file_name: &str,
-        disposition: CreateDisposition,
-        desired_access: FileAccessMask,
-    ) -> crate::Result<Resource> {
-        self.create(
-            file_name,
-            &FileCreateArgs {
-                disposition,
-                options: CreateOptions::new(),
-                desired_access,
-                attributes: FileAttributes::new(),
-                ..Default::default()
-            },
-        )
-        .await
-    }
-
-    /// A wrapper around [Tree::create] that creates a directory on the remote server.
-    /// See [Tree::create] for more information.
-    #[tracing::instrument(level = "debug", skip_all, fields(dir_name = %dir_name))]
-    pub async fn create_directory(
-        &self,
-        dir_name: &str,
-        disposition: CreateDisposition,
-        desired_access: FileAccessMask,
-    ) -> crate::Result<Resource> {
-        self.create(
-            dir_name,
-            &FileCreateArgs {
-                disposition,
-                options: CreateOptions::new().with_directory_file(true),
-                desired_access,
-                attributes: FileAttributes::new().with_directory(true),
-                ..Default::default()
-            },
-        )
-        .await
-    }
-
-    /// A wrapper around [create][crate::tree::Tree::create] that opens an existing file or directory on the remote server.
-    /// See [create][crate::tree::Tree::create] for more information.
-    #[tracing::instrument(level = "debug", skip_all, fields(file_name = %file_name))]
-    pub async fn open_existing(
-        &self,
-        file_name: &str,
-        access: FileAccessMask,
-    ) -> crate::Result<Resource> {
-        self.create(file_name, &FileCreateArgs::make_open_existing(access))
-            .await
-    }
-
-    /// Returns the SMB-assigned tree id for this connected share.
-    /// Used by the lease cache (Phase C) so cache hits can match opens
-    /// against the same tree the original Create was issued on.
-    pub fn tree_id(&self) -> u32 {
-        self.context.generation().tree_id
-    }
-
     pub(crate) fn object_token(&self) -> crate::runtime::ObjectToken {
         self.context.generation().object
-    }
-
-    /// Borrow the tree's underlying `Upstream` context reference.
-    /// Phase C uses this from [`crate::resource::Resource::build_lease_proto`]
-    /// so the lease cache can construct a `ResourceMessageHandle` against
-    /// the same tree the Create was issued on. `pub(crate)` because the
-    /// Crate-private because the per-connection context type is internal.
-    pub(crate) fn context_ref(&self) -> &Arc<TreeContext> {
-        &self.context
     }
 
     /// Disconnects from the tree (share) on the server.
@@ -434,19 +352,6 @@ impl TreeContext {
         self.execute_for(msg, options, object).await
     }
 
-    pub(crate) async fn create_resource_object(
-        self: &Arc<Self>,
-    ) -> crate::Result<crate::runtime::ObjectToken> {
-        self.wait_for_reconnect(Some(self.upstream.conn_info().config.timeout()), None)
-            .await?;
-        self.upstream
-            .create_object(
-                self.generation().object,
-                crate::runtime::ObjectKind::Resource,
-            )
-            .await
-    }
-
     pub(crate) async fn register_oplock_slot(&self, slot: &Arc<crate::lease::OplockSlot>) {
         self.upstream.register_oplock_slot(slot).await;
     }
@@ -511,17 +416,6 @@ impl TreeContext {
         Ok(result)
     }
 
-    pub(crate) async fn send_recv(
-        self: &Arc<Self>,
-        content: RequestContent,
-    ) -> crate::Result<crate::command::CommandResponse> {
-        self.execute_request(
-            CommandRequest::new(content),
-            crate::command::ResponseOptions::new(),
-        )
-        .await
-    }
-
     pub(crate) async fn send_recv_for(
         &self,
         content: RequestContent,
@@ -553,16 +447,6 @@ impl TreeContext {
         self.execute(message, options)
             .await
             .map(|(_, incoming)| incoming)
-    }
-
-    pub(crate) async fn submit_for(
-        &self,
-        message: CommandRequest,
-        dependency: crate::runtime::ObjectToken,
-    ) -> crate::Result<CommandSubmission> {
-        self.upstream
-            .submit_for(self.prepare(message)?.0, dependency)
-            .await
     }
 
     async fn _disconnect(

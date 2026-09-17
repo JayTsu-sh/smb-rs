@@ -64,103 +64,6 @@ impl File {
         self.end_of_file
     }
 
-    /// Returns the access mask of the file,
-    /// when the file was opened.
-    pub fn access(&self) -> FileAccessMask {
-        self.access
-    }
-
-    /// Read a block of data from an opened file.
-    /// # Arguments
-    /// * `buf` - The buffer to read the data into. A maximum of `buf.len()` bytes will be read.
-    /// * `pos` - The offset in the file to read from.
-    /// * `unbuffered` - Whether to try using unbuffered I/O (if supported by the server).
-    /// # Returns
-    /// The number of bytes read, up to `buf.len()`.
-    pub async fn read_block(
-        &self,
-        buf: &mut [u8],
-        pos: u64,
-        channel: Option<u32>,
-        unbuffered: bool,
-    ) -> std::io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
-        if !self.access.file_read_data() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "No read permission",
-            ));
-        }
-
-        tracing::debug!(
-            "Reading up to {} bytes at offset {} from {}",
-            buf.len(),
-            pos,
-            self.handle.name()
-        );
-
-        let response = self
-            .send_read_request(buf.len() as u32, pos, channel, unbuffered)
-            .await?;
-        if response
-            .message
-            .header
-            .status()
-            .map_err(std::io::Error::other)?
-            == Status::EndOfFile
-        {
-            return Ok(0);
-        }
-        let content = response
-            .message
-            .content
-            .to_read()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        // Zero-copy path: extract data directly from raw bytes using offset metadata,
-        // avoiding the intermediate Vec<u8> allocation that binrw would otherwise create.
-        let data_range = content
-            .data_range(response.raw.len())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let raw_data = &response.raw[data_range.as_range()];
-        let actual_read_length = raw_data.len();
-
-        tracing::debug!(
-            "Read {} bytes from {}.",
-            actual_read_length,
-            self.handle.name()
-        );
-
-        buf[..actual_read_length].copy_from_slice(raw_data);
-
-        Ok(actual_read_length)
-    }
-
-    /// Read a block of data from an opened file, returning a zero-copy `Bytes` slice.
-    ///
-    /// This avoids copying data into a caller-provided buffer. The returned `Bytes`
-    /// is a zero-copy slice of the raw network response.
-    pub async fn read_block_bytes(
-        &self,
-        max_len: u32,
-        pos: u64,
-        channel: Option<u32>,
-        unbuffered: bool,
-    ) -> std::io::Result<bytes::Bytes> {
-        self.read_block_bytes_with_options(
-            max_len,
-            pos,
-            channel,
-            unbuffered,
-            FileOperationOptions::default(),
-        )
-        .await
-        .map_err(std::io::Error::other)
-    }
-
     pub(crate) async fn read_block_bytes_with_options(
         &self,
         max_len: u32,
@@ -195,27 +98,6 @@ impl File {
 
         // Zero-copy: slice the immutable frame owner without copying payload.
         Ok(response.raw.slice(data_range.as_range()))
-    }
-
-    /// Builds and sends a read request, returning the incoming response message.
-    /// Shared by `read_block` and `read_block_bytes` to avoid duplicating
-    /// flag construction and request/response plumbing.
-    async fn send_read_request(
-        &self,
-        length: u32,
-        pos: u64,
-        channel: Option<u32>,
-        unbuffered: bool,
-    ) -> std::io::Result<crate::command::CommandResponse> {
-        self.send_read_request_with_options(
-            length,
-            pos,
-            channel,
-            unbuffered,
-            FileOperationOptions::default(),
-        )
-        .await
-        .map_err(std::io::Error::other)
     }
 
     async fn send_read_request_with_options(
@@ -262,43 +144,6 @@ impl File {
         self.handle
             .execute_request_with_replay(request, options, operation.replay)
             .await
-    }
-
-    /// Write a block of data to an opened file.
-    /// # Arguments
-    /// * `buf` - The data to write. The data is copied into a `Bytes` buffer.
-    /// * `pos` - The offset in the file to write to.
-    /// # Returns
-    /// The number of bytes written.
-    /// # Note
-    /// This method copies the data from `buf`. To avoid this copy,
-    /// use [`File::write_block_zc`] with a pre-existing `Bytes` buffer.
-    #[inline]
-    pub async fn write_block(
-        &self,
-        buf: &[u8],
-        pos: u64,
-        channel: Option<u32>,
-    ) -> std::io::Result<usize> {
-        self.write_block_zc(Bytes::copy_from_slice(buf), pos, channel)
-            .await
-    }
-
-    /// Write a block of data to an opened file, without copying the data.
-    /// # Arguments
-    /// * `buf` - The data to write as a zero-copy `Bytes` buffer.
-    /// * `pos` - The offset in the file to write to.
-    /// # Returns
-    /// The number of bytes written.
-    pub async fn write_block_zc(
-        &self,
-        buf: Bytes,
-        pos: u64,
-        channel: Option<u32>,
-    ) -> std::io::Result<usize> {
-        self.write_block_zc_with_options(buf, pos, channel, FileOperationOptions::default())
-            .await
-            .map_err(std::io::Error::other)
     }
 
     pub(crate) async fn write_block_zc_with_options(

@@ -168,7 +168,6 @@ mod gmac_signer {
         aead::{AeadInOut, KeyInit},
     };
     use binrw::prelude::*;
-    use modular_bitfield::prelude::*;
 
     use super::*;
 
@@ -181,22 +180,6 @@ mod gmac_signer {
         // no online mode implemented in RustCrypto,
         // so we'll buffer the input until finalized().
         buffer: Vec<u8>,
-    }
-
-    #[allow(dead_code)]
-    mod gmac_nonce {
-        use super::*;
-        #[bitfield]
-        pub struct NonceSuffixFlags {
-            #[skip(getters)]
-            pub msg_id: B64,
-            #[skip(getters)]
-            pub is_server: bool,
-            #[skip(getters)]
-            pub is_cancel: bool,
-            #[skip]
-            __: B30,
-        }
     }
 
     impl Gmac128Signer {
@@ -239,11 +222,13 @@ mod gmac_signer {
         fn make_nonce(header: &Header) -> Gmac128Nonce {
             debug_assert!(header.message_id > 0 && header.message_id != u64::MAX);
 
-            gmac_nonce::NonceSuffixFlags::new()
-                .with_msg_id(header.message_id)
-                .with_is_cancel(header.command == Command::Cancel)
-                .with_is_server(header.flags.server_to_redir())
-                .into_bytes()
+            // MS-SMB2 2.2.41.1 / 3.1.4.1: 64-bit message id, then the
+            // server-to-redir and cancel bits, then 30 zero bits.
+            let mut nonce: Gmac128Nonce = [0; 12];
+            nonce[..8].copy_from_slice(&header.message_id.to_le_bytes());
+            nonce[8] = u8::from(header.flags.server_to_redir())
+                | (u8::from(header.command == Command::Cancel) << 1);
+            nonce
         }
     }
 }

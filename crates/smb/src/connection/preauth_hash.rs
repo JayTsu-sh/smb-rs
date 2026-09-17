@@ -52,14 +52,4 @@ impl PreauthHashState {
             )),
         }
     }
-
-    pub fn unwrap_final_hash(&self) -> crate::Result<Option<&PreauthHashValue>> {
-        match self {
-            PreauthHashState::Finished(hash) => Ok(Some(hash)),
-            PreauthHashState::Unsupported => Ok(None),
-            PreauthHashState::InProgress(_) => Err(crate::Error::InvalidState(
-                "Preauth hash not finished".to_string(),
-            )),
-        }
-    }
 }

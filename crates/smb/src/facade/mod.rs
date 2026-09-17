@@ -1,6 +1,6 @@
 //! Public async SMB facade.
 
-use crate::SigningPolicy;
+use crate::{GuestPolicy, SigningPolicy};
 use smb_rpc::interface::{ShareKind as RpcShareKind, SrvSvc};
 
 use crate::domain::{
@@ -65,6 +65,15 @@ impl Client {
     pub fn with_signing_policy(policy: SigningPolicy) -> Self {
         Self {
             domain: DomainClient::with_signing_policy(policy),
+        }
+    }
+
+    /// Create a client with explicit signing and guest-session policies.
+    /// `GuestPolicy::AllowUnsigned` is required to use shares that map unknown or
+    /// password-less users to a guest account; such sessions are unsigned.
+    pub fn with_policies(signing: SigningPolicy, guest: GuestPolicy) -> Self {
+        Self {
+            domain: DomainClient::with_policies(signing, guest),
         }
     }
 

@@ -99,7 +99,6 @@ macro_rules! query_dir_type {
             impl $name {
                 #[cfg(test)]
                 /// This is a test helper function to quickly initialize common fields for test cases.
-                #[allow(dead_code)]
                 fn make_common_test_dir(file_index: u32, created: time::PrimitiveDateTime, access_time: time::PrimitiveDateTime, write_time: time::PrimitiveDateTime,
                     change_time: time::PrimitiveDateTime, file_name: &str) -> Self {
                     Self {

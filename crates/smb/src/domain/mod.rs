@@ -400,9 +400,13 @@ impl DomainClient {
     }
 
     pub(crate) fn with_signing_policy(policy: crate::SigningPolicy) -> Self {
+        Self::with_policies(policy, crate::GuestPolicy::default())
+    }
+
+    pub(crate) fn with_policies(signing: crate::SigningPolicy, guest: crate::GuestPolicy) -> Self {
         Self {
             inner: Arc::new(DomainClientInner {
-                runtime: RuntimeClient::with_signing_policy(policy),
+                runtime: RuntimeClient::with_policies(signing, guest),
                 sessions: Mutex::new(HashMap::new()),
                 close_report: OnceCell::new(),
             }),
@@ -1461,6 +1465,38 @@ impl Directory {
             Box::pin(async move {
                 context.remaining()?;
                 self.inner.delete().await
+            })
+        })
+    }
+
+    /// Renames this directory; an existing destination fails with
+    /// `STATUS_OBJECT_NAME_COLLISION`.
+    pub fn rename<'a>(&'a self, destination: &'a SharePath) -> Operation<'a, ()> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                if context.replay != ReplayPolicy::Never {
+                    return Err(Error::UnsupportedOperation(
+                        "directory rename permits only ReplayPolicy::Never".into(),
+                    ));
+                }
+                self.inner.rename(destination.as_str(), false).await
+            })
+        })
+    }
+
+    /// Renames this directory and replaces an existing destination when the server
+    /// allows it (NTFS-style servers only replace empty directories).
+    pub fn rename_replace<'a>(&'a self, destination: &'a SharePath) -> Operation<'a, ()> {
+        Operation::new(move |context| {
+            Box::pin(async move {
+                context.remaining()?;
+                if context.replay != ReplayPolicy::Never {
+                    return Err(Error::UnsupportedOperation(
+                        "directory replace permits only ReplayPolicy::Never".into(),
+                    ));
+                }
+                self.inner.rename(destination.as_str(), true).await
             })
         })
     }

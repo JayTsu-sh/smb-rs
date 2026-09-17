@@ -17,7 +17,7 @@ use arc_swap::ArcSwapOption;
 use smb_msg::{Notification, RequestContent, ResponseContent, Status, session_setup::*};
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 
@@ -54,8 +54,6 @@ pub(crate) const PRIMARY_CHANNEL_ID: u32 = 0;
 
 pub struct Session {
     primary_channel: Channel,
-    alt_channels: RwLock<HashMap<u32, Channel>>,
-    channel_counter: AtomicU32,
 
     // Message context for this session.
     session_context: Arc<SessionContext>,
@@ -148,39 +146,11 @@ impl Session {
         Ok(Session {
             session_context: context,
             primary_channel,
-            alt_channels: Default::default(),
-            channel_counter: AtomicU32::new(PRIMARY_CHANNEL_ID + 1),
         })
-    }
-
-    /// Whether this session owns a capability that can supply fresh
-    /// authentication material after a Connection generation change.
-    pub fn supports_reauthentication(&self) -> bool {
-        self.session_context.credential_provider.is_some()
     }
 
     pub fn session_id(&self) -> u64 {
         self.session_context.session_id()
-    }
-
-    pub async fn allow_unsigned(&self) -> crate::Result<bool> {
-        let primary = self.session_context.primary_channel();
-        primary
-            .session_state()
-            .session
-            .read()
-            .await
-            .allow_unsigned()
-    }
-
-    pub async fn should_encrypt(&self) -> crate::Result<bool> {
-        let primary = self.session_context.primary_channel();
-        primary
-            .session_state()
-            .session
-            .read()
-            .await
-            .should_encrypt()
     }
 
     pub(crate) fn recovery_context(&self) -> Arc<SessionContext> {
@@ -189,71 +159,6 @@ impl Session {
 
     pub(crate) fn object_token(&self) -> crate::Result<crate::runtime::ObjectToken> {
         self.session_context.session_object()
-    }
-
-    /// Binds an existing session to a new connection.
-    ///
-    /// Returns the channel ID (in the scope of the current session) of the newly created channel.
-    pub(crate) async fn bind(
-        &self,
-        identity: sspi::AuthIdentity,
-        context: &Arc<ConnectionCore>,
-        conn_info: &Arc<ConnectionInfo>,
-    ) -> crate::Result<u32> {
-        if self.conn_info.negotiation.dialect_rev != conn_info.negotiation.dialect_rev {
-            return Err(Error::InvalidState(
-                "Cannot bind session to connection with different dialect.".to_string(),
-            ));
-        }
-        if self.conn_info.client_guid != conn_info.client_guid {
-            return Err(Error::InvalidState(
-                "Cannot bind session to connection with different client GUID.".to_string(),
-            ));
-        }
-
-        {
-            let session = self.context.session_state().session.read().await;
-            if !session.is_ready() {
-                return Err(Error::InvalidState(
-                    "Cannot bind session that is not ready.".to_string(),
-                ));
-            }
-            if session.is_guest_or_anonymous()? {
-                return Err(Error::InvalidState(
-                    "Cannot bind guest or anonymous session.".to_string(),
-                ));
-            }
-        }
-
-        let new_channel_id = self
-            .channel_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        let setup_result = SessionSetup::new(
-            identity,
-            context,
-            conn_info,
-            new_channel_id,
-            Some(self.context.session_state()),
-            SetupKind::Bind,
-        )
-        .await?;
-
-        let channel = Self::_common_setup(setup_result).await?;
-        let channel_context = channel.context.clone();
-
-        self.alt_channels
-            .write()
-            .await
-            .insert(new_channel_id, channel);
-
-        self.session_context
-            .channel_contexts
-            .write()
-            .await
-            .insert(new_channel_id, channel_context);
-
-        Ok(new_channel_id)
     }
 
     async fn _common_setup<G>(mut session_setup: SessionSetup<'_, G>) -> crate::Result<Channel>
@@ -758,17 +663,6 @@ impl SessionContext {
         kind: crate::runtime::ObjectKind,
     ) -> crate::Result<crate::runtime::ObjectToken> {
         self.primary_channel().create_object(parent, kind).await
-    }
-
-    pub(crate) async fn submit_for(
-        &self,
-        message: CommandRequest,
-        dependency: crate::runtime::ObjectToken,
-    ) -> crate::Result<CommandSubmission> {
-        self.resolve_channel(message.channel_id)
-            .await?
-            .submit_for(message, dependency)
-            .await
     }
 
     pub(crate) async fn send_recv(
