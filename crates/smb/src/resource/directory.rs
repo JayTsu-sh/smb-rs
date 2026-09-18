@@ -585,8 +585,26 @@ pub mod iter_stream {
 
                 // Notify the stream that a new batch is available
                 notify_fetch_next.notify_waiters();
-                notify_fetch_next.notified().await;
+                if !wait_for_demand(&notify_fetch_next, &cancellation).await {
+                    return;
+                }
             }
+        }
+    }
+
+    /// Parks the fetch loop until the consumer wants another page.
+    ///
+    /// Returns `false` when the stream was dropped instead: its `Drop` cancels the token and
+    /// then wakes this loop, and a page requested for a consumer that is gone would only
+    /// produce a response nobody collects (issue #75).
+    async fn wait_for_demand(
+        notify_fetch_next: &tokio::sync::Notify,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> bool {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => false,
+            _ = notify_fetch_next.notified() => !cancellation.is_cancelled(),
         }
     }
 
@@ -613,7 +631,57 @@ pub mod iter_stream {
 
     impl<T> Drop for QueryDirectoryStream<'_, T> {
         fn drop(&mut self) {
+            // Cancel first, wake second: the fetch loop re-checks the token when it wakes, so
+            // the page it would have sent for this consumer never leaves the client.
+            self._cancellation.0.cancel();
             self.notify_fetch_next.notify_waiters();
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used)]
+    mod demand_tests {
+        use super::*;
+
+        fn parked() -> (
+            Arc<tokio::sync::Notify>,
+            tokio_util::sync::CancellationToken,
+            tokio::task::JoinHandle<bool>,
+        ) {
+            let notify = Arc::new(tokio::sync::Notify::new());
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let task = tokio::spawn({
+                let notify = notify.clone();
+                let cancellation = cancellation.clone();
+                async move { wait_for_demand(&notify, &cancellation).await }
+            });
+            (notify, cancellation, task)
+        }
+
+        #[tokio::test]
+        async fn demand_from_a_live_consumer_fetches_the_next_page() {
+            let (notify, _cancellation, task) = parked();
+            tokio::task::yield_now().await;
+            notify.notify_waiters();
+            assert!(task.await.unwrap());
+        }
+
+        #[tokio::test]
+        async fn a_dropped_consumer_stops_the_fetch_loop_without_another_page() {
+            let (notify, cancellation, task) = parked();
+            tokio::task::yield_now().await;
+            // `Drop` order: cancel, then wake.
+            cancellation.cancel();
+            notify.notify_waiters();
+            assert!(!task.await.unwrap());
+        }
+
+        #[tokio::test]
+        async fn a_cancelled_token_is_seen_even_without_a_wake_up() {
+            let (_notify, cancellation, task) = parked();
+            tokio::task::yield_now().await;
+            cancellation.cancel();
+            assert!(!task.await.unwrap());
         }
     }
 }

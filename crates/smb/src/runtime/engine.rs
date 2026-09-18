@@ -943,6 +943,14 @@ async fn owner_task(
     let cause = if close_request.is_some() {
         GenerationExitCause::ExplicitClose
     } else if let Some(error) = fatal {
+        // The one place every fatal path converges; without this line a transport-class exit
+        // is invisible to the caller, who only sees the next operation fail in recovery.
+        tracing::warn!(
+            generation = ?config.generation,
+            ?error,
+            unresolved_requests = report.unresolved_requests,
+            "SMB connection generation exited on a transport fault"
+        );
         GenerationExitCause::Transport(error)
     } else {
         GenerationExitCause::HandlesDropped
@@ -1611,18 +1619,16 @@ fn process_decoded_response(
         authority.state.generation(),
         message.message.header.message_id,
     );
-    let status = match message.message.header.status() {
-        Ok(status) => status,
-        Err(_) => {
-            *fatal = Some(RuntimeError::Wire("invalid-status"));
-            return;
-        }
-    };
+    // An NTSTATUS the enum does not model is not a wire fault: the server may answer with any
+    // status, and a late `STATUS_FILE_CLOSED` for a cancelled QUERY_DIRECTORY used to take the
+    // whole connection down (issue #75). An unknown status simply never matches a policy; an
+    // error body still reaches the caller with the raw status.
+    let status = smb_msg::Status::try_from(message.message.header.status).ok();
     let Some(pending) = authority.operation_pending.get(&key) else {
         *fatal = Some(RuntimeError::Wire("response-without-operation"));
         return;
     };
-    if status == smb_msg::Status::Pending {
+    if matches!(status, Some(smb_msg::Status::Pending)) {
         let Some(async_id) = message.message.header.async_id else {
             *fatal = Some(RuntimeError::Wire("pending-without-async-id"));
             return;
@@ -1636,7 +1642,7 @@ fn process_decoded_response(
     }
     let session_invalidated = matches!(
         status,
-        smb_msg::Status::UserSessionDeleted | smb_msg::Status::NetworkSessionExpired
+        Some(smb_msg::Status::UserSessionDeleted | smb_msg::Status::NetworkSessionExpired)
     );
     if message.form.unauthenticated_recovery_hint && !session_invalidated {
         *fatal = Some(RuntimeError::Wire("invalid-recovery-hint"));
@@ -1652,11 +1658,14 @@ fn process_decoded_response(
         );
         return;
     }
-    let response_is_accepted = response_status_is_admissible(
-        &pending.response,
-        status,
-        matches!(message.message.content, smb_msg::ResponseContent::Error(_)),
-    );
+    // A draining operation has no caller left to hold the server to a status contract: whatever
+    // the late answer says, it only settles the tombstone. The command must still match.
+    let response_is_accepted = pending.draining
+        || response_status_is_admissible(
+            &pending.response,
+            status,
+            matches!(message.message.content, smb_msg::ResponseContent::Error(_)),
+        );
     if message.message.header.command != pending.response.wire_command()
         || (!session_invalidated && !response_is_accepted)
     {
@@ -1702,10 +1711,10 @@ fn process_decoded_response(
 
 fn response_status_is_admissible(
     policy: &ResponsePolicy,
-    status: smb_msg::Status,
+    status: Option<smb_msg::Status>,
     is_server_error: bool,
 ) -> bool {
-    policy.accepts_status(status) || is_server_error
+    status.is_some_and(|status| policy.accepts_status(status)) || is_server_error
 }
 
 fn apply_operation_effects(
@@ -2455,6 +2464,104 @@ mod tests {
             handle.exited().await.cause,
             GenerationExitCause::Transport(RuntimeError::Wire("operation-response-contract"))
         ));
+    }
+
+    /// `STATUS_FILE_CORRUPT_ERROR`, which `smb_msg::Status` does not model. The live case was
+    /// `STATUS_FILE_CLOSED` (a QUERY_DIRECTORY that lost the race against its handle's CLOSE);
+    /// that one is modelled now, so the test needs another gap in the enum.
+    const UNMODELLED_STATUS: u32 = 0xC000_0102;
+
+    fn error_response_with_raw_status(message_id: u64, status: u32) -> Bytes {
+        let mut encoded = create_error_response(message_id).to_vec();
+        encoded[SMB2_STATUS_RANGE].copy_from_slice(&status.to_le_bytes());
+        Bytes::from(encoded)
+    }
+
+    async fn assert_generation_still_serves(
+        control: &ScriptedTransportControl,
+        handle: &RuntimeHandle,
+        events: &mut RuntimeEvents,
+    ) {
+        let follow_up = handle
+            .submit_operation(echo_operation(), None)
+            .await
+            .unwrap();
+        let follow_up_key = follow_up.key;
+        wait_for_write(events, follow_up_key).await;
+        control.push_server_frame(echo_response(follow_up_key.message_id));
+        assert_eq!(follow_up.completion().await.unwrap().key, follow_up_key);
+    }
+
+    #[tokio::test]
+    async fn unmodelled_error_status_reaches_the_caller_and_generation_remains_usable() {
+        let (control, clock, handle, mut events) = test_runtime();
+        assert!(smb_msg::Status::try_from(UNMODELLED_STATUS).is_err());
+
+        let ticket = handle
+            .submit_operation(create_operation(), None)
+            .await
+            .unwrap();
+        wait_for_write(&mut events, ticket.key).await;
+        control.push_server_frame(error_response_with_raw_status(
+            ticket.key.message_id,
+            UNMODELLED_STATUS,
+        ));
+        let result = ticket.completion().await.unwrap();
+        assert_eq!(result.response.message.header.status, UNMODELLED_STATUS);
+        assert!(matches!(
+            result.response.message.content,
+            smb_msg::ResponseContent::Error(_)
+        ));
+
+        assert_generation_still_serves(&control, &handle, &mut events).await;
+        handle
+            .close(clock.now().saturating_add(Duration::from_secs(1)))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_unmodelled_status_for_a_cancelled_operation_is_discarded() {
+        let (control, clock, handle, mut events) = test_runtime();
+        let ticket = handle
+            .submit_operation(create_operation(), None)
+            .await
+            .unwrap();
+        let key = ticket.key;
+        wait_for_write(&mut events, key).await;
+        handle.cancel(key, clock.now()).unwrap();
+        assert!(ticket.completion().await.is_err());
+
+        control.push_server_frame(error_response_with_raw_status(
+            key.message_id,
+            UNMODELLED_STATUS,
+        ));
+        assert_generation_still_serves(&control, &handle, &mut events).await;
+        let report = handle
+            .close(clock.now().saturating_add(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        assert_eq!(report.unresolved_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn late_off_policy_status_for_a_cancelled_operation_is_not_fatal() {
+        let (control, clock, handle, mut events) = test_runtime();
+        let operation = session_setup_operation_accepting(false, &[smb_msg::Status::Success]);
+        let ticket = handle.submit_operation(operation, None).await.unwrap();
+        let key = ticket.key;
+        wait_for_write(&mut events, key).await;
+        handle.cancel(key, clock.now()).unwrap();
+        assert!(ticket.completion().await.is_err());
+
+        // Same frame that is fatal for a live operation in
+        // `same_command_non_error_unexpected_status_remains_fatal`.
+        control.push_server_frame(session_setup_response(key.message_id));
+        assert_generation_still_serves(&control, &handle, &mut events).await;
+        handle
+            .close(clock.now().saturating_add(Duration::from_secs(1)))
+            .await
+            .unwrap();
     }
 
     async fn wait_for_write(events: &mut RuntimeEvents, expected: RequestKey) {
