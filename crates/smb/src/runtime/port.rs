@@ -9,13 +9,15 @@ use std::{pin::Pin, sync::Arc, time::SystemTime};
 
 use bytes::Bytes;
 use futures_core::{Stream, future::BoxFuture};
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use smb_dtyp::SecurityDescriptor;
+use smb_dtyp::binrw_util::prelude::FileTime;
 use smb_fscc::{
     FileAccessMask, FileAttributes, FileBasicInformation, FileDirectoryInformation,
-    FileDispositionInformation, FileRenameInformation, FileStandardInformation, NotifyAction,
+    FileDispositionInformation, FileIdExtdDirectoryInformation, FileIdFullDirectoryInformation,
+    FileRenameInformation, FileStandardInformation, NotifyAction,
 };
-use smb_msg::{AdditionalInfo, CreateOptions, NotifyFilter, SrvEnumerateSnapshotsRequest};
+use smb_msg::{AdditionalInfo, CreateOptions, NotifyFilter, SrvEnumerateSnapshotsRequest, Status};
 use sspi::{AuthIdentity, Secret, Username};
 use zeroize::Zeroizing;
 
@@ -169,6 +171,10 @@ pub(crate) struct RuntimeMetadata {
     pub(crate) written: SystemTime,
     pub(crate) changed: SystemTime,
     pub(crate) len: u64,
+    pub(crate) readonly: bool,
+    pub(crate) reparse_point: bool,
+    pub(crate) file_id: Option<u64>,
+    pub(crate) volume_id: Option<u64>,
 }
 
 impl RuntimeShare {
@@ -437,6 +443,14 @@ pub(crate) struct RuntimeDirectoryEntry {
     pub(crate) changed: SystemTime,
     pub(crate) readonly: bool,
     pub(crate) reparse_point: bool,
+    /// 64-bit file identifier, when the server accepted an information class that carries one.
+    ///
+    /// The same width the `QFid` create context reports on an open, so a listing and an open of
+    /// the same object agree on every filesystem (ReFS also has a 128-bit form, whose low half
+    /// is this value). `None` means the server rejected every wide class, not that the entry
+    /// has no identity. A zero identifier is also reported as `None`: FAT and other back ends
+    /// that do not track one answer with zero rather than refusing the class.
+    pub(crate) file_id: Option<u64>,
 }
 
 pub(crate) enum RuntimeDirectoryEventKind {
@@ -487,27 +501,102 @@ impl RuntimeDirectory {
         metadata(&self.inner).await
     }
 
+    pub(crate) fn opened_metadata(&self) -> RuntimeMetadata {
+        opened_metadata(&self.inner.handle)
+    }
+
     pub(crate) fn entries<'a>(
         &'a self,
         pattern: &'a str,
     ) -> Pin<Box<dyn Stream<Item = crate::Result<RuntimeDirectoryEntry>> + Send + 'a>> {
         Box::pin(
-            futures_util::stream::once(async move {
-                ProtocolDirectory::query::<FileDirectoryInformation>(&self.inner, pattern).await
-            })
-            .try_flatten()
-            .map_ok(|entry| RuntimeDirectoryEntry {
-                name: entry.file_name.to_string(),
-                is_directory: entry.file_attributes.directory(),
-                len: entry.end_of_file,
-                created: entry.creation_time.into(),
-                accessed: entry.last_access_time.into(),
-                written: entry.last_write_time.into(),
-                changed: entry.change_time.into(),
-                readonly: entry.file_attributes.readonly(),
-                reparse_point: entry.file_attributes.reparse_point(),
-            }),
+            futures_util::stream::once(async move { self.entry_stream(pattern).await })
+                .try_flatten(),
         )
+    }
+
+    /// Enumerates with the widest information class the server accepts.
+    ///
+    /// `FileIdFullDirectoryInformation` carries the 64-bit identifier the `QFid` create context
+    /// also reports, and `FileIdExtdDirectoryInformation` a 128-bit one whose low half is that
+    /// value; both arrive in the same `QUERY_DIRECTORY` responses as the narrow class, so an
+    /// identifier costs no extra round trip. Servers that do not implement a class answer
+    /// `STATUS_INVALID_INFO_CLASS`, and that answer only appears once the query has actually
+    /// run — `query` hands back a stream whose first item carries it — so each rung is probed
+    /// by reading that first item. A rejected stream is dropped, which releases the directory's
+    /// query lock and cancels its fetch loop before the next rung is tried.
+    async fn entry_stream<'a>(
+        &'a self,
+        pattern: &'a str,
+    ) -> crate::Result<Pin<Box<dyn Stream<Item = crate::Result<RuntimeDirectoryEntry>> + Send + 'a>>>
+    {
+        if let Some(stream) = probe_class(
+            &self.inner,
+            pattern,
+            |entry: FileIdFullDirectoryInformation| {
+                let file_id = entry.file_id;
+                runtime_entry(
+                    entry.file_name.to_string(),
+                    entry.file_attributes,
+                    entry.end_of_file,
+                    (
+                        entry.creation_time,
+                        entry.last_access_time,
+                        entry.last_write_time,
+                        entry.change_time,
+                    ),
+                    identifier(file_id),
+                )
+            },
+        )
+        .await?
+        {
+            return Ok(stream);
+        }
+        if let Some(stream) = probe_class(
+            &self.inner,
+            pattern,
+            |entry: FileIdExtdDirectoryInformation| {
+                // Low 64 bits: the width every other source of this identifier reports.
+                let file_id = (entry.file_id & u128::from(u64::MAX)) as u64;
+                runtime_entry(
+                    entry.file_name.to_string(),
+                    entry.file_attributes,
+                    entry.end_of_file,
+                    (
+                        entry.creation_time,
+                        entry.last_access_time,
+                        entry.last_write_time,
+                        entry.change_time,
+                    ),
+                    identifier(file_id),
+                )
+            },
+        )
+        .await?
+        {
+            return Ok(stream);
+        }
+        tracing::debug!(
+            "server rejected every file-id directory class; enumerating without identifiers"
+        );
+        let stream = ProtocolDirectory::query::<FileDirectoryInformation>(&self.inner, pattern)
+            .await?
+            .map_ok(|entry| {
+                runtime_entry(
+                    entry.file_name.to_string(),
+                    entry.file_attributes,
+                    entry.end_of_file,
+                    (
+                        entry.creation_time,
+                        entry.last_access_time,
+                        entry.last_write_time,
+                        entry.change_time,
+                    ),
+                    None,
+                )
+            });
+        Ok(Box::pin(stream))
     }
 
     pub(crate) fn watch<'a>(
@@ -616,6 +705,10 @@ impl RuntimeFile {
         metadata(&self.inner).await
     }
 
+    pub(crate) fn opened_metadata(&self) -> RuntimeMetadata {
+        opened_metadata(self.inner.handle())
+    }
+
     pub(crate) fn opened_len(&self) -> u64 {
         self.inner.end_of_file()
     }
@@ -702,16 +795,114 @@ impl RuntimeFile {
     }
 }
 
+/// Zero means "this back end does not track one" rather than a real identifier: FAT and similar
+/// volumes accept the wide class and answer zero instead of refusing it.
+fn identifier(file_id: u64) -> Option<u64> {
+    (file_id != 0).then_some(file_id)
+}
+
+fn runtime_entry(
+    name: String,
+    attributes: FileAttributes,
+    len: u64,
+    times: (FileTime, FileTime, FileTime, FileTime),
+    file_id: Option<u64>,
+) -> RuntimeDirectoryEntry {
+    let (created, accessed, written, changed) = times;
+    RuntimeDirectoryEntry {
+        name,
+        is_directory: attributes.directory(),
+        len,
+        created: created.into(),
+        accessed: accessed.into(),
+        written: written.into(),
+        changed: changed.into(),
+        readonly: attributes.readonly(),
+        reparse_point: attributes.reparse_point(),
+        file_id,
+    }
+}
+
+/// Runs one rung of the information-class ladder.
+///
+/// `Ok(None)` means the server rejected the class and the caller should try a narrower one. Any
+/// other failure belongs to the caller, not to the ladder, and is propagated.
+async fn probe_class<'a, T, F>(
+    directory: &'a Arc<ProtocolDirectory>,
+    pattern: &'a str,
+    convert: F,
+) -> crate::Result<
+    Option<Pin<Box<dyn Stream<Item = crate::Result<RuntimeDirectoryEntry>> + Send + 'a>>>,
+>
+where
+    T: smb_fscc::QueryDirectoryInfoValue
+        + for<'b> binrw::prelude::BinWrite<Args<'b> = ()>
+        + Unpin
+        + Send
+        + 'a,
+    F: Fn(T) -> RuntimeDirectoryEntry + Send + 'a,
+{
+    let mut stream = ProtocolDirectory::query::<T>(directory, pattern).await?;
+    let first = stream.next().await;
+    match first {
+        Some(Err(error)) if is_invalid_info_class(&error) => Ok(None),
+        Some(Err(error)) => Err(error),
+        // The probe consumed the first item, so put it back in front of the rest.
+        Some(Ok(entry)) => Ok(Some(Box::pin(
+            futures_util::stream::once(std::future::ready(Ok(convert(entry))))
+                .chain(stream.map_ok(convert)),
+        ))),
+        None => Ok(Some(Box::pin(futures_util::stream::empty()))),
+    }
+}
+
+fn is_invalid_info_class(error: &crate::Error) -> bool {
+    matches!(
+        error,
+        crate::Error::ReceivedErrorMessage(status, _)
+            | crate::Error::UnexpectedMessageStatus(status)
+            if *status == Status::U32_INVALID_INFO_CLASS
+    )
+}
+
 async fn metadata(resource: &crate::resource::ResourceHandle) -> crate::Result<RuntimeMetadata> {
     let basic = resource.query_info::<FileBasicInformation>().await?;
     let standard = resource.query_info::<FileStandardInformation>().await?;
+    let opened = resource.opened();
     Ok(RuntimeMetadata {
         created: basic.creation_time.into(),
         accessed: basic.last_access_time.into(),
         written: basic.last_write_time.into(),
         changed: basic.change_time.into(),
         len: standard.end_of_file,
+        // `FileBasicInformation` already carries the attributes; reporting them costs nothing
+        // beyond the query that was being made anyway.
+        readonly: basic.file_attributes.readonly(),
+        reparse_point: basic.file_attributes.reparse_point(),
+        // Identity does not change over the life of an open, so the `CREATE` answer is as
+        // authoritative as a fresh query and costs nothing.
+        file_id: opened.file_id(),
+        volume_id: opened.volume_id(),
     })
+}
+
+/// Metadata as the `CREATE` response reported it, with no `QUERY_INFO` round trip.
+///
+/// Accurate for anything observed at open time. A caller that has written through the handle
+/// since and needs the current length or timestamps must use [`metadata`] instead.
+fn opened_metadata(resource: &crate::resource::ResourceHandle) -> RuntimeMetadata {
+    let opened = resource.opened();
+    RuntimeMetadata {
+        created: opened.created().into(),
+        accessed: opened.accessed().into(),
+        written: opened.written().into(),
+        changed: opened.changed().into(),
+        len: opened.end_of_file(),
+        readonly: opened.attributes().readonly(),
+        reparse_point: opened.attributes().reparse_point() || opened.is_reparse_point(),
+        file_id: opened.file_id(),
+        volume_id: opened.volume_id(),
+    }
 }
 
 fn security_selection(dacl: bool) -> AdditionalInfo {

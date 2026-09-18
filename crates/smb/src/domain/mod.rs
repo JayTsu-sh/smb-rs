@@ -848,6 +848,10 @@ pub struct ResourceMetadata {
     written: std::time::SystemTime,
     changed: std::time::SystemTime,
     len: u64,
+    readonly: bool,
+    reparse_point: bool,
+    file_id: Option<u64>,
+    volume_id: Option<u64>,
 }
 
 impl ResourceMetadata {
@@ -858,7 +862,26 @@ impl ResourceMetadata {
             written: value.written,
             changed: value.changed,
             len: value.len,
+            readonly: value.readonly,
+            reparse_point: value.reparse_point,
+            file_id: value.file_id,
+            volume_id: value.volume_id,
         }
+    }
+
+    /// On-disk file identifier, stable across renames within its volume.
+    ///
+    /// Comes from the `QFid` create context this client attaches to every open, so it costs no
+    /// round trip and matches [`DirectoryEntry::file_id`] for the same object. `None` when the
+    /// server did not answer the context or reports zero (FAT and similar back ends).
+    pub const fn file_id(&self) -> Option<u64> {
+        self.file_id
+    }
+
+    /// Volume identifier from the same context; tells apart equal file identifiers that come
+    /// from different volumes behind one share (DFS links, ONTAP junctions).
+    pub const fn volume_id(&self) -> Option<u64> {
+        self.volume_id
     }
 
     pub const fn created(&self) -> std::time::SystemTime {
@@ -881,12 +904,36 @@ impl ResourceMetadata {
         self.len
     }
 
+    /// `FILE_ATTRIBUTE_READONLY`, from the same `FileBasicInformation` the timestamps come from.
+    pub const fn is_readonly(&self) -> bool {
+        self.readonly
+    }
+
+    /// Whether the entry is a reparse point.
+    pub const fn is_reparse_point(&self) -> bool {
+        self.reparse_point
+    }
+
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 }
 
 impl Resource {
+    /// Metadata as the `CREATE` response reported it: no round trip, accurate as of the open.
+    ///
+    /// # Errors
+    /// Pipes carry no storage metadata.
+    pub fn opened_metadata(&self) -> crate::Result<ResourceMetadata> {
+        match self {
+            Resource::File(file) => Ok(file.opened_metadata()),
+            Resource::Directory(directory) => Ok(directory.opened_metadata()),
+            Resource::Pipe(_) => Err(Error::UnsupportedOperation(
+                "Pipe metadata is not a domain operation".into(),
+            )),
+        }
+    }
+
     pub fn metadata(&self) -> Operation<'_, ResourceMetadata> {
         Operation::new(move |context| {
             Box::pin(async move {
@@ -1028,6 +1075,12 @@ impl File {
                 Ok(ResourceMetadata::from_runtime(self.inner.metadata().await?))
             })
         })
+    }
+
+    /// Metadata as the `CREATE` response reported it: no round trip, accurate as of the open.
+    /// Prefer it whenever the handle was opened to observe rather than to write.
+    pub fn opened_metadata(&self) -> ResourceMetadata {
+        ResourceMetadata::from_runtime(self.inner.opened_metadata())
     }
 
     pub fn cursor(&self) -> FileCursor<'_> {
@@ -1299,6 +1352,7 @@ pub struct DirectoryEntry {
     changed: std::time::SystemTime,
     readonly: bool,
     reparse_point: bool,
+    file_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1387,6 +1441,19 @@ impl DirectoryEntry {
     pub const fn is_reparse_point(&self) -> bool {
         self.reparse_point
     }
+
+    /// Server-assigned 64-bit file identifier, stable across renames within the volume.
+    ///
+    /// Present when the server accepted a `QUERY_DIRECTORY` information class that carries
+    /// one (`FileIdFullDirectoryInformation`, or the low half of
+    /// `FileIdExtdDirectoryInformation`). It is the same value [`ResourceMetadata::file_id`]
+    /// reports for an open of the object, so a listing and a later open agree. NTFS reports its
+    /// index number and Samba the underlying inode. `None` means the server refused every such
+    /// class or reported zero, as FAT back ends do; treat the entry as identified by its path
+    /// alone in that case.
+    pub const fn file_id(&self) -> Option<u64> {
+        self.file_id
+    }
 }
 
 pub struct Directory {
@@ -1443,6 +1510,11 @@ impl Directory {
         })
     }
 
+    /// Metadata as the `CREATE` response reported it: no round trip, accurate as of the open.
+    pub fn opened_metadata(&self) -> ResourceMetadata {
+        ResourceMetadata::from_runtime(self.inner.opened_metadata())
+    }
+
     pub fn entries<'a>(&'a self, pattern: &'a str) -> DirectoryEntries<'a> {
         Box::pin(self.inner.entries(pattern).map(|result| {
             result.map(|entry| DirectoryEntry {
@@ -1455,6 +1527,7 @@ impl Directory {
                 changed: entry.changed,
                 readonly: entry.readonly,
                 reparse_point: entry.reparse_point,
+                file_id: entry.file_id,
             })
         }))
     }

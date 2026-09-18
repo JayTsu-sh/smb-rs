@@ -1,6 +1,7 @@
 use std::sync::{Arc, atomic::AtomicBool};
 
 use smb_dtyp::SecurityDescriptor;
+use smb_dtyp::binrw_util::prelude::FileTime;
 use smb_fscc::*;
 use smb_msg::*;
 
@@ -335,6 +336,17 @@ impl Resource {
         } else {
             None
         };
+        let opened = OpenedFacts {
+            created: response.creation_time,
+            accessed: response.last_access_time,
+            written: response.last_write_time,
+            changed: response.change_time,
+            end_of_file: response.endof_file,
+            attributes: response.file_attributes,
+            reparse_point: response.flags.reparsepoint(),
+            on_disk_id: CreateContextResponseData::first_qfid(&response.create_contexts)
+                .map(|qfid| (qfid.file_id, qfid.volume_id)),
+        };
         let handle = ResourceHandle {
             name: name.to_string(),
             context: upstream.clone(),
@@ -349,6 +361,7 @@ impl Resource {
             durable_granted,
             oplock_slot,
             conn_info: conn_info.clone(),
+            opened,
         };
 
         // Construct specific resource and return it.
@@ -420,6 +433,66 @@ impl ResourceGeneration {
     }
 }
 
+/// Facts the `CREATE` response already carried about the opened object.
+///
+/// Every open costs one round trip, and the server answers it with the same timestamps, sizes
+/// and attributes a `FileBasicInformation` + `FileStandardInformation` pair would return — plus,
+/// because this client always attaches a `QFid` create context, the on-disk file and volume
+/// identifiers. Keeping that answer lets callers describe an object without any `QUERY_INFO`
+/// round trip. The snapshot is taken at open time and is not refreshed by later writes; use
+/// the query-based metadata when freshness after modification matters.
+#[derive(Clone, Copy, Debug)]
+pub struct OpenedFacts {
+    created: FileTime,
+    accessed: FileTime,
+    written: FileTime,
+    changed: FileTime,
+    end_of_file: u64,
+    attributes: FileAttributes,
+    reparse_point: bool,
+    /// `(file_id, volume_id)` from the `QFid` create context, when the server returned one.
+    on_disk_id: Option<(u64, u64)>,
+}
+
+impl OpenedFacts {
+    pub fn created(&self) -> FileTime {
+        self.created
+    }
+    pub fn accessed(&self) -> FileTime {
+        self.accessed
+    }
+    pub fn written(&self) -> FileTime {
+        self.written
+    }
+    pub fn changed(&self) -> FileTime {
+        self.changed
+    }
+    pub fn end_of_file(&self) -> u64 {
+        self.end_of_file
+    }
+    pub fn attributes(&self) -> FileAttributes {
+        self.attributes
+    }
+    /// Whether the last path component is a reparse point (`SMB2_CREATE_FLAG_REPARSEPOINT`).
+    pub fn is_reparse_point(&self) -> bool {
+        self.reparse_point
+    }
+    /// On-disk file identifier from the `QFid` create context.
+    ///
+    /// `None` when the server did not answer the context. Zero is also reported as `None`:
+    /// back ends without a stable identifier answer zero rather than omitting the context.
+    pub fn file_id(&self) -> Option<u64> {
+        self.on_disk_id
+            .map(|(file_id, _)| file_id)
+            .filter(|file_id| *file_id != 0)
+    }
+    /// Volume identifier from the `QFid` create context, for telling apart identical file
+    /// identifiers that come from different volumes behind one share.
+    pub fn volume_id(&self) -> Option<u64> {
+        self.on_disk_id.map(|(_, volume_id)| volume_id)
+    }
+}
+
 pub struct ResourceHandle {
     name: String,
     context: Arc<TreeContext>,
@@ -437,12 +510,19 @@ pub struct ResourceHandle {
     oplock_slot: Option<Arc<OplockSlot>>,
 
     conn_info: Arc<ConnectionInfo>,
+
+    opened: OpenedFacts,
 }
 
 impl ResourceHandle {
     /// Returns the name of the resource.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Facts the `CREATE` response carried when this handle was opened.
+    pub fn opened(&self) -> &OpenedFacts {
+        &self.opened
     }
 
     /// Returns the server-granted durable-v2 properties for this Resource.
