@@ -249,6 +249,11 @@ impl RecoveryDriver {
                             let _ = candidate.runtime.close(self.clock.now()).await;
                             return Err(RecoveryError::MismatchedGeneration);
                         }
+                        // The bootstrap found its connection gone (issue #77). No later
+                        // attempt can succeed, so end recovery now instead of burning the
+                        // backoff budget and reporting `AttemptsExhausted` for a server that
+                        // was never asked.
+                        Err(RuntimeError::Closed) => return Err(RecoveryError::Closed),
                         Err(error) => {
                             tracing::debug!(
                                 ?error,
@@ -280,6 +285,13 @@ impl RecoveryDriver {
         self.closed.cancel();
         let _ = self.reduce(RecoveryEvent::Close).await;
         self.fail_waiters().await;
+    }
+
+    /// Synchronous half of [`close`](Self::close), for a `Drop` that cannot await: trips the
+    /// close token so a running or future `recover` returns `Closed` and releases its waiters
+    /// on the way out.
+    pub(crate) fn abandon(&self) {
+        self.closed.cancel();
     }
 
     pub(crate) async fn state(&self) -> RecoveryState {
@@ -812,6 +824,94 @@ mod tests {
             driver.resolve_dependency(connection, None, None).await,
             Ok(connection)
         );
+    }
+
+    struct ClosedBootstrap {
+        calls: AtomicUsize,
+    }
+
+    impl GenerationBootstrap for ClosedBootstrap {
+        fn bootstrap(
+            &self,
+            _generation: GenerationId,
+            _deadline: MonotonicTime,
+        ) -> BoxFuture<'static, Result<PreparedGeneration, RuntimeError>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(RuntimeError::Closed) }.boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_reporting_a_dropped_connection_ends_recovery_at_once() {
+        let clock = Arc::new(ManualClock::new());
+        let (exit, connection) = transport_exit(clock.clone()).await;
+        let bootstrap = Arc::new(ClosedBootstrap {
+            calls: AtomicUsize::new(0),
+        });
+        let driver = Arc::new(RecoveryDriver::new(
+            connection,
+            policy(),
+            clock.clone(),
+            bootstrap.clone(),
+            Arc::new(NoRecoveryJitter),
+        ));
+        let waiter = tokio::spawn({
+            let driver = driver.clone();
+            async move {
+                // Queue behind the recovery before it starts; `recovering` flips inside
+                // `recover`, so poll until the wait is actually parked.
+                driver.resolve_dependency(connection, None, None).await
+            }
+        });
+        tokio::task::yield_now().await;
+
+        assert!(matches!(
+            driver.recover(exit).await,
+            Err(RecoveryError::Closed)
+        ));
+        assert_eq!(bootstrap.calls.load(Ordering::SeqCst), 1);
+        // No backoff was scheduled: the loop ended on the first `Closed`.
+        assert_eq!(clock.pending_sleepers(), 0);
+        let waited = waiter.await.unwrap();
+        assert!(
+            matches!(waited, Ok(_) | Err(RecoveryError::WaitFailed)),
+            "waiter must be released, got {waited:?}"
+        );
+        assert_eq!(
+            driver.resolve_dependency(connection, None, None).await,
+            Ok(connection)
+        );
+    }
+
+    #[tokio::test]
+    async fn abandon_from_a_drop_ends_a_parked_recovery_and_releases_waiters() {
+        let clock = Arc::new(ManualClock::new());
+        let (exit, connection) = transport_exit(clock.clone()).await;
+        let driver = Arc::new(RecoveryDriver::new(
+            connection,
+            policy(),
+            clock.clone(),
+            Arc::new(PendingBootstrap),
+            Arc::new(NoRecoveryJitter),
+        ));
+        let recovery = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.recover(exit).await }
+        });
+        tokio::task::yield_now().await;
+        let waiter = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.resolve_dependency(connection, None, None).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        driver.abandon();
+        assert!(matches!(
+            recovery.await.unwrap(),
+            Err(RecoveryError::Closed)
+        ));
+        assert_eq!(waiter.await.unwrap(), Err(RecoveryError::WaitFailed));
     }
 
     #[tokio::test]

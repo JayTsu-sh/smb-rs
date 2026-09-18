@@ -845,6 +845,12 @@ impl ConnectionCore {
             let mut current = generation_runtime;
             loop {
                 let exit = current.exited().await;
+                // A connection nobody holds any more has nothing to recover for; the bootstrap
+                // would only rediscover the dead `Weak` on every attempt (issue #77).
+                if context.strong_count() == 0 {
+                    driver.close().await;
+                    break;
+                }
                 match driver.recover(exit).await {
                     Ok(_) => {
                         let Some(context) = context.upgrade() else {
@@ -1225,6 +1231,11 @@ impl Drop for ConnectionCore {
     fn drop(&mut self) {
         self.stop_notify();
         self.generation.store(None);
+        // `Connection::close()` stops recovery through `close_recovery`; a plain drop must not
+        // leave the spawned recovery task retrying a bootstrap whose `Weak` can never upgrade.
+        if let Some(driver) = self.recovery.get() {
+            driver.abandon();
+        }
     }
 }
 

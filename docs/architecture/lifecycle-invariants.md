@@ -199,6 +199,10 @@ async interim response goes directly from `Sent` to `Completed`.
   option may return immediately.
 - Every non-success exit of the recovery driver releases the queued waiters
   with a typed failure. `recovering` is never left set without a driver.
+- Dropping a connection without `close()` still ends its recovery: the drop
+  trips the driver's close token, and a bootstrap that finds its connection
+  gone ends recovery with `Closed` on the first attempt instead of spending
+  the retry budget.
 - Waiting operations never enter an old generation's send queue.
 - The recovery wait queue is bounded simultaneously by operation count, total
   retained payload bytes, and individual deadlines.
