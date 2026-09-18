@@ -170,6 +170,7 @@ make_status! {
     RequestNotAccepted = 0xC00000D0: "Request Not Accepted",
     DirectoryNotEmpty = 0xC0000101: "Directory Not Empty",
     Cancelled = 0xC0000120: "Cancelled",
+    FileClosed = 0xC0000128: "File Closed",
     UserSessionDeleted = 0xC0000203: "User Session Deleted",
     UserAccountLockedOut = 0xC0000234: "User Account Locked Out",
     PathNotCovered = 0xC0000257: "Path Not Covered",

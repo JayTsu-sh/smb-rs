@@ -117,6 +117,9 @@ struct RecoveryAdmissions {
 pub(crate) struct RecoveryDriver {
     coordinator: Mutex<RecoveryCoordinator>,
     admissions: Mutex<RecoveryAdmissions>,
+    /// Upper bound for a dependency wait whose caller passed no deadline: the policy's total
+    /// recovery budget. A wait must never outlive the recovery it is waiting for.
+    default_wait: Duration,
     clock: Arc<dyn Clock>,
     bootstrap: Arc<dyn GenerationBootstrap>,
     jitter: Arc<dyn RecoveryJitter>,
@@ -139,6 +142,7 @@ impl RecoveryDriver {
                 queue: RecoveryQueue::new(policy.max_waiting_operations),
                 completions: HashMap::new(),
             }),
+            default_wait: policy.total_timeout,
             clock,
             bootstrap,
             jitter,
@@ -160,7 +164,7 @@ impl RecoveryDriver {
             .generation
             .checked_next()
             .ok_or(RecoveryError::GenerationExhausted)?;
-        let mut effect = {
+        let effect = {
             let mut coordinator = self.coordinator.lock().await;
             if coordinator.state() != RecoveryState::Connected(exit.generation) {
                 return Err(RecoveryError::StaleGeneration);
@@ -171,7 +175,37 @@ impl RecoveryDriver {
             })
         };
         self.begin_recovery(exit.generation).await?;
+        tracing::warn!(
+            generation = ?exit.generation,
+            cause = ?exit.cause,
+            "SMB connection lost its transport; recovery started"
+        );
 
+        // Every exit from the attempt loop other than a published replacement must release the
+        // operations queued behind the recovery; otherwise `recovering` stays set with nobody
+        // driving it, and every later Connection-dependency wait hangs.
+        let outcome = self.drive_attempts(next_generation, effect).await;
+        match &outcome {
+            Ok(runtime) => tracing::info!(
+                generation = ?runtime.connection_object().generation(),
+                "SMB connection recovered"
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "SMB connection recovery ended without a replacement"
+                );
+                self.fail_waiters().await;
+            }
+        }
+        outcome
+    }
+
+    async fn drive_attempts(
+        &self,
+        next_generation: GenerationId,
+        mut effect: Option<RecoveryEffect>,
+    ) -> Result<RuntimeHandle, RecoveryError> {
         loop {
             effect = match effect {
                 Some(RecoveryEffect::ScheduleAttempt { at, .. }) => {
@@ -215,7 +249,12 @@ impl RecoveryDriver {
                             let _ = candidate.runtime.close(self.clock.now()).await;
                             return Err(RecoveryError::MismatchedGeneration);
                         }
-                        Err(_) => {
+                        Err(error) => {
+                            tracing::debug!(
+                                ?error,
+                                attempt,
+                                "SMB connection recovery attempt failed"
+                            );
                             self.reduce(RecoveryEvent::AttemptFailed {
                                 now: self.clock.now(),
                                 jitter: self.jitter.next(attempt),
@@ -225,11 +264,9 @@ impl RecoveryDriver {
                     }
                 }
                 Some(RecoveryEffect::RecoveryFailed) => {
-                    self.fail_waiters().await;
                     return Err(RecoveryError::AttemptsExhausted);
                 }
                 Some(RecoveryEffect::Closed) | None => {
-                    self.fail_waiters().await;
                     return Err(RecoveryError::Closed);
                 }
                 Some(RecoveryEffect::PublishGeneration(_)) => {
@@ -263,7 +300,7 @@ impl RecoveryDriver {
         deadline: Option<MonotonicTime>,
         cancellation: Option<CancellationToken>,
     ) -> Result<ObjectToken, RecoveryError> {
-        let (id, completion) =
+        let (id, completion, deadline) =
             {
                 let mut admissions = self.admissions.lock().await;
                 if !admissions.recovering {
@@ -272,6 +309,9 @@ impl RecoveryDriver {
                 if dependency != admissions.active_connection {
                     return Err(RecoveryError::DependencyNotConnection);
                 }
+                let deadline = Some(
+                    deadline.unwrap_or_else(|| self.clock.now().saturating_add(self.default_wait)),
+                );
                 let id = admissions.queue.enqueue(dependency, deadline).map_err(
                     |error| match error {
                         RecoveryQueueError::Full => RecoveryError::QueueFull,
@@ -280,7 +320,7 @@ impl RecoveryDriver {
                 )?;
                 let (reply, completion) = oneshot::channel();
                 admissions.completions.insert(id, reply);
-                (id, completion)
+                (id, completion, deadline)
             };
 
         let deadline_wait = async {
@@ -673,6 +713,105 @@ mod tests {
         assert_eq!(first.await.unwrap().unwrap(), replacement);
         assert_eq!(second.await.unwrap().unwrap(), replacement);
         recovered.close(clock.now()).await.unwrap();
+    }
+
+    /// Publishes a runtime for the wrong generation, once released, so a waiter can be
+    /// queued before the mismatch is discovered.
+    struct MismatchedBootstrap {
+        release: Arc<tokio::sync::Notify>,
+        clock: Arc<ManualClock>,
+    }
+
+    impl GenerationBootstrap for MismatchedBootstrap {
+        fn bootstrap(
+            &self,
+            _generation: GenerationId,
+            _deadline: MonotonicTime,
+        ) -> BoxFuture<'static, Result<PreparedGeneration, RuntimeError>> {
+            let release = self.release.clone();
+            let clock = self.clock.clone();
+            async move {
+                release.notified().await;
+                let (transport, _) = ScriptedTransport::new();
+                let (runtime, _) = start_generation(transport, clock, config(GenerationId::new(9)));
+                Ok(PreparedGeneration::new(runtime, Box::new(NoopPublication)))
+            }
+            .boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_wait_without_deadline_is_bounded_by_the_recovery_budget() {
+        let clock = Arc::new(ManualClock::new());
+        let (exit, connection) = transport_exit(clock.clone()).await;
+        let driver = Arc::new(RecoveryDriver::new(
+            connection,
+            policy(),
+            clock.clone(),
+            Arc::new(PendingBootstrap),
+            Arc::new(NoRecoveryJitter),
+        ));
+        let recovery = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.recover(exit).await }
+        });
+        tokio::task::yield_now().await;
+        let attempt_sleepers = clock.pending_sleepers();
+
+        let waiter = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.resolve_dependency(connection, None, None).await }
+        });
+        tokio::task::yield_now().await;
+        // The wait registered its own deadline sleeper even though the caller passed none.
+        assert_eq!(clock.pending_sleepers(), attempt_sleepers + 1);
+
+        driver.close().await;
+        assert_eq!(waiter.await.unwrap(), Err(RecoveryError::WaitFailed));
+        assert!(matches!(
+            recovery.await.unwrap(),
+            Err(RecoveryError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mismatched_replacement_generation_releases_waiters() {
+        let clock = Arc::new(ManualClock::new());
+        let (exit, connection) = transport_exit(clock.clone()).await;
+        let release = Arc::new(tokio::sync::Notify::new());
+        let driver = Arc::new(RecoveryDriver::new(
+            connection,
+            policy(),
+            clock.clone(),
+            Arc::new(MismatchedBootstrap {
+                release: release.clone(),
+                clock: clock.clone(),
+            }),
+            Arc::new(NoRecoveryJitter),
+        ));
+        let recovery = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.recover(exit).await }
+        });
+        tokio::task::yield_now().await;
+        let waiter = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.resolve_dependency(connection, None, None).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        release.notify_one();
+        assert!(matches!(
+            recovery.await.unwrap(),
+            Err(RecoveryError::MismatchedGeneration)
+        ));
+        assert_eq!(waiter.await.unwrap(), Err(RecoveryError::WaitFailed));
+        // Nobody is recovering any more, so a fresh wait must not queue behind a ghost.
+        assert_eq!(
+            driver.resolve_dependency(connection, None, None).await,
+            Ok(connection)
+        );
     }
 
     #[tokio::test]

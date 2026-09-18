@@ -194,8 +194,11 @@ async interim response goes directly from `Sent` to `Completed`.
 ### Request admission
 
 - An operation submitted during `Reconnecting`/`Recovering` waits for recovery
-  within its own deadline by default. A deliberate fail-fast option may return
-  immediately.
+  within its own deadline by default; a caller that supplies no deadline is
+  bounded by the recovery policy's total budget instead. A deliberate fail-fast
+  option may return immediately.
+- Every non-success exit of the recovery driver releases the queued waiters
+  with a typed failure. `recovering` is never left set without a driver.
 - Waiting operations never enter an old generation's send queue.
 - The recovery wait queue is bounded simultaneously by operation count, total
   retained payload bytes, and individual deadlines.
@@ -270,7 +273,14 @@ response after user completion—first undergoes the applicable:
 
 Only then does the runtime decide whether a user waiter should be completed.
 A late response can clear an old tombstone and settle old-generation credits,
-but never wakes the caller twice.
+but never wakes the caller twice. A tombstone's late response is accepted
+whatever its status says: status contracts belong to live callers, and the
+server answers a cancelled request with whatever it likes (`STATUS_CANCELLED`,
+`STATUS_FILE_CLOSED`, or the real result). The command must still match.
+
+An NTSTATUS outside the modelled `Status` enum is not a wire fault. It never
+satisfies a response policy, so a live caller receives it as a raw-status error
+response; it does not terminate the generation.
 
 Data belonging to a retired generation cannot mutate the new generation's
 credit pool, session state, tree state, resource state, or pending table.
