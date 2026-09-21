@@ -1621,8 +1621,8 @@ fn process_decoded_response(
     );
     // An NTSTATUS the enum does not model is not a wire fault: the server may answer with any
     // status, and a late `STATUS_FILE_CLOSED` for a cancelled QUERY_DIRECTORY used to take the
-    // whole connection down (issue #75). An unknown status simply never matches a policy; an
-    // error body still reaches the caller with the raw status.
+    // whole connection down (issue #75). `ResponsePolicy::accepts_wire_status` admits it under
+    // an `Any` policy, and the caller sees the raw status on the response.
     let status = smb_msg::Status::try_from(message.message.header.status).ok();
     let Some(pending) = authority.operation_pending.get(&key) else {
         *fatal = Some(RuntimeError::Wire("response-without-operation"));
@@ -1714,7 +1714,7 @@ fn response_status_is_admissible(
     status: Option<smb_msg::Status>,
     is_server_error: bool,
 ) -> bool {
-    status.is_some_and(|status| policy.accepts_status(status)) || is_server_error
+    policy.accepts_wire_status(status) || is_server_error
 }
 
 fn apply_operation_effects(
