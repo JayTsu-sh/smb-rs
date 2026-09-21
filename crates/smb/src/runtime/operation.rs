@@ -91,9 +91,22 @@ impl ResponsePolicy {
     }
 
     pub(crate) fn accepts_status(&self, status: Status) -> bool {
-        match &self.statuses {
-            AcceptedStatuses::Any => true,
-            AcceptedStatuses::OneOf(statuses) => statuses.contains(&status),
+        self.accepts_wire_status(Some(status))
+    }
+
+    /// Whether a response carrying `status` satisfies this policy, where `None` is a code the
+    /// `Status` enum does not model yet.
+    ///
+    /// `Any` accepts `None`, because "any" has to include the codes the enum has not caught up
+    /// with. Rejecting them does not surface a better error: an inadmissible status ends the
+    /// whole connection generation, so a server refusing one request with an unmodelled
+    /// NTSTATUS would take every other operation down with it. A `OneOf` policy cannot match
+    /// what it cannot name, so it still rejects.
+    pub(crate) fn accepts_wire_status(&self, status: Option<Status>) -> bool {
+        match (&self.statuses, status) {
+            (AcceptedStatuses::Any, _) => true,
+            (AcceptedStatuses::OneOf(statuses), Some(status)) => statuses.contains(&status),
+            (AcceptedStatuses::OneOf(_), None) => false,
         }
     }
 }
@@ -286,6 +299,30 @@ mod tests {
         assert!(policy.accepts_status(Status::MoreProcessingRequired));
         assert!(policy.accepts_status(Status::Success));
         assert!(!policy.accepts_status(Status::AccessDenied));
+    }
+
+    /// A server may answer with an NTSTATUS this crate has not modelled yet. Under an `Any`
+    /// policy that must still be a valid answer: an inadmissible status ends the connection
+    /// generation, so refusing one request would take every other operation down with it.
+    /// Reproduced against ONTAP, which refuses a guest `SESSION_SETUP` with `0xC0000466`,
+    /// a code the enum does not name; the whole connection died instead of the logon failing.
+    #[test]
+    fn an_any_policy_admits_a_status_the_enum_does_not_model() {
+        let policy = ResponsePolicy::any(Command::SessionSetup);
+        assert!(
+            policy.accepts_wire_status(None),
+            "\"any\" has to include the codes the Status enum has not caught up with"
+        );
+        assert!(policy.accepts_wire_status(Some(Status::Success)));
+    }
+
+    /// The other half of the rule: a policy that names its statuses cannot match one it is
+    /// unable to name, so an unmodelled code stays inadmissible there.
+    #[test]
+    fn a_one_of_policy_rejects_a_status_it_cannot_name() {
+        let policy = ResponsePolicy::one_of(Command::Negotiate, [Status::Success]).unwrap();
+        assert!(!policy.accepts_wire_status(None));
+        assert!(policy.accepts_wire_status(Some(Status::Success)));
     }
 
     #[test]

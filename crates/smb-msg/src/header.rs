@@ -172,6 +172,7 @@ make_status! {
     Cancelled = 0xC0000120: "Cancelled",
     FileClosed = 0xC0000128: "File Closed",
     UserSessionDeleted = 0xC0000203: "User Session Deleted",
+    ServerUnavailable = 0xC0000466: "Server Unavailable",
     UserAccountLockedOut = 0xC0000234: "User Account Locked Out",
     PathNotCovered = 0xC0000257: "Path Not Covered",
     NetworkSessionExpired = 0xC000035C: "Network Session Expired",
