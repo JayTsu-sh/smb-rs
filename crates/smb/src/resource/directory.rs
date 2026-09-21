@@ -583,13 +583,21 @@ pub mod iter_stream {
                     }
                 }
 
-                // Notify the stream that a new batch is available
-                notify_fetch_next.notify_waiters();
                 if !wait_for_demand(&notify_fetch_next, &cancellation).await {
                     return;
                 }
             }
         }
+    }
+
+    /// Signals that the consumer is ready for another page.
+    ///
+    /// Stored, not broadcast. Nothing orders this against [`wait_for_demand`] reaching its
+    /// park, and a broadcast wake-up reaches only the tasks already registered on the
+    /// `Notify`, so the demand would be dropped whenever the consumer wins that race and both
+    /// sides would then wait for each other for good.
+    fn signal_demand(notify_fetch_next: &tokio::sync::Notify) {
+        notify_fetch_next.notify_one();
     }
 
     /// Parks the fetch loop until the consumer wants another page.
@@ -619,7 +627,7 @@ pub mod iter_stream {
             match this.receiver.poll_recv(cx) {
                 Poll::Ready(Some(value)) => {
                     if this.receiver.is_empty() {
-                        this.notify_fetch_next.notify_waiters() // Notify that batch is done
+                        signal_demand(&this.notify_fetch_next) // Notify that batch is done
                     }
                     Poll::Ready(Some(value))
                 }
@@ -634,7 +642,7 @@ pub mod iter_stream {
             // Cancel first, wake second: the fetch loop re-checks the token when it wakes, so
             // the page it would have sent for this consumer never leaves the client.
             self._cancellation.0.cancel();
-            self.notify_fetch_next.notify_waiters();
+            signal_demand(&self.notify_fetch_next);
         }
     }
 
@@ -662,7 +670,7 @@ pub mod iter_stream {
         async fn demand_from_a_live_consumer_fetches_the_next_page() {
             let (notify, _cancellation, task) = parked();
             tokio::task::yield_now().await;
-            notify.notify_waiters();
+            signal_demand(&notify);
             assert!(task.await.unwrap());
         }
 
@@ -672,8 +680,29 @@ pub mod iter_stream {
             tokio::task::yield_now().await;
             // `Drop` order: cancel, then wake.
             cancellation.cancel();
-            notify.notify_waiters();
+            signal_demand(&notify);
             assert!(!task.await.unwrap());
+        }
+
+        /// The consumer drains the channel and asks for the next page *before* the fetch loop
+        /// reaches its park. Nothing orders those two, so the wake-up has to survive the
+        /// ordering; every other test here calls `yield_now` first and so never tries it.
+        #[tokio::test]
+        async fn demand_signalled_before_the_loop_parks_is_not_lost() {
+            let notify = Arc::new(tokio::sync::Notify::new());
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            signal_demand(&notify);
+            let task = tokio::spawn({
+                let notify = notify.clone();
+                let cancellation = cancellation.clone();
+                async move { wait_for_demand(&notify, &cancellation).await }
+            });
+            let woken = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
+            assert!(
+                woken.is_ok(),
+                "the fetch loop never woke: the demand signal was dropped"
+            );
+            assert!(woken.unwrap().unwrap());
         }
 
         #[tokio::test]
