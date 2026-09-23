@@ -366,6 +366,7 @@ mod tests {
     fn state() -> NegotiatedProperties {
         NegotiatedProperties {
             server_guid: Guid::from([0; 16]),
+            signing_required: false,
             caps: GlobalCapabilities::new(),
             max_transact_size: 1024,
             max_read_size: 1024,

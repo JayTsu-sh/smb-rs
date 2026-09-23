@@ -44,14 +44,14 @@ pub mod test_support {
 pub use domain::{
     ACE, ACL, AccessAce, AccessCallbackAce, AccessMask, AccessObjectAce, AccessObjectCallbackAce,
     AceFlags, AceType, AceValue, AclRevision, Batch, BatchCommand, BatchOutcome, BatchRef,
-    BatchResult, CancelToken, CloseOutcome,
-    CloseReport, CredentialProvider, Credentials, Deadline, Directory, DirectoryEntries,
-    DirectoryEntry, DirectoryEvent, DirectoryEvents, DirectoryOpenOptions, DirectoryWatchOptions,
-    File, FileCursor, FileOpenOptions, IoCapabilities, MetadataOpenOptions, MetadataUpdate,
-    ObjectGeneration, OpenInfo, OpenKind, Operation, Pipe, PipeName, PreviousVersion, ReplayPolicy,
-    Resource, ResourceMetadata, RpcPipeConnection, SID, SecurityDescriptor, SecurityDescriptorControl,
-    SecurityOpenOptions, SecuritySelection, Session, SessionInfo, Share, ShareInfo, SharePath, ShareTarget, Transfer,
-    TransferEvents, TransferOptions, TransferProgress, TransferReport,
+    BatchResult, CancelToken, CloseOutcome, CloseReport, CredentialProvider, Credentials, Deadline,
+    Directory, DirectoryEntries, DirectoryEntry, DirectoryEvent, DirectoryEvents,
+    DirectoryOpenOptions, DirectoryWatchOptions, File, FileCursor, FileOpenOptions, IoCapabilities,
+    MetadataOpenOptions, MetadataUpdate, ObjectGeneration, OpenInfo, OpenKind, Operation, Pipe,
+    PipeName, PreviousVersion, ReplayPolicy, Resource, ResourceMetadata, RpcPipeConnection, SID,
+    SecurityDescriptor, SecurityDescriptorControl, SecurityOpenOptions, SecuritySelection, Session,
+    SessionInfo, Share, ShareInfo, SharePath, ShareTarget, Transfer, TransferEvents,
+    TransferOptions, TransferProgress, TransferReport,
 };
 pub use error::Error;
 pub use facade::{Client, ClientConfig, RemoteShare, ShareKind};

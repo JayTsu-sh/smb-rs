@@ -20,7 +20,10 @@ use conformance::transcripts::{
     session_setup_response_intermediate,
 };
 use conformance::{MockGss, ScriptedGssStep, ScriptedTransport, assert_negotiate_signing_policy};
-use smb::test_support::{Connection, ConnectionConfig};
+use smb::{
+    SigningPolicy,
+    test_support::{Connection, ConnectionConfig},
+};
 use smb_dtyp::Guid;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -86,10 +89,11 @@ async fn anonymous_session_accepts_unsigned_final_response() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn default_connection_advertises_signing_without_requiring_it() {
+async fn optional_connection_advertises_signing_without_requiring_it() {
     let (transport, control) = ScriptedTransport::new();
     control.push_server_frame(negotiate_response_signing_optional());
     let config = ConnectionConfig {
+        signing_policy: SigningPolicy::WhenRequired,
         smb2_only_negotiate: true,
         timeout: Some(std::time::Duration::from_secs(5)),
         ..Default::default()

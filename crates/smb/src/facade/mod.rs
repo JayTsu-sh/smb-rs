@@ -71,8 +71,18 @@ impl Client {
 
     /// Creates a client with explicit connection policy.
     pub fn with_config(config: ClientConfig) -> Self {
+        let signing = if config.signing_required {
+            SigningPolicy::Required
+        } else {
+            SigningPolicy::WhenRequired
+        };
+        let guest = if config.signing_required {
+            GuestPolicy::Deny
+        } else {
+            GuestPolicy::AllowUnsigned
+        };
         Self {
-            domain: DomainClient::new(config.signing_required),
+            domain: DomainClient::with_policies(signing, guest),
         }
     }
 

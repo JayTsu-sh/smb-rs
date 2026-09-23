@@ -276,6 +276,7 @@ impl ConnectionConfig {
         self.timeout.unwrap_or(Self::DEFAULT_TIMEOUT)
     }
 
+    #[cfg(test)]
     pub(crate) fn effective_credits_backlog(&self) -> u16 {
         self.credits_backlog
             .unwrap_or(Self::DEFAULT_CREDITS_BACKLOG)

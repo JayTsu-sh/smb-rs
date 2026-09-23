@@ -161,6 +161,7 @@ impl RuntimeSession {
 
 pub(crate) struct RuntimeShare {
     inner: Arc<ProtocolShare>,
+    security_cleanup: SecurityCleanup,
 }
 
 pub(crate) enum RuntimeResource {
@@ -320,11 +321,11 @@ impl RuntimeShare {
             ..FileCreateArgs::make_open_existing(access)
         };
         let resource = self.inner.create(path, &args).await?;
-        if let Some(handle) = resource.handle() {
-            if let Err(error) = metadata::reject_reparse(handle).await {
-                let _ = handle.close().await;
-                return Err(error);
-            }
+        if let Some(handle) = resource.handle()
+            && let Err(error) = metadata::reject_reparse(handle).await
+        {
+            let _ = handle.close().await;
+            return Err(error);
         }
         Ok(match resource {
             ProtocolResource::File(file) => RuntimeResource::File(RuntimeFile { inner: file }),

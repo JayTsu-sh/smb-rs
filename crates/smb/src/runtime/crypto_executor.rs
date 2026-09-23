@@ -1,8 +1,17 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use tokio::sync::Semaphore;
 
 const MINIMUM_OFFLOAD_BYTES: usize = 64 * 1024;
+
+/// Process-wide bound for payload-sized crypto transforms. Every production
+/// wire pipeline borrows this pool; per-pipeline pools would multiply blocking
+/// work as connections are added.
+static GLOBAL_CRYPTO_PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    Arc::new(Semaphore::new(
+        BoundedCryptoExecutor::recommended_parallelism(),
+    ))
+});
 
 #[derive(Clone)]
 pub(crate) struct BoundedCryptoExecutor {
@@ -11,7 +20,9 @@ pub(crate) struct BoundedCryptoExecutor {
 
 impl Default for BoundedCryptoExecutor {
     fn default() -> Self {
-        Self::new(Self::recommended_parallelism())
+        Self {
+            permits: Arc::clone(&GLOBAL_CRYPTO_PERMITS),
+        }
     }
 }
 
@@ -33,11 +44,7 @@ impl BoundedCryptoExecutor {
         work_bytes >= MINIMUM_OFFLOAD_BYTES
     }
 
-    pub(crate) async fn execute<F, T>(
-        &self,
-        work_bytes: usize,
-        job: F,
-    ) -> Result<T, tokio::task::JoinError>
+    pub(crate) async fn execute<F, T>(&self, work_bytes: usize, job: F) -> crate::Result<T>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
@@ -45,17 +52,16 @@ impl BoundedCryptoExecutor {
         if !self.should_offload(work_bytes) {
             return Ok(job());
         }
-        let permit = self
-            .permits
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("the crypto executor never closes its semaphore");
+        let permit =
+            self.permits.clone().acquire_owned().await.map_err(|_| {
+                crate::Error::InvalidState("crypto executor permit pool closed".into())
+            })?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             job()
         })
         .await
+        .map_err(|error| crate::Error::InvalidState(format!("crypto worker failed: {error}")))
     }
 }
 

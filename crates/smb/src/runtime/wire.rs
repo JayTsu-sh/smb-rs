@@ -495,10 +495,7 @@ impl WirePipeline {
                     builder.finish_signed()?;
                     crate::Result::Ok((signatures, builder))
                 })
-                .await
-                .map_err(|_| {
-                    crate::Error::InvalidState("compound signing worker failed".into())
-                })??;
+                .await??;
             builder = signed_builder;
             for (index, (msg, signature)) in msgs.iter_mut().zip(signatures).enumerate() {
                 msg.message.header.signature = signature;
@@ -611,7 +608,11 @@ impl WirePipeline {
                         .cmac_batcher
                         .sign(
                             signer,
-                            batch_segments.expect("batched signing segments must exist"),
+                            batch_segments.ok_or_else(|| {
+                                crate::Error::InvalidState(
+                                    "batched signing segments were not prepared".into(),
+                                )
+                            })?,
                         )
                         .await?;
                     builder.patch_signature(0, signature)?;
@@ -630,10 +631,7 @@ impl WirePipeline {
                         builder.finish_signed()?;
                         crate::Result::Ok((signature, builder))
                     })
-                    .await
-                    .map_err(|_| {
-                        crate::Error::InvalidState("message signing worker failed".into())
-                    })??
+                    .await??
             };
             builder = signed_builder;
             msg.message.header.signature = signature;
@@ -950,7 +948,11 @@ impl WirePipeline {
                     .cmac_batcher
                     .sign(
                         signer,
-                        batch_segments.expect("batched verification segments must exist"),
+                        batch_segments.ok_or_else(|| {
+                            crate::Error::InvalidState(
+                                "batched verification segments were not prepared".into(),
+                            )
+                        })?,
                     )
                     .await?;
                 if calculated != expected {
@@ -962,10 +964,7 @@ impl WirePipeline {
                 .execute(verification_bytes, move || {
                     signer.verify_signature(&mut header, &raw)
                 })
-                .await
-                .map_err(|_| {
-                    crate::Error::InvalidState("signature verification worker failed".into())
-                })??;
+                .await??;
         }
         if message.header.command == Command::SessionSetup
             && message.header.status == Status::Success as u32

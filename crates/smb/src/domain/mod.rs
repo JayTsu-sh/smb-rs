@@ -399,10 +399,6 @@ type SessionCacheKey = (String, [u8; 32]);
 type SessionCache = HashMap<SessionCacheKey, Weak<SessionInner>>;
 
 impl DomainClient {
-    pub(crate) fn new() -> Self {
-        Self::with_signing_policy(crate::SigningPolicy::default())
-    }
-
     pub(crate) fn with_signing_policy(policy: crate::SigningPolicy) -> Self {
         Self::with_policies(policy, crate::GuestPolicy::default())
     }

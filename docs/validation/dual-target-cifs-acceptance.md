@@ -21,6 +21,8 @@ through the named environment variables.
 | --- | --- |
 | `SERVER_FD` | SMB server identity |
 | `SHARE_FD` | Share name |
+| `EXPECTED_SERVER_FD` | Controlled-runner server identity the profile is authorized to test; must exactly match `SERVER_FD` |
+| `EXPECTED_SHARE_FD` | Controlled-runner share name the profile is authorized to test; must exactly match `SHARE_FD` |
 | `USERNAME_FD` | Validation username |
 | `PASSWORD_FD` | Valid password |
 | `REJECT_PASSWORD_FD` | Distinct, known-wrong password for one rejection probe |

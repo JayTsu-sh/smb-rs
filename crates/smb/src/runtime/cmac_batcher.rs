@@ -95,12 +95,16 @@ impl CmacBatcher {
                     else {
                         break;
                     };
-                    jobs.push(
-                        state
-                            .queue
-                            .remove(index)
-                            .expect("a located CMAC batch job must remain queued"),
-                    );
+                    let Some(job) = state.queue.remove(index) else {
+                        for job in jobs {
+                            let _ = job.complete.send(Err(crate::Error::InvalidState(
+                                "CMAC batch queue changed during selection".into(),
+                            )));
+                        }
+                        state.leader_active = false;
+                        return;
+                    };
+                    jobs.push(job);
                 }
                 #[cfg(test)]
                 state.observed_batch_sizes.push(jobs.len());

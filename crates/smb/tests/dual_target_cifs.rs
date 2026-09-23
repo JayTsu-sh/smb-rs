@@ -137,10 +137,28 @@ impl ProfileConfig {
         } else {
             (None, None)
         };
+        let server = descriptor_value(profile, "SERVER_FD")?;
+        let share = descriptor_value(profile, "SHARE_FD")?;
+        let username = descriptor_value(profile, "USERNAME_FD")?;
+        if profile.evidence == CifsAcceptanceProfile::DxnAd
+            && !is_domain_qualified_username(username.as_str())
+        {
+            return Err(
+                "DXN_AD_USERNAME_FD must be domain-qualified (DOMAIN\\\\user or user@domain)"
+                    .into(),
+            );
+        }
+        let expected_server = descriptor_value(profile, "EXPECTED_SERVER_FD")?;
+        let expected_share = descriptor_value(profile, "EXPECTED_SHARE_FD")?;
+        if server != expected_server || share != expected_share {
+            return Err(
+                "profile endpoint or share does not match its controlled-runner binding".into(),
+            );
+        }
         Ok(Self {
-            server: descriptor_value(profile, "SERVER_FD")?,
-            share: descriptor_value(profile, "SHARE_FD")?,
-            username: descriptor_value(profile, "USERNAME_FD")?,
+            server,
+            share,
+            username,
             password,
             reject_password,
             commit: required_value(COMMIT_ENV)?,
@@ -410,6 +428,21 @@ fn descriptor_value(profile: Profile, suffix: &str) -> Result<Zeroizing<String>,
     Ok(Zeroizing::new(value))
 }
 
+fn is_domain_qualified_username(username: &str) -> bool {
+    let valid_part = |part: &str| !part.is_empty() && !part.chars().any(char::is_whitespace);
+    match username.split_once('\\') {
+        Some((domain, account)) => {
+            valid_part(domain) && valid_part(account) && !account.contains('\\')
+        }
+        None => match username.split_once('@') {
+            Some((account, domain)) => {
+                valid_part(account) && valid_part(domain) && !domain.contains('@')
+            }
+            None => false,
+        },
+    }
+}
+
 fn required_value(name: &str) -> Result<String, String> {
     env::var(name).map_err(|_| format!("missing {name}"))
 }
@@ -434,6 +467,14 @@ fn generated_run_id_is_128_bit_lowercase_hex() {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     );
+}
+
+#[test]
+fn dxn_identity_must_be_domain_qualified() {
+    assert!(is_domain_qualified_username("EXAMPLE\\lisauser"));
+    assert!(is_domain_qualified_username("lisauser@example.test"));
+    assert!(!is_domain_qualified_username("lisauser"));
+    assert!(!is_domain_qualified_username("EXAMPLE\\"));
 }
 
 #[test]

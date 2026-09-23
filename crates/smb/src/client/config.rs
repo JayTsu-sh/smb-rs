@@ -60,18 +60,6 @@ impl Default for ClientConfig {
     }
 }
 
-impl ClientConfig {
-    pub(crate) fn with_signing_required(mut self, signing_required: bool) -> Self {
-        self.connection.signing_required = signing_required;
-        self
-    }
-
-    pub(crate) fn with_unsigned_guest_access(mut self, allow_unsigned_guest_access: bool) -> Self {
-        self.connection.allow_unsigned_guest_access = allow_unsigned_guest_access;
-        self
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::ClientConfig;
@@ -83,11 +71,10 @@ mod tests {
                 .connection
                 .allow_unsigned_guest_access
         );
-        assert!(
-            ClientConfig::default()
-                .with_unsigned_guest_access(true)
-                .connection
-                .allow_unsigned_guest_access
-        );
+        assert!({
+            let mut config = ClientConfig::default();
+            config.connection.allow_unsigned_guest_access = true;
+            config.connection.allow_unsigned_guest_access
+        });
     }
 }

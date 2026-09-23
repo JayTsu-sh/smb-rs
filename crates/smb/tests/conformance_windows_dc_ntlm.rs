@@ -1,4 +1,4 @@
-//! Conformance test: Windows DC + SMB 3.1.1 + `signing_required=true`.
+//! Conformance test: Windows DC + SMB 3.1.1 with required signing.
 //!
 //! A new session sends an unsigned final SessionSetup continuation. The mock
 //! final response is deliberately unsigned and must be rejected.
@@ -95,8 +95,8 @@ async fn windows_dc_new_session_final_continuation_is_unsigned() {
     //   #1 = SessionSetup Request #1 (NTLM Type1)       (unsigned)
     //   #2 = SessionSetup Request #2 (NTLM Type3)       (unsigned, SessionId set)
     let req2: &Bytes = &frames[2];
-    assert_session_setup_signing_policy(&frames[1], true, false);
-    assert_session_setup_signing_policy(req2, true, false);
+    assert_session_setup_signing_policy(&frames[1], true, true);
+    assert_session_setup_signing_policy(req2, true, true);
     assert_unsigned_final_session_setup(req2, 2, SESSION_ID);
 }
 
