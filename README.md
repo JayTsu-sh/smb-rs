@@ -9,7 +9,9 @@ This project is the first rust implementation of
 the protocol that powers Windows file sharing and remote services.
 The project is designed as a Rust library crate with an asynchronous domain interface.
 
-While most current implementations are mostly bindings to C libraries (such as libsmb2, samba, or windows' own libraries), this project is a full implementation in Rust, with no _direct_ dependencies on C libraries.
+Unlike bindings to libsmb2, Samba, or Windows' SMB libraries, the SMB protocol
+implementation lives in Rust. The AES-CMAC signer uses a pure-Rust four-lane
+RustCrypto backend and does not depend on OpenSSL or AES-NI.
 
 ## Getting started
 

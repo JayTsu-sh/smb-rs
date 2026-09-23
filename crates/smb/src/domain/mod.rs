@@ -12,7 +12,11 @@ pub use cursor::FileCursor;
 pub use metadata::{MetadataOpenOptions, MetadataUpdate};
 pub use operation::{CancelToken, Deadline, Operation, ReplayPolicy};
 pub use rpc::RpcPipeConnection;
-pub use security::{SecurityDescriptor, SecurityOpenOptions, SecuritySelection};
+pub use security::{
+    ACE, ACL, AccessAce, AccessCallbackAce, AccessMask, AccessObjectAce, AccessObjectCallbackAce,
+    AceFlags, AceType, AceValue, AclRevision, SID, SecurityDescriptor, SecurityDescriptorControl,
+    SecurityOpenOptions, SecuritySelection,
+};
 pub use transfer::{Transfer, TransferEvents, TransferOptions, TransferProgress, TransferReport};
 
 use std::{
@@ -687,7 +691,7 @@ impl Share {
                 let resource = self
                     .inner
                     .runtime
-                    .open_security_resource(path.as_str(), options.writes_dacl())
+                    .open_security_resource(path.as_str(), true, options.writes_dacl())
                     .await?;
                 self.record_resource_open();
                 Ok(match resource {
@@ -1456,6 +1460,10 @@ impl DirectoryEntry {
     }
 }
 
+fn is_navigation_directory_entry(name: &str) -> bool {
+    matches!(name, "." | "..")
+}
+
 pub struct Directory {
     inner: crate::runtime::port::RuntimeDirectory,
     close_authority: FileCloseAuthority,
@@ -1516,20 +1524,27 @@ impl Directory {
     }
 
     pub fn entries<'a>(&'a self, pattern: &'a str) -> DirectoryEntries<'a> {
-        Box::pin(self.inner.entries(pattern).map(|result| {
-            result.map(|entry| DirectoryEntry {
-                name: entry.name,
-                is_directory: entry.is_directory,
-                len: entry.len,
-                created: entry.created,
-                accessed: entry.accessed,
-                written: entry.written,
-                changed: entry.changed,
-                readonly: entry.readonly,
-                reparse_point: entry.reparse_point,
-                file_id: entry.file_id,
-            })
-        }))
+        Box::pin(
+            self.inner
+                .entries(pattern)
+                .map(|result| {
+                    result.map(|entry| DirectoryEntry {
+                        name: entry.name,
+                        is_directory: entry.is_directory,
+                        len: entry.len,
+                        created: entry.created,
+                        accessed: entry.accessed,
+                        written: entry.written,
+                        changed: entry.changed,
+                        readonly: entry.readonly,
+                        reparse_point: entry.reparse_point,
+                        file_id: entry.file_id,
+                    })
+                })
+                .try_filter(|entry| {
+                    futures_util::future::ready(!is_navigation_directory_entry(entry.name()))
+                }),
+        )
     }
 
     pub fn collect_entries<'a>(&'a self, pattern: &'a str) -> Operation<'a, Vec<DirectoryEntry>> {
@@ -1812,5 +1827,13 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn directory_enumeration_hides_protocol_navigation_entries() {
+        assert!(is_navigation_directory_entry("."));
+        assert!(is_navigation_directory_entry(".."));
+        assert!(!is_navigation_directory_entry("..."));
+        assert!(!is_navigation_directory_entry("file.txt"));
     }
 }
