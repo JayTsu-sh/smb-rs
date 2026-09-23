@@ -249,6 +249,13 @@ impl SharePath {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Returns the name carried in an SMB CREATE request. SMB represents the
+    /// root of an already connected share with an empty name; `.` is only the
+    /// public relative-path spelling used by callers.
+    pub(crate) fn as_create_name(&self) -> &str {
+        if self.0 == "." { "" } else { &self.0 }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -791,7 +798,7 @@ impl Share {
                 let inner = self
                     .inner
                     .runtime
-                    .open_directory(path.as_str(), options.create)
+                    .open_directory(path.as_create_name(), options.create)
                     .await?;
                 self.record_resource_open();
                 Ok(Directory {
@@ -1741,6 +1748,17 @@ mod tests {
         assert!(SharePath::new("dir/file.bin").is_ok());
         assert!(SharePath::new("../escape").is_err());
         assert!(SharePath::new("\\absolute").is_err());
+    }
+
+    #[test]
+    fn share_root_uses_an_empty_smb_create_name() {
+        assert_eq!(SharePath::new(".").unwrap().as_create_name(), "");
+        assert_eq!(
+            SharePath::new("directory\\file.bin")
+                .unwrap()
+                .as_create_name(),
+            "directory\\file.bin"
+        );
     }
 
     #[tokio::test]

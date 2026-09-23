@@ -457,14 +457,20 @@ impl RuntimeShare {
                 CreateOptions::new().with_directory_file(true),
             )
         } else {
+            // The share root is only opened for enumeration. Requesting write
+            // and delete access there can conflict with a Windows server's
+            // existing root handle even though the caller only needs to list.
+            let access = if path.is_empty() {
+                FileAccessMask::new().with_generic_read(true)
+            } else {
+                FileAccessMask::new()
+                    .with_generic_read(true)
+                    .with_generic_write(true)
+                    .with_delete(true)
+            };
             FileCreateArgs {
                 options: CreateOptions::new().with_directory_file(true),
-                ..FileCreateArgs::make_open_existing(
-                    FileAccessMask::new()
-                        .with_generic_read(true)
-                        .with_generic_write(true)
-                        .with_delete(true),
-                )
+                ..FileCreateArgs::make_open_existing(access)
             }
         };
         match self.inner.create(path, &args).await? {
