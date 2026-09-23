@@ -119,9 +119,10 @@ fn parse_options(
         return Err(usage());
     }
     let mut options = BTreeMap::new();
-    for pair in values.chunks_exact(2) {
-        if !pair[0].starts_with("--") || options.insert(pair[0].clone(), pair[1].clone()).is_some()
-        {
+    let (pairs, remainder) = values.as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    for [name, value] in pairs {
+        if !name.starts_with("--") || options.insert(name.clone(), value.clone()).is_some() {
             return Err("options must be unique --name value pairs".into());
         }
     }
