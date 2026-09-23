@@ -466,10 +466,10 @@ fn current_module_prefix(module_root: &Path, file: &Path, import_prefix: &str) -
             _ => None,
         }));
     }
-    if relative.file_name().is_some_and(|name| name != "mod.rs") {
-        if let Some(stem) = relative.file_stem() {
-            prefix.push(stem.to_string_lossy().into_owned());
-        }
+    if relative.file_name().is_some_and(|name| name != "mod.rs")
+        && let Some(stem) = relative.file_stem()
+    {
+        prefix.push(stem.to_string_lossy().into_owned());
     }
     prefix
 }
