@@ -14,6 +14,17 @@ pub struct Client {
     domain: DomainClient,
 }
 
+/// Configuration shared by connections opened through a [`Client`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClientConfig {
+    /// Whether this client requires SMB message signing.
+    ///
+    /// The default is `false`: signing is supported but not required by the
+    /// client. This option does not disable signing when the server or the
+    /// established session requires it.
+    pub signing_required: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShareKind {
     Disk,
@@ -55,8 +66,23 @@ impl RemoteShare {
 
 impl Client {
     pub fn new() -> Self {
+        Self::with_config(ClientConfig::default())
+    }
+
+    /// Creates a client with explicit connection policy.
+    pub fn with_config(config: ClientConfig) -> Self {
+        let signing = if config.signing_required {
+            SigningPolicy::Required
+        } else {
+            SigningPolicy::WhenRequired
+        };
+        let guest = if config.signing_required {
+            GuestPolicy::Deny
+        } else {
+            GuestPolicy::AllowUnsigned
+        };
         Self {
-            domain: DomainClient::new(),
+            domain: DomainClient::with_policies(signing, guest),
         }
     }
 

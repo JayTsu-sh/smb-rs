@@ -19,6 +19,7 @@ use smb_fscc::{
 };
 use smb_msg::{AdditionalInfo, CreateOptions, NotifyFilter, SrvEnumerateSnapshotsRequest, Status};
 use sspi::{AuthIdentity, Secret, Username};
+use tokio_util::task::TaskTracker;
 use zeroize::Zeroizing;
 
 use super::metadata;
@@ -147,7 +148,10 @@ impl RuntimeSession {
     pub(crate) async fn connect_share(&self, share: &str) -> crate::Result<RuntimeShare> {
         let target = UncPath::new(&self.server)?.with_share(share)?;
         let share = Arc::new(self.inner.tree_connect(&target).await?);
-        Ok(RuntimeShare { inner: share })
+        Ok(RuntimeShare {
+            inner: share,
+            security_cleanup: SecurityCleanup::new(),
+        })
     }
 
     pub(crate) async fn close(&self) -> crate::Result<()> {
@@ -157,12 +161,115 @@ impl RuntimeSession {
 
 pub(crate) struct RuntimeShare {
     inner: Arc<ProtocolShare>,
+    security_cleanup: SecurityCleanup,
 }
 
 pub(crate) enum RuntimeResource {
     File(RuntimeFile),
     Directory(RuntimeDirectory),
     Pipe(RuntimePipe),
+}
+
+struct SecurityResourceGuard {
+    resource: Option<RuntimeResource>,
+    cleanup: SecurityCleanup,
+}
+
+impl SecurityResourceGuard {
+    fn new(resource: RuntimeResource, cleanup: SecurityCleanup) -> Self {
+        Self {
+            resource: Some(resource),
+            cleanup,
+        }
+    }
+
+    fn resource(&self) -> crate::Result<&RuntimeResource> {
+        self.resource
+            .as_ref()
+            .ok_or_else(|| Error::InvalidState("security resource was already closed".to_string()))
+    }
+
+    async fn close(mut self) -> crate::Result<()> {
+        let resource = self.resource.take().ok_or_else(|| {
+            Error::InvalidState("security resource was already closed".to_string())
+        })?;
+        let cleanup = self.cleanup.spawn(close_security_resource(resource));
+        cleanup.await.map_err(|error| {
+            Error::InvalidState(format!("security resource cleanup task failed: {error}"))
+        })?
+    }
+}
+
+#[derive(Clone)]
+struct SecurityCleanup {
+    tasks: TaskTracker,
+    runtime: tokio::runtime::Handle,
+}
+
+impl SecurityCleanup {
+    fn new() -> Self {
+        Self {
+            tasks: TaskTracker::new(),
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+
+    fn spawn<F, T>(&self, cleanup: F) -> tokio::task::JoinHandle<T>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.tasks.spawn_on(cleanup, &self.runtime)
+    }
+
+    async fn close_and_wait(&self) {
+        self.tasks.close();
+        self.tasks.wait().await;
+    }
+}
+
+impl Drop for SecurityResourceGuard {
+    fn drop(&mut self) {
+        let Some(resource) = self.resource.take() else {
+            return;
+        };
+        let cleanup = self.cleanup.spawn(close_security_resource(resource));
+        std::mem::drop(cleanup);
+    }
+}
+
+async fn close_security_resource(resource: RuntimeResource) -> crate::Result<()> {
+    let result = resource.close().await;
+    if let Err(error) = &result {
+        tracing::warn!(?error, "security resource cleanup failed");
+    }
+    result
+}
+
+impl RuntimeResource {
+    async fn query_security(&self, dacl: bool) -> crate::Result<SecurityDescriptor> {
+        match self {
+            Self::File(file) => file.query_security(dacl).await,
+            Self::Directory(directory) => directory.query_security(dacl).await,
+            Self::Pipe(pipe) => pipe.query_security(dacl).await,
+        }
+    }
+
+    async fn set_security(&self, descriptor: SecurityDescriptor, dacl: bool) -> crate::Result<()> {
+        match self {
+            Self::File(file) => file.set_security(descriptor, dacl).await,
+            Self::Directory(directory) => directory.set_security(descriptor, dacl).await,
+            Self::Pipe(pipe) => pipe.set_security(descriptor, dacl).await,
+        }
+    }
+
+    async fn close(&self) -> crate::Result<()> {
+        match self {
+            Self::File(file) => file.close().await,
+            Self::Directory(directory) => directory.close().await,
+            Self::Pipe(pipe) => pipe.close().await,
+        }
+    }
 }
 
 pub(crate) struct RuntimeMetadata {
@@ -214,11 +321,11 @@ impl RuntimeShare {
             ..FileCreateArgs::make_open_existing(access)
         };
         let resource = self.inner.create(path, &args).await?;
-        if let Some(handle) = resource.handle() {
-            if let Err(error) = metadata::reject_reparse(handle).await {
-                let _ = handle.close().await;
-                return Err(error);
-            }
+        if let Some(handle) = resource.handle()
+            && let Err(error) = metadata::reject_reparse(handle).await
+        {
+            let _ = handle.close().await;
+            return Err(error);
         }
         Ok(match resource {
             ProtocolResource::File(file) => RuntimeResource::File(RuntimeFile { inner: file }),
@@ -234,11 +341,10 @@ impl RuntimeShare {
     pub(crate) async fn open_security_resource(
         &self,
         path: &str,
+        read_control: bool,
         write_dacl: bool,
     ) -> crate::Result<RuntimeResource> {
-        let access = FileAccessMask::new()
-            .with_read_control(true)
-            .with_write_dacl(write_dacl);
+        let access = security_resource_access(read_control, write_dacl);
         let resource = self
             .inner
             .create(path, &FileCreateArgs::make_open_existing(access))
@@ -252,6 +358,42 @@ impl RuntimeShare {
             }
             ProtocolResource::Pipe(pipe) => RuntimeResource::Pipe(RuntimePipe { inner: pipe }),
         })
+    }
+
+    pub(crate) async fn query_path_security(
+        &self,
+        path: &str,
+        dacl: bool,
+    ) -> crate::Result<SecurityDescriptor> {
+        let resource = SecurityResourceGuard::new(
+            self.open_security_resource(path, true, false).await?,
+            self.security_cleanup.clone(),
+        );
+        let result = resource.resource()?.query_security(dacl).await;
+        let close = resource.close().await;
+        match result {
+            Err(error) => Err(error),
+            Ok(descriptor) => {
+                close?;
+                Ok(descriptor)
+            }
+        }
+    }
+
+    pub(crate) async fn set_path_security(
+        &self,
+        path: &str,
+        descriptor: SecurityDescriptor,
+        dacl: bool,
+    ) -> crate::Result<()> {
+        let resource = SecurityResourceGuard::new(
+            self.open_security_resource(path, false, dacl).await?,
+            self.security_cleanup.clone(),
+        );
+        let result = resource.resource()?.set_security(descriptor, dacl).await;
+        let close = resource.close().await;
+        result?;
+        close
     }
 
     pub(crate) async fn open_file(
@@ -315,14 +457,20 @@ impl RuntimeShare {
                 CreateOptions::new().with_directory_file(true),
             )
         } else {
+            // The share root is only opened for enumeration. Requesting write
+            // and delete access there can conflict with a Windows server's
+            // existing root handle even though the caller only needs to list.
+            let access = if path.is_empty() {
+                FileAccessMask::new().with_generic_read(true)
+            } else {
+                FileAccessMask::new()
+                    .with_generic_read(true)
+                    .with_generic_write(true)
+                    .with_delete(true)
+            };
             FileCreateArgs {
                 options: CreateOptions::new().with_directory_file(true),
-                ..FileCreateArgs::make_open_existing(
-                    FileAccessMask::new()
-                        .with_generic_read(true)
-                        .with_generic_write(true)
-                        .with_delete(true),
-                )
+                ..FileCreateArgs::make_open_existing(access)
             }
         };
         match self.inner.create(path, &args).await? {
@@ -349,8 +497,15 @@ impl RuntimeShare {
     }
 
     pub(crate) async fn close(&self) -> crate::Result<()> {
+        self.security_cleanup.close_and_wait().await;
         self.inner.disconnect().await
     }
+}
+
+fn security_resource_access(read_control: bool, write_dacl: bool) -> FileAccessMask {
+    FileAccessMask::new()
+        .with_read_control(read_control)
+        .with_write_dacl(write_dacl)
 }
 
 pub(crate) struct RuntimePipe {
@@ -905,15 +1060,24 @@ fn opened_metadata(resource: &crate::resource::ResourceHandle) -> RuntimeMetadat
     }
 }
 
-fn security_selection(dacl: bool) -> AdditionalInfo {
+fn query_security_selection(dacl: bool) -> AdditionalInfo {
     AdditionalInfo::new().with_dacl_security_information(dacl)
+}
+
+fn set_security_selection(dacl: bool, dacl_protected: bool) -> AdditionalInfo {
+    AdditionalInfo::new()
+        .with_dacl_security_information(dacl)
+        .with_protected_dacl_security_information(dacl && dacl_protected)
+        .with_unprotected_dacl_security_information(dacl && !dacl_protected)
 }
 
 async fn query_security(
     resource: &crate::resource::ResourceHandle,
     dacl: bool,
 ) -> crate::Result<SecurityDescriptor> {
-    resource.query_security_info(security_selection(dacl)).await
+    resource
+        .query_security_info(query_security_selection(dacl))
+        .await
 }
 
 async fn set_security(
@@ -921,8 +1085,9 @@ async fn set_security(
     descriptor: SecurityDescriptor,
     dacl: bool,
 ) -> crate::Result<()> {
+    let additional_information = set_security_selection(dacl, descriptor.control.dacl_protected());
     resource
-        .set_security_info(descriptor, security_selection(dacl))
+        .set_security_info(descriptor, additional_information)
         .await
 }
 

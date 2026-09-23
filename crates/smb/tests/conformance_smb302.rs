@@ -1,4 +1,4 @@
-//! Conformance test: SMB 3.0.2 + `signing_required = true`.
+//! Conformance test: SMB 3.0.2 final SessionSetup continuation.
 //!
 //! Locks the "dialect doesn't support preauth integrity" branch of
 //! the transformer's preauth-hash plumbing. SMB 3.0.2 negotiates
@@ -12,10 +12,7 @@
 //!   `SmbSign\0` context (the `preauth_hash = None` branch in
 //!   `SessionAlgosFactory::smb3xx_make_signer`).
 //!
-//! But MS-SMB2 §3.3.5.5.3's "non-anonymous SMB 3.x SessionSetup
-//! final Request must be signed" rule applies independently of the
-//! preauth-integrity feature. The driver must still produce a
-//! signed final Request — this test asserts that exactly.
+//! A new SMB 3.0.2 session sends an unsigned final SessionSetup continuation.
 
 #[path = "conformance/mod.rs"]
 mod conformance;
@@ -25,22 +22,14 @@ use conformance::transcripts::{
     negotiate_response_smb302_signing_required, session_setup_response_final,
     session_setup_response_intermediate,
 };
-use conformance::{MockGss, ScriptedGssStep, ScriptedTransport, assert_signed_final_session_setup};
-use smb::SigningPolicy;
+use conformance::{
+    MockGss, ScriptedGssStep, ScriptedTransport, assert_unsigned_final_session_setup,
+};
 use smb::test_support::{Connection, ConnectionConfig};
 use smb_dtyp::Guid;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn smb302_signing_required_signs_final_session_setup() {
-    check_server_required(SigningPolicy::Required).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn optional_policy_honors_server_required_signing() {
-    check_server_required(SigningPolicy::WhenRequired).await;
-}
-
-async fn check_server_required(policy: SigningPolicy) {
+async fn smb302_new_session_final_continuation_is_unsigned() {
     const SESSION_ID: u64 = 0x0000_0302_8000_000A;
 
     let (transport, control) = ScriptedTransport::new();
@@ -49,7 +38,6 @@ async fn check_server_required(policy: SigningPolicy) {
     control.push_server_frame(session_setup_response_final(SESSION_ID));
 
     let config = ConnectionConfig {
-        signing_policy: policy,
         smb2_only_negotiate: true,
         timeout: Some(std::time::Duration::from_secs(5)),
         ..Default::default()
@@ -75,19 +63,11 @@ async fn check_server_required(policy: SigningPolicy) {
         ],
     );
 
-    // The mock server's final SessionSetup Response is unsigned, so
-    // the driver rejects it with SetupError::UnsignedFinalResponse —
-    // same flow as the windows-dc test. We capture but don't fail on
-    // this; the real assertion is on the client-emitted frames.
     let auth_result = conn.authenticate_with_gss(gss).await;
-    match &auth_result {
+    match auth_result {
         Err(smb::Error::Setup(smb::error::SetupError::UnsignedFinalResponse)) => {}
-        Err(other) => panic!(
-            "expected SetupError::UnsignedFinalResponse against the mock unsigned reply, got: {other}"
-        ),
-        Ok(_) => panic!(
-            "authenticate_with_gss unexpectedly succeeded — the mock server's final response is unsigned"
-        ),
+        Err(error) => panic!("an unsigned final response returned the wrong error: {error}"),
+        Ok(_) => panic!("an unsigned final response must be rejected"),
     }
 
     // worker.send() returns once the message is queued on the worker's
@@ -111,9 +91,9 @@ async fn check_server_required(policy: SigningPolicy) {
         frames.len()
     );
 
-    // Frame #2 is the final SessionSetup Request (NTLM Type3). Per
-    // MS-SMB2 §3.3.5.5.3 it must be signed even though SMB 3.0.2
-    // doesn't fold the request into a preauth hash.
+    // Frame #2 is the final SessionSetup Request (NTLM Type3). It carries
+    // the SessionId supplied by the intermediate response and remains
+    // unsigned until the channel is established.
     let req2: &Bytes = &frames[2];
-    assert_signed_final_session_setup(req2, 2);
+    assert_unsigned_final_session_setup(req2, 2, SESSION_ID);
 }

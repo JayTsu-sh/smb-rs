@@ -59,3 +59,22 @@ impl Default for ClientConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ClientConfig;
+
+    #[test]
+    fn unsigned_guest_access_is_an_explicit_connection_policy() {
+        assert!(
+            !ClientConfig::default()
+                .connection
+                .allow_unsigned_guest_access
+        );
+        assert!({
+            let mut config = ClientConfig::default();
+            config.connection.allow_unsigned_guest_access = true;
+            config.connection.allow_unsigned_guest_access
+        });
+    }
+}

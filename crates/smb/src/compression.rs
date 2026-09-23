@@ -226,12 +226,12 @@ impl CompressionMethod for ChainedCompression {
                     "Decompressed size exceeds the expected size".to_string(),
                 ));
             }
-            if let Some(original_size) = item.original_size {
-                if len_after - len_before != original_size as usize {
-                    Err(CompressionError::ChainedCompressionFailed(
-                        "Decompressed size does not match the item expected size".to_string(),
-                    ))?;
-                }
+            if let Some(original_size) = item.original_size
+                && len_after - len_before != original_size as usize
+            {
+                Err(CompressionError::ChainedCompressionFailed(
+                    "Decompressed size does not match the item expected size".to_string(),
+                ))?;
             }
         }
 
@@ -275,42 +275,40 @@ impl CompressionMethod for ChainedCompression {
                 if !algorithms.contains(algo) {
                     continue;
                 }
-                if let Ok(algo_impl) = self.get_compression_algorithm(*algo) {
-                    if let Ok(compressed_data) = algo_impl.compress(remaining) {
-                        // Only use compression if it actually saves space.
-                        if compressed_data.len() < remaining.len() {
-                            items.push(CompressedChainedItem {
-                                compression_algorithm: *algo,
-                                flags: 0,
-                                original_size: if algo.original_size_required() {
-                                    Some(remaining.len() as u32)
-                                } else {
-                                    None
-                                },
-                                payload_data: compressed_data,
-                            });
-                            compressed = true;
-                            break;
-                        }
-                    }
+                if let Ok(algo_impl) = self.get_compression_algorithm(*algo)
+                    && let Ok(compressed_data) = algo_impl.compress(remaining)
+                    && compressed_data.len() < remaining.len()
+                {
+                    // Only use compression if it actually saves space.
+                    items.push(CompressedChainedItem {
+                        compression_algorithm: *algo,
+                        flags: 0,
+                        original_size: if algo.original_size_required() {
+                            Some(remaining.len() as u32)
+                        } else {
+                            None
+                        },
+                        payload_data: compressed_data,
+                    });
+                    compressed = true;
+                    break;
                 }
             }
 
             // Fallback: try PatternV1 if data is a single repeated byte.
-            if !compressed && algorithms.contains(&CompressionAlgorithm::PatternV1) {
-                if let Ok(algo_impl) =
+            if !compressed
+                && algorithms.contains(&CompressionAlgorithm::PatternV1)
+                && let Ok(algo_impl) =
                     self.get_compression_algorithm(CompressionAlgorithm::PatternV1)
-                {
-                    if let Ok(pattern_data) = algo_impl.compress(remaining) {
-                        items.push(CompressedChainedItem {
-                            compression_algorithm: CompressionAlgorithm::PatternV1,
-                            flags: 0,
-                            original_size: None,
-                            payload_data: pattern_data,
-                        });
-                        compressed = true;
-                    }
-                }
+                && let Ok(pattern_data) = algo_impl.compress(remaining)
+            {
+                items.push(CompressedChainedItem {
+                    compression_algorithm: CompressionAlgorithm::PatternV1,
+                    flags: 0,
+                    original_size: None,
+                    payload_data: pattern_data,
+                });
+                compressed = true;
             }
 
             // If nothing could compress it, store uncompressed.

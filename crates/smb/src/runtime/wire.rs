@@ -1,4 +1,7 @@
 use crate::connection::preauth_hash::{PreauthHashState, PreauthHashValue};
+#[cfg(feature = "sign_cmac_rustcrypto")]
+use crate::runtime::cmac_batcher::CmacBatcher;
+use crate::runtime::crypto_executor::BoundedCryptoExecutor;
 use crate::session::{MessageDecryptor, MessageEncryptor, MessageSigner, SessionAndChannel};
 use crate::{command::*, compression::*};
 use binrw::prelude::*;
@@ -15,7 +18,6 @@ use crate::connection::connection_info::ConnectionInfo;
 /// send over NetBios TCP connection.
 ///
 /// See [`WirePipeline::transform_outgoing`] and [`WirePipeline::transform_incoming`] for transformation functions.
-#[derive(Default)]
 pub struct WirePipeline {
     /// Sessions opened from this connection.
     // This structure is performance-critical, so it uses RwLock to allow concurrent reads.
@@ -44,6 +46,25 @@ pub struct WirePipeline {
     /// One-shot signer bridging the final SessionSetup request/response
     /// race before the primary channel is installed in the session table.
     setup_signers: Mutex<HashMap<u64, MessageSigner>>,
+
+    crypto_executor: BoundedCryptoExecutor,
+
+    #[cfg(feature = "sign_cmac_rustcrypto")]
+    cmac_batcher: CmacBatcher,
+}
+
+impl Default for WirePipeline {
+    fn default() -> Self {
+        Self {
+            sessions: RwLock::new(HashMap::new()),
+            config: RwLock::new(WirePipelineConfig::default()),
+            preauth_hash: Mutex::new(PreauthHashState::default()),
+            setup_signers: Mutex::new(HashMap::new()),
+            crypto_executor: BoundedCryptoExecutor::default(),
+            #[cfg(feature = "sign_cmac_rustcrypto")]
+            cmac_batcher: CmacBatcher::default(),
+        }
+    }
 }
 
 #[derive(Default, Debug)]
@@ -61,6 +82,27 @@ struct WirePipelineConfig {
 }
 
 impl WirePipeline {
+    pub(crate) fn with_crypto_parallelism(parallelism: usize) -> Self {
+        Self {
+            crypto_executor: BoundedCryptoExecutor::new(parallelism),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn should_prepare_concurrently(&self, request: &CommandRequest) -> bool {
+        let signed = matches!(
+            request.security,
+            Some(Protection::SignWithChannel | Protection::SnapshotKdfSign { .. })
+        );
+        let payload_bytes = request.additional_data.as_ref().map_or(0, Bytes::len);
+        let should_offload = self.crypto_executor.should_offload(payload_bytes);
+        #[cfg(feature = "sign_cmac_rustcrypto")]
+        let should_batch = request.cmac_batch_eligible && CmacBatcher::should_batch(payload_bytes);
+        #[cfg(not(feature = "sign_cmac_rustcrypto"))]
+        let should_batch = false;
+        signed && (should_offload || should_batch)
+    }
+
     /// Notifies that the connection negotiation has been completed,
     /// with the given [`ConnectionInfo`].
     pub async fn negotiated(&self, neg_info: &Arc<ConnectionInfo>) -> crate::Result<()> {
@@ -423,22 +465,46 @@ impl WirePipeline {
                     why: "Compound message is signed, but no channel signer is set up",
                     msg_id: None,
                 }))?;
-
-            for (i, msg) in msgs.iter_mut().enumerate() {
-                let mut signer = signer.clone();
-                let signature = signer.signature_for_segments(
-                    &mut msg.message.header,
-                    builder.signing_segments(i)?,
-                )?;
+            let headers = msgs
+                .iter()
+                .map(|message| message.message.header.clone())
+                .collect::<Vec<_>>();
+            let signing_bytes = (0..headers.len()).try_fold(0_usize, |total, index| {
+                builder
+                    .signing_segments(index)?
+                    .try_fold(total, |total, segment| {
+                        total.checked_add(segment.len()).ok_or_else(|| {
+                            crate::Error::InvalidMessage("compound signing size overflow".into())
+                        })
+                    })
+            })?;
+            let (signatures, signed_builder) = self
+                .crypto_executor
+                .execute(signing_bytes, move || {
+                    let mut builder = builder;
+                    let mut signatures = Vec::with_capacity(headers.len());
+                    for (index, mut header) in headers.into_iter().enumerate() {
+                        let mut signer = signer.clone();
+                        let signature = signer.signature_for_segments(
+                            &mut header,
+                            builder.signing_segments(index)?,
+                        )?;
+                        builder.patch_signature(index, signature)?;
+                        signatures.push(signature);
+                    }
+                    builder.finish_signed()?;
+                    crate::Result::Ok((signatures, builder))
+                })
+                .await??;
+            builder = signed_builder;
+            for (index, (msg, signature)) in msgs.iter_mut().zip(signatures).enumerate() {
                 msg.message.header.signature = signature;
-                builder.patch_signature(i, signature)?;
                 tracing::trace!(
-                    "Compound member {i} (msg_id {}) signed (signature={}).",
+                    "Compound member {index} (msg_id {}) signed (signature={}).",
                     msg.message.header.message_id,
                     msg.message.header.signature,
                 );
             }
-            builder.finish_signed()?;
         } else {
             builder.finish_unsigned()?;
         }
@@ -476,14 +542,13 @@ impl WirePipeline {
         if Self::participates_in_preauth_outgoing(&msg.message.header)
             && !(msg.message.header.command == Command::SessionSetup
                 && msg.message.header.flags.signed())
+            && let Some(plain) = builder.signing_segments(0)?.next()
         {
-            if let Some(plain) = builder.signing_segments(0)?.next() {
-                let mut hash = self.preauth_hash.lock().await;
-                // Clone-then-replace: if `next` errors we want to keep
-                // the previous hash state intact, not corrupt it to a
-                // default `Unsupported`.
-                *hash = hash.clone().next(plain)?;
-            }
+            let mut hash = self.preauth_hash.lock().await;
+            // Clone-then-replace: if `next` errors we want to keep
+            // the previous hash state intact, not corrupt it to a
+            // default `Unsupported`.
+            *hash = hash.clone().next(plain)?;
         }
 
         // 1. Sign
@@ -515,11 +580,61 @@ impl WirePipeline {
                         }))?
                 };
 
-            let signature = signer
-                .signature_for_segments(&mut msg.message.header, builder.signing_segments(0)?)?;
+            let mut header = msg.message.header.clone();
+            let signing_bytes =
+                builder
+                    .signing_segments(0)?
+                    .try_fold(0_usize, |total, segment| {
+                        total.checked_add(segment.len()).ok_or_else(|| {
+                            crate::Error::InvalidMessage("message signing size overflow".into())
+                        })
+                    })?;
+            #[cfg(feature = "sign_cmac_rustcrypto")]
+            let batch_segments = (msg.cmac_batch_eligible
+                && setup_session_key.is_none()
+                && signer.is_batchable_cmac()
+                && CmacBatcher::should_batch(signing_bytes))
+            .then(|| builder.owned_signing_segments(0))
+            .transpose()?;
+            #[cfg(feature = "sign_cmac_rustcrypto")]
+            let batched = batch_segments.is_some();
+            #[cfg(not(feature = "sign_cmac_rustcrypto"))]
+            let batched = false;
+
+            let (signature, signed_builder) = if batched {
+                #[cfg(feature = "sign_cmac_rustcrypto")]
+                {
+                    let signature = self
+                        .cmac_batcher
+                        .sign(
+                            signer,
+                            batch_segments.ok_or_else(|| {
+                                crate::Error::InvalidState(
+                                    "batched signing segments were not prepared".into(),
+                                )
+                            })?,
+                        )
+                        .await?;
+                    builder.patch_signature(0, signature)?;
+                    builder.finish_signed()?;
+                    (signature, builder)
+                }
+                #[cfg(not(feature = "sign_cmac_rustcrypto"))]
+                unreachable!("batched CMAC is unavailable without the RustCrypto backend");
+            } else {
+                self.crypto_executor
+                    .execute(signing_bytes, move || {
+                        let mut builder = builder;
+                        let signature = signer
+                            .signature_for_segments(&mut header, builder.signing_segments(0)?)?;
+                        builder.patch_signature(0, signature)?;
+                        builder.finish_signed()?;
+                        crate::Result::Ok((signature, builder))
+                    })
+                    .await??
+            };
+            builder = signed_builder;
             msg.message.header.signature = signature;
-            builder.patch_signature(0, signature)?;
-            builder.finish_signed()?;
 
             tracing::debug!(
                 "Message #{} signed (signature={}).",
@@ -734,7 +849,7 @@ impl WirePipeline {
                 *hash = hash.clone().next(&this_slice)?;
             }
             if let Err(e) = self
-                .verify_plain_incoming(&mut current, &this_slice, &mut member_form)
+                .verify_plain_incoming(&mut current, this_slice.clone(), &mut member_form)
                 .await
             {
                 tracing::error!("Failed to verify compound member message: {e:?}");
@@ -777,7 +892,7 @@ impl WirePipeline {
     async fn verify_plain_incoming(
         &self,
         message: &mut PlainResponse,
-        raw: &[u8],
+        raw: Bytes,
         form: &mut MessageForm,
     ) -> crate::Result<()> {
         // A server cannot sign a session-invalidated response with a key it has
@@ -814,7 +929,43 @@ impl WirePipeline {
                 msg_id: Some(message.header.message_id),
             }))?;
 
-        signer.verify_signature(&mut message.header, raw)?;
+        let mut header = message.header.clone();
+        let verification_bytes = raw.len();
+        #[cfg(feature = "sign_cmac_rustcrypto")]
+        let batch_segments = (signer.is_batchable_cmac()
+            && CmacBatcher::should_batch(verification_bytes))
+        .then(|| Self::owned_verification_segments(&raw))
+        .transpose()?;
+        #[cfg(feature = "sign_cmac_rustcrypto")]
+        let batched = batch_segments.is_some();
+        #[cfg(not(feature = "sign_cmac_rustcrypto"))]
+        let batched = false;
+        if batched {
+            #[cfg(feature = "sign_cmac_rustcrypto")]
+            {
+                let expected = header.signature;
+                let calculated = self
+                    .cmac_batcher
+                    .sign(
+                        signer,
+                        batch_segments.ok_or_else(|| {
+                            crate::Error::InvalidState(
+                                "batched verification segments were not prepared".into(),
+                            )
+                        })?,
+                    )
+                    .await?;
+                if calculated != expected {
+                    return Err(crate::Error::SignatureVerificationFailed);
+                }
+            }
+        } else {
+            self.crypto_executor
+                .execute(verification_bytes, move || {
+                    signer.verify_signature(&mut header, &raw)
+                })
+                .await??;
+        }
         if message.header.command == Command::SessionSetup
             && message.header.status == Status::Success as u32
         {
@@ -827,6 +978,18 @@ impl WirePipeline {
         );
         form.signed = true;
         Ok(())
+    }
+
+    #[cfg(feature = "sign_cmac_rustcrypto")]
+    fn owned_verification_segments(raw: &Bytes) -> crate::Result<Vec<Bytes>> {
+        if raw.len() < Header::STRUCT_SIZE {
+            return Err(crate::Error::InvalidMessage(
+                "Signed message is shorter than the SMB2 header".into(),
+            ));
+        }
+        let mut header = bytes::BytesMut::from(&raw[..Header::STRUCT_SIZE]);
+        header[48..64].fill(0);
+        Ok(vec![header.freeze(), raw.slice(Header::STRUCT_SIZE..)])
     }
 
     /// (Internal)
@@ -907,7 +1070,27 @@ pub enum TransformPhase {
 
 #[cfg(test)]
 mod wire_builder_tests {
+    #[cfg(feature = "sign_cmac_rustcrypto")]
+    use futures_util::future::join_all;
+
     use super::*;
+
+    #[cfg(feature = "sign_cmac_rustcrypto")]
+    async fn install_test_cmac_session(wire: &WirePipeline, session_id: u64, key: [u8; 16]) {
+        let session = Arc::new(SessionAndChannel::new(
+            session_id,
+            Arc::new(tokio::sync::RwLock::new(crate::session::SessionInfo::new(
+                session_id,
+            ))),
+        ));
+        wire.sessions.write().await.insert(session_id, session);
+        wire.setup_signers.lock().await.insert(
+            session_id,
+            MessageSigner::new(
+                crate::crypto::make_signing_algo(SigningAlgorithmId::AesCmac, &key).unwrap(),
+            ),
+        );
+    }
 
     #[tokio::test]
     async fn plain_bytes_write_keeps_payload_identity_through_sealed_frame() {
@@ -928,6 +1111,93 @@ mod wire_builder_tests {
         assert_eq!(wire.segments()[1].as_ptr(), pointer);
     }
 
+    #[cfg(feature = "sign_cmac_rustcrypto")]
+    #[tokio::test]
+    async fn ready_4k_writes_share_one_four_lane_cmac_batch() {
+        let wire = Arc::new(WirePipeline::default());
+        let session_id = 17;
+        install_test_cmac_session(&wire, session_id, [0x5a; 16]).await;
+        let jobs = (0..crate::crypto::PORTABLE_CMAC_LANES)
+            .map(|index| {
+                let wire = wire.clone();
+                async move {
+                    let mut request = CommandRequest::new(
+                        WriteRequest::new(0, FileId::EMPTY, WriteFlags::new(), 4096).into(),
+                    )
+                    .with_additional_data(Bytes::from(vec![index as u8; 4096]))
+                    .with_protection(Protection::SignWithChannel);
+                    request.message.header.session_id = session_id;
+                    request.message.header.message_id = index as u64;
+                    request.message.header.flags.set_signed(true);
+                    request.cmac_batch_eligible = true;
+                    wire.transform_outgoing(request).await.unwrap()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let frames = join_all(jobs).await;
+
+        assert_eq!(frames.len(), crate::crypto::PORTABLE_CMAC_LANES);
+        assert_eq!(
+            wire.cmac_batcher.observed_batch_sizes(),
+            [crate::crypto::PORTABLE_CMAC_LANES]
+        );
+        for frame in frames {
+            let header = Header::read_le(&mut Cursor::new(&frame.segments()[0])).unwrap();
+            assert_ne!(header.signature, 0);
+        }
+    }
+
+    #[cfg(feature = "sign_cmac_rustcrypto")]
+    #[tokio::test]
+    async fn ready_4k_responses_share_one_four_lane_cmac_batch() {
+        let wire = Arc::new(WirePipeline::default());
+        let session_id = 19;
+        let key = [0x33; 16];
+        install_test_cmac_session(&wire, session_id, key).await;
+        let jobs = (0..crate::crypto::PORTABLE_CMAC_LANES)
+            .map(|index| {
+                let wire = wire.clone();
+                async move {
+                    let mut response =
+                        PlainResponse::new(ResponseContent::Logoff(LogoffResponse {}));
+                    response.header.session_id = session_id;
+                    response.header.message_id = index as u64;
+                    response.header.flags.set_server_to_redir(true);
+                    response.header.flags.set_signed(true);
+                    let mut raw = vec![index as u8; 4160];
+                    response
+                        .header
+                        .write_le(&mut Cursor::new(&mut raw[..Header::STRUCT_SIZE]))
+                        .unwrap();
+                    let mut signer = MessageSigner::new(
+                        crate::crypto::make_signing_algo(SigningAlgorithmId::AesCmac, &key)
+                            .unwrap(),
+                    );
+                    response.header.signature = signer
+                        .signature_for_segments(&mut response.header.clone(), [raw.as_slice()])
+                        .unwrap();
+                    response
+                        .header
+                        .write_le(&mut Cursor::new(&mut raw[..Header::STRUCT_SIZE]))
+                        .unwrap();
+                    let mut form = MessageForm::default();
+                    wire.verify_plain_incoming(&mut response, Bytes::from(raw), &mut form)
+                        .await
+                        .unwrap();
+                    assert!(form.signed);
+                }
+            })
+            .collect::<Vec<_>>();
+
+        join_all(jobs).await;
+
+        assert_eq!(
+            wire.cmac_batcher.observed_batch_sizes(),
+            [crate::crypto::PORTABLE_CMAC_LANES]
+        );
+    }
+
     #[tokio::test]
     async fn unsigned_session_loss_is_marked_only_as_a_recovery_hint() {
         let mut response = PlainResponse::new(ResponseContent::Logoff(LogoffResponse {}));
@@ -939,7 +1209,7 @@ mod wire_builder_tests {
         let mut form = MessageForm::default();
 
         WirePipeline::default()
-            .verify_plain_incoming(&mut response, &[0; 64], &mut form)
+            .verify_plain_incoming(&mut response, Bytes::from_static(&[0; 64]), &mut form)
             .await
             .unwrap();
 

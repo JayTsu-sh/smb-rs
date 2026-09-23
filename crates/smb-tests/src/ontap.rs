@@ -813,8 +813,17 @@ impl<'a, A: OntapAdapter> ProvisioningRun<'a, A> {
 
     pub fn create_snapshot(mut self) -> Result<RunManifest, String> {
         let plan = self.manifest.plan.clone();
-        if self.manifest.state(ResourceKind::Snapshot) != Some(Lifecycle::Planned) {
-            return Err("snapshot is not in Planned state".into());
+        match self.manifest.state(ResourceKind::Snapshot) {
+            Some(Lifecycle::Planned) => {}
+            Some(Lifecycle::Deleted) => {
+                self.manifest
+                    .inventory
+                    .resources
+                    .insert(ResourceKind::Snapshot, Lifecycle::Planned);
+            }
+            _ => {
+                return Err("snapshot is not in a creatable state".into());
+            }
         }
         self.adapter.create_snapshot(&plan)?;
         self.manifest.record_created(ResourceKind::Snapshot)?;

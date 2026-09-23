@@ -6,6 +6,122 @@ The single asynchronous execution model that owns SMB connection lifecycle,
 request scheduling, cancellation, and I/O progress. Synchronous interfaces, if
 offered, are adapters and are not separate protocol implementations.
 
+## Directory authentication
+
+**AD-authenticated CIFS access**:
+An SMB session in which an Active Directory domain user is authenticated by a
+domain-joined CIFS server and authorized to access a named share.
+_Avoid_: AD domain function, domain API
+
+**Samba CIFS gateway**:
+The Samba service that exports an SMB share and owns Active Directory
+authentication, Kerberos, and SMB signing behavior above its storage backend.
+_Avoid_: CephFS server, storage backend
+
+**Validation principal**:
+A dedicated least-privilege Active Directory user whose share access is used
+to prove AD-authenticated CIFS access.
+_Avoid_: Administrator account, test credential
+
+**Dual-target CIFS acceptance**:
+A repeatable acceptance profile that proves the same SMB client behavior
+against a DXN Samba share authenticated by Active Directory and an FAS ONTAP
+share authenticated by a local CIFS user. It does not imply that both targets
+use the same identity provider.
+_Avoid_: universal AD validation
+
+**CIFS acceptance profile**:
+A named, reproducible binding of one validation target endpoint, one share,
+one identity kind, and runtime-only credentials. A profile rejects a target,
+share, or identity-kind mismatch rather than silently testing another share.
+_Avoid_: generic real-server configuration
+
+**Identity kind**:
+The declared source of a validation identity: either an Active Directory
+principal or a local CIFS principal. It is part of the acceptance profile and
+must not be inferred from a successful login.
+_Avoid_: username format, authenticated user
+
+**Run-owned temporary file**:
+A uniquely named file whose ownership is established only after this validation
+run successfully creates it with create-new semantics and records its Run ID.
+Cleanup authority covers only that recorded file, never a matching prefix or
+pre-existing name.
+_Avoid_: temporary file, test prefix
+
+**Acceptance evidence**:
+A secret-free record of a validation run's profile, Run ID, phase outcomes,
+cleanup outcome, and any run-owned residual object. It is not a packet trace
+or command transcript.
+_Avoid_: test log, raw trace
+
+**Acceptance failure category**:
+A portable classification of a failed validation phase: authentication
+rejection, share access denial, I/O failure, cleanup failure, or target
+unavailability. It preserves the underlying diagnostic without using raw
+server text as the acceptance result.
+_Avoid_: generic failure, server error string
+
+**Acceptance execution**:
+A manually authorized real-device run on a controlled, secret-enabled runner.
+A profile may run alone for diagnosis, while merge or release acceptance
+requires the DXN and FAS profiles to pass against the same commit.
+_Avoid_: ordinary CI run, device smoke test
+
+**Blocked acceptance run**:
+A real-device validation run whose target is unavailable at preflight. It
+records target unavailability and evidence but cannot pass or be treated as a
+code failure.
+_Avoid_: skipped acceptance, successful retry
+
+**Acceptance artifact**:
+A controlled CI-retained, secret-free evidence package for a validation run.
+It is not repository history; only an accepted checkpoint Markdown summary is
+committed.
+_Avoid_: permanent raw logs, committed test output
+
+**Dual-target acceptance runner**:
+Two dedicated operator-invoked integration tests, one for `dxn-ad` and one for
+`fas-local`. Each receives runtime credentials only through descriptors, uses
+the public SMB client API, and produces acceptance artifacts. The shared
+evidence helpers have no storage-management authority.
+_Avoid_: production binary, ONTAP provisioning runner
+
+**Profile invocation**:
+One execution of the dedicated integration test for exactly one named profile.
+The test name fixes the identity kind; endpoint, share, username, and password
+are explicit descriptor inputs with no defaults. It writes one required
+secret-free evidence artifact.
+_Avoid_: generic test environment, inferred identity kind
+
+**Owned-path conflict**:
+A `create_new` collision for the exact run-owned temporary path. It blocks the
+run without overwrite, retry-by-renaming, or deletion authority over the
+existing object.
+_Avoid_: retryable test failure, stale temporary file
+
+**Credential-rejection probe**:
+One explicitly authorized SessionSetup attempt using a separately supplied,
+known-wrong password for one profile. It passes only when authentication is
+rejected before any Session, Share, Guest, or Anonymous success; a missing
+account-lockout authorization blocks the probe before network I/O.
+_Avoid_: failed login smoke test, authentication timeout
+
+**CIFS acceptance evidence**:
+A versioned, secret-free JSON record for exactly one profile invocation. It
+contains profile, commit, Run ID, stable phase outcomes, classifications, and
+cleanup state; it contains neither connection details nor raw diagnostics. A
+separate verifier accepts the combined result only for one passing `dxn-ad`
+record and one passing `fas-local` record from the same commit.
+_Avoid_: architecture-wave evidence, raw test log
+
+**Controlled acceptance wrapper**:
+A repository-owned test invocation contract that validates and forwards
+explicit descriptor numbers to the two profile tests and their evidence
+verifier. The external controlled runner, not ordinary CI or the test code,
+obtains secrets and retains secret-free artifacts.
+_Avoid_: secret-aware CI workflow, credential bootstrap script
+
 ## Data path
 
 The path file payload bytes take between a caller-owned buffer and the network

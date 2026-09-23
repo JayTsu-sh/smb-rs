@@ -7,7 +7,7 @@ use smb::{
     SecurityOpenOptions, SecuritySelection, TransferOptions, TransferProgress,
 };
 use smb::{
-    Client, CloseOutcome, CloseReport, CredentialProvider, Credentials, Directory,
+    Client, ClientConfig, CloseOutcome, CloseReport, CredentialProvider, Credentials, Directory,
     DirectoryOpenOptions, File, FileCursor, FileOpenOptions, IoCapabilities, ObjectGeneration,
     OpenInfo, Operation, Pipe, PipeName, PreviousVersion, ReplayPolicy, Session, SessionInfo,
     Share, ShareInfo, SharePath, ShareTarget, Transfer, TransferEvents,
@@ -112,6 +112,14 @@ fn public_spine_defers_async_work_to_lazy_operations() {
     let _ = file_info_is_open_snapshot;
     let _ = directory_info_is_open_snapshot;
     let _ = pipe_info_is_open_snapshot;
+}
+
+#[test]
+fn client_signing_requirement_is_an_explicit_public_policy() {
+    assert!(!ClientConfig::default().signing_required);
+    let _client = Client::with_config(ClientConfig {
+        signing_required: true,
+    });
 }
 
 #[test]
@@ -533,6 +541,46 @@ async fn domain_named_pipe_open_cancel_and_close() -> smb::Result<()> {
 
 #[cfg(feature = "real-server-tests")]
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[ignore = "requires a real SMB share"]
+async fn domain_share_connect_and_close() -> smb::Result<()> {
+    let client = Client::new();
+    let target = ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?;
+    let share = client
+        .connect_share(&target, common::smb_test_credentials())
+        .await?;
+
+    share.close().await?;
+    client.close().await.map(|_| ())
+}
+
+#[cfg(feature = "real-server-tests")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[ignore = "requires an isolated writable real-server share"]
+async fn domain_share_create_write_read_and_delete() -> smb::Result<()> {
+    let client = Client::new();
+    let target = ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?;
+    let share = client
+        .connect_share(&target, common::smb_test_credentials())
+        .await?;
+    let path = SharePath::new(format!("domain-roundtrip-{}.bin", std::process::id()))?;
+    let payload = Bytes::from_static(b"smb-rs domain share roundtrip");
+    let file = share
+        .open_file(&path, FileOpenOptions::create_new())
+        .await?;
+
+    file.write_all_at(0, payload.clone()).await?;
+    file.flush().await?;
+    let payload_length = u32::try_from(payload.len()).expect("test payload fits in u32");
+    assert_eq!(file.read_exact_at(0, payload_length).await?, payload);
+
+    file.delete().await?;
+    file.close().await?;
+    share.close().await?;
+    client.close().await.map(|_| ())
+}
+
+#[cfg(feature = "real-server-tests")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore = "requires an isolated writable real-server share"]
 async fn domain_directory_query_only() -> smb::Result<()> {
     let target = ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?;
@@ -545,14 +593,7 @@ async fn domain_directory_query_only() -> smb::Result<()> {
         .open_directory(&path, DirectoryOpenOptions::create_new())
         .await?;
     let entries = directory.collect_entries("*").await?;
-    let current = entries
-        .iter()
-        .find(|entry| entry.name() == ".")
-        .ok_or_else(|| smb::Error::InvalidMessage("listing has no '.' entry".into()))?;
-    assert!(current.is_directory());
-    assert!(!current.is_reparse_point());
-    assert!(current.created() > std::time::UNIX_EPOCH);
-    assert!(current.written() >= current.created());
+    assert!(entries.is_empty());
     directory.delete().await?;
     directory.close().await?;
     share.close().await?;

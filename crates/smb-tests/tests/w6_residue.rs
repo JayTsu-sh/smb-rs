@@ -91,8 +91,12 @@ fn removed_dead_features_cannot_return() {
 
     let facade = read("crates/smb/src/facade/mod.rs");
     assert!(
-        !facade.contains("pub struct ClientConfig"),
+        !facade.contains("pub struct ClientConfig;"),
         "empty public ClientConfig returned"
+    );
+    assert!(
+        facade.contains("pub signing_required: bool"),
+        "public ClientConfig lost its connection signing policy"
     );
 
     for path in [

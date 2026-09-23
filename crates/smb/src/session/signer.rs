@@ -1,6 +1,8 @@
 //! Message signing implementation.
 
 use binrw::prelude::*;
+#[cfg(feature = "sign_cmac_rustcrypto")]
+use bytes::Bytes;
 use std::io::Cursor;
 
 use crate::{Error, crypto};
@@ -18,6 +20,30 @@ pub struct MessageSigner {
 impl MessageSigner {
     pub fn new(signing_algo: crypto::SigningAlgoEnum) -> MessageSigner {
         MessageSigner { signing_algo }
+    }
+
+    #[cfg(feature = "sign_cmac_rustcrypto")]
+    pub(crate) fn calculate_cmac_batch(
+        &self,
+        messages: &[Vec<Bytes>],
+    ) -> Option<crate::Result<Vec<u128>>> {
+        let inputs = messages
+            .iter()
+            .map(|segments| crypto::CmacBatchInput { segments })
+            .collect::<Vec<_>>();
+        self.signing_algo
+            .sign_cmac_batch(&inputs)
+            .map(|result| result.map_err(Into::into))
+    }
+
+    #[cfg(feature = "sign_cmac_rustcrypto")]
+    pub(crate) fn is_batchable_cmac(&self) -> bool {
+        self.signing_algo.is_batchable_cmac()
+    }
+
+    #[cfg(feature = "sign_cmac_rustcrypto")]
+    pub(crate) fn batch_cmac_key_id(&self) -> Option<usize> {
+        self.signing_algo.batch_cmac_key_id()
     }
 
     /// Verifies the signature of a message using contiguous raw bytes.
@@ -52,13 +78,14 @@ impl MessageSigner {
         header.write(&mut header_bytes)?;
         header.signature = signature_backup;
 
-        self.signing_algo.start(header);
-        self.signing_algo.update(&header_bytes.into_inner());
-        self.signing_algo.update(&first[Header::STRUCT_SIZE..]);
-        for segment in segments {
-            self.signing_algo.update(segment);
-        }
-        Ok(self.signing_algo.finalize())
+        let header_bytes = header_bytes.into_inner();
+        self.signing_algo
+            .sign_segments(
+                header,
+                header_bytes.as_slice(),
+                std::iter::once(&first[Header::STRUCT_SIZE..]).chain(segments),
+            )
+            .map_err(Into::into)
     }
 
     /// Calculate signature from contiguous bytes (for incoming verification).
@@ -76,20 +103,24 @@ impl MessageSigner {
         header_bytes.copy_from_slice(&data[..Header::STRUCT_SIZE]);
         header_bytes[48..64].fill(0);
 
-        // Start signing session with the header.
-        self.signing_algo.start(header);
-        self.signing_algo.update(&header_bytes);
-
-        // Skip the header portion of the raw data.
-        if data.len() >= Header::STRUCT_SIZE {
-            self.signing_algo.update(&data[Header::STRUCT_SIZE..]);
-        }
-
-        Ok(self.signing_algo.finalize())
+        self.signing_algo
+            .sign_segments(
+                header,
+                header_bytes.as_slice(),
+                std::iter::once(&data[Header::STRUCT_SIZE..]),
+            )
+            .map_err(Into::into)
     }
 }
 
-#[cfg(all(test, feature = "sign_gmac"))]
+#[cfg(all(
+    test,
+    any(
+        feature = "sign_hmac",
+        feature = "sign_cmac_rustcrypto",
+        feature = "sign_gmac"
+    )
+))]
 mod tests {
     use crate::crypto::make_signing_algo;
 
@@ -99,6 +130,39 @@ mod tests {
         0xAC, 0x36, 0xE9, 0x54, 0x3C, 0xD8, 0x88, 0xF0, 0xA8, 0x41, 0x23, 0xE4, 0x6B, 0xB2, 0xA0,
         0xD7,
     ];
+
+    fn assert_verification_rejects_tampered_payload(algorithm: smb_msg::SigningAlgorithmId) {
+        let mut raw = vec![
+            0xfeu8, 0x53, 0x4d, 0x42, 0x40, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2, 0x0, 0x1, 0x0,
+            0x18, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x9, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+            0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x53, 0x20, 0xc, 0x21, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+            0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x4, 0x0, 0x0,
+            0x0,
+        ];
+        let mut header = Header::read_le(&mut Cursor::new(&raw[..Header::STRUCT_SIZE])).unwrap();
+        let mut signer = MessageSigner::new(
+            make_signing_algo(algorithm, &TEST_SIGNING_KEY).expect("signer creation failed"),
+        );
+        header.signature = signer
+            ._calculate_signature_bytes(&mut header, &raw)
+            .expect("signature calculation failed");
+
+        let mut verifier = MessageSigner::new(
+            make_signing_algo(algorithm, &TEST_SIGNING_KEY).expect("verifier creation failed"),
+        );
+        verifier
+            .verify_signature(&mut header, &raw)
+            .expect("valid signature must be accepted");
+
+        raw[Header::STRUCT_SIZE] ^= 1;
+        let mut verifier = MessageSigner::new(
+            make_signing_algo(algorithm, &TEST_SIGNING_KEY).expect("verifier creation failed"),
+        );
+        assert!(matches!(
+            verifier.verify_signature(&mut header, &raw),
+            Err(Error::SignatureVerificationFailed)
+        ));
+    }
 
     #[test]
     #[cfg(feature = "sign_gmac")]
@@ -137,5 +201,23 @@ mod tests {
             .expect("segmented signature failed");
         assert_eq!(signature2, 0x28ebd443faf95c8aab512f813c4b2376);
         assert_eq!(signature3, signature2);
+    }
+
+    #[test]
+    #[cfg(feature = "sign_hmac")]
+    fn hmac_verification_rejects_a_tampered_payload() {
+        assert_verification_rejects_tampered_payload(smb_msg::SigningAlgorithmId::HmacSha256);
+    }
+
+    #[test]
+    #[cfg(feature = "sign_cmac_rustcrypto")]
+    fn cmac_verification_rejects_a_tampered_payload() {
+        assert_verification_rejects_tampered_payload(smb_msg::SigningAlgorithmId::AesCmac);
+    }
+
+    #[test]
+    #[cfg(feature = "sign_gmac")]
+    fn gmac_verification_rejects_a_tampered_payload() {
+        assert_verification_rejects_tampered_payload(smb_msg::SigningAlgorithmId::AesGmac);
     }
 }

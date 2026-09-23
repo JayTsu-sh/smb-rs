@@ -244,7 +244,7 @@ impl IoctlResponse {
             return Err(crate::SmbMsgError::MissingFsctlDefinition(self.ctl_code));
         }
         let mut cursor = std::io::Cursor::new(&self.out_buffer);
-        Ok(T::read_le(&mut cursor).unwrap())
+        T::read_le(&mut cursor).map_err(crate::SmbMsgError::from)
     }
 }
 

@@ -73,8 +73,12 @@ pub struct SecurityDescriptorControl {
     pub dacl_trusted: bool,
     pub server_security: bool,
 
-    pub dacl_computed: bool,
-    pub sacl_computed: bool,
+    /// `SE_DACL_AUTO_INHERIT_REQ` (`0x0100`): request propagation to
+    /// existing children when the provider supports automatic inheritance.
+    pub dacl_auto_inherit_req: bool,
+    /// `SE_SACL_AUTO_INHERIT_REQ` (`0x0200`): the SACL counterpart of
+    /// [`Self::dacl_auto_inherit_req`].
+    pub sacl_auto_inherit_req: bool,
     pub dacl_auto_inherited: bool,
     pub sacl_auto_inherited: bool,
 

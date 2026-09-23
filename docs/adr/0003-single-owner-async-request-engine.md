@@ -2,14 +2,15 @@
 status: accepted
 ---
 
-# Use one state owner with read and write pumps
+# Use one connection driver with a single state owner
 
-Each physical SMB connection generation uses one asynchronous state-owner task
-and two I/O pumps. The owner is the only authority for lifecycle, admission,
-message IDs, credits, pending requests, deadlines, tombstones, and caller
-completion; the pumps only advance framed reads and writes and report typed
-events. This topology keeps full-duplex I/O while making every state transition
-and first-terminal-wins race serializable and testable.
+Each physical SMB connection generation uses one asynchronous connection-driver
+task. The driver is the only authority for lifecycle, admission, message IDs,
+credits, pending requests, deadlines, tombstones, and caller completion. It
+cooperatively polls independent framed-read and active-write futures, retaining
+full-duplex I/O without routing every transport completion through additional
+Tokio tasks and channels. Every state transition and first-terminal-wins race
+therefore remains serializable and testable.
 
 This replaces the handler/worker/backend split and its shared awaiting/pending
 maps. It rejects a single task that interleaves blocking I/O with state commits,

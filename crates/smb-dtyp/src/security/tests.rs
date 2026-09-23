@@ -22,6 +22,7 @@ test_binrw! {
         sbz1: 0,
         control: SecurityDescriptorControl::new()
             .with_self_relative(true)
+            .with_dacl_auto_inherit_req(true)
             .with_dacl_auto_inherited(true)
             .with_dacl_present(true),
         owner_sid: None,
@@ -85,7 +86,7 @@ test_binrw! {
             ],
         }
         .into(),
-    } => "0100048400000000000000000000000014000000020090000500000000
+    } => "0100048500000000000000000000000014000000020090000500000000
     132400ff011f00010500000000000515000000173da72e955653f915dff280
     e903000000131800ff011f0001020000000000052000000020020000001314
     00ff011f0001010000000000051200000000131400a9001200010100000000

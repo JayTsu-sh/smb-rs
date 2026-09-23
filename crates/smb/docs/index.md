@@ -1,6 +1,6 @@
 # SMB
 
-The `smb` crate is an asynchronous, pure-Rust SMB2/SMB3 client. Its public
+The `smb` crate is an asynchronous SMB2/SMB3 client implemented in Rust. Its public
 object hierarchy follows the lifetime of remote objects:
 
 `Client` → `Session` → `Share` → `File` / `Directory` / `Pipe`
@@ -117,10 +117,16 @@ directly instead of opening each child for `metadata()`.
 | Signing | all supported | `sign` |
 | Signing | HMAC-SHA256 | `sign_hmac` |
 | Signing | AES-GMAC | `sign_gmac` |
-| Signing | AES-CMAC | `sign_cmac` |
+| Signing | AES-CMAC, batched pure-Rust backend | `sign_cmac` |
+| Signing | AES-CMAC, explicit RustCrypto backend | `sign_cmac_rustcrypto` |
 | Encryption | all supported | `encrypt` |
 | Encryption | AES-CCM | `encrypt_aesccm` |
 | Encryption | AES-GCM | `encrypt_aesgcm` |
 | Compression | all supported | `compress` |
 | Compression | LZ4 | `compress_lz4` |
 | Compression | Pattern V1 | `compress_pattern_v1` |
+
+`sign_cmac` selects the RustCrypto backend and batches independent CMAC chains
+across the portable software AES implementation's four native 64-bit fixslice
+lanes. It does not require OpenSSL or AES-NI. Batching does not change the
+public SMB API or the negotiated AES-CMAC algorithm.

@@ -140,9 +140,8 @@ where
     /// the error out.
     pub(crate) async fn setup(&mut self) -> crate::Result<Arc<SessionAndChannel>> {
         tracing::debug!(
-            "Setting up session for user {} (@{}).",
-            self.authenticator.user_name().account_name(),
-            self.authenticator.user_name().domain_name().unwrap_or("")
+            "Setting up session for user {}.",
+            self.authenticator.user_name().inner()
         );
 
         let result = self._setup_loop().await;
@@ -221,6 +220,17 @@ where
         self.flags.ok_or(Error::InvalidState(
             "Failed to complete authentication properly.".to_string(),
         ))?;
+
+        // New sessions intentionally admit the final unsigned response before
+        // a primary channel exists. Once the GSS exchange succeeds, derive
+        // and install that channel from the finalized request transcript.
+        if self
+            .result
+            .as_ref()
+            .is_some_and(|session| session.channel().is_none())
+        {
+            self.make_channel().await?;
+        }
 
         tracing::trace!("setup success, finishing up.");
         self.on_setup_success().await?;
@@ -401,7 +411,7 @@ where
             Some(result) => result.channel().is_some(),
             None => false,
         };
-        let skip_security_validation = !is_auth_done && !channel_set_up;
+        let skip_security_validation = self.kind == SetupKind::New && !channel_set_up;
         let result = if let Some(context) = &self.context {
             tracing::trace!(
                 "setup loop: receiving with channel context; skip_security_validation={skip_security_validation}"
@@ -476,14 +486,9 @@ where
     /// Final SessionSetup Request (the one carrying the GSS authenticator
     /// that completes the exchange).
     ///
-    /// Per MS-SMB2 §3.3.5.5.3 the server **requires** this request to
-    /// be signed on any non-anonymous SMB 3.x session (Windows DCs in
-    /// particular drop it silently otherwise). The wire pipeline owns
-    /// the preauth-hash plumbing: we just attach the GSS-derived
-    /// SessionKey to the outgoing message via `setup_phase_signing_key`,
-    /// and `WirePipeline::transform_outgoing` ingests the plain bytes,
-    /// derives a one-shot signer from the resulting finalized hash, and
-    /// signs in place — all in one pass.
+    /// A new session remains unsigned until the server accepts its final GSS
+    /// token. A multichannel binding uses an established session and is signed
+    /// with that session's setup-phase key.
     async fn send_final_setup_request(
         &mut self,
         mut request: CommandRequest,
@@ -499,31 +504,38 @@ where
             .session_id;
         request.message.header.session_id = session_id;
 
-        request.security = Some(crate::command::Protection::SnapshotKdfSign {
-            session_key: self.session_key()?,
-        });
-        let request = request.into_signed();
-        // The SnapshotKdfSign Protection set above is what the
-        // wire pipeline dispatches on; `into_signed` just flips the
-        // wire-protocol signed flag so generation_runtime bookkeeping that still
-        // inspects `flags.signed` sees a consistent state.
+        match self.kind {
+            SetupKind::New => {
+                request.security = Some(crate::command::Protection::None);
+                tracing::trace!(
+                    "setup loop: dispatching final unsigned SessionSetup msg_id={} session_id={:#x}",
+                    request.message.header.message_id,
+                    session_id
+                );
+                let result = self.upstream.dispatch_outgoing(request).await?;
 
-        tracing::trace!(
-            "setup loop: dispatching final signed SessionSetup msg_id={} session_id={:#x}",
-            request.message.header.message_id,
-            session_id
-        );
-        let result = self.upstream.dispatch_outgoing(request).await?;
-
-        // Install the channel into session_state *after* dispatch so
-        // the receive path can verify the matching signed Response —
-        // the channel signer is derived from the same preauth hash the
-        // wire pipeline used a moment ago (it's stable now: the
-        // SessionSetup Response with status=Success does NOT update
-        // the hash per MS-SMB2 §3.1.4.2).
-        self.make_channel().await?;
-
-        Ok(result)
+                // The final response is signed. Its preauth hash excludes the
+                // success response, so the primary signer can be derived once
+                // the final request has been dispatched and before the wire
+                // pipeline admits that response.
+                self.make_channel().await?;
+                Ok(result)
+            }
+            SetupKind::Bind => {
+                request.security = Some(crate::command::Protection::SnapshotKdfSign {
+                    session_key: self.session_key()?,
+                });
+                let request = request.into_signed();
+                tracing::trace!(
+                    "setup loop: dispatching final signed binding SessionSetup msg_id={} session_id={:#x}",
+                    request.message.header.message_id,
+                    session_id
+                );
+                let result = self.upstream.dispatch_outgoing(request).await?;
+                self.make_channel().await?;
+                Ok(result)
+            }
+        }
     }
 
     /// Builds the [`ChannelInfo`] for this session's primary channel

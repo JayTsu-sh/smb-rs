@@ -12,7 +12,11 @@ pub use cursor::FileCursor;
 pub use metadata::{MetadataOpenOptions, MetadataUpdate};
 pub use operation::{CancelToken, Deadline, Operation, ReplayPolicy};
 pub use rpc::RpcPipeConnection;
-pub use security::{SecurityDescriptor, SecurityOpenOptions, SecuritySelection};
+pub use security::{
+    ACE, ACL, AccessAce, AccessCallbackAce, AccessMask, AccessObjectAce, AccessObjectCallbackAce,
+    AceFlags, AceType, AceValue, AclRevision, SID, SecurityDescriptor, SecurityDescriptorControl,
+    SecurityOpenOptions, SecuritySelection,
+};
 pub use transfer::{Transfer, TransferEvents, TransferOptions, TransferProgress, TransferReport};
 
 use std::{
@@ -245,6 +249,13 @@ impl SharePath {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Returns the name carried in an SMB CREATE request. SMB represents the
+    /// root of an already connected share with an empty name; `.` is only the
+    /// public relative-path spelling used by callers.
+    pub(crate) fn as_create_name(&self) -> &str {
+        if self.0 == "." { "" } else { &self.0 }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -395,10 +406,6 @@ type SessionCacheKey = (String, [u8; 32]);
 type SessionCache = HashMap<SessionCacheKey, Weak<SessionInner>>;
 
 impl DomainClient {
-    pub(crate) fn new() -> Self {
-        Self::with_signing_policy(crate::SigningPolicy::default())
-    }
-
     pub(crate) fn with_signing_policy(policy: crate::SigningPolicy) -> Self {
         Self::with_policies(policy, crate::GuestPolicy::default())
     }
@@ -687,7 +694,7 @@ impl Share {
                 let resource = self
                     .inner
                     .runtime
-                    .open_security_resource(path.as_str(), options.writes_dacl())
+                    .open_security_resource(path.as_str(), true, options.writes_dacl())
                     .await?;
                 self.record_resource_open();
                 Ok(match resource {
@@ -791,7 +798,7 @@ impl Share {
                 let inner = self
                     .inner
                     .runtime
-                    .open_directory(path.as_str(), options.create)
+                    .open_directory(path.as_create_name(), options.create)
                     .await?;
                 self.record_resource_open();
                 Ok(Directory {
@@ -1456,6 +1463,10 @@ impl DirectoryEntry {
     }
 }
 
+fn is_navigation_directory_entry(name: &str) -> bool {
+    matches!(name, "." | "..")
+}
+
 pub struct Directory {
     inner: crate::runtime::port::RuntimeDirectory,
     close_authority: FileCloseAuthority,
@@ -1516,20 +1527,27 @@ impl Directory {
     }
 
     pub fn entries<'a>(&'a self, pattern: &'a str) -> DirectoryEntries<'a> {
-        Box::pin(self.inner.entries(pattern).map(|result| {
-            result.map(|entry| DirectoryEntry {
-                name: entry.name,
-                is_directory: entry.is_directory,
-                len: entry.len,
-                created: entry.created,
-                accessed: entry.accessed,
-                written: entry.written,
-                changed: entry.changed,
-                readonly: entry.readonly,
-                reparse_point: entry.reparse_point,
-                file_id: entry.file_id,
-            })
-        }))
+        Box::pin(
+            self.inner
+                .entries(pattern)
+                .map(|result| {
+                    result.map(|entry| DirectoryEntry {
+                        name: entry.name,
+                        is_directory: entry.is_directory,
+                        len: entry.len,
+                        created: entry.created,
+                        accessed: entry.accessed,
+                        written: entry.written,
+                        changed: entry.changed,
+                        readonly: entry.readonly,
+                        reparse_point: entry.reparse_point,
+                        file_id: entry.file_id,
+                    })
+                })
+                .try_filter(|entry| {
+                    futures_util::future::ready(!is_navigation_directory_entry(entry.name()))
+                }),
+        )
     }
 
     pub fn collect_entries<'a>(&'a self, pattern: &'a str) -> Operation<'a, Vec<DirectoryEntry>> {
@@ -1732,6 +1750,17 @@ mod tests {
         assert!(SharePath::new("\\absolute").is_err());
     }
 
+    #[test]
+    fn share_root_uses_an_empty_smb_create_name() {
+        assert_eq!(SharePath::new(".").unwrap().as_create_name(), "");
+        assert_eq!(
+            SharePath::new("directory\\file.bin")
+                .unwrap()
+                .as_create_name(),
+            "directory\\file.bin"
+        );
+    }
+
     #[tokio::test]
     async fn concurrent_file_close_invokes_the_wire_closure_once() {
         let authority = Arc::new(FileCloseAuthority::new());
@@ -1812,5 +1841,13 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn directory_enumeration_hides_protocol_navigation_entries() {
+        assert!(is_navigation_directory_entry("."));
+        assert!(is_navigation_directory_entry(".."));
+        assert!(!is_navigation_directory_entry("..."));
+        assert!(!is_navigation_directory_entry("file.txt"));
     }
 }
