@@ -11,6 +11,7 @@ use smb_transport::SendFrame;
 use std::sync::Arc;
 use std::{collections::HashMap, io::Cursor};
 use tokio::sync::{Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 
 use crate::connection::connection_info::ConnectionInfo;
 
@@ -82,13 +83,6 @@ struct WirePipelineConfig {
 }
 
 impl WirePipeline {
-    pub(crate) fn with_crypto_parallelism(parallelism: usize) -> Self {
-        Self {
-            crypto_executor: BoundedCryptoExecutor::new(parallelism),
-            ..Self::default()
-        }
-    }
-
     pub(crate) fn should_prepare_concurrently(&self, request: &CommandRequest) -> bool {
         let signed = matches!(
             request.security,
@@ -515,7 +509,32 @@ impl WirePipeline {
     }
 
     /// Transforms an outgoing message to a raw SMB message.
-    pub async fn transform_outgoing(&self, mut msg: CommandRequest) -> crate::Result<SendFrame> {
+    pub async fn transform_outgoing(&self, msg: CommandRequest) -> crate::Result<SendFrame> {
+        self.transform_outgoing_with_cancellation(msg, None).await
+    }
+
+    /// As [`Self::transform_outgoing`], but stops before entering CPU-bound
+    /// crypto work when the request is no longer owned by the runtime.
+    pub(crate) async fn transform_outgoing_cancellable(
+        &self,
+        msg: CommandRequest,
+        cancellation: CancellationToken,
+    ) -> crate::Result<SendFrame> {
+        self.transform_outgoing_with_cancellation(msg, Some(cancellation))
+            .await
+    }
+
+    async fn transform_outgoing_with_cancellation(
+        &self,
+        mut msg: CommandRequest,
+        cancellation: Option<CancellationToken>,
+    ) -> crate::Result<SendFrame> {
+        if cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(crate::Error::Cancelled("outgoing preparation"));
+        }
         let protection = msg.security.as_ref().ok_or_else(|| {
             crate::Error::InvalidState("wire protection policy is not sealed".into())
         })?;
@@ -623,7 +642,7 @@ impl WirePipeline {
                 unreachable!("batched CMAC is unavailable without the RustCrypto backend");
             } else {
                 self.crypto_executor
-                    .execute(signing_bytes, move || {
+                    .execute_with_cancellation(signing_bytes, cancellation, move || {
                         let mut builder = builder;
                         let signature = signer
                             .signature_for_segments(&mut header, builder.signing_segments(0)?)?;
