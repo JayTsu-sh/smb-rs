@@ -23,7 +23,9 @@ pub mod mock_gss;
 pub mod transcripts;
 
 pub use asserts::{
-    ClientFrameHeader, assert_intermediate_session_setup, assert_signed_final_session_setup,
+    ClientFrameHeader, assert_intermediate_session_setup, assert_negotiate_signing_policy,
+    assert_session_setup_signing_policy, assert_signed_final_session_setup,
+    assert_unsigned_final_session_setup,
 };
 pub use mock_gss::{MockGss, ScriptedGssStep};
 pub use smb_transport::test_support::{ScriptedTransport, ScriptedTransportControl};

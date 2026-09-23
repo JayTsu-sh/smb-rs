@@ -121,6 +121,34 @@ impl WireBuilder {
         Ok(std::iter::once(metadata).chain(payloads.iter().map(Bytes::as_ref)))
     }
 
+    /// Clone the immutable owners needed by asynchronous signature work.
+    /// Metadata is copied because its signature field remains patchable;
+    /// attached file payloads retain their existing shared `Bytes` storage.
+    pub fn owned_signing_segments(&self, member: usize) -> Result<Vec<Bytes>> {
+        self.require_state(BuildState::OffsetsFinalized)?;
+        let range = self.builder_member_range(member)?;
+        let metadata = self
+            .metadata
+            .get(range)
+            .ok_or_else(|| invalid("signature member range escaped metadata"))?;
+        if metadata.len() < Header::STRUCT_SIZE {
+            return Err(invalid("signature member is shorter than the SMB2 header"));
+        }
+        let mut metadata = BytesMut::from(metadata);
+        metadata[48..64].fill(0);
+        let payloads = if self.member_count() == 1 {
+            self.payloads.len()
+        } else {
+            0
+        };
+        let mut segments = Vec::with_capacity(1 + payloads);
+        segments.push(metadata.freeze());
+        if self.member_count() == 1 {
+            segments.extend(self.payloads.iter().cloned());
+        }
+        Ok(segments)
+    }
+
     /// Patch exactly the 16-byte SMB2 header signature field. Members must be
     /// patched in wire order, preventing duplicate or skipped signatures.
     pub fn patch_signature(&mut self, member: usize, signature: u128) -> Result<()> {
@@ -389,6 +417,22 @@ mod tests {
         let message = builder.seal().unwrap();
         assert_eq!(message.segment_count(), 2);
         assert_eq!(message.segments().nth(1).unwrap().as_ptr(), pointer);
+    }
+
+    #[test]
+    fn owned_signing_segments_copy_metadata_but_share_payload() {
+        let payload = Bytes::from_static(b"payload");
+        let payload_pointer = payload.as_ptr();
+        let mut requests = [write_request(payload.len() as u32)];
+        requests[0].header.signature = u128::MAX;
+        let mut builder = WireBuilder::encode(&mut requests, 2).unwrap();
+        builder.attach_payload(payload).unwrap();
+        builder.finalize_offsets().unwrap();
+
+        let segments = builder.owned_signing_segments(0).unwrap();
+
+        assert_eq!(&segments[0][48..64], &[0; 16]);
+        assert_eq!(segments[1].as_ptr(), payload_pointer);
     }
 
     #[test]

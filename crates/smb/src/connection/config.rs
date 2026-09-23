@@ -170,6 +170,14 @@ pub struct ConnectionConfig {
     /// Sets whether signing may be skipped for guest or anonymous access.
     pub allow_unsigned_guest_access: bool,
 
+    /// Whether this client requires signing for the connection.
+    ///
+    /// Signing capability is still advertised when signing algorithms are
+    /// compiled in. `false` means that the client does not require signing; it
+    /// does not disable signing. Messages are still signed when the server or
+    /// established session requires it. Defaults to `false`.
+    pub signing_required: bool,
+
     /// Whether to enable compression, if supported by the server and specified connection dialects.
     ///
     /// Note: you must also have compression features enabled when building the crate, otherwise compression
@@ -199,7 +207,7 @@ pub struct ConnectionConfig {
     pub auth_methods: AuthMethodsConfig,
 
     /// The number of SMB2 credits to request for the connection.
-    /// If not configured, requests 512 credits. The server controls the granted amount.
+    /// If not configured, uses [`ConnectionConfig::DEFAULT_CREDITS_BACKLOG`].
     ///
     /// The higher number of credits, the more concurrent requests can be sent on the connection.
     /// However, some servers may not issue such high number of credits.
@@ -219,22 +227,30 @@ pub struct ConnectionConfig {
 impl ConnectionConfig {
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// Default target for the number of SMB2 credits maintained by a connection.
+    pub const DEFAULT_CREDITS_BACKLOG: u16 = 1024;
+
     /// Validates common configuration settings.
     pub fn validate(&self) -> crate::Result<()> {
         // Make sure dialects min <= max.
-        if let (Some(min), Some(max)) = (self.min_dialect, self.max_dialect) {
-            if min > max {
-                return Err(crate::Error::InvalidConfiguration(
-                    "Minimum dialect is greater than maximum dialect".to_string(),
-                ));
-            }
+        if let (Some(min), Some(max)) = (self.min_dialect, self.max_dialect)
+            && min > max
+        {
+            return Err(crate::Error::InvalidConfiguration(
+                "Minimum dialect is greater than maximum dialect".to_string(),
+            ));
         }
-        if let Some(default_transaction_size) = self.default_transaction_size {
-            if default_transaction_size == 0 {
-                return Err(crate::Error::InvalidConfiguration(
-                    "Default transaction size cannot be zero".to_string(),
-                ));
-            }
+        if let Some(default_transaction_size) = self.default_transaction_size
+            && default_transaction_size == 0
+        {
+            return Err(crate::Error::InvalidConfiguration(
+                "Default transaction size cannot be zero".to_string(),
+            ));
+        }
+        if self.signing_required && crate::crypto::SIGNING_ALGOS.is_empty() {
+            return Err(crate::Error::InvalidConfiguration(
+                "Signing is required, but no signing algorithms are enabled".to_string(),
+            ));
         }
         if self.auto_reconnect.enabled {
             if self.auto_reconnect.max_attempts == 0
@@ -260,11 +276,70 @@ impl ConnectionConfig {
         self.timeout.unwrap_or(Self::DEFAULT_TIMEOUT)
     }
 
+    pub(crate) fn effective_credits_backlog(&self) -> u16 {
+        self.credits_backlog
+            .unwrap_or(Self::DEFAULT_CREDITS_BACKLOG)
+    }
+
     pub const DEFAULT_TRANSACTION_SIZE: u32 = 0x10_000;
 
     /// Returns the effective value to be used if [`default_transaction_size`][`Self::default_transaction_size`] is not set.
     pub fn default_transaction_size(&self) -> u32 {
         self.default_transaction_size
             .unwrap_or(Self::DEFAULT_TRANSACTION_SIZE)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credit_backlog_uses_documented_default_and_preserves_override() {
+        assert_eq!(
+            ConnectionConfig::default().effective_credits_backlog(),
+            ConnectionConfig::DEFAULT_CREDITS_BACKLOG
+        );
+        assert_eq!(
+            ConnectionConfig {
+                credits_backlog: Some(128),
+                ..Default::default()
+            }
+            .effective_credits_backlog(),
+            128
+        );
+    }
+
+    #[test]
+    #[cfg(not(any(
+        feature = "sign_hmac",
+        feature = "sign_cmac_rustcrypto",
+        feature = "sign_gmac"
+    )))]
+    fn required_signing_is_rejected_when_no_algorithm_is_compiled() {
+        let config = ConnectionConfig {
+            signing_required: true,
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            config.validate(),
+            Err(crate::Error::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
+    #[cfg(any(
+        feature = "sign_hmac",
+        feature = "sign_cmac_rustcrypto",
+        feature = "sign_gmac"
+    ))]
+    fn required_signing_is_valid_when_an_algorithm_is_compiled() {
+        let config = ConnectionConfig {
+            signing_required: true,
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_ok());
     }
 }

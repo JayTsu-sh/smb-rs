@@ -24,34 +24,41 @@ deterministic I/O, clocks, and transform execution.
 
 ## Task topology
 
-One physical connection generation owns exactly three long-lived tasks:
+One physical connection generation owns exactly one long-lived connection
+driver task:
 
 ```text
-State owner
-  ├─ Read pump
-  └─ Write pump
+Connection driver / state owner
+  ├─ framed-read future
+  ├─ at most one active-write future
+  └─ bounded short-lived transform work
 ```
 
-The state owner creates and joins both pumps. It exclusively owns connection
-state, generation identity, admission accounting, credit balance, message and
-async IDs, request records, deadlines, tombstones, send scheduling, and caller
-completion. It never waits on network I/O or performs payload-sized CPU work.
+The driver exclusively owns connection state, both transport halves,
+generation identity, admission accounting, credit balance, message and async
+IDs, request records, deadlines, tombstones, send scheduling, and caller
+completion. Independent read and write futures are polled in the same
+`select!`, so a pending read never blocks a write or vice versa. Transport
+progress and completion are handled directly instead of crossing per-event
+Tokio task and channel boundaries.
 
-The read pump owns the transport read half. It performs framing, codec decode,
-and protection validation using an immutable generation security plan, then
-reports a typed response, notification, or failure event. Ordered mutable
-security phases such as negotiation and preauthentication are driven by an
-explicit plan from the owner, never by registry lookup in the pump.
+Each read future owns the transport read half for one framed receive and
+returns both the frame result and the half to the driver. The driver starts the
+next receive immediately and submits codec/protection work to the bounded
+transform stage while preserving receive order. Ordered mutable security phases
+such as negotiation and preauthentication remain driven by an explicit owner
+plan.
 
-The write pump owns the transport write half and at most one active sealed
-frame. It advances the transport-private `SendCursor` and reports
-`CancelledBeforeWrite`, positive-byte progress, completion, or failure. It
-does not schedule requests, mutate credits, or complete callers.
+Each active-write future similarly owns the write half and one sealed frame. It
+advances the transport-private `SendCursor`, observes positive-byte progress,
+and returns the half with `CancelledBeforeWrite`, completion, or failure. The
+driver remains the sole scheduler and the only component that mutates credits
+or completes callers.
 
-The root owner task holds pump handles. Pump exit is an owner event. If the
-owner terminates unexpectedly, channel closure stops both pumps, drops the
-registry and payload owners, and closes terminal senders. `RequestFuture` maps
-that closure to typed `RuntimeTerminated`; pumps are never silently restarted.
+If the connection driver terminates unexpectedly, dropping its read/write
+futures releases transport and payload owners, the registry is revoked, and
+terminal senders close. `RequestFuture` maps that closure to typed
+`RuntimeTerminated`; the driver is never silently restarted.
 
 ## Request record
 
@@ -65,7 +72,7 @@ caller outcome     Open | Terminal(result)
 send progress      NotQueued | Queued | Partial(bytes) | Complete
 response progress  None | AsyncPending | Final
 credit obligation  reserved charge and observed grants
-payload owner       admission / preparation / owner queue / write pump / released
+payload owner       admission / preparation / owner queue / active write / released
 tombstone           absent | drain deadline
 operation facts     side-effect class, cancellation support, dependency token
 ```
@@ -87,12 +94,12 @@ typed backpressure without partially admitting the operation. Once its complete
 dependency chain is active, the owner atomically reserves generation, message
 ID, and credits and emits an immutable `PreparationPlan`.
 
-Encoding, signing, encryption, and compression execute outside the owner as
-short-lived owned tasks. Synchronous payload-sized transforms use
+Encoding, signing, encryption, and compression execute outside the driver's
+state-transition path as short-lived owned work. Synchronous payload-sized transforms use
 `spawn_blocking` behind a global bounded semaphore; every SMB chunk is bounded
-by the negotiated maximum. Tasks are tracked in the owner's `JoinSet`, check
-cancellation before and after work, and report only `Prepared` or
-`PrepareFailed`. No preparation task is detached.
+by the negotiated maximum. Work is tracked by the driver's bounded completion
+queues, checks cancellation before and after execution, and reports only
+`Prepared` or `PrepareFailed`. No preparation work is detached.
 
 A preparation or queue failure before any byte is written rolls back every
 permit, identifier reservation, credit reservation, and payload owner exactly
@@ -103,7 +110,7 @@ once through the reducer.
 The owner consumes three internal lanes:
 
 - control: cancellation, deadline, explicit close, shutdown;
-- I/O completion: read/write pump events;
+- I/O readiness/completion: direct read/write future results;
 - admission/preparation: new operations and preparation results.
 
 External submitters cannot write directly to internal lanes. Admission permits
@@ -131,18 +138,19 @@ implementation details, never hidden backpressure policies.
 ## Send commitment and response races
 
 The owner registers the complete request record and credit obligation before a
-frame can reach the write pump. A valid response may therefore arrive before
-the owner observes `WriteComplete` and still resolves the correct record.
+frame can reach the active-write future. A valid response may therefore arrive
+before the owner observes `WriteComplete` and still resolves the correct
+record.
 
 The owner retains all not-yet-dispatched frames in its removable send queue.
-The write pump receives only one active frame with a one-shot cancellation
+The active-write future receives only one frame with a one-shot cancellation
 token. Before its first transport write it reports one provable branch:
 
 - `CancelledBeforeWrite`: zero bytes reached transport and all reservations
   can be rolled back;
 - `WriteProgress(bytes > 0)` or `WriteComplete`: wire commitment exists.
 
-After complete send, the write pump returns outbound payload ownership for
+After complete send, the write future returns outbound payload ownership for
 immediate release. Waiting for a response retains request metadata and credit
 obligations, not sent file payload.
 
@@ -184,7 +192,7 @@ cleanup. The runtime continues draining its wire obligation independently.
 
 ## Notifications
 
-The read pump reports validated unsolicited traffic through the I/O lane. The
+The read/transform path reports validated unsolicited traffic to the owner. The
 owner performs mandatory authoritative updates and timely ACK work before
 publishing a typed domain event. Domain streams are bounded per event family.
 Recoverability determines overflow behavior: explicitly coalescible events may
@@ -193,16 +201,18 @@ object. A universal log-and-drop policy is forbidden.
 
 ## Failure, reconnection, and shutdown
 
-Transport loss or any pump/preparation panic is a typed owner event. The engine
-does not restart pumps, migrate registries, replay operations, or reconnect. It
-classifies every request, terminates the current generation, joins its tasks,
-and publishes generation loss to the runtime recovery policy. Only that higher
-policy may submit a proven-safe operation into a new generation.
+Transport loss or any read/write/preparation panic is a typed owner event. The
+engine does not restart I/O futures after failure, migrate registries, replay
+operations, or reconnect. It classifies every request, terminates the current
+generation, settles bounded work, and publishes generation loss to the runtime
+recovery policy. Only that higher policy may submit a proven-safe operation
+into a new generation.
 
 Explicit `close(deadline)` closes admission, rolls back undispatched work,
 attempts to finish an active partial frame, and drains sent requests and
 tombstones until the deadline. It then terminates transport if necessary,
-cancels and joins preparation and pump tasks, and only then publishes `Closed`.
+cancels and settles preparation and active-I/O work, and only then publishes
+`Closed`.
 Its structured `CloseReport` includes final state, completed/cancelled/unknown
 counts, unresolved wire obligations, task join results, and the first teardown
 cause.
@@ -220,12 +230,12 @@ Replacement of the old worker requires:
   and failure orderings;
 - invariant checks that caller completion is at most once and every credit,
   permit, payload owner, tombstone, and sender is released exactly once;
-- deterministic clock plus fake read/write pump adapters;
+- deterministic clock plus fake read/write transport adapters;
 - cancellation and failure injection at every partial-write cursor position;
 - early-response-before-write-completion and late-response cases;
 - independent compound-member outcomes;
 - deadline heap and generation failure on tombstone expiry;
-- pump, owner, and preparation panic with bounded shutdown;
+- read, write, owner, and preparation panic with bounded shutdown;
 - loom models for channel closure, future Drop, terminal sender, and task exit;
 - copy/allocation and in-flight-memory budgets from ADR-0001;
 - FAS2750 concurrency, cancellation, disconnect, and automatic-recovery UAT.

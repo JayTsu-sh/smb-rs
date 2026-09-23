@@ -11,6 +11,58 @@
 use bytes::Bytes;
 use smb_msg::{Command, Header};
 
+/// Assert the signing capability and requirement advertised by the client in
+/// its SMB2 NEGOTIATE request.
+pub fn assert_negotiate_signing_policy(frame: &Bytes, signing_required: bool) {
+    use binrw::BinRead;
+    use smb_msg::PlainRequest;
+    use std::io::Cursor;
+
+    let request = PlainRequest::read_le(&mut Cursor::new(frame.as_ref()))
+        .expect("captured frame must be a valid SMB2 request");
+    let negotiate = request
+        .content
+        .to_negotiate()
+        .expect("captured frame must be an SMB2 NEGOTIATE request");
+    assert!(
+        negotiate.security_mode.signing_enabled(),
+        "client must continue advertising signing capability"
+    );
+    assert_eq!(
+        negotiate.security_mode.signing_required(),
+        signing_required,
+        "client NEGOTIATE signing requirement differs from ConnectionConfig"
+    );
+}
+
+/// Assert the signing capability and requirement sent in SMB2 SESSION_SETUP.
+pub fn assert_session_setup_signing_policy(
+    frame: &Bytes,
+    signing_enabled: bool,
+    signing_required: bool,
+) {
+    use binrw::BinRead;
+    use smb_msg::PlainRequest;
+    use std::io::Cursor;
+
+    let request = PlainRequest::read_le(&mut Cursor::new(frame.as_ref()))
+        .expect("captured frame must be a valid SMB2 request");
+    let setup = request
+        .content
+        .to_sessionsetup()
+        .expect("captured frame must be an SMB2 SESSION_SETUP request");
+    assert_eq!(
+        setup.security_mode.signing_enabled(),
+        signing_enabled,
+        "client SESSION_SETUP signing policy differs from the effective connection policy"
+    );
+    assert_eq!(
+        setup.security_mode.signing_required(),
+        signing_required,
+        "client SESSION_SETUP signing requirement differs from ConnectionConfig"
+    );
+}
+
 /// Decoded view of an outbound client frame's SMB2 header.
 ///
 /// Cheap to construct from raw bytes; covers the small subset of
@@ -96,6 +148,28 @@ pub fn assert_signed_final_session_setup(frame: &Bytes, frame_idx: usize) {
         h.signature, 0,
         "frame #{frame_idx} (final SessionSetup) has zero signature — signing flag \
          is set but transformer didn't compute a real signature"
+    );
+}
+
+/// Assert a final SessionSetup continuation for a newly established session.
+///
+/// The server allocated the SessionId after the first GSS round. The final
+/// new-session exchange remains unsigned until the primary channel exists.
+pub fn assert_unsigned_final_session_setup(
+    frame: &Bytes,
+    frame_idx: usize,
+    expected_session_id: u64,
+) {
+    let h = ClientFrameHeader::parse_frame(frame, frame_idx);
+    assert_eq!(h.command, Command::SessionSetup);
+    assert_eq!(h.session_id, expected_session_id);
+    assert!(
+        !h.signed_flag,
+        "new-session final SessionSetup must be unsigned"
+    );
+    assert_eq!(
+        h.signature, 0,
+        "unsigned SessionSetup must have no signature"
     );
 }
 

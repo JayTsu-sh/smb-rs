@@ -1,6 +1,10 @@
+#[cfg(feature = "sign_cmac_rustcrypto")]
+mod cmac_batch;
 mod encryption;
 mod kbkdf;
 mod signing;
+#[cfg(feature = "sign_cmac_rustcrypto")]
+pub(crate) use cmac_batch::{BatchCmac128, CmacBatchInput, PORTABLE_CMAC_LANES};
 
 pub use encryption::{ENCRYPTING_ALGOS, EncryptingAlgo, make_encrypting_algo};
 pub use kbkdf::{DerivedKey, KeyToDerive, kbkdf_hmacsha256};
@@ -19,6 +23,9 @@ pub enum CryptoError {
     UnsupportedEncryptionAlgorithm(EncryptionCipher),
     #[error("Unsupported signing algorithm")]
     UnsupportedSigningAlgorithm(SigningAlgorithmId),
+    #[cfg(feature = "sign_cmac_rustcrypto")]
+    #[error("AES-CMAC input length overflow")]
+    CmacInputTooLong,
     #[cfg(any(
         feature = "encrypt_aes128ccm",
         feature = "encrypt_aes256ccm",

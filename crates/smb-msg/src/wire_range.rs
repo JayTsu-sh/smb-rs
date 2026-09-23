@@ -45,7 +45,7 @@ impl WireRange {
         minimum_offset: usize,
         alignment: usize,
     ) -> Result<Self> {
-        if offset < minimum_offset || alignment == 0 || offset % alignment != 0 {
+        if offset < minimum_offset || alignment == 0 || !offset.is_multiple_of(alignment) {
             return Err(SmbMsgError::InvalidWireRange {
                 field,
                 offset,

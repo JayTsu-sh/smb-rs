@@ -191,12 +191,12 @@ impl GssState for Authenticator {
             return Err(Error::InvalidState("Authentication already done.".into()));
         }
 
-        if let Some(ref state) = self.current_state {
-            if state.status != sspi::SecurityStatus::ContinueNeeded {
-                return Err(Error::InvalidState(
-                    "NTLM GSS session is not in a state to process next token.".into(),
-                ));
-            }
+        if let Some(ref state) = self.current_state
+            && state.status != sspi::SecurityStatus::ContinueNeeded
+        {
+            return Err(Error::InvalidState(
+                "NTLM GSS session is not in a state to process next token.".into(),
+            ));
         }
 
         let mut output_buffer = vec![SecurityBuffer::new(Vec::new(), BufferType::Token)];

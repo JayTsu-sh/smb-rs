@@ -4,6 +4,9 @@
 //! reducer is deliberately independent of transport I/O so every race can be
 //! checked deterministically before the owner task and pumps are connected.
 
+#[cfg(feature = "sign_cmac_rustcrypto")]
+mod cmac_batcher;
+mod crypto_executor;
 #[allow(
     dead_code,
     reason = "deterministic fixture controls are wider than the production interface"
@@ -20,6 +23,7 @@ mod object_state;
 )]
 mod operation;
 pub(crate) mod port;
+mod preparation_order;
 mod recovery;
 #[allow(
     dead_code,

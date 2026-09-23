@@ -28,7 +28,16 @@ pub struct AdditionalInfo {
     __: B9,
     pub backup_security_information: bool,
     #[skip]
-    __: B15,
+    __: B11,
+
+    /// Clear `SE_SACL_PROTECTED` while setting a security descriptor.
+    pub unprotected_sacl_security_information: bool,
+    /// Clear `SE_DACL_PROTECTED` while setting a security descriptor.
+    pub unprotected_dacl_security_information: bool,
+    /// Set `SE_SACL_PROTECTED` while setting a security descriptor.
+    pub protected_sacl_security_information: bool,
+    /// Set `SE_DACL_PROTECTED` while setting a security descriptor.
+    pub protected_dacl_security_information: bool,
 }
 
 /// Internal helper macro to easily generate fields & methods for [QueryInfoData](super::query::QueryInfoData).
@@ -158,3 +167,26 @@ macro_rules! query_info_data {
 
 pub(crate) use query_info_data;
 use smb_msg_derive::smb_message_binrw;
+
+#[cfg(test)]
+mod tests {
+    use super::AdditionalInfo;
+
+    #[test]
+    fn dacl_protection_security_information_uses_the_high_protocol_bits() {
+        assert_eq!(
+            AdditionalInfo::new()
+                .with_dacl_security_information(true)
+                .with_protected_dacl_security_information(true)
+                .into_bytes(),
+            0x8000_0004_u32.to_le_bytes()
+        );
+        assert_eq!(
+            AdditionalInfo::new()
+                .with_dacl_security_information(true)
+                .with_unprotected_dacl_security_information(true)
+                .into_bytes(),
+            0x2000_0004_u32.to_le_bytes()
+        );
+    }
+}

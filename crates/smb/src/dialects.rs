@@ -9,8 +9,8 @@ use crate::{
     crypto,
 };
 use smb_msg::{
-    Dialect, GlobalCapabilities, NegotiateResponse, ShareCacheMode, ShareFlags, SigningAlgorithmId,
-    TreeCapabilities,
+    Dialect, GlobalCapabilities, NegotiateContextType, NegotiateResponse, ShareCacheMode,
+    ShareFlags, SigningAlgorithmId, TreeCapabilities,
 };
 
 /// This is a utility struct that returns constants and functions for the given dialect.
@@ -186,16 +186,41 @@ impl DialectMethods for Smb311 {
         state: &mut NegotiatedProperties,
         config: &ConnectionConfig,
     ) -> crate::Result<()> {
-        if response.negotiate_context_list.is_none() {
-            return Err(Error::InvalidMessage(
-                "Expected negotiate context list".to_string(),
+        let contexts = response
+            .negotiate_context_list
+            .as_ref()
+            .ok_or_else(|| Error::InvalidMessage("Expected negotiate context list".to_string()))?;
+
+        let preauth_context_count = contexts
+            .iter()
+            .filter(|context| {
+                context.context_type == NegotiateContextType::PreauthIntegrityCapabilities
+            })
+            .count();
+        if preauth_context_count != 1 {
+            return Err(Error::NegotiationError(
+                "SMB 3.1.1 requires exactly one preauthentication integrity context".into(),
+            ));
+        }
+
+        let signing_context_count = contexts
+            .iter()
+            .filter(|context| context.context_type == NegotiateContextType::SigningCapabilities)
+            .count();
+        if signing_context_count > 1 {
+            return Err(Error::NegotiationError(
+                "SMB 3.1.1 response contains multiple signing capability contexts".into(),
             ));
         }
 
         let ctx_signing = response.get_ctx_signing_capabilities();
-        let signing_algo = if let Some(signing_algo) =
-            ctx_signing.and_then(|ctx| ctx.signing_algorithms.first())
-        {
+        let signing_algo = if let Some(ctx) = ctx_signing {
+            if ctx.signing_algorithms.len() != 1 {
+                return Err(Error::NegotiationError(
+                    "The server must select exactly one signing algorithm".into(),
+                ));
+            }
+            let signing_algo = &ctx.signing_algorithms[0];
             if !crypto::SIGNING_ALGOS.contains(signing_algo) {
                 return Err(Error::NegotiationError(
                     "Unsupported signing algorithm selected!".into(),
@@ -206,14 +231,18 @@ impl DialectMethods for Smb311 {
             None
         };
 
-        // Make sure preauth integrity capability is SHA-512, if it exists in response:
-        let ctx_integrity = response.get_ctx_preauth_integrity_capabilities();
-        if let Some(algo) = ctx_integrity.and_then(|ctx| ctx.hash_algorithms.first()) {
-            if !preauth_hash::SUPPORTED_ALGOS.contains(algo) {
-                return Err(Error::NegotiationError(
-                    "Unsupported preauth integrity algorithm received".into(),
-                ));
-            }
+        let ctx_integrity = response
+            .get_ctx_preauth_integrity_capabilities()
+            .expect("preauthentication context count was validated above");
+        if ctx_integrity.hash_algorithms.len() != 1 {
+            return Err(Error::NegotiationError(
+                "The server must select exactly one preauthentication integrity algorithm".into(),
+            ));
+        }
+        if !preauth_hash::SUPPORTED_ALGOS.contains(&ctx_integrity.hash_algorithms[0]) {
+            return Err(Error::NegotiationError(
+                "Unsupported preauth integrity algorithm received".into(),
+            ));
         }
 
         // And verify that the encryption algorithm is supported.
@@ -289,5 +318,123 @@ impl DialectMethods for Smb201 {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use smb_dtyp::{Guid, binrw_util::file_time::FileTime};
+    use smb_msg::{
+        EncryptionCapabilities, EncryptionCipher, GlobalCapabilities, HashAlgorithm,
+        NegotiateContext, NegotiateDialect, NegotiateResponse, NegotiateSecurityMode,
+        PreauthIntegrityCapabilities, SigningAlgorithmId, SigningCapabilities,
+    };
+
+    use super::*;
+
+    fn preauth(algorithms: Vec<HashAlgorithm>) -> NegotiateContext {
+        PreauthIntegrityCapabilities {
+            hash_algorithms: algorithms,
+            salt: vec![],
+        }
+        .into()
+    }
+
+    fn signing(algorithms: Vec<SigningAlgorithmId>) -> NegotiateContext {
+        SigningCapabilities {
+            signing_algorithms: algorithms,
+        }
+        .into()
+    }
+
+    fn response(contexts: Vec<NegotiateContext>) -> NegotiateResponse {
+        NegotiateResponse {
+            security_mode: NegotiateSecurityMode::new().with_signing_enabled(true),
+            dialect_revision: NegotiateDialect::Smb0311,
+            server_guid: Guid::from([0; 16]),
+            capabilities: GlobalCapabilities::new(),
+            max_transact_size: 1024,
+            max_read_size: 1024,
+            max_write_size: 1024,
+            system_time: FileTime::default(),
+            server_start_time: FileTime::default(),
+            buffer: vec![],
+            negotiate_context_list: Some(contexts),
+        }
+    }
+
+    fn state() -> NegotiatedProperties {
+        NegotiatedProperties {
+            server_guid: Guid::from([0; 16]),
+            caps: GlobalCapabilities::new(),
+            max_transact_size: 1024,
+            max_read_size: 1024,
+            max_write_size: 1024,
+            auth_buffer: vec![],
+            signing_algo: None,
+            encryption_cipher: None,
+            compression: None,
+            dialect_rev: Dialect::Smb0311,
+        }
+    }
+
+    #[test]
+    fn smb311_rejects_missing_preauth_context() {
+        let response = response(vec![signing(vec![SigningAlgorithmId::AesCmac])]);
+
+        assert!(
+            Smb311
+                .process_negotiate_request(&response, &mut state(), &ConnectionConfig::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn smb311_rejects_multiple_preauth_contexts() {
+        let response = response(vec![
+            preauth(vec![HashAlgorithm::Sha512]),
+            preauth(vec![HashAlgorithm::Sha512]),
+        ]);
+
+        assert!(
+            Smb311
+                .process_negotiate_request(&response, &mut state(), &ConnectionConfig::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn smb311_rejects_preauth_algorithm_count_other_than_one() {
+        let response = response(vec![preauth(vec![
+            HashAlgorithm::Sha512,
+            HashAlgorithm::Sha512,
+        ])]);
+
+        assert!(
+            Smb311
+                .process_negotiate_request(&response, &mut state(), &ConnectionConfig::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn smb311_rejects_signing_algorithm_count_other_than_one() {
+        let response = response(vec![
+            preauth(vec![HashAlgorithm::Sha512]),
+            signing(vec![
+                SigningAlgorithmId::AesCmac,
+                SigningAlgorithmId::HmacSha256,
+            ]),
+            EncryptionCapabilities {
+                ciphers: vec![EncryptionCipher::Aes128Ccm],
+            }
+            .into(),
+        ]);
+
+        assert!(
+            Smb311
+                .process_negotiate_request(&response, &mut state(), &ConnectionConfig::default())
+                .is_err()
+        );
     }
 }

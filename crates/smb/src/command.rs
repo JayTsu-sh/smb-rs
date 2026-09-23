@@ -18,6 +18,10 @@ pub struct CommandRequest {
     /// Channel submission derives it from Session state; connection-level
     /// negotiation and setup requests stamp `Protection::None` directly.
     pub(crate) security: Option<Protection>,
+
+    /// The connection owner observed another ready operation in this
+    /// admission turn, so the portable CMAC path may coalesce this request.
+    pub(crate) cmac_batch_eligible: bool,
 }
 
 /// Explicit security treatment for an [`CommandRequest`].
@@ -60,6 +64,7 @@ impl CommandRequest {
             additional_data: None,
             channel_id: None,
             security: None,
+            cmac_batch_eligible: false,
         }
     }
 

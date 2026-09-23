@@ -19,7 +19,7 @@ use conformance::transcripts::{
     negotiate_response_signing_optional, session_setup_response_final_anonymous,
     session_setup_response_intermediate,
 };
-use conformance::{MockGss, ScriptedGssStep, ScriptedTransport};
+use conformance::{MockGss, ScriptedGssStep, ScriptedTransport, assert_negotiate_signing_policy};
 use smb::test_support::{Connection, ConnectionConfig};
 use smb_dtyp::Guid;
 
@@ -83,4 +83,22 @@ async fn anonymous_session_accepts_unsigned_final_response() {
     // Don't hold the session into Drop: same ScriptedTransport deadlock
     // concern as the windows-dc test.
     std::mem::forget(session);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_connection_advertises_signing_without_requiring_it() {
+    let (transport, control) = ScriptedTransport::new();
+    control.push_server_frame(negotiate_response_signing_optional());
+    let config = ConnectionConfig {
+        smb2_only_negotiate: true,
+        timeout: Some(std::time::Duration::from_secs(5)),
+        ..Default::default()
+    };
+    let conn =
+        Connection::from_transport(transport, "samba-optional.test", Guid::generate(), config)
+            .await
+            .expect("Negotiate must succeed");
+    let frames = control.captured_client_frames();
+    assert_negotiate_signing_policy(&frames[0], false);
+    drop(conn);
 }

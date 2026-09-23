@@ -1,45 +1,25 @@
 //! Conformance test: Windows DC + SMB 3.1.1 + `signing_required=true`.
 //!
-//! Locks the fix shipped in **S3b-minimal**: the final SessionSetup
-//! Request on a non-anonymous SMB 3.x session **MUST** be signed
-//! (MS-SMB2 §3.3.5.5.3). Regressing on this property would re-introduce
-//! the 10-second silent-drop bug against Windows AD domain controllers
-//! and any other server with `signing_required = true`.
-//!
-//! ## What the assertion covers
-//!
-//! Only the *client*'s wire bytes for the final SessionSetup Request:
-//! `header.flags.signed = true` and a non-zero `signature`. Everything
-//! the server does (verify the signature, send a signed response, etc.)
-//! is **out of scope** — this is a unit-style regression test on the
-//! driver, not an end-to-end protocol test.
-//!
-//! ## Why `authenticate_with_gss` is allowed to return Err
-//!
-//! The mock server's final SessionSetup Response is deliberately
-//! emitted unsigned, because [`MockGss`] does not derive a real MAC
-//! key. The production driver therefore correctly rejects it with
-//! `"Expected a signed message!"` after the client has already put
-//! all three request frames on the wire. We swallow that Err on
-//! purpose; if it ever changes to `Ok`, that's a separate signal
-//! worth investigating (probably means the server-verify path got
-//! disabled by accident), but it does not invalidate the client-side
-//! property under test.
+//! A new session sends an unsigned final SessionSetup continuation. The mock
+//! final response is deliberately unsigned and must be rejected.
 
 #[path = "conformance/mod.rs"]
 mod conformance;
 
 use bytes::Bytes;
 use conformance::transcripts::{
-    negotiate_response_windows_dc, session_setup_response_final,
-    session_setup_response_intermediate,
+    negotiate_response_signing_optional, negotiate_response_windows_dc,
+    session_setup_response_final, session_setup_response_intermediate,
 };
-use conformance::{MockGss, ScriptedGssStep, ScriptedTransport, assert_signed_final_session_setup};
+use conformance::{
+    MockGss, ScriptedGssStep, ScriptedTransport, assert_negotiate_signing_policy,
+    assert_session_setup_signing_policy, assert_unsigned_final_session_setup,
+};
 use smb::test_support::{Connection, ConnectionConfig};
 use smb_dtyp::Guid;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn windows_dc_signing_required_signs_final_session_setup() {
+async fn windows_dc_new_session_final_continuation_is_unsigned() {
     const SESSION_ID: u64 = 0x0029_4cb6_8000_0009;
 
     // -- 1. Set up the mock and queue the scripted server frames. --
@@ -78,25 +58,10 @@ async fn windows_dc_signing_required_signs_final_session_setup() {
         ],
     );
     let auth_result = conn.authenticate_with_gss(gss).await;
-
-    // The mock server's final SessionSetup Response is intentionally
-    // emitted unsigned (MockGss doesn't derive a real MAC key), so the
-    // production driver correctly rejects it with
-    // `SetupError::UnsignedFinalResponse`. That assertion doubles as a
-    // regression test on S6 — the user-facing error must be the
-    // protocol-specific variant, not a bare `InvalidMessage("Expected
-    // a signed message!")` string.
-    match &auth_result {
-        Err(smb::Error::Setup(smb::error::SetupError::UnsignedFinalResponse)) => {
-            // expected — proceed to the client-side assertions below
-        }
-        Err(other) => panic!(
-            "expected `SetupError::UnsignedFinalResponse` from the mock-server path, got: {other:?}"
-        ),
-        Ok(_) => panic!(
-            "authenticate_with_gss unexpectedly succeeded — the mock server's response \
-             is unsigned, so the driver must reject it"
-        ),
+    match auth_result {
+        Err(smb::Error::Setup(smb::error::SetupError::UnsignedFinalResponse)) => {}
+        Err(error) => panic!("an unsigned final response returned the wrong error: {error}"),
+        Ok(_) => panic!("an unsigned final response must be rejected"),
     }
 
     // -- 4. Inspect what the client put on the wire. --
@@ -128,7 +93,101 @@ async fn windows_dc_signing_required_signs_final_session_setup() {
     // Frame indexing:
     //   #0 = Negotiate Request                          (never signed)
     //   #1 = SessionSetup Request #1 (NTLM Type1)       (unsigned)
-    //   #2 = SessionSetup Request #2 (NTLM Type3)       (MUST be signed)
+    //   #2 = SessionSetup Request #2 (NTLM Type3)       (unsigned, SessionId set)
     let req2: &Bytes = &frames[2];
-    assert_signed_final_session_setup(req2, 2);
+    assert_session_setup_signing_policy(&frames[1], true, false);
+    assert_session_setup_signing_policy(req2, true, false);
+    assert_unsigned_final_session_setup(req2, 2, SESSION_ID);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsigned_non_guest_final_response_is_rejected_when_guest_access_is_allowed() {
+    const SESSION_ID: u64 = 0x0029_4cb6_8000_0010;
+
+    let (transport, control) = ScriptedTransport::new();
+    control.push_server_frame(negotiate_response_windows_dc());
+    control.push_server_frame(session_setup_response_intermediate(SESSION_ID));
+    control.push_server_frame(session_setup_response_final(SESSION_ID));
+
+    let config = ConnectionConfig {
+        smb2_only_negotiate: true,
+        timeout: Some(std::time::Duration::from_secs(5)),
+        allow_unsigned_guest_access: true,
+        ..Default::default()
+    };
+    let conn = Connection::from_transport(transport, "windows-dc.test", Guid::generate(), config)
+        .await
+        .expect("Negotiate must succeed against scripted server");
+    let gss = MockGss::new(
+        "alice",
+        Some("EXAMPLE"),
+        [0x11; 16],
+        vec![
+            ScriptedGssStep {
+                client_token: b"<scripted-ntlm-type1>".to_vec(),
+                completes_auth: false,
+            },
+            ScriptedGssStep {
+                client_token: b"<scripted-ntlm-type3>".to_vec(),
+                completes_auth: true,
+            },
+        ],
+    );
+
+    let auth_result = conn.authenticate_with_gss(gss).await;
+    match auth_result {
+        Err(smb::Error::Setup(smb::error::SetupError::UnsignedFinalResponse)) => {}
+        Err(error) => panic!("an unsigned final response returned the wrong error: {error}"),
+        Ok(_) => panic!(
+            "allow_unsigned_guest_access must not admit an unsigned non-guest final response"
+        ),
+    }
+    drop(conn);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_required_signing_is_advertised_to_optional_server() {
+    const SESSION_ID: u64 = 0x0029_4cb6_8000_0011;
+
+    let (transport, control) = ScriptedTransport::new();
+    control.push_server_frame(negotiate_response_signing_optional());
+    control.push_server_frame(session_setup_response_intermediate(SESSION_ID));
+    control.push_server_frame(session_setup_response_final(SESSION_ID));
+    let config = ConnectionConfig {
+        smb2_only_negotiate: true,
+        timeout: Some(std::time::Duration::from_secs(5)),
+        signing_required: true,
+        ..Default::default()
+    };
+    let conn =
+        Connection::from_transport(transport, "optional-signing.test", Guid::generate(), config)
+            .await
+            .expect("Negotiate must succeed");
+    let gss = MockGss::new(
+        "alice",
+        Some("EXAMPLE"),
+        [0x44; 16],
+        vec![
+            ScriptedGssStep {
+                client_token: b"<type1>".to_vec(),
+                completes_auth: false,
+            },
+            ScriptedGssStep {
+                client_token: b"<type3>".to_vec(),
+                completes_auth: true,
+            },
+        ],
+    );
+
+    assert!(matches!(
+        conn.authenticate_with_gss(gss).await,
+        Err(smb::Error::Setup(
+            smb::error::SetupError::UnsignedFinalResponse
+        ))
+    ));
+    assert_negotiate_signing_policy(&control.captured_client_frames()[0], true);
+    let frames = control.captured_client_frames();
+    assert_session_setup_signing_policy(&frames[1], true, true);
+    assert_session_setup_signing_policy(&frames[2], true, true);
+    drop(conn);
 }
