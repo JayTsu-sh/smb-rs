@@ -12,6 +12,7 @@ use smb::{
     FileOpenOptions, SID, SecurityDescriptor, SecuritySelection, Share, SharePath, ShareTarget,
 };
 use smb_msg::Status;
+use std::str::FromStr;
 const DIRECTORY_ACE_MASK: u32 = 0x0002_0080;
 const NEW_PARENT_ACE_MASK: u32 = 0x0002_0010;
 const LATER_PARENT_ACE_MASK: u32 = 0x0002_0020;
@@ -155,9 +156,15 @@ async fn exercise_acl_primitives(
     // Use only an account-domain or POSIX-mapped user/group SID already
     // accepted by this server. Real-device acceptance must not manufacture a
     // well-known trustee that the target ACL backend cannot represent.
-    let trustee = existing_account_trustee(&parent_descriptor).ok_or_else(|| {
-        smb::Error::InvalidState("server DACL contains no usable account user/group SID".into())
-    })?;
+    let trustee = existing_account_trustee(&parent_descriptor)
+        .or_else(|| {
+            std::env::var("SMB_FAS_ACL_TEST_TRUSTEE_SID")
+                .ok()
+                .and_then(|value| SID::from_str(&value).ok())
+        })
+        .ok_or_else(|| {
+            smb::Error::InvalidState("server DACL contains no usable account user/group SID".into())
+        })?;
     let new_trustee = trustee.clone();
     let deny_trustee = trustee.clone();
     let later_trustee = trustee.clone();
