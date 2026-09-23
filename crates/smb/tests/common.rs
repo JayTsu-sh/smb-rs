@@ -16,6 +16,24 @@ static MANAGEMENT_TARGET_FROM_FD: OnceLock<Zeroizing<String>> = OnceLock::new();
 static MANAGEMENT_USER_FROM_FD: OnceLock<Zeroizing<String>> = OnceLock::new();
 static MANAGEMENT_PASSWORD_FROM_FD: OnceLock<Zeroizing<String>> = OnceLock::new();
 
+#[derive(Default)]
+struct SessionRecord {
+    connection_id: Option<String>,
+    session_id: Option<String>,
+    node: Option<String>,
+    windows_user: Option<String>,
+    client_ip: Option<String>,
+}
+
+impl SessionRecord {
+    fn matches(&self, username: &str, client_ip: &str) -> bool {
+        self.windows_user.as_deref().is_some_and(|value| {
+            (value == username || value.ends_with(&format!("\\{username}")))
+                && self.client_ip.as_deref() == Some(client_ip)
+        })
+    }
+}
+
 pub struct TestEnv;
 
 impl TestEnv {
@@ -83,6 +101,8 @@ pub fn smb_test_username() -> String {
 pub fn close_exact_ontap_session(share: &str) -> Result<(), String> {
     let svm = var("SMB_ONTAP_TEST_SVM").map_err(|_| "missing SMB_ONTAP_TEST_SVM")?;
     let username = smb_test_username();
+    let client_ip =
+        var("SMB_ONTAP_TEST_CLIENT_IP").map_err(|_| "missing SMB_ONTAP_TEST_CLIENT_IP")?;
     let output = management_command(&[
         "vserver",
         "cifs",
@@ -94,12 +114,18 @@ pub fn close_exact_ontap_session(share: &str) -> Result<(), String> {
         share,
         "-instance",
     ])?;
-    let mut connection_id = None;
-    let mut session_id = None;
-    let mut node = None;
-    let mut matches_user = false;
-    for line in output.lines() {
+    let mut matches = Vec::new();
+    let mut record = SessionRecord::default();
+    for line in output.lines().chain(std::iter::once("")) {
         let line = line.trim();
+        if line.is_empty() {
+            if record.matches(&username, &client_ip) {
+                matches.push(std::mem::take(&mut record));
+            } else {
+                record = SessionRecord::default();
+            }
+            continue;
+        }
         let Some((label, value)) = line.split_once(':') else {
             continue;
         };
@@ -110,21 +136,33 @@ pub fn close_exact_ontap_session(share: &str) -> Result<(), String> {
             .to_ascii_lowercase();
         let value = value.trim();
         if label == "connectionid" {
-            connection_id = Some(value.to_owned());
+            record.connection_id = Some(value.to_owned());
         } else if label == "sessionid" {
-            session_id = Some(value.to_owned());
+            record.session_id = Some(value.to_owned());
         } else if label == "node" {
-            node = Some(value.to_owned());
+            record.node = Some(value.to_owned());
         } else if label == "windowsuser" {
-            matches_user = value == username || value.ends_with(&format!("\\{username}"));
+            record.windows_user = Some(value.to_owned());
+        } else if label == "workstationipaddress" {
+            record.client_ip = Some(value.to_owned());
         }
     }
-    if !matches_user {
-        return Err("management preflight found no exact test-share session".into());
+    if matches.len() != 1 {
+        return Err(format!(
+            "management preflight found {} exact test-share sessions",
+            matches.len()
+        ));
     }
-    let connection_id = connection_id.ok_or("management preflight omitted connection ID")?;
-    let session_id = session_id.ok_or("management preflight omitted session ID")?;
-    let node = node.ok_or("management preflight omitted node")?;
+    let record = matches
+        .pop()
+        .ok_or("management preflight lost the exact test-share session")?;
+    let connection_id = record
+        .connection_id
+        .ok_or("management preflight omitted connection ID")?;
+    let session_id = record
+        .session_id
+        .ok_or("management preflight omitted session ID")?;
+    let node = record.node.ok_or("management preflight omitted node")?;
     let close_arguments = [
         "vserver",
         "cifs",
