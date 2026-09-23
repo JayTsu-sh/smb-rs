@@ -8,11 +8,15 @@
 mod common;
 
 use smb::{
-    ACE, ACL, AccessAce, AccessMask, AceFlags, AceValue, AclRevision, Client, DirectoryOpenOptions,
-    FileOpenOptions, SID, SecurityDescriptor, SecuritySelection, Share, SharePath, ShareTarget,
+    ACE, ACL, AccessAce, AccessMask, AceFlags, AceValue, AclRevision, Client, Credentials,
+    DirectoryOpenOptions, FileOpenOptions, SID, SecurityDescriptor, SecuritySelection, Share,
+    SharePath, ShareTarget,
 };
 use smb_msg::Status;
-use std::str::FromStr;
+use std::{env, fs, str::FromStr, sync::OnceLock};
+use zeroize::Zeroizing;
+
+const FAS_LOCAL_PROFILE_PREFIX: &str = "SMB_CIFS_ACCEPTANCE_FAS_LOCAL_";
 const DIRECTORY_ACE_MASK: u32 = 0x0002_0080;
 const NEW_PARENT_ACE_MASK: u32 = 0x0002_0010;
 const LATER_PARENT_ACE_MASK: u32 = 0x0002_0020;
@@ -40,14 +44,40 @@ struct AclObservations {
     reenabled_directory_contains_parent_inherited_ace: bool,
 }
 
+#[derive(Debug)]
+struct AutoInheritRequestObservations {
+    request_retained_by_parent: bool,
+    parent_reports_auto_inherited: bool,
+    child_reports_auto_inherited: bool,
+    existing_child_had_requested_right: bool,
+    existing_child_has_requested_right_after: bool,
+}
+
+struct FasAclTestConfig {
+    server: String,
+    share: String,
+    credentials: Credentials,
+}
+
+#[derive(Clone)]
+struct FasLocalProfile {
+    server: Zeroizing<String>,
+    share: Zeroizing<String>,
+    username: Zeroizing<String>,
+    password: Zeroizing<String>,
+}
+
+static FAS_LOCAL_PROFILE: OnceLock<Result<FasLocalProfile, String>> = OnceLock::new();
+
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-#[ignore = "requires an isolated writable FAS2750 NTFS CIFS share with WRITE_DAC"]
+#[ignore = "requires an isolated writable FAS2750 NTFS CIFS share with WRITE_DAC and controlled profile descriptors"]
 async fn fas2750_directory_file_aces_and_inheritance() -> smb::Result<()> {
     let client = Client::new();
+    let config = fas_acl_test_config()?;
     let share = client
         .connect_share(
-            &ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?,
-            common::smb_test_credentials(),
+            &ShareTarget::new(config.server, config.share)?,
+            config.credentials,
         )
         .await?;
     let suffix = format!("{}-{}", std::process::id(), random_suffix());
@@ -136,6 +166,199 @@ async fn fas2750_directory_file_aces_and_inheritance() -> smb::Result<()> {
         "re-enabled child directory omitted the submitted inherited parent ACE: {observations:?}"
     );
     Ok(())
+}
+
+/// Reports whether this ONTAP target implements the optional Windows
+/// auto-inheritance propagation contract for existing descendants. This is
+/// deliberately separate from ordinary create-time ACE inheritance: an absent
+/// `SE_DACL_AUTO_INHERITED` result is a supported capability outcome, not a
+/// failure of the basic DACL API.
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[ignore = "requires an isolated writable FAS2750 NTFS CIFS share with WRITE_DAC and controlled profile descriptors"]
+async fn fas2750_auto_inherit_request_capability() -> smb::Result<()> {
+    let client = Client::new();
+    let config = fas_acl_test_config()?;
+    let share = client
+        .connect_share(
+            &ShareTarget::new(config.server, config.share)?,
+            config.credentials,
+        )
+        .await?;
+    let suffix = format!("{}-{}", std::process::id(), random_suffix());
+    let parent_path = SharePath::new(format!("smb-rs-auto-inherit-{suffix}"))?;
+    let child_file_path = SharePath::new(format!("{}\\existing.bin", parent_path.as_str()))?;
+
+    let observations = exercise_auto_inherit_request(&share, &parent_path, &child_file_path).await;
+    cleanup_auto_inherit_request(&share, &parent_path, &child_file_path).await;
+    let close_result = share.close().await;
+    let client_close_result = client.close().await;
+
+    let observations = observations?;
+    close_result?;
+    client_close_result?;
+    record_auto_inherit_request_observations(&observations);
+    assert!(
+        !observations.parent_reports_auto_inherited
+            || (observations.child_reports_auto_inherited
+                && observations.existing_child_has_requested_right_after),
+        "server reported automatic inheritance without propagating the requested ACE: {observations:?}"
+    );
+    Ok(())
+}
+
+/// Loads a FAS ACL target from the controlled `fas-local` profile when that
+/// profile is present. The generic real-server inputs remain a local/manual
+/// fallback for the existing test harness, but a partially supplied profile is
+/// rejected rather than silently falling back to another target.
+fn fas_acl_test_config() -> smb::Result<FasAclTestConfig> {
+    if fas_local_profile_present() {
+        let profile = FAS_LOCAL_PROFILE
+            .get_or_init(load_fas_local_profile)
+            .as_ref()
+            .map_err(|error| smb::Error::InvalidState(error.clone()))?;
+        return Ok(FasAclTestConfig {
+            server: profile.server.to_string(),
+            share: profile.share.to_string(),
+            credentials: Credentials::ntlm(
+                profile.username.to_string(),
+                profile.password.to_string(),
+            ),
+        });
+    }
+
+    Ok(FasAclTestConfig {
+        server: common::smb_tests_server(),
+        share: common::smb_tests_share(),
+        credentials: common::smb_test_credentials(),
+    })
+}
+
+fn load_fas_local_profile() -> Result<FasLocalProfile, String> {
+    let server = fas_local_profile_descriptor("SERVER_FD").map_err(|error| error.to_string())?;
+    let share = fas_local_profile_descriptor("SHARE_FD").map_err(|error| error.to_string())?;
+    let username =
+        fas_local_profile_descriptor("USERNAME_FD").map_err(|error| error.to_string())?;
+    let password =
+        fas_local_profile_descriptor("PASSWORD_FD").map_err(|error| error.to_string())?;
+    let expected_server =
+        fas_local_profile_descriptor("EXPECTED_SERVER_FD").map_err(|error| error.to_string())?;
+    let expected_share =
+        fas_local_profile_descriptor("EXPECTED_SHARE_FD").map_err(|error| error.to_string())?;
+    if server != expected_server || share != expected_share {
+        return Err(
+            "FAS local profile endpoint or share does not match its controlled-runner binding"
+                .into(),
+        );
+    }
+    Ok(FasLocalProfile {
+        server,
+        share,
+        username,
+        password,
+    })
+}
+
+fn fas_local_profile_present() -> bool {
+    ["SERVER_FD", "SHARE_FD", "USERNAME_FD", "PASSWORD_FD"]
+        .into_iter()
+        .any(|suffix| env::var_os(fas_local_profile_variable(suffix)).is_some())
+}
+
+fn fas_local_profile_descriptor(suffix: &str) -> smb::Result<Zeroizing<String>> {
+    let variable = fas_local_profile_variable(suffix);
+    let descriptor = env::var(&variable).map_err(|_| {
+        smb::Error::InvalidState(format!(
+            "missing controlled FAS local profile descriptor {variable}"
+        ))
+    })?;
+    let descriptor = descriptor.parse::<i32>().map_err(|_| {
+        smb::Error::InvalidState(format!(
+            "controlled FAS local profile descriptor {variable} is invalid"
+        ))
+    })?;
+    if descriptor < 3 {
+        return Err(smb::Error::InvalidState(format!(
+            "controlled FAS local profile descriptor {variable} must be at least 3"
+        )));
+    }
+    let value = fs::read_to_string(format!("/proc/self/fd/{descriptor}")).map_err(|_| {
+        smb::Error::InvalidState(format!(
+            "controlled FAS local profile descriptor {variable} is unavailable"
+        ))
+    })?;
+    let value = value.trim_end_matches(['\r', '\n']);
+    if value.is_empty() {
+        return Err(smb::Error::InvalidState(format!(
+            "controlled FAS local profile descriptor {variable} is empty"
+        )));
+    }
+    Ok(Zeroizing::new(value.to_string()))
+}
+
+fn fas_local_profile_variable(suffix: &str) -> String {
+    format!("{FAS_LOCAL_PROFILE_PREFIX}{suffix}")
+}
+
+async fn exercise_auto_inherit_request(
+    share: &Share,
+    parent_path: &SharePath,
+    child_file_path: &SharePath,
+) -> smb::Result<AutoInheritRequestObservations> {
+    let selection = SecuritySelection::default().dacl(true);
+    let parent = share
+        .open_directory(parent_path, DirectoryOpenOptions::create_new())
+        .await?;
+    parent.close().await?;
+    let child = share
+        .open_file(child_file_path, FileOpenOptions::create_new())
+        .await?;
+    child.close().await?;
+
+    let mut parent_descriptor = share.query_security(parent_path, selection).await?;
+    let trustee = existing_account_trustee(&parent_descriptor)
+        .or_else(|| {
+            std::env::var("SMB_FAS_ACL_TEST_TRUSTEE_SID")
+                .ok()
+                .and_then(|value| SID::from_str(&value).ok())
+        })
+        .ok_or_else(|| {
+            smb::Error::InvalidState("server DACL contains no usable account user/group SID".into())
+        })?;
+    let child_before = share.query_security(child_file_path, selection).await?;
+    let child_had_requested_right =
+        contains_ace(&child_before, &trustee, NEW_PARENT_ACE_MASK, true)
+            || contains_ace(&child_before, &trustee, NEW_PARENT_ACE_MASK, false);
+
+    insert_allow_ace(
+        &mut parent_descriptor,
+        trustee.clone(),
+        NEW_PARENT_ACE_MASK,
+        AceFlags::new()
+            .with_object_inherit(true)
+            .with_container_inherit(true),
+    );
+    parent_descriptor.control = parent_descriptor.control.with_dacl_auto_inherit_req(true);
+    share
+        .set_security(parent_path, parent_descriptor, selection)
+        .await?;
+    let parent_after = share.query_security(parent_path, selection).await?;
+    let child_after = share.query_security(child_file_path, selection).await?;
+    record_descriptor("auto-inherit-request-parent", "parent", &parent_after);
+    record_descriptor(
+        "auto-inherit-request-existing-child",
+        "child-file",
+        &child_after,
+    );
+
+    let child_has_requested_right = contains_ace(&child_after, &trustee, NEW_PARENT_ACE_MASK, true)
+        || contains_ace(&child_after, &trustee, NEW_PARENT_ACE_MASK, false);
+    Ok(AutoInheritRequestObservations {
+        request_retained_by_parent: parent_after.control.dacl_auto_inherit_req(),
+        parent_reports_auto_inherited: parent_after.control.dacl_auto_inherited(),
+        child_reports_auto_inherited: child_after.control.dacl_auto_inherited(),
+        existing_child_had_requested_right: child_had_requested_right,
+        existing_child_has_requested_right_after: child_has_requested_right,
+    })
 }
 
 async fn exercise_acl_primitives(
@@ -563,7 +786,7 @@ fn contains_ace(descriptor: &SecurityDescriptor, sid: &SID, mask: u32, inherited
             ace.ace_flags.inherited() == inherited
                 && ace.value.as_access_allowed().is_some_and(|access| {
                     access.sid == *sid
-                        && u32::from_le_bytes(access.access_mask.into_bytes()) == mask
+                        && u32::from_le_bytes(access.access_mask.into_bytes()) & mask == mask
                 })
         })
     })
@@ -637,6 +860,7 @@ fn record_descriptor(stage: &str, path_role: &str, descriptor: &SecurityDescript
             ),
             "dacl_present": descriptor.control.dacl_present(),
             "dacl_defaulted": descriptor.control.dacl_defaulted(),
+            "dacl_auto_inherit_req": descriptor.control.dacl_auto_inherit_req(),
             "dacl_auto_inherited": descriptor.control.dacl_auto_inherited(),
             "dacl_protected": descriptor.control.dacl_protected(),
             "self_relative": descriptor.control.self_relative(),
@@ -650,6 +874,74 @@ fn record_descriptor(stage: &str, path_role: &str, descriptor: &SecurityDescript
         "ACL_RECORD {}",
         serde_json::to_string(&record).expect("ACL record is JSON serializable")
     );
+}
+
+fn record_auto_inherit_request_observations(observations: &AutoInheritRequestObservations) {
+    let record = serde_json::json!({
+        "record_type": "acl_auto_inherit_request_capability",
+        "request_retained_by_parent": observations.request_retained_by_parent,
+        "parent_reports_auto_inherited": observations.parent_reports_auto_inherited,
+        "child_reports_auto_inherited": observations.child_reports_auto_inherited,
+        "existing_child_had_requested_right": observations.existing_child_had_requested_right,
+        "existing_child_has_requested_right_after": observations.existing_child_has_requested_right_after,
+    });
+    println!(
+        "ACL_RECORD {}",
+        serde_json::to_string(&record).expect("ACL record is JSON serializable")
+    );
+}
+
+async fn cleanup_auto_inherit_request(
+    share: &Share,
+    parent_path: &SharePath,
+    child_file_path: &SharePath,
+) {
+    match share
+        .open_file(child_file_path, FileOpenOptions::open_existing())
+        .await
+    {
+        Ok(file) => {
+            let delete = file.delete().await;
+            let close = file.close().await;
+            record_cleanup(
+                "auto-inherit-child-file",
+                "file",
+                "passed",
+                cleanup_status(&delete),
+                cleanup_status(&close),
+            );
+        }
+        Err(error) => record_cleanup(
+            "auto-inherit-child-file",
+            "file",
+            &format!("failed: {error}"),
+            cleanup_not_run(),
+            cleanup_not_run(),
+        ),
+    }
+    match share
+        .open_directory(parent_path, DirectoryOpenOptions::open_existing())
+        .await
+    {
+        Ok(directory) => {
+            let delete = directory.delete().await;
+            let close = directory.close().await;
+            record_cleanup(
+                "auto-inherit-parent",
+                "directory",
+                "passed",
+                cleanup_status(&delete),
+                cleanup_status(&close),
+            );
+        }
+        Err(error) => record_cleanup(
+            "auto-inherit-parent",
+            "directory",
+            &format!("failed: {error}"),
+            cleanup_not_run(),
+            cleanup_not_run(),
+        ),
+    }
 }
 
 fn record_observations(observations: &AclObservations) {
@@ -725,6 +1017,34 @@ fn record_residual_check(status: &str, error: Option<&smb::Error>) {
         "ACL_RECORD {}",
         serde_json::to_string(&record).expect("ACL residual record is JSON serializable")
     );
+}
+
+#[test]
+fn contains_ace_accepts_a_server_coalesced_allow_mask() {
+    let sid = SID::from_str("S-1-5-21-1-2-3-4").expect("valid test SID");
+    let descriptor = SecurityDescriptor {
+        sbz1: 0,
+        control: smb::SecurityDescriptorControl::new()
+            .with_self_relative(true)
+            .with_dacl_present(true),
+        owner_sid: None,
+        group_sid: None,
+        sacl: None,
+        dacl: Some(ACL {
+            acl_revision: AclRevision::Nt4,
+            ace: vec![ACE {
+                ace_flags: AceFlags::new().with_inherited(true),
+                value: AceValue::AccessAllowed(AccessAce {
+                    access_mask: AccessMask::from_bytes(
+                        (DIRECTORY_ACE_MASK | NEW_PARENT_ACE_MASK).to_le_bytes(),
+                    ),
+                    sid: sid.clone(),
+                }),
+            }],
+        }),
+    };
+
+    assert!(contains_ace(&descriptor, &sid, NEW_PARENT_ACE_MASK, true));
 }
 
 async fn cleanup(

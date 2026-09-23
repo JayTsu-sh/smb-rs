@@ -49,6 +49,16 @@ perform a create-new/write/flush/read round trip, and exact-object delete then
 close. A target that cannot be reached is recorded as
 `Blocked/target-unavailable`; it is never a passing result.
 
+### FAS ACL specialist checks
+
+The ignored FAS ACL tests in `crates/smb/tests/fas2750_acl.rs` preferentially
+use the same `SMB_CIFS_ACCEPTANCE_FAS_LOCAL_*_FD` descriptor contract. They
+also require `EXPECTED_SERVER_FD` and `EXPECTED_SHARE_FD` to match the supplied
+target before any SMB connection is opened. A partially supplied profile is an
+error; it never falls back to another share. The legacy
+`SMB_RUST_TESTS_*_FD` inputs remain only for a deliberately configured local
+or manual harness.
+
 After account-lockout policy authorization, the full acceptance tests also
 perform one wrong-password SessionSetup probe. They require the two additional
 profile variables `REJECT_PASSWORD_FD` and `ACCOUNT_LOCKOUT_ATTESTED=yes`:
