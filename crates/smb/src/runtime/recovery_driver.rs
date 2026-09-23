@@ -520,7 +520,7 @@ mod tests {
             maximum_frame_size: 1024,
             emit_events: false,
             decode_unsolicited: false,
-            crypto_parallelism: 2,
+            preparation_parallelism: 2,
         }
     }
 

@@ -91,9 +91,9 @@ that constructor for every generation (`crates/smb/src/runtime/engine.rs:793-805
 Therefore the review wording “global semaphore” is inaccurate for the current
 production path. It should be corrected while fixing P2: production should use
 the global executor, while a private/test injection seam supplies a local
-one-permit executor for deterministic tests. `RuntimeConfig::crypto_parallelism`
-can remain an inbound/preparation-capacity setting only if its meaning is
-renamed/documented; it must not silently describe a global CPU cap.
+one-permit executor for deterministic tests. The implementation should rename
+`RuntimeConfig::crypto_parallelism` to `preparation_parallelism`: it is an
+inbound/preparation-capacity setting, not a global CPU cap.
 
 ## Recommended data flow
 

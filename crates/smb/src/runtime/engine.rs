@@ -50,7 +50,9 @@ pub(crate) struct RuntimeConfig {
     pub(crate) maximum_frame_size: usize,
     pub(crate) emit_events: bool,
     pub(crate) decode_unsolicited: bool,
-    pub(crate) crypto_parallelism: usize,
+    /// Per-owner concurrency limit for inbound frame preparation. Payload
+    /// crypto itself is constrained separately by the process-global executor.
+    pub(crate) preparation_parallelism: usize,
 }
 
 impl RuntimeConfig {
@@ -79,7 +81,7 @@ impl RuntimeConfig {
             maximum_frame_size: smb_transport::DEFAULT_MAX_FRAME_SIZE,
             emit_events: false,
             decode_unsolicited: true,
-            crypto_parallelism: BoundedCryptoExecutor::recommended_parallelism(),
+            preparation_parallelism: BoundedCryptoExecutor::recommended_parallelism(),
         }
     }
 }
@@ -560,6 +562,7 @@ struct RequestAuthority {
     early_responses: HashMap<RequestKey, crate::command::CommandResponse>,
     frame_members: HashMap<RequestKey, Arc<[RequestKey]>>,
     frame_cancellations: HashMap<RequestKey, CancellationToken>,
+    preparation_cancellations: HashMap<RequestKey, CancellationToken>,
     deferred_cancellations: HashMap<RequestKey, MonotonicTime>,
     notifications: Option<mpsc::Sender<crate::command::CommandResponse>>,
     large_mtu: bool,
@@ -800,9 +803,7 @@ async fn owner_task(
     mut control_rx: mpsc::Receiver<ControlCommand>,
     event_tx: mpsc::Sender<RuntimeEvent>,
 ) -> GenerationExit {
-    let wire = Arc::new(WirePipeline::with_crypto_parallelism(
-        config.crypto_parallelism,
-    ));
+    let wire = Arc::new(WirePipeline::default());
     let Ok((read, write)) = transport.split() else {
         fail_waiting_admissions(&mut admission_rx, RuntimeError::Transport("split")).await;
         fail_waiting_operations(&mut operation_rx, RuntimeError::Transport("split")).await;
@@ -842,6 +843,7 @@ async fn owner_task(
         early_responses: HashMap::new(),
         frame_members: HashMap::new(),
         frame_cancellations: HashMap::new(),
+        preparation_cancellations: HashMap::new(),
         deferred_cancellations: HashMap::new(),
         notifications: None,
         large_mtu: false,
@@ -863,7 +865,7 @@ async fn owner_task(
         // Drain only transport reads that are already ready. This gives the
         // transform stage up to one portable CMAC lane set without waiting
         // for another frame or adding a coalescing timer.
-        for _ in 0..config.crypto_parallelism.max(1) {
+        for _ in 0..config.preparation_parallelism.max(1) {
             // A scripted or very fast server can make a response readable in
             // the same turn that its typed operation reaches the owner. When
             // unsolicited decoding is disabled, admit that operation first
@@ -908,7 +910,7 @@ async fn owner_task(
                 }
             }
         }
-        while inbound_preparations.len() < config.crypto_parallelism.max(1) {
+        while inbound_preparations.len() < config.preparation_parallelism.max(1) {
             let Some(frame) = received_frames.pop_front() else {
                 break;
             };
@@ -1257,7 +1259,11 @@ async fn owner_task(
             },
             _ = &mut deadline_sleep => {
                 let effects = authority.state.reduce(OwnerEvent::AdvanceTime { now: clock.now() });
-                apply_operation_effects(&effects, &mut authority.operation_pending);
+                apply_operation_effects(
+                    &effects,
+                    &mut authority.operation_pending,
+                    &mut authority.preparation_cancellations,
+                );
                 apply_owner_effects(effects, &mut authority.terminals);
                 if authority.state.is_unhealthy() {
                     fatal = Some(RuntimeError::Transport("generation-unhealthy"));
@@ -1272,6 +1278,9 @@ async fn owner_task(
     admission_rx.close();
     operation_rx.close();
     compound_rx.close();
+    for (_, cancellation) in authority.preparation_cancellations.drain() {
+        cancellation.cancel();
+    }
     fail_waiting_admissions(
         &mut admission_rx,
         fatal.clone().unwrap_or(RuntimeError::Closed),
@@ -1308,7 +1317,11 @@ async fn owner_task(
     // effects so no token from this generation can survive transport loss.
     authority.objects.lose_generation();
     let effects = authority.state.reduce(OwnerEvent::Disconnect);
-    apply_operation_effects(&effects, &mut authority.operation_pending);
+    apply_operation_effects(
+        &effects,
+        &mut authority.operation_pending,
+        &mut authority.preparation_cancellations,
+    );
     apply_owner_effects(effects, &mut authority.terminals);
     for (_, terminal) in authority.terminals.drain() {
         let _ = terminal.send(Err(fatal.clone().unwrap_or(RuntimeError::Closed)));
@@ -1506,10 +1519,16 @@ async fn process_operation_admission(
         },
     );
     preparation_order.reserve(key);
+    let cancellation = CancellationToken::new();
+    authority
+        .preparation_cancellations
+        .insert(key, cancellation.clone());
     let wire = wire.clone();
     preparations.push(
         async move {
-            let result = wire.transform_outgoing(outgoing).await;
+            let result = wire
+                .transform_outgoing_cancellable(outgoing, cancellation)
+                .await;
             PreparedOperation {
                 key,
                 result,
@@ -1529,6 +1548,7 @@ fn finish_prepared_operation(
     fatal: &mut Option<RuntimeError>,
 ) {
     let key = prepared.key;
+    authority.preparation_cancellations.remove(&key);
     let Some(caller) = authority.state.request(key).map(|request| request.caller()) else {
         // A preparation-stage request can disappear only when its caller
         // deadline rolls back the still-uncommitted reservation. The caller
@@ -1939,7 +1959,11 @@ async fn handle_control(
                 || !authority.frame_cancellations.contains_key(&key)
             {
                 let effects = authority.state.reduce(OwnerEvent::Cancel { key, now });
-                apply_operation_effects(&effects, &mut authority.operation_pending);
+                apply_operation_effects(
+                    &effects,
+                    &mut authority.operation_pending,
+                    &mut authority.preparation_cancellations,
+                );
                 apply_owner_effects(effects, &mut authority.terminals);
             } else {
                 authority.deferred_cancellations.entry(key).or_insert(now);
@@ -2098,7 +2122,11 @@ async fn process_io(
                 let effects = authority
                     .state
                     .reduce(OwnerEvent::Cancel { key: member, now });
-                apply_operation_effects(&effects, &mut authority.operation_pending);
+                apply_operation_effects(
+                    &effects,
+                    &mut authority.operation_pending,
+                    &mut authority.preparation_cancellations,
+                );
                 apply_owner_effects(effects, &mut authority.terminals);
             }
             authority.frame_cancellations.remove(&key);
@@ -2118,7 +2146,11 @@ async fn process_io(
             }
             if let Some(now) = authority.deferred_cancellations.remove(&key) {
                 let effects = authority.state.reduce(OwnerEvent::Cancel { key, now });
-                apply_operation_effects(&effects, &mut authority.operation_pending);
+                apply_operation_effects(
+                    &effects,
+                    &mut authority.operation_pending,
+                    &mut authority.preparation_cancellations,
+                );
                 apply_owner_effects(effects, &mut authority.terminals);
             }
             Some(RuntimeEvent::WriteProgress { key, bytes })
@@ -2136,7 +2168,11 @@ async fn process_io(
             }
             if let Some(now) = authority.deferred_cancellations.remove(&key) {
                 let effects = authority.state.reduce(OwnerEvent::Cancel { key, now });
-                apply_operation_effects(&effects, &mut authority.operation_pending);
+                apply_operation_effects(
+                    &effects,
+                    &mut authority.operation_pending,
+                    &mut authority.preparation_cancellations,
+                );
                 apply_owner_effects(effects, &mut authority.terminals);
             }
             authority.frame_cancellations.remove(&key);
@@ -2286,7 +2322,9 @@ fn response_status_is_admissible(
 fn apply_operation_effects(
     effects: &[OwnerEffect],
     pending: &mut HashMap<RequestKey, OperationPending>,
+    preparations: &mut HashMap<RequestKey, CancellationToken>,
 ) {
+    cancel_rolled_back_preparations(effects, preparations);
     for key in effects.iter().filter_map(|effect| match effect {
         OwnerEffect::BestEffortWireCancel(key) => Some(*key),
         _ => None,
@@ -2315,6 +2353,20 @@ fn apply_operation_effects(
             } else {
                 complete_operation(pending, *key, Err(RuntimeError::Terminal(*outcome)));
             }
+        }
+    }
+}
+
+fn cancel_rolled_back_preparations(
+    effects: &[OwnerEffect],
+    preparations: &mut HashMap<RequestKey, CancellationToken>,
+) {
+    for key in effects.iter().filter_map(|effect| match effect {
+        OwnerEffect::ReservationRolledBack(key) => Some(*key),
+        _ => None,
+    }) {
+        if let Some(cancellation) = preparations.remove(&key) {
+            cancellation.cancel();
         }
     }
 }
@@ -2877,7 +2929,7 @@ mod tests {
             maximum_frame_size: 1024 * 1024,
             emit_events: true,
             decode_unsolicited: false,
-            crypto_parallelism: 2,
+            preparation_parallelism: 2,
         }
     }
 
@@ -2887,6 +2939,21 @@ mod tests {
             2,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn reservation_rollback_cancels_and_forgets_its_preparation() {
+        let key = RequestKey::new(GenerationId::new(1), 10);
+        let cancellation = CancellationToken::new();
+        let mut preparations = HashMap::from([(key, cancellation.clone())]);
+
+        cancel_rolled_back_preparations(
+            &[OwnerEffect::ReservationRolledBack(key)],
+            &mut preparations,
+        );
+
+        assert!(cancellation.is_cancelled());
+        assert!(preparations.is_empty());
     }
 
     #[tokio::test]
@@ -2907,6 +2974,7 @@ mod tests {
             early_responses: HashMap::new(),
             frame_members: HashMap::new(),
             frame_cancellations: HashMap::new(),
+            preparation_cancellations: HashMap::new(),
             deferred_cancellations: HashMap::new(),
             notifications: None,
             large_mtu: false,

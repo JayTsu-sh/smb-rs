@@ -1,6 +1,7 @@
 use std::sync::{Arc, LazyLock};
 
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 const MINIMUM_OFFLOAD_BYTES: usize = 64 * 1024;
 
@@ -34,6 +35,7 @@ impl BoundedCryptoExecutor {
             .min(4)
     }
 
+    #[cfg(test)]
     pub(crate) fn new(parallelism: usize) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(parallelism.max(1))),
@@ -49,19 +51,67 @@ impl BoundedCryptoExecutor {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
+        self.execute_with_cancellation(work_bytes, None, job).await
+    }
+
+    pub(crate) async fn execute_with_cancellation<F, T>(
+        &self,
+        work_bytes: usize,
+        cancellation: Option<CancellationToken>,
+        job: F,
+    ) -> crate::Result<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        if cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(crate::Error::Cancelled("crypto preparation"));
+        }
         if !self.should_offload(work_bytes) {
+            if cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                return Err(crate::Error::Cancelled("crypto preparation"));
+            }
             return Ok(job());
         }
-        let permit =
-            self.permits.clone().acquire_owned().await.map_err(|_| {
+        let acquire = self.permits.clone().acquire_owned();
+        let permit = if let Some(cancellation) = cancellation.as_ref() {
+            tokio::select! {
+                _ = cancellation.cancelled() => return Err(crate::Error::Cancelled("crypto preparation")),
+                permit = acquire => permit.map_err(|_| {
+                    crate::Error::InvalidState("crypto executor permit pool closed".into())
+                })?,
+            }
+        } else {
+            acquire.await.map_err(|_| {
                 crate::Error::InvalidState("crypto executor permit pool closed".into())
-            })?;
+            })?
+        };
+        if cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            drop(permit);
+            return Err(crate::Error::Cancelled("crypto preparation"));
+        }
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            job()
+            if cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                Err(crate::Error::Cancelled("crypto preparation"))
+            } else {
+                Ok(job())
+            }
         })
         .await
-        .map_err(|error| crate::Error::InvalidState(format!("crypto worker failed: {error}")))
+        .map_err(|error| crate::Error::InvalidState(format!("crypto worker failed: {error}")))?
     }
 }
 
@@ -74,6 +124,14 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+
+    #[test]
+    fn default_executors_share_process_global_permits() {
+        let first = BoundedCryptoExecutor::default();
+        let second = BoundedCryptoExecutor::default();
+
+        assert!(Arc::ptr_eq(&first.permits, &second.permits));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn executor_never_starts_more_jobs_than_its_parallelism() {
@@ -194,5 +252,56 @@ mod tests {
         ready.notify_all();
         assert_eq!(starts.recv().await, Some(2));
         second.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_while_waiting_for_a_permit_never_starts_the_job() {
+        let executor = BoundedCryptoExecutor::new(1);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let first = tokio::spawn({
+            let executor = executor.clone();
+            let gate = gate.clone();
+            let started = started.clone();
+            async move {
+                executor
+                    .execute(usize::MAX, move || {
+                        started.send(1).unwrap();
+                        let (lock, ready) = &*gate;
+                        let released = lock.lock().unwrap();
+                        drop(ready.wait_while(released, |released| !*released).unwrap());
+                    })
+                    .await
+            }
+        });
+        assert_eq!(starts.recv().await, Some(1));
+        let cancellation = CancellationToken::new();
+        let second = tokio::spawn({
+            let executor = executor.clone();
+            let started = started.clone();
+            let cancellation = cancellation.clone();
+            async move {
+                executor
+                    .execute_with_cancellation(usize::MAX, Some(cancellation), move || {
+                        started.send(2).unwrap()
+                    })
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        assert!(matches!(
+            second.await.unwrap(),
+            Err(crate::Error::Cancelled("crypto preparation"))
+        ));
+        let (lock, ready) = &*gate;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+        first.await.unwrap().unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), starts.recv())
+                .await
+                .is_err()
+        );
     }
 }
