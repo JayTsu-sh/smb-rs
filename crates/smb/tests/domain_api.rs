@@ -680,7 +680,14 @@ async fn domain_directory_open_existing_is_read_only_until_modify_access_is_name
         let deleted = deletable.delete().await;
         deletable.close().await?;
         renamed_result?;
-        deleted
+        deleted?;
+        // A parent that still had the child in it would refuse with DIRECTORY_NOT_EMPTY.
+        let parent_handle = share
+            .open_directory(&parent, DirectoryOpenOptions::open_existing().delete(true))
+            .await?;
+        let parent_deleted = parent_handle.delete().await;
+        parent_handle.close().await?;
+        parent_deleted
     }
     .await;
     for leftover in [&renamed, &child, &parent] {
