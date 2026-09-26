@@ -37,8 +37,8 @@ use zeroize::Zeroizing;
 use crate::{
     Error,
     runtime::port::{
-        OpenMode, RuntimeClient, RuntimeCredentialProvider, RuntimeCredentials, RuntimeFile,
-        RuntimeResource, RuntimeSession, RuntimeShare,
+        DirectoryAccess, OpenMode, RuntimeClient, RuntimeCredentialProvider, RuntimeCredentials,
+        RuntimeFile, RuntimeResource, RuntimeSession, RuntimeShare,
     },
 };
 
@@ -376,18 +376,57 @@ impl FileOpenOptions {
     }
 }
 
+/// How [`Share::open_directory`] opens a directory, and which access the handle holds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DirectoryOpenOptions {
     create: bool,
+    access: DirectoryAccess,
 }
 
 impl DirectoryOpenOptions {
+    /// Opens an existing directory with read access only (`GENERIC_READ`).
+    ///
+    /// That is all listing, watching, and reading metadata or the security
+    /// descriptor need, so it works for an account or share that grants only
+    /// read, and a handle kept open for a long listing holds no write or
+    /// delete access. [`Directory::delete`], [`Directory::rename`], and
+    /// [`Directory::rename_replace`] need [`delete`](Self::delete);
+    /// [`Directory::set_metadata`] needs
+    /// [`write_attributes`](Self::write_attributes).
     pub const fn open_existing() -> Self {
-        Self { create: false }
+        Self {
+            create: false,
+            access: DirectoryAccess {
+                delete: false,
+                write_attributes: false,
+            },
+        }
     }
 
+    /// Creates a new directory. As its creator, the handle has read, write,
+    /// and delete access; the access options below do not change that.
     pub const fn create_new() -> Self {
-        Self { create: true }
+        Self {
+            create: true,
+            access: DirectoryAccess {
+                delete: false,
+                write_attributes: false,
+            },
+        }
+    }
+
+    /// Also requests `DELETE`, which deleting or renaming the directory
+    /// through the handle needs.
+    pub const fn delete(mut self, delete: bool) -> Self {
+        self.access.delete = delete;
+        self
+    }
+
+    /// Also requests `FILE_WRITE_ATTRIBUTES`, which setting the directory's
+    /// timestamps through the handle needs.
+    pub const fn write_attributes(mut self, write: bool) -> Self {
+        self.access.write_attributes = write;
+        self
     }
 }
 
@@ -798,7 +837,7 @@ impl Share {
                 let inner = self
                     .inner
                     .runtime
-                    .open_directory(path.as_create_name(), options.create)
+                    .open_directory(path.as_create_name(), options.create, options.access)
                     .await?;
                 self.record_resource_open();
                 Ok(Directory {
@@ -1596,6 +1635,10 @@ impl Directory {
         ))
     }
 
+    /// Marks this directory for deletion when its last handle closes.
+    ///
+    /// Needs `DELETE` access: open with
+    /// [`DirectoryOpenOptions::delete`] or [`DirectoryOpenOptions::create_new`].
     pub fn delete(&self) -> Operation<'_, ()> {
         Operation::new(move |context| {
             Box::pin(async move {
@@ -1607,6 +1650,9 @@ impl Directory {
 
     /// Renames this directory; an existing destination fails with
     /// `STATUS_OBJECT_NAME_COLLISION`.
+    ///
+    /// Needs `DELETE` access: open with
+    /// [`DirectoryOpenOptions::delete`] or [`DirectoryOpenOptions::create_new`].
     pub fn rename<'a>(&'a self, destination: &'a SharePath) -> Operation<'a, ()> {
         Operation::new(move |context| {
             Box::pin(async move {
@@ -1623,6 +1669,9 @@ impl Directory {
 
     /// Renames this directory and replaces an existing destination when the server
     /// allows it (NTFS-style servers only replace empty directories).
+    ///
+    /// Needs `DELETE` access: open with
+    /// [`DirectoryOpenOptions::delete`] or [`DirectoryOpenOptions::create_new`].
     pub fn rename_replace<'a>(&'a self, destination: &'a SharePath) -> Operation<'a, ()> {
         Operation::new(move |context| {
             Box::pin(async move {

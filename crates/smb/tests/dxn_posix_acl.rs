@@ -530,7 +530,7 @@ async fn cleanup(
     }
     for path in [sibling_directory_path, child_directory_path, parent_path] {
         if let Ok(directory) = share
-            .open_directory(path, DirectoryOpenOptions::open_existing())
+            .open_directory(path, DirectoryOpenOptions::open_existing().delete(true))
             .await
         {
             let _ = directory.delete().await;

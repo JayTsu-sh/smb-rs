@@ -70,6 +70,20 @@ pub(crate) enum OpenMode {
     Overwrite,
 }
 
+/// Access an open of an existing directory requests on top of `GENERIC_READ`.
+///
+/// Read access is all that listing, watching, and reading metadata or the
+/// security descriptor need. Everything else is opt-in, so a read-only account
+/// can open any directory and a long-lived listing handle holds no write or
+/// delete access.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DirectoryAccess {
+    /// `DELETE`: delete-on-close disposition and rename through the handle.
+    pub(crate) delete: bool,
+    /// `FILE_WRITE_ATTRIBUTES`: setting timestamps through the handle.
+    pub(crate) write_attributes: bool,
+}
+
 /// Protocol configuration behind every facade client.
 ///
 /// Negotiation always opens with an SMB2 NEGOTIATE. `ConnectionConfig` defaults
@@ -450,29 +464,9 @@ impl RuntimeShare {
         &self,
         path: &str,
         create: bool,
+        access: DirectoryAccess,
     ) -> crate::Result<RuntimeDirectory> {
-        let args = if create {
-            FileCreateArgs::make_create_new(
-                FileAttributes::new().with_directory(true),
-                CreateOptions::new().with_directory_file(true),
-            )
-        } else {
-            // The share root is only opened for enumeration. Requesting write
-            // and delete access there can conflict with a Windows server's
-            // existing root handle even though the caller only needs to list.
-            let access = if path.is_empty() {
-                FileAccessMask::new().with_generic_read(true)
-            } else {
-                FileAccessMask::new()
-                    .with_generic_read(true)
-                    .with_generic_write(true)
-                    .with_delete(true)
-            };
-            FileCreateArgs {
-                options: CreateOptions::new().with_directory_file(true),
-                ..FileCreateArgs::make_open_existing(access)
-            }
-        };
+        let args = directory_create_args(create, access);
         match self.inner.create(path, &args).await? {
             ProtocolResource::Directory(directory) => Ok(RuntimeDirectory {
                 inner: Arc::new(directory),
@@ -499,6 +493,31 @@ impl RuntimeShare {
     pub(crate) async fn close(&self) -> crate::Result<()> {
         self.security_cleanup.close_and_wait().await;
         self.inner.disconnect().await
+    }
+}
+
+/// CREATE arguments for [`RuntimeShare::open_directory`].
+///
+/// Creating a directory keeps the read, write, and delete access of
+/// [`FileCreateArgs::make_create_new`], which already covers every
+/// [`DirectoryAccess`] bit. Opening an existing one, the share root included,
+/// asks for `GENERIC_READ` plus only the bits the caller named. The same rule
+/// holds at the root, where requesting write and delete can also conflict
+/// with a Windows server's own root handle.
+fn directory_create_args(create: bool, access: DirectoryAccess) -> FileCreateArgs {
+    if create {
+        return FileCreateArgs::make_create_new(
+            FileAttributes::new().with_directory(true),
+            CreateOptions::new().with_directory_file(true),
+        );
+    }
+    let desired_access = FileAccessMask::new()
+        .with_generic_read(true)
+        .with_delete(access.delete)
+        .with_file_write_attributes(access.write_attributes);
+    FileCreateArgs {
+        options: CreateOptions::new().with_directory_file(true),
+        ..FileCreateArgs::make_open_existing(desired_access)
     }
 }
 
@@ -1093,8 +1112,74 @@ async fn set_security(
 
 #[cfg(test)]
 mod tests {
-    use super::client_config;
+    use super::{DirectoryAccess, client_config, directory_create_args};
     use crate::{GuestPolicy, SigningPolicy};
+    use smb_fscc::FileAccessMask;
+    use smb_msg::CreateDisposition;
+
+    #[test]
+    fn opening_an_existing_directory_requests_read_access_only_by_default() {
+        let args = directory_create_args(false, DirectoryAccess::default());
+        assert_eq!(args.disposition, CreateDisposition::Open);
+        assert!(args.options.directory_file());
+        assert_eq!(
+            args.desired_access,
+            FileAccessMask::new().with_generic_read(true)
+        );
+    }
+
+    #[test]
+    fn modify_access_on_an_existing_directory_is_requested_only_when_named() {
+        let delete = directory_create_args(
+            false,
+            DirectoryAccess {
+                delete: true,
+                write_attributes: false,
+            },
+        );
+        assert_eq!(
+            delete.desired_access,
+            FileAccessMask::new()
+                .with_generic_read(true)
+                .with_delete(true)
+        );
+        let write_attributes = directory_create_args(
+            false,
+            DirectoryAccess {
+                delete: false,
+                write_attributes: true,
+            },
+        );
+        assert_eq!(
+            write_attributes.desired_access,
+            FileAccessMask::new()
+                .with_generic_read(true)
+                .with_file_write_attributes(true)
+        );
+        assert!(!write_attributes.desired_access.generic_write());
+    }
+
+    #[test]
+    fn creating_a_directory_keeps_the_creator_read_write_and_delete_access() {
+        for access in [
+            DirectoryAccess::default(),
+            DirectoryAccess {
+                delete: true,
+                write_attributes: true,
+            },
+        ] {
+            let args = directory_create_args(true, access);
+            assert_eq!(args.disposition, CreateDisposition::Create);
+            assert!(args.options.directory_file());
+            assert_eq!(
+                args.desired_access,
+                FileAccessMask::new()
+                    .with_generic_read(true)
+                    .with_generic_write(true)
+                    .with_delete(true)
+            );
+        }
+    }
 
     #[test]
     fn negotiation_never_opens_with_the_smb1_multi_protocol_frame() {
