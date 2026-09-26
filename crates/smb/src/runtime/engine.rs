@@ -19,6 +19,7 @@ use smb_transport::{
     SendFrame, SmbTransport, SmbTransportRead, SmbTransportWrite, TransportError, TransportFrame,
 };
 use std::collections::{HashMap, VecDeque};
+use std::future::pending;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -708,6 +709,33 @@ fn read_step(
     .boxed()
 }
 
+/// Take the read pump's result if it has already completed.
+///
+/// The owner holds the read pump as `Option<ReadStepFuture>`. A completed
+/// future leaves the slot here, before its result is inspected, so it can
+/// never be polled a second time: only a received frame re-arms the pump
+/// with a fresh [`read_step`], and a transport error or a panic leaves the
+/// slot empty until the generation exits.
+fn take_ready_read(read: &mut Option<ReadStepFuture>) -> Option<std::thread::Result<ReadStep>> {
+    let completion = read.as_mut()?.as_mut().now_or_never()?;
+    *read = None;
+    Some(completion)
+}
+
+/// Wait for the read pump to complete, then empty its slot.
+///
+/// Cancellation-safe: dropped before completion (another `select!` arm won),
+/// the pump stays in `read` untouched. An empty slot never resolves; the
+/// owner also guards its `select!` arm on `read.is_some()`.
+async fn next_read(read: &mut Option<ReadStepFuture>) -> std::thread::Result<ReadStep> {
+    let Some(pump) = read.as_mut() else {
+        return pending().await;
+    };
+    let completion = pump.as_mut().await;
+    *read = None;
+    completion
+}
+
 fn write_step(mut transport: Box<dyn SmbTransportWrite>, command: WriteCommand) -> ActiveWrite {
     let key = command.key;
     let progressed = Arc::new(AtomicUsize::new(0));
@@ -822,7 +850,7 @@ async fn owner_task(
     // Read and write remain independent, cancellation-safe futures, but they
     // are polled by the owner task itself. This keeps full-duplex transport
     // progress without crossing Tokio worker queues for every I/O event.
-    let mut read = read_step(read, config.maximum_frame_size);
+    let mut read = Some(read_step(read, config.maximum_frame_size));
     let mut write = Some(write);
     let mut active_write: Option<ActiveWrite> = None;
     let mut read_panicked = false;
@@ -879,13 +907,13 @@ async fn owner_task(
             if received_frames.len() >= config.io_capacity.max(1) {
                 break;
             }
-            let Some(completion) = read.as_mut().now_or_never() else {
+            let Some(completion) = take_ready_read(&mut read) else {
                 break;
             };
             match completion {
                 Ok(step) => match step.result {
                     Ok(frame) => {
-                        read = read_step(step.transport, config.maximum_frame_size);
+                        read = Some(read_step(step.transport, config.maximum_frame_size));
                         received_frames.push_back(frame);
                     }
                     Err(error) => {
@@ -1093,14 +1121,15 @@ async fn owner_task(
                     }
                 }
             }
-            completion = read.as_mut(), if received_frames.len() < config.io_capacity.max(1)
+            completion = next_read(&mut read), if read.is_some()
+                && received_frames.len() < config.io_capacity.max(1)
                 && (config.decode_unsolicited
                     || !authority.operation_pending.is_empty()
                     || (operation_rx.is_empty() && compound_rx.is_empty())) => {
                 match completion {
                     Ok(step) => match step.result {
                         Ok(frame) => {
-                            read = read_step(step.transport, config.maximum_frame_size);
+                            read = Some(read_step(step.transport, config.maximum_frame_size));
                             received_frames.push_back(frame);
                         }
                         Err(error) => {
@@ -2910,6 +2939,84 @@ mod tests {
         }
     }
 
+    /// A read that parks until triggered and then fails once with a
+    /// connection reset, like a server dropping an idle connection.
+    struct ResetRead {
+        began: Arc<Notify>,
+        trigger: Arc<Notify>,
+    }
+
+    impl SmbTransportRead for ResetRead {
+        fn receive_exact<'a>(
+            &'a mut self,
+            _out: &'a mut [u8],
+        ) -> BoxFuture<'a, smb_transport::error::Result<()>> {
+            async move {
+                self.began.notify_one();
+                self.trigger.notified().await;
+                Err(TransportError::IoError(std::io::Error::new(
+                    ErrorKind::ConnectionReset,
+                    "scripted connection reset",
+                )))
+            }
+            .boxed()
+        }
+    }
+
+    struct ResetTransport {
+        began: Arc<Notify>,
+        trigger: Arc<Notify>,
+    }
+
+    impl SmbTransportRead for ResetTransport {
+        fn receive_exact<'a>(
+            &'a mut self,
+            _out: &'a mut [u8],
+        ) -> BoxFuture<'a, smb_transport::error::Result<()>> {
+            futures_util::future::pending().boxed()
+        }
+    }
+
+    impl SmbTransportWrite for ResetTransport {
+        fn send_raw<'a>(
+            &'a mut self,
+            _bytes: &'a [u8],
+        ) -> BoxFuture<'a, smb_transport::error::Result<()>> {
+            async { Ok(()) }.boxed()
+        }
+    }
+
+    impl SmbTransport for ResetTransport {
+        fn connect<'a>(
+            &'a mut self,
+            _server_name: &'a str,
+            _address: SocketAddr,
+        ) -> BoxFuture<'a, smb_transport::error::Result<()>> {
+            async { Ok(()) }.boxed()
+        }
+
+        fn default_port(&self) -> u16 {
+            445
+        }
+
+        fn split(
+            self: Box<Self>,
+        ) -> smb_transport::error::Result<(Box<dyn SmbTransportRead>, Box<dyn SmbTransportWrite>)>
+        {
+            Ok((
+                Box::new(ResetRead {
+                    began: self.began,
+                    trigger: self.trigger,
+                }),
+                Box::new(NoopWrite),
+            ))
+        }
+
+        fn remote_address(&self) -> smb_transport::error::Result<SocketAddr> {
+            Ok(SocketAddr::from(([127, 0, 0, 1], 445)))
+        }
+    }
+
     fn config() -> RuntimeConfig {
         RuntimeConfig {
             generation: GenerationId::new(1),
@@ -3661,6 +3768,63 @@ mod tests {
             handle.submit(frame(), 0, 1, None).await,
             Err(RuntimeError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn read_error_while_parked_ends_the_generation_without_polling_the_pump_again() {
+        // The owner task runs on this current-thread runtime, so any panic on
+        // this thread is the owner's; a double poll of the completed read
+        // future panics with "`async fn` resumed after completion" even
+        // though `catch_unwind` then hides it from the owner.
+        let test_thread = std::thread::current().id();
+        let panicked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::clone(&panicked);
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if std::thread::current().id() == test_thread {
+                observed.store(true, Ordering::Relaxed);
+            }
+            previous(info);
+        }));
+
+        let began = Arc::new(Notify::new());
+        let trigger = Arc::new(Notify::new());
+        let transport = Box::new(ResetTransport {
+            began: Arc::clone(&began),
+            trigger: Arc::clone(&trigger),
+        });
+        let clock = Arc::new(ManualClock::new());
+        let (handle, mut events) = start_generation(transport, clock, config());
+        // Let the owner park in `select!` on the pending read, so the error
+        // completes the read through the `select!` arm rather than the
+        // ready-drain loop.
+        began.notified().await;
+        tokio::task::yield_now().await;
+        trigger.notify_one();
+
+        let exit = tokio::time::timeout(Duration::from_secs(1), handle.exited())
+            .await
+            .expect("a read error must end the generation");
+        assert!(
+            !panicked.load(Ordering::Relaxed),
+            "the owner polled the completed read pump again"
+        );
+        assert!(matches!(
+            exit.cause,
+            GenerationExitCause::Transport(RuntimeError::Transport("io"))
+        ));
+        assert_eq!(exit.report.joined_tasks, 2);
+        assert_eq!(exit.report.failed_tasks, 0);
+        let mut failures = Vec::new();
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("the event stream must close once the owner exits")
+        {
+            if let RuntimeEvent::PumpFailed { pump, code } = event {
+                failures.push((pump, code));
+            }
+        }
+        assert_eq!(failures, [(PumpName::Read, "io")]);
     }
 
     #[tokio::test]
