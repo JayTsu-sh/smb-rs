@@ -359,6 +359,12 @@ impl FileOpenOptions {
     /// [`File::delete`], [`File::rename`], and [`File::rename_replace`] need
     /// [`delete`](Self::delete); [`File::set_metadata`] needs
     /// [`write_attributes`](Self::write_attributes) (or `write`).
+    ///
+    /// Without them the server refuses the operation with
+    /// `STATUS_ACCESS_DENIED`, with two exceptions: a write fails locally with
+    /// [`Error::MissingPermissions`] when the principal may not write the file
+    /// at all (the server's maximal-access answer says so), and a flush, where
+    /// a server refuses it, surfaces as [`Error::IoError`].
     pub const fn open_existing() -> Self {
         Self::with_mode(OpenMode::OpenExisting)
     }
@@ -383,8 +389,8 @@ impl FileOpenOptions {
     }
 
     /// Also requests `GENERIC_WRITE`, which writing ([`File::write_at`],
-    /// [`File::write_all_at`], a transfer destination, ...) and
-    /// [`File::flush`] need. It includes `FILE_WRITE_ATTRIBUTES`. Only
+    /// [`File::write_all_at`], a transfer destination, ...) needs, and which
+    /// MS-SMB2 requires for [`File::flush`]. It includes `FILE_WRITE_ATTRIBUTES`. Only
     /// [`open_existing`](Self::open_existing) honours it.
     pub const fn write(mut self, write: bool) -> Self {
         self.access.write = write;
@@ -1137,8 +1143,9 @@ impl File {
 
     /// Flushes the file's buffered data to stable storage.
     ///
-    /// Needs write access: open with [`FileOpenOptions::write`],
+    /// MS-SMB2 requires write access: open with [`FileOpenOptions::write`],
     /// [`FileOpenOptions::create_new`], or [`FileOpenOptions::overwrite`].
+    /// Some servers (ONTAP 9.19) accept a flush on a read-only handle anyway.
     pub fn flush(&self) -> Operation<'_, ()> {
         Operation::new(move |context| {
             Box::pin(async move {

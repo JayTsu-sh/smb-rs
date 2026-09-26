@@ -18,6 +18,8 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+#[cfg(feature = "real-server-tests")]
+use std::time::SystemTime;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
@@ -760,17 +762,20 @@ async fn domain_file_open_existing_is_read_only_until_modify_access_is_named() -
             }
             other => Err(Error::InvalidState(format!("read-only {what}: {other:?}"))),
         };
+        let touch = MetadataUpdate {
+            written: Some(SystemTime::now()),
+            ..MetadataUpdate::default()
+        };
         let read_only = share
             .open_file(&path, FileOpenOptions::open_existing())
             .await?;
+        // Every result is collected before the handle closes, so no `?` leaves it open.
         let read = read_only.read_exact_at(0, payload.len() as u32).await;
-        let touch = MetadataUpdate {
-            written: Some(read_only.metadata().await?.written()),
-            ..MetadataUpdate::default()
-        };
+        let metadata = read_only.metadata().await;
         let write = read_only.write_all_at(0, Bytes::from_static(b"x")).await;
         let delete = read_only.delete().await;
         let rename = read_only.rename(&renamed).await;
+        let rename_replace = read_only.rename_replace(&renamed).await;
         let set_metadata = read_only.set_metadata(touch).await;
         read_only.close().await?;
         if read? != payload {
@@ -778,9 +783,15 @@ async fn domain_file_open_existing_is_read_only_until_modify_access_is_named() -
                 "read-only read returned other bytes".into(),
             ));
         }
+        if metadata?.len() != payload.len() as u64 {
+            return Err(Error::InvalidState(
+                "read-only metadata reported another length".into(),
+            ));
+        }
         expect_denied("write", &write)?;
         expect_denied("delete", &delete)?;
         expect_denied("rename", &rename)?;
+        expect_denied("rename_replace", &rename_replace)?;
         expect_denied("set_metadata", &set_metadata)?;
 
         let attributes = share
@@ -791,9 +802,11 @@ async fn domain_file_open_existing_is_read_only_until_modify_access_is_named() -
             .await?;
         let set_metadata = attributes.set_metadata(touch).await;
         let write = attributes.write_all_at(0, Bytes::from_static(b"x")).await;
+        let delete = attributes.delete().await;
         attributes.close().await?;
         set_metadata?;
         expect_denied("write with write_attributes only", &write)?;
+        expect_denied("delete with write_attributes only", &delete)?;
 
         let writable = share
             .open_file(&path, FileOpenOptions::open_existing().write(true))
