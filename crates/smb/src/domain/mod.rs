@@ -416,14 +416,15 @@ impl DirectoryOpenOptions {
     }
 
     /// Also requests `DELETE`, which deleting or renaming the directory
-    /// through the handle needs.
+    /// through the handle needs. Has no effect with [`create_new`](Self::create_new).
     pub const fn delete(mut self, delete: bool) -> Self {
         self.access.delete = delete;
         self
     }
 
     /// Also requests `FILE_WRITE_ATTRIBUTES`, which setting the directory's
-    /// timestamps through the handle needs.
+    /// timestamps through the handle needs. Has no effect with
+    /// [`create_new`](Self::create_new).
     pub const fn write_attributes(mut self, write: bool) -> Self {
         self.access.write_attributes = write;
         self
