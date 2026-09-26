@@ -110,6 +110,11 @@ impl File {
     }
 }
 impl Directory {
+    /// Sets the directory's timestamps.
+    ///
+    /// Needs `FILE_WRITE_ATTRIBUTES` access: open with
+    /// [`DirectoryOpenOptions::write_attributes`](super::DirectoryOpenOptions::write_attributes)
+    /// or [`DirectoryOpenOptions::create_new`](super::DirectoryOpenOptions::create_new).
     pub fn set_metadata(&self, update: MetadataUpdate) -> Operation<'_, ()> {
         Operation::new(move |context| {
             Box::pin(async move {

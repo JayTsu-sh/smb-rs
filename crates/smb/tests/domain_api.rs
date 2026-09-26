@@ -3,8 +3,8 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 #[cfg(feature = "real-server-tests")]
 use smb::{
-    Batch, BatchOutcome, CancelToken, DirectoryEvent, DirectoryWatchOptions, Error, Resource,
-    SecurityOpenOptions, SecuritySelection, TransferOptions, TransferProgress,
+    Batch, BatchOutcome, CancelToken, DirectoryEvent, DirectoryWatchOptions, Error, MetadataUpdate,
+    Resource, SecurityOpenOptions, SecuritySelection, TransferOptions, TransferProgress,
 };
 use smb::{
     Client, ClientConfig, CloseOutcome, CloseReport, CredentialProvider, Credentials, Directory,
@@ -12,6 +12,8 @@ use smb::{
     OpenInfo, Operation, Pipe, PipeName, PreviousVersion, ReplayPolicy, Session, SessionInfo,
     Share, ShareInfo, SharePath, ShareTarget, Transfer, TransferEvents,
 };
+#[cfg(feature = "real-server-tests")]
+use smb_msg::Status;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -596,6 +598,108 @@ async fn domain_directory_query_only() -> smb::Result<()> {
     assert!(entries.is_empty());
     directory.delete().await?;
     directory.close().await?;
+    share.close().await?;
+    client.close().await.map(|_| ())
+}
+
+/// `open_existing()` asks for read access only, below the share root too: listing works, and
+/// the server refuses a delete, rename, or timestamp change through that handle until the caller
+/// names the access with `delete(true)` / `write_attributes(true)` (issue #85).
+#[cfg(feature = "real-server-tests")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[ignore = "requires an isolated writable real-server share"]
+async fn domain_directory_open_existing_is_read_only_until_modify_access_is_named()
+-> smb::Result<()> {
+    let target = ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?;
+    let client = Client::new();
+    let share = client
+        .connect_share(&target, common::smb_test_credentials())
+        .await?;
+    let parent_name = format!("read-only-open-{}", std::process::id());
+    let parent = SharePath::new(&parent_name)?;
+    let child = SharePath::new(format!("{parent_name}/child"))?;
+    let renamed = SharePath::new(format!("{parent_name}/child-renamed"))?;
+    share
+        .open_directory(&parent, DirectoryOpenOptions::create_new())
+        .await?
+        .close()
+        .await?;
+    share
+        .open_directory(&child, DirectoryOpenOptions::create_new())
+        .await?
+        .close()
+        .await?;
+
+    let checked = async {
+        // Failures are returned, not asserted, so the cleanup below still runs.
+        let expect_denied = |what: &str, result: &smb::Result<()>| match result {
+            Err(Error::ReceivedErrorMessage(status, _))
+                if *status == Status::AccessDenied as u32 =>
+            {
+                Ok(())
+            }
+            other => Err(Error::InvalidState(format!("read-only {what}: {other:?}"))),
+        };
+        let read_only = share
+            .open_directory(&child, DirectoryOpenOptions::open_existing())
+            .await?;
+        let entries = read_only.collect_entries("*").await?;
+        if !entries
+            .iter()
+            .all(|entry| matches!(entry.name(), "." | ".."))
+        {
+            return Err(Error::InvalidState(
+                "new child directory is not empty".into(),
+            ));
+        }
+        let touch = MetadataUpdate {
+            written: Some(read_only.metadata().await?.written()),
+            ..MetadataUpdate::default()
+        };
+        let delete = read_only.delete().await;
+        let rename = read_only.rename(&renamed).await;
+        let set_metadata = read_only.set_metadata(touch).await;
+        read_only.close().await?;
+        expect_denied("delete", &delete)?;
+        expect_denied("rename", &rename)?;
+        expect_denied("set_metadata", &set_metadata)?;
+
+        let writable = share
+            .open_directory(
+                &child,
+                DirectoryOpenOptions::open_existing().write_attributes(true),
+            )
+            .await?;
+        writable.set_metadata(touch).await?;
+        writable.close().await?;
+
+        let deletable = share
+            .open_directory(&child, DirectoryOpenOptions::open_existing().delete(true))
+            .await?;
+        let renamed_result = deletable.rename(&renamed).await;
+        let deleted = deletable.delete().await;
+        deletable.close().await?;
+        renamed_result?;
+        deleted?;
+        // A parent that still had the child in it would refuse with DIRECTORY_NOT_EMPTY.
+        let parent_handle = share
+            .open_directory(&parent, DirectoryOpenOptions::open_existing().delete(true))
+            .await?;
+        let parent_deleted = parent_handle.delete().await;
+        parent_handle.close().await?;
+        parent_deleted
+    }
+    .await;
+    for leftover in [&renamed, &child, &parent] {
+        if let Ok(handle) = share
+            .open_directory(leftover, DirectoryOpenOptions::open_existing().delete(true))
+            .await
+        {
+            let _ = handle.delete().await;
+            let _ = handle.close().await;
+        }
+    }
+    checked?;
     share.close().await?;
     client.close().await.map(|_| ())
 }

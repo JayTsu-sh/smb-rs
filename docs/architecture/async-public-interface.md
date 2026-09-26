@@ -81,11 +81,19 @@ Normal open methods return the requested resource directly:
 
 ```text
 Share::open_file(path, FileOpenOptions) → File
-Share::open_dir(path, DirectoryOpenOptions) → Directory
+Share::open_directory(path, DirectoryOpenOptions) → Directory
 Share::open_pipe(name, PipeOpenOptions) → Pipe
 ```
 
 The option types prevent contradictory combinations and provide common presets.
+A directory open requests only the access its preset names. `DirectoryOpenOptions::open_existing()`
+is read-only (`GENERIC_READ`) at every depth, which is all listing, watching, and
+reading metadata or security need; deleting or renaming through the handle requires
+`.delete(true)` and setting timestamps requires `.write_attributes(true)`, so a
+read-only principal can list any directory and a long-lived listing handle holds no
+write or delete access. A handle from `create_new()` keeps its creator's read, write,
+and delete access. (`FileOpenOptions::open_existing()` still requests read, write, and
+delete access; that preset is unchanged.)
 Rare SMB flags live in an explicit advanced substructure. A restricted generic
 open may exist for extension modules but is not in the normal prelude and does
 not return an enum that every common caller must downcast.

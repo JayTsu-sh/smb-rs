@@ -243,7 +243,7 @@ async fn cleanup(share: &Share, root: &SharePath) -> smb::Result<()> {
         delete_exact_if_present(share, &child(root, &name)?).await?;
     }
     let directory = share
-        .open_directory(root, DirectoryOpenOptions::open_existing())
+        .open_directory(root, DirectoryOpenOptions::open_existing().delete(true))
         .await?;
     directory.delete().await?;
     directory.close().await.map(|_| ())

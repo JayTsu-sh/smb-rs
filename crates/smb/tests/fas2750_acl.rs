@@ -920,7 +920,10 @@ async fn cleanup_auto_inherit_request(
         ),
     }
     match share
-        .open_directory(parent_path, DirectoryOpenOptions::open_existing())
+        .open_directory(
+            parent_path,
+            DirectoryOpenOptions::open_existing().delete(true),
+        )
         .await
     {
         Ok(directory) => {
@@ -1080,7 +1083,7 @@ async fn cleanup(
     match share
         .open_directory(
             sibling_directory_path,
-            DirectoryOpenOptions::open_existing(),
+            DirectoryOpenOptions::open_existing().delete(true),
         )
         .await
     {
@@ -1104,7 +1107,10 @@ async fn cleanup(
         ),
     }
     match share
-        .open_directory(child_directory_path, DirectoryOpenOptions::open_existing())
+        .open_directory(
+            child_directory_path,
+            DirectoryOpenOptions::open_existing().delete(true),
+        )
         .await
     {
         Ok(directory) => {
@@ -1127,7 +1133,10 @@ async fn cleanup(
         ),
     }
     match share
-        .open_directory(parent_path, DirectoryOpenOptions::open_existing())
+        .open_directory(
+            parent_path,
+            DirectoryOpenOptions::open_existing().delete(true),
+        )
         .await
     {
         Ok(directory) => {
