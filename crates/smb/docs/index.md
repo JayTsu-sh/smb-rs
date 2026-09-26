@@ -23,7 +23,7 @@ async fn main() -> smb::Result<()> {
 
     let path = SharePath::new("file.txt")?;
     let file = share
-        .open_file(&path, FileOpenOptions::open_existing())
+        .open_file(&path, FileOpenOptions::open_existing().write(true))
         .await?;
 
     let contents = file.read_at(0, 4096).await?;
@@ -34,6 +34,10 @@ async fn main() -> smb::Result<()> {
     client.close().await.map(|_| ())
 }
 ```
+
+`FileOpenOptions::open_existing()` opens a file for reading only; name the
+access a handle needs on top of that with `.write(true)` (write, flush),
+`.delete(true)` (delete, rename), or `.write_attributes(true)` (timestamps).
 
 Operations are lazy futures. Deadlines, cancellation, and replay policy are
 configured on the returned operation before it is awaited. File payloads use

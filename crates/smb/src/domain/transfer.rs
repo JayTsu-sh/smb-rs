@@ -129,6 +129,8 @@ impl Future for Transfer<'_> {
 }
 
 impl File {
+    /// Copies this file's data into `destination`. This handle only needs read
+    /// access; `destination` needs write access (see [`File::write_at`]).
     pub fn transfer_to<'a>(
         &'a self,
         destination: &'a File,

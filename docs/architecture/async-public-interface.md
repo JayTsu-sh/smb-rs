@@ -92,8 +92,12 @@ reading metadata or security need; deleting or renaming through the handle requi
 `.delete(true)` and setting timestamps requires `.write_attributes(true)`, so a
 read-only principal can list any directory and a long-lived listing handle holds no
 write or delete access. A handle from `create_new()` keeps its creator's read, write,
-and delete access. (`FileOpenOptions::open_existing()` still requests read, write, and
-delete access; that preset is unchanged.)
+and delete access. File opens follow the same rule: `FileOpenOptions::open_existing()`
+is read-only (`GENERIC_READ`), which is all reading the data, metadata, and Previous
+Versions need, so a read-only principal (or a read-only file) can be copied from;
+writing and flushing require `.write(true)` (`GENERIC_WRITE`), deleting or renaming
+`.delete(true)`, and setting timestamps `.write_attributes(true)` (or `.write(true)`).
+`create_new()` and `overwrite()` keep the creator's read, write, and delete access.
 Rare SMB flags live in an explicit advanced substructure. A restricted generic
 open may exist for extension modules but is not in the normal prelude and does
 not return an enum that every common caller must downcast.

@@ -2235,7 +2235,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "smb"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "aead",
  "aes",
@@ -2283,7 +2283,7 @@ dependencies = [
 
 [[package]]
 name = "smb-dtyp"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "binrw",
  "modular-bitfield",
@@ -2296,7 +2296,7 @@ dependencies = [
 
 [[package]]
 name = "smb-dtyp-derive"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2305,7 +2305,7 @@ dependencies = [
 
 [[package]]
 name = "smb-fscc"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "binrw",
  "const_format",
@@ -2319,7 +2319,7 @@ dependencies = [
 
 [[package]]
 name = "smb-msg"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "binrw",
  "bytes",
@@ -2336,7 +2336,7 @@ dependencies = [
 
 [[package]]
 name = "smb-msg-derive"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2345,7 +2345,7 @@ dependencies = [
 
 [[package]]
 name = "smb-rpc"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "binrw",
  "modular-bitfield",
@@ -2358,7 +2358,7 @@ dependencies = [
 
 [[package]]
 name = "smb-tests"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "binrw",
  "bytes",
@@ -2376,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "smb-transport"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "binrw",
  "bytes",
