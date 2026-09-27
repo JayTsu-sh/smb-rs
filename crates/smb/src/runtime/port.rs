@@ -70,6 +70,22 @@ pub(crate) enum OpenMode {
     Overwrite,
 }
 
+/// Access an open of an existing file requests on top of `GENERIC_READ`.
+///
+/// Read access is all that reading the data, its metadata, and its Previous
+/// Versions need. Everything else is opt-in, so a read-only account can read
+/// any file it may see, a `FILE_ATTRIBUTE_READONLY` file can be opened for
+/// reading, and a long-lived read handle holds no write or delete access.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FileAccess {
+    /// `GENERIC_WRITE`: writing and flushing through the handle.
+    pub(crate) write: bool,
+    /// `DELETE`: delete-on-close disposition and rename through the handle.
+    pub(crate) delete: bool,
+    /// `FILE_WRITE_ATTRIBUTES`: setting timestamps through the handle.
+    pub(crate) write_attributes: bool,
+}
+
 /// Access an open of an existing directory requests on top of `GENERIC_READ`.
 ///
 /// Read access is all that listing, watching, and reading metadata or the
@@ -414,22 +430,10 @@ impl RuntimeShare {
         &self,
         path: &str,
         mode: OpenMode,
+        access: FileAccess,
         persistent_timeout_millis: Option<u32>,
     ) -> crate::Result<RuntimeFile> {
-        let mut args = match mode {
-            OpenMode::CreateNew => {
-                FileCreateArgs::make_create_new(Default::default(), Default::default())
-            }
-            OpenMode::OpenExisting => FileCreateArgs::make_open_existing(
-                FileAccessMask::new()
-                    .with_generic_read(true)
-                    .with_generic_write(true)
-                    .with_delete(true),
-            ),
-            OpenMode::Overwrite => {
-                FileCreateArgs::make_overwrite(Default::default(), Default::default())
-            }
-        };
+        let mut args = file_create_args(mode, access);
         if let Some(timeout) = persistent_timeout_millis {
             args = args.with_durable(crate::resource::DurableOpenRequest::persistent(
                 timeout,
@@ -493,6 +497,30 @@ impl RuntimeShare {
     pub(crate) async fn close(&self) -> crate::Result<()> {
         self.security_cleanup.close_and_wait().await;
         self.inner.disconnect().await
+    }
+}
+
+/// CREATE arguments for [`RuntimeShare::open_file`], before any durable request.
+///
+/// Creating or overwriting a file keeps the read, write, and delete access of
+/// [`FileCreateArgs::make_create_new`] / [`FileCreateArgs::make_overwrite`],
+/// which already covers every [`FileAccess`] bit. Opening an existing one asks
+/// for `GENERIC_READ` plus only the bits the caller named.
+fn file_create_args(mode: OpenMode, access: FileAccess) -> FileCreateArgs {
+    match mode {
+        OpenMode::CreateNew => {
+            FileCreateArgs::make_create_new(Default::default(), Default::default())
+        }
+        OpenMode::Overwrite => {
+            FileCreateArgs::make_overwrite(Default::default(), Default::default())
+        }
+        OpenMode::OpenExisting => FileCreateArgs::make_open_existing(
+            FileAccessMask::new()
+                .with_generic_read(true)
+                .with_generic_write(access.write)
+                .with_delete(access.delete)
+                .with_file_write_attributes(access.write_attributes),
+        ),
     }
 }
 
@@ -1112,7 +1140,10 @@ async fn set_security(
 
 #[cfg(test)]
 mod tests {
-    use super::{DirectoryAccess, client_config, directory_create_args};
+    use super::{
+        DirectoryAccess, FileAccess, OpenMode, client_config, directory_create_args,
+        file_create_args,
+    };
     use crate::{GuestPolicy, SigningPolicy};
     use smb_fscc::FileAccessMask;
     use smb_msg::CreateDisposition;
@@ -1178,6 +1209,86 @@ mod tests {
                     .with_generic_write(true)
                     .with_delete(true)
             );
+        }
+    }
+
+    #[test]
+    fn opening_an_existing_file_requests_read_access_only_by_default() {
+        let args = file_create_args(OpenMode::OpenExisting, FileAccess::default());
+        assert_eq!(args.disposition, CreateDisposition::Open);
+        assert!(!args.options.directory_file());
+        assert_eq!(
+            args.desired_access,
+            FileAccessMask::new().with_generic_read(true)
+        );
+    }
+
+    #[test]
+    fn modify_access_on_an_existing_file_is_requested_only_when_named() {
+        let read = FileAccessMask::new().with_generic_read(true);
+        for (access, expected) in [
+            (
+                FileAccess {
+                    write: true,
+                    ..FileAccess::default()
+                },
+                read.with_generic_write(true),
+            ),
+            (
+                FileAccess {
+                    delete: true,
+                    ..FileAccess::default()
+                },
+                read.with_delete(true),
+            ),
+            (
+                FileAccess {
+                    write_attributes: true,
+                    ..FileAccess::default()
+                },
+                read.with_file_write_attributes(true),
+            ),
+            (
+                FileAccess {
+                    write: true,
+                    delete: true,
+                    write_attributes: true,
+                },
+                read.with_generic_write(true)
+                    .with_delete(true)
+                    .with_file_write_attributes(true),
+            ),
+        ] {
+            let args = file_create_args(OpenMode::OpenExisting, access);
+            assert_eq!(args.disposition, CreateDisposition::Open);
+            assert_eq!(args.desired_access, expected, "{access:?}");
+        }
+    }
+
+    #[test]
+    fn creating_or_overwriting_a_file_keeps_read_write_and_delete_access() {
+        for (mode, disposition) in [
+            (OpenMode::CreateNew, CreateDisposition::Create),
+            (OpenMode::Overwrite, CreateDisposition::OverwriteIf),
+        ] {
+            for access in [
+                FileAccess::default(),
+                FileAccess {
+                    write: true,
+                    delete: true,
+                    write_attributes: true,
+                },
+            ] {
+                let args = file_create_args(mode, access);
+                assert_eq!(args.disposition, disposition);
+                assert_eq!(
+                    args.desired_access,
+                    FileAccessMask::new()
+                        .with_generic_read(true)
+                        .with_generic_write(true)
+                        .with_delete(true)
+                );
+            }
         }
     }
 

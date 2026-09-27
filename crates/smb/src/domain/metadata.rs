@@ -98,6 +98,13 @@ impl Resource {
 }
 
 impl File {
+    /// Sets the file's timestamps.
+    ///
+    /// Needs `FILE_WRITE_ATTRIBUTES` access: open with
+    /// [`FileOpenOptions::write_attributes`](super::FileOpenOptions::write_attributes),
+    /// [`FileOpenOptions::write`](super::FileOpenOptions::write),
+    /// [`FileOpenOptions::create_new`](super::FileOpenOptions::create_new), or
+    /// [`FileOpenOptions::overwrite`](super::FileOpenOptions::overwrite).
     pub fn set_metadata(&self, update: MetadataUpdate) -> Operation<'_, ()> {
         Operation::new(move |context| {
             Box::pin(async move {

@@ -37,8 +37,8 @@ use zeroize::Zeroizing;
 use crate::{
     Error,
     runtime::port::{
-        DirectoryAccess, OpenMode, RuntimeClient, RuntimeCredentialProvider, RuntimeCredentials,
-        RuntimeFile, RuntimeResource, RuntimeSession, RuntimeShare,
+        DirectoryAccess, FileAccess, OpenMode, RuntimeClient, RuntimeCredentialProvider,
+        RuntimeCredentials, RuntimeFile, RuntimeResource, RuntimeSession, RuntimeShare,
     },
 };
 
@@ -282,9 +282,11 @@ impl PipeName {
     }
 }
 
+/// How [`Share::open_file`] opens a file, and which access the handle holds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileOpenOptions {
     mode: OpenMode,
+    access: FileAccess,
     persistent_timeout_millis: Option<u32>,
 }
 
@@ -341,25 +343,73 @@ impl PreviousVersion {
 }
 
 impl FileOpenOptions {
+    /// Creates a new file; an existing one fails with
+    /// `STATUS_OBJECT_NAME_COLLISION`. As its creator, the handle has read,
+    /// write, and delete access; the access options below do not change that.
     pub const fn create_new() -> Self {
-        Self {
-            mode: OpenMode::CreateNew,
-            persistent_timeout_millis: None,
-        }
+        Self::with_mode(OpenMode::CreateNew)
     }
 
+    /// Opens an existing file with read access only (`GENERIC_READ`).
+    ///
+    /// That is all reading the data, its metadata, and its Previous Versions
+    /// need, so it works for an account, share, or read-only file that grants
+    /// only read, and a handle kept open for a long copy holds no write or
+    /// delete access. Writing and flushing need [`write`](Self::write);
+    /// [`File::delete`], [`File::rename`], and [`File::rename_replace`] need
+    /// [`delete`](Self::delete); [`File::set_metadata`] needs
+    /// [`write_attributes`](Self::write_attributes) (or `write`).
+    ///
+    /// Without them the server refuses the operation with
+    /// `STATUS_ACCESS_DENIED`, with two exceptions: a write fails locally with
+    /// [`Error::MissingPermissions`] when the principal may not write the file
+    /// at all (the server's maximal-access answer says so), and a flush, where
+    /// a server refuses it, surfaces as [`Error::IoError`].
     pub const fn open_existing() -> Self {
+        Self::with_mode(OpenMode::OpenExisting)
+    }
+
+    /// Opens a file, creating it or truncating an existing one to zero length.
+    /// The handle has read, write, and delete access; the access options below
+    /// do not change that.
+    pub const fn overwrite() -> Self {
+        Self::with_mode(OpenMode::Overwrite)
+    }
+
+    const fn with_mode(mode: OpenMode) -> Self {
         Self {
-            mode: OpenMode::OpenExisting,
+            mode,
+            access: FileAccess {
+                write: false,
+                delete: false,
+                write_attributes: false,
+            },
             persistent_timeout_millis: None,
         }
     }
 
-    pub const fn overwrite() -> Self {
-        Self {
-            mode: OpenMode::Overwrite,
-            persistent_timeout_millis: None,
-        }
+    /// Also requests `GENERIC_WRITE`, which writing ([`File::write_at`],
+    /// [`File::write_all_at`], a transfer destination, ...) needs, and which
+    /// MS-SMB2 requires for [`File::flush`]. It includes `FILE_WRITE_ATTRIBUTES`. Only
+    /// [`open_existing`](Self::open_existing) honours it.
+    pub const fn write(mut self, write: bool) -> Self {
+        self.access.write = write;
+        self
+    }
+
+    /// Also requests `DELETE`, which deleting or renaming the file through the
+    /// handle needs. Only [`open_existing`](Self::open_existing) honours it.
+    pub const fn delete(mut self, delete: bool) -> Self {
+        self.access.delete = delete;
+        self
+    }
+
+    /// Also requests `FILE_WRITE_ATTRIBUTES`, which setting the file's
+    /// timestamps through the handle needs, without granting write access to
+    /// its data. Only [`open_existing`](Self::open_existing) honours it.
+    pub const fn write_attributes(mut self, write: bool) -> Self {
+        self.access.write_attributes = write;
+        self
     }
 
     pub const fn persistent(mut self, timeout_millis: u32) -> Self {
@@ -778,6 +828,7 @@ impl Share {
                     .open_file(
                         path.as_str(),
                         options.mode,
+                        options.access,
                         options.persistent_timeout_millis,
                     )
                     .await?;
@@ -1090,6 +1141,11 @@ impl File {
         }
     }
 
+    /// Flushes the file's buffered data to stable storage.
+    ///
+    /// MS-SMB2 requires write access: open with [`FileOpenOptions::write`],
+    /// [`FileOpenOptions::create_new`], or [`FileOpenOptions::overwrite`].
+    /// Some servers (ONTAP 9.19) accept a flush on a read-only handle anyway.
     pub fn flush(&self) -> Operation<'_, ()> {
         Operation::new(move |context| {
             Box::pin(async move {
@@ -1164,6 +1220,10 @@ impl File {
         })
     }
 
+    /// Writes up to one negotiated write chunk at `offset`.
+    ///
+    /// Needs write access: open with [`FileOpenOptions::write`],
+    /// [`FileOpenOptions::create_new`], or [`FileOpenOptions::overwrite`].
     pub fn write_at(&self, offset: u64, bytes: Bytes) -> Operation<'_, usize> {
         Operation::new(move |context| {
             Box::pin(async move {
@@ -1206,6 +1266,10 @@ impl File {
         })
     }
 
+    /// Writes up to one negotiated write chunk from `buffer` at `offset`.
+    ///
+    /// Needs write access: open with [`FileOpenOptions::write`],
+    /// [`FileOpenOptions::create_new`], or [`FileOpenOptions::overwrite`].
     pub fn write_at_from<'a>(&'a self, offset: u64, buffer: &'a [u8]) -> Operation<'a, usize> {
         Operation::new(move |context| {
             Box::pin(async move {
@@ -1290,6 +1354,10 @@ impl File {
         })
     }
 
+    /// Writes all of `bytes` at `offset`, in negotiated write chunks.
+    ///
+    /// Needs write access: open with [`FileOpenOptions::write`],
+    /// [`FileOpenOptions::create_new`], or [`FileOpenOptions::overwrite`].
     pub fn write_all_at(&self, offset: u64, bytes: Bytes) -> Operation<'_, ()> {
         Operation::new(move |context| {
             Box::pin(async move {
@@ -1327,6 +1395,10 @@ impl File {
         })
     }
 
+    /// Marks this file for deletion when its last handle closes.
+    ///
+    /// Needs `DELETE` access: open with [`FileOpenOptions::delete`],
+    /// [`FileOpenOptions::create_new`], or [`FileOpenOptions::overwrite`].
     pub fn delete(&self) -> Operation<'_, ()> {
         Operation::new(move |context| {
             Box::pin(async move {
@@ -1341,6 +1413,11 @@ impl File {
         })
     }
 
+    /// Renames this file; an existing destination fails with
+    /// `STATUS_OBJECT_NAME_COLLISION`.
+    ///
+    /// Needs `DELETE` access: open with [`FileOpenOptions::delete`],
+    /// [`FileOpenOptions::create_new`], or [`FileOpenOptions::overwrite`].
     pub fn rename<'a>(&'a self, destination: &'a SharePath) -> Operation<'a, ()> {
         Operation::new(move |context| {
             Box::pin(async move {
@@ -1356,6 +1433,9 @@ impl File {
     }
 
     /// Renames this file and atomically replaces an existing destination.
+    ///
+    /// Needs `DELETE` access: open with [`FileOpenOptions::delete`],
+    /// [`FileOpenOptions::create_new`], or [`FileOpenOptions::overwrite`].
     pub fn rename_replace<'a>(&'a self, destination: &'a SharePath) -> Operation<'a, ()> {
         Operation::new(move |context| {
             Box::pin(async move {

@@ -897,7 +897,10 @@ async fn cleanup_auto_inherit_request(
     child_file_path: &SharePath,
 ) {
     match share
-        .open_file(child_file_path, FileOpenOptions::open_existing())
+        .open_file(
+            child_file_path,
+            FileOpenOptions::open_existing().delete(true),
+        )
         .await
     {
         Ok(file) => {
@@ -1058,7 +1061,10 @@ async fn cleanup(
     child_file_path: &SharePath,
 ) {
     match share
-        .open_file(child_file_path, FileOpenOptions::open_existing())
+        .open_file(
+            child_file_path,
+            FileOpenOptions::open_existing().delete(true),
+        )
         .await
     {
         Ok(file) => {

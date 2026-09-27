@@ -522,7 +522,10 @@ async fn cleanup(
     child_file_path: &SharePath,
 ) -> bool {
     if let Ok(file) = share
-        .open_file(child_file_path, FileOpenOptions::open_existing())
+        .open_file(
+            child_file_path,
+            FileOpenOptions::open_existing().delete(true),
+        )
         .await
     {
         let _ = file.delete().await;

@@ -18,6 +18,8 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+#[cfg(feature = "real-server-tests")]
+use std::time::SystemTime;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
@@ -164,6 +166,25 @@ fn persistent_open_intent_is_explicit_at_the_domain_boundary() {
     assert!(options.requests_persistent_handle());
     assert_eq!(options.durable_timeout_millis(), Some(30_000));
     assert!(!FileOpenOptions::open_existing().requests_persistent_handle());
+    assert_eq!(
+        FileOpenOptions::open_existing()
+            .write(true)
+            .persistent(30_000)
+            .durable_timeout_millis(),
+        Some(30_000)
+    );
+}
+
+#[test]
+fn file_modify_access_is_part_of_the_open_options() {
+    let read_only = FileOpenOptions::open_existing();
+    assert_eq!(
+        read_only.write(false).delete(false).write_attributes(false),
+        read_only
+    );
+    assert_ne!(read_only.write(true), read_only);
+    assert_ne!(read_only.delete(true), read_only);
+    assert_ne!(read_only.write_attributes(true), read_only);
 }
 
 #[test]
@@ -232,7 +253,7 @@ async fn domain_resource_open_and_metadata() -> smb::Result<()> {
     file.close().await?;
     tracing::info!("metadata-stage=delete");
     let file = share
-        .open_file(&path, FileOpenOptions::open_existing())
+        .open_file(&path, FileOpenOptions::open_existing().delete(true))
         .await?;
     file.delete().await?;
     file.close().await?;
@@ -270,7 +291,7 @@ async fn domain_security_query_and_idempotent_set() -> smb::Result<()> {
     };
 
     let file = share
-        .open_file(&path, FileOpenOptions::open_existing())
+        .open_file(&path, FileOpenOptions::open_existing().delete(true))
         .await?;
     file.delete().await?;
     file.close().await?;
@@ -328,7 +349,7 @@ async fn common_and_explicit_session_paths_compile(
         .await?;
     let share = session.connect_share(target.share()).await?;
     let file = share
-        .open_file(&path, FileOpenOptions::open_existing())
+        .open_file(&path, FileOpenOptions::open_existing().delete(true))
         .await?;
     let _bytes = file
         .read_exact_at(0, 6)
@@ -461,7 +482,10 @@ async fn domain_spine_roundtrips_without_protocol_escape_hatches() -> smb::Resul
         .await?;
     let share = session.connect_share(target.share()).await?;
     let file = share
-        .open_file(&path, FileOpenOptions::open_existing())
+        .open_file(
+            &path,
+            FileOpenOptions::open_existing().write(true).delete(true),
+        )
         .await?;
     assert_eq!(
         file.read_at(0, payload.len() as u32)
@@ -704,6 +728,138 @@ async fn domain_directory_open_existing_is_read_only_until_modify_access_is_name
     client.close().await.map(|_| ())
 }
 
+/// `FileOpenOptions::open_existing()` asks for read access only: reading the data and metadata
+/// works, and the server refuses a write, delete, rename, or timestamp change through that handle
+/// until the caller names the access with `write(true)` / `delete(true)` /
+/// `write_attributes(true)` (issue #88).
+#[cfg(feature = "real-server-tests")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+#[ignore = "requires an isolated writable real-server share"]
+async fn domain_file_open_existing_is_read_only_until_modify_access_is_named() -> smb::Result<()> {
+    let target = ShareTarget::new(common::smb_tests_server(), common::smb_tests_share())?;
+    let client = Client::new();
+    let share = client
+        .connect_share(&target, common::smb_test_credentials())
+        .await?;
+    let name = format!("read-only-file-open-{}", std::process::id());
+    let path = SharePath::new(&name)?;
+    let renamed = SharePath::new(format!("{name}-renamed"))?;
+    let payload = Bytes::from_static(b"read-only open");
+    let created = share
+        .open_file(&path, FileOpenOptions::create_new())
+        .await?;
+    let written = created.write_all_at(0, payload.clone()).await;
+    created.close().await?;
+    written?;
+
+    let checked = async {
+        // Failures are returned, not asserted, so the cleanup below still runs.
+        let expect_denied = |what: &str, result: &smb::Result<()>| match result {
+            Err(Error::ReceivedErrorMessage(status, _))
+                if *status == Status::AccessDenied as u32 =>
+            {
+                Ok(())
+            }
+            other => Err(Error::InvalidState(format!("read-only {what}: {other:?}"))),
+        };
+        let touch = MetadataUpdate {
+            written: Some(SystemTime::now()),
+            ..MetadataUpdate::default()
+        };
+        let read_only = share
+            .open_file(&path, FileOpenOptions::open_existing())
+            .await?;
+        // Every result is collected before the handle closes, so no `?` leaves it open.
+        let read = read_only.read_exact_at(0, payload.len() as u32).await;
+        let metadata = read_only.metadata().await;
+        let write = read_only.write_all_at(0, Bytes::from_static(b"x")).await;
+        let delete = read_only.delete().await;
+        let rename = read_only.rename(&renamed).await;
+        let rename_replace = read_only.rename_replace(&renamed).await;
+        let set_metadata = read_only.set_metadata(touch).await;
+        read_only.close().await?;
+        if read? != payload {
+            return Err(Error::InvalidState(
+                "read-only read returned other bytes".into(),
+            ));
+        }
+        if metadata?.len() != payload.len() as u64 {
+            return Err(Error::InvalidState(
+                "read-only metadata reported another length".into(),
+            ));
+        }
+        expect_denied("write", &write)?;
+        expect_denied("delete", &delete)?;
+        expect_denied("rename", &rename)?;
+        expect_denied("rename_replace", &rename_replace)?;
+        expect_denied("set_metadata", &set_metadata)?;
+
+        let attributes = share
+            .open_file(
+                &path,
+                FileOpenOptions::open_existing().write_attributes(true),
+            )
+            .await?;
+        let set_metadata = attributes.set_metadata(touch).await;
+        let write = attributes.write_all_at(0, Bytes::from_static(b"x")).await;
+        let delete = attributes.delete().await;
+        attributes.close().await?;
+        set_metadata?;
+        expect_denied("write with write_attributes only", &write)?;
+        expect_denied("delete with write_attributes only", &delete)?;
+
+        let writable = share
+            .open_file(&path, FileOpenOptions::open_existing().write(true))
+            .await?;
+        let write = writable
+            .write_all_at(payload.len() as u64, Bytes::from_static(b"!"))
+            .await;
+        let flush = writable.flush().await;
+        let delete = writable.delete().await;
+        writable.close().await?;
+        write?;
+        flush?;
+        expect_denied("delete with write only", &delete)?;
+
+        let deletable = share
+            .open_file(&path, FileOpenOptions::open_existing().delete(true))
+            .await?;
+        let renamed_result = deletable.rename(&renamed).await;
+        let deleted = deletable.delete().await;
+        deletable.close().await?;
+        renamed_result?;
+        deleted?;
+        match share
+            .open_file(&renamed, FileOpenOptions::open_existing())
+            .await
+        {
+            Err(Error::ReceivedErrorMessage(status, _))
+                if status == Status::ObjectNameNotFound as u32 =>
+            {
+                Ok(())
+            }
+            Ok(file) => {
+                file.close().await?;
+                Err(Error::InvalidState("deleted file still opens".into()))
+            }
+            Err(error) => Err(error),
+        }
+    }
+    .await;
+    for leftover in [&renamed, &path] {
+        if let Ok(handle) = share
+            .open_file(leftover, FileOpenOptions::open_existing().delete(true))
+            .await
+        {
+            let _ = handle.delete().await;
+            let _ = handle.close().await;
+        }
+    }
+    checked?;
+    share.close().await?;
+    client.close().await.map(|_| ())
+}
+
 #[cfg(feature = "real-server-tests")]
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 #[ignore = "requires a manifest-owned ONTAP Snapshot between prepare and verify"]
@@ -738,7 +894,7 @@ async fn previous_versions_read_snapshot_and_active_version() -> smb::Result<()>
         .await?;
     let path = SharePath::new("w6-previous-version.bin")?;
     let active = share
-        .open_file(&path, FileOpenOptions::open_existing())
+        .open_file(&path, FileOpenOptions::open_existing().write(true))
         .await?;
     active
         .write_all_at(0, Bytes::from_static(b"version-b"))
@@ -796,7 +952,7 @@ async fn previous_version_no_longer_opens_after_snapshot_delete() -> smb::Result
         )
         .await?;
     let active = share
-        .open_file(&path, FileOpenOptions::open_existing())
+        .open_file(&path, FileOpenOptions::open_existing().delete(true))
         .await?;
     assert_eq!(active.read_exact_at(0, 9).await?, b"version-b"[..]);
     active.delete().await?;
@@ -820,7 +976,13 @@ async fn persistent_handle_is_granted_on_ca_share() -> smb::Result<()> {
     let created = share.open_file(&path, FileOpenOptions::overwrite()).await?;
     created.close().await?;
     let file = share
-        .open_file(&path, FileOpenOptions::open_existing().persistent(0))
+        .open_file(
+            &path,
+            FileOpenOptions::open_existing()
+                .write(true)
+                .delete(true)
+                .persistent(0),
+        )
         .await?;
     assert!(file.persistent_granted());
     file.write_all_at(0, Bytes::from_static(b"persistent-data"))
@@ -902,7 +1064,7 @@ async fn domain_batch_and_concurrent_transfer() -> smb::Result<()> {
     source.write_all_at(0, payload.clone()).await?;
     source.close().await?;
     let source = share
-        .open_file(&source_path, FileOpenOptions::open_existing())
+        .open_file(&source_path, FileOpenOptions::open_existing().delete(true))
         .await?;
     let destination = share
         .open_file(&destination_path, FileOpenOptions::overwrite())

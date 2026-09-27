@@ -393,7 +393,7 @@ fn record_acl_observation(stage: &str, descriptor: &SecurityDescriptor) {
 
 async fn delete_exact_if_present(share: &Share, path: &SharePath) -> smb::Result<()> {
     match share
-        .open_file(path, FileOpenOptions::open_existing())
+        .open_file(path, FileOpenOptions::open_existing().delete(true))
         .await
     {
         Ok(file) => {

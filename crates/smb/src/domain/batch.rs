@@ -191,6 +191,8 @@ impl File {
         })
     }
 
+    /// Queues one write chunk at `offset`. Needs write access, as
+    /// [`File::write_at`] does.
     pub fn batch_write_at(&self, offset: u64, bytes: Bytes) -> BatchCommand<'_, usize> {
         BatchCommand::new(move |context| {
             Box::pin(async move {
