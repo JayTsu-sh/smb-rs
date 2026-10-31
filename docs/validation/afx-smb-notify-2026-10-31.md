@@ -94,3 +94,5 @@ while let Some(event) = events.next().await {
 6 个本地回归测试通过，覆盖不确定关闭、事件流提前结束、非递归检查、观察任务错误传播和超时任务销毁。修复版 `2230995` 已在 AFX 重跑全部 13 类验证，程序退出码为 0，两个本轮测试目录已删除，新连接回查通过。
 
 合入前本地完整检查：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings` 均通过；`cargo test --workspace --all-targets --all-features` 为 655 passed / 0 failed / 35 ignored（包含上述 6 个回归测试）；`cargo test --workspace --doc` 为 7 passed / 0 failed / 6 ignored。忽略项未计作已验证通过的用例。
+
+GitHub CI 的 Rust 1.99.1 还暴露了已有测试辅助代码的 `AtomicU64::fetch_update` 弃用错误。为保持 Rust 1.89 最低版本兼容性，将 `smb-tests` 内的饱和减法改为等价的 `compare_exchange_weak` 循环，保留 Relaxed 内存序与饱和语义；8 个现有内存计量测试通过。该改动不影响 SMB 客户端协议实现或上述 AFX 通知验证程序。
