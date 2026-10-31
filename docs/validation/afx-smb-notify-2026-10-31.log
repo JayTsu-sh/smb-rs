@@ -1,0 +1,57 @@
+exit_code=0
+Connected observer and independent writer to 192.168.9.101 / smb_notify_20261031
+CASE recursive=true directory=notify-1793440059665-57307-true
+EVENT Added { path: "ready" }
+PASS Added ready
+EVENT Added { path: "file.txt" }
+PASS Added file.txt
+EVENT Modified { path: "file.txt" }
+PASS Modified file.txt
+EVENT Modified { path: "file.txt" }
+PASS Modified file.txt
+EVENT Renamed { from: "file.txt", to: "renamed.txt" }
+PASS Renamed file.txt->renamed.txt
+EVENT Removed { path: "renamed.txt" }
+PASS Removed renamed.txt
+EVENT Added { path: "child" }
+PASS Added child
+EVENT Modified { path: "child" }
+PASS Modified child
+EVENT Added { path: "child\\nested.txt" }
+PASS Added child\nested.txt
+EVENT Modified { path: "child\\nested.txt" }
+PASS Modified child\nested.txt
+EVENT Removed { path: "child\\nested.txt" }
+PASS Removed child\nested.txt
+EVENT Renamed { from: "child", to: "renamed-child" }
+PASS Renamed child->renamed-child
+EVENT Removed { path: "renamed-child" }
+PASS Removed renamed-child
+CLEANUP notify-1793440059665-57307-true
+PASS cancellation and cleanup recursive=true
+CASE recursive=false directory=notify-1793440059665-57307-false
+EVENT Added { path: "ready" }
+PASS Added ready
+EVENT Added { path: "file.txt" }
+PASS Added file.txt
+EVENT Modified { path: "file.txt" }
+PASS Modified file.txt
+EVENT Modified { path: "file.txt" }
+PASS Modified file.txt
+EVENT Renamed { from: "file.txt", to: "renamed.txt" }
+PASS Renamed file.txt->renamed.txt
+EVENT Removed { path: "renamed.txt" }
+PASS Removed renamed.txt
+EVENT Added { path: "child" }
+PASS Added child
+EVENT Modified { path: "child" }
+PASS Modified child
+PASS nonrecursive excludes child\nested.txt (2s observation)
+EVENT Renamed { from: "child", to: "renamed-child" }
+PASS Renamed child->renamed-child
+EVENT Removed { path: "renamed-child" }
+PASS Removed renamed-child
+CLEANUP notify-1793440059665-57307-false
+PASS cancellation and cleanup recursive=false
+PASS fresh connection confirms test directories removed
+PASS all notify probes
