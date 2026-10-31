@@ -1,6 +1,6 @@
 # AFX SMB CHANGE_NOTIFY 实测
 
-日期：2026-10-31。源码基线：`2649a0b`，加本次 `notify_probe` 示例；未修改库实现。
+日期：2026-10-31。库源码基线：`2649a0b`；验证程序：复审修复版 `2230995`。本文日志来自修复版重新执行的 AFX 验证；未修改库实现。
 
 ## 结果
 
@@ -84,3 +84,13 @@ while let Some(event) = events.next().await {
 本轮没有验证断线恢复、通知溢出、高并发压力、ACL/只读属性修改、其他协议或存储内部操作引起的变化，以及主机/节点故障。目录“修改”具体验证最后写入时间，文件“修改”验证内容写入和最后写入时间，不能把它们扩展成所有修改类型均已验证。
 
 验证命令：`cargo build -p smb --example notify_probe --target x86_64-unknown-linux-musl`、对应目标的 `cargo clippy -p smb --example notify_probe --target x86_64-unknown-linux-musl -- -D warnings`、示例 rustfmt 检查，以及 AFX 实际执行。
+
+## 合入前审查与复验
+
+规范审查发现 1 项路径写法问题；需求/正确性审查发现 2 项异常路径问题：部分失败路径绕过测试目录清理，以及未检查关闭确认结果可能误报通过。修复后，两项审查均无剩余阻塞问题。
+
+修复版显式检查文件/目录的 `CloseOutcome` 和客户端的 `CloseReport`；监听任务超时时执行 abort 并等待回收；创建成功的目录立即登记，异常退出后先关闭两个客户端，再由独立新连接按登记的确切目录名尝试恢复清理并回查。不会按宽泛前缀删除其他运行的数据。
+
+6 个本地回归测试通过，覆盖不确定关闭、事件流提前结束、非递归检查、观察任务错误传播和超时任务销毁。修复版 `2230995` 已在 AFX 重跑全部 13 类验证，程序退出码为 0，两个本轮测试目录已删除，新连接回查通过。
+
+合入前本地完整检查：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings` 均通过；`cargo test --workspace --all-targets --all-features` 为 655 passed / 0 failed / 35 ignored（包含上述 6 个回归测试）；`cargo test --workspace --doc` 为 7 passed / 0 failed / 6 ignored。忽略项未计作已验证通过的用例。
