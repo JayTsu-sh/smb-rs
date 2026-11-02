@@ -969,7 +969,11 @@ async fn owner_task(
             )
             .await
             {
-                let _ = shutdown_reason.set(fatal.clone().unwrap_or(RuntimeError::Closed));
+                let _ = publish_shutdown_reason(
+                    &shutdown_reason,
+                    fatal.as_ref(),
+                    close_request.is_some(),
+                );
                 admission_rx.close();
                 operation_rx.close();
                 compound_rx.close();
@@ -1029,7 +1033,11 @@ async fn owner_task(
                     )
                     .await
                     {
-                        let _ = shutdown_reason.set(fatal.clone().unwrap_or(RuntimeError::Closed));
+                        let _ = publish_shutdown_reason(
+                            &shutdown_reason,
+                            fatal.as_ref(),
+                            close_request.is_some(),
+                        );
                         admission_rx.close();
                         operation_rx.close();
                         compound_rx.close();
@@ -1111,7 +1119,7 @@ async fn owner_task(
                 Some(command) => {
                     let close = handle_control(command, &wire, &mut authority, &mut send_queue, &mut close_request).await;
                     if close {
-                        let _ = shutdown_reason.set(RuntimeError::Closed);
+                        let _ = publish_shutdown_reason(&shutdown_reason, fatal.as_ref(), true);
                     }
                     close_admission_if(close, &mut admission_rx);
                     if close {
@@ -1132,7 +1140,7 @@ async fn owner_task(
                             config.emit_events,
                             &mut fatal,
                         ) {
-                            let _ = shutdown_reason.set(fatal.clone().unwrap_or(RuntimeError::Closed));
+                            let _ = publish_shutdown_reason(&shutdown_reason, fatal.as_ref(), close_request.is_some());
                 admission_rx.close();
                             operation_rx.close();
                             compound_rx.close();
@@ -1167,7 +1175,7 @@ async fn owner_task(
                     }
                 }
                 if fatal.is_some() {
-                    let _ = shutdown_reason.set(fatal.clone().unwrap_or(RuntimeError::Closed));
+                    let _ = publish_shutdown_reason(&shutdown_reason, fatal.as_ref(), close_request.is_some());
                 admission_rx.close();
                     operation_rx.close();
                     compound_rx.close();
@@ -1242,7 +1250,7 @@ async fn owner_task(
                     }
                 }
                 if fatal.is_some() {
-                    let _ = shutdown_reason.set(fatal.clone().unwrap_or(RuntimeError::Closed));
+                    let _ = publish_shutdown_reason(&shutdown_reason, fatal.as_ref(), close_request.is_some());
                 admission_rx.close();
                     operation_rx.close();
                     compound_rx.close();
@@ -1270,7 +1278,7 @@ async fn owner_task(
                         &mut fatal,
                     ).await
                 {
-                    let _ = shutdown_reason.set(fatal.clone().unwrap_or(RuntimeError::Closed));
+                    let _ = publish_shutdown_reason(&shutdown_reason, fatal.as_ref(), close_request.is_some());
                 admission_rx.close();
                     operation_rx.close();
                     compound_rx.close();
@@ -1318,7 +1326,7 @@ async fn owner_task(
                 apply_owner_effects(effects, &mut authority.terminals);
                 if authority.state.is_unhealthy() {
                     fatal = Some(RuntimeError::Transport("generation-unhealthy"));
-                    let _ = shutdown_reason.set(fatal.clone().unwrap_or(RuntimeError::Closed));
+                    let _ = publish_shutdown_reason(&shutdown_reason, fatal.as_ref(), close_request.is_some());
                 admission_rx.close();
                     operation_rx.close();
                     compound_rx.close();
@@ -1327,29 +1335,17 @@ async fn owner_task(
         }
     }
 
-    let _ = shutdown_reason.set(fatal.clone().unwrap_or(RuntimeError::Closed));
+    let terminal_error =
+        publish_shutdown_reason(&shutdown_reason, fatal.as_ref(), close_request.is_some());
     admission_rx.close();
     operation_rx.close();
     compound_rx.close();
     for (_, cancellation) in authority.preparation_cancellations.drain() {
         cancellation.cancel();
     }
-    fail_waiting_admissions(
-        &mut admission_rx,
-        fatal.clone().unwrap_or(RuntimeError::Closed),
-    )
-    .await;
-    fail_waiting_compounds(
-        &mut compound_rx,
-        fatal.clone().unwrap_or(RuntimeError::Closed),
-    )
-    .await;
-    fail_waiting_operations(
-        &mut operation_rx,
-        fatal.clone().unwrap_or(RuntimeError::Closed),
-    )
-    .await;
-    let terminal_error = fatal.clone().unwrap_or(RuntimeError::Closed);
+    fail_waiting_admissions(&mut admission_rx, terminal_error.clone()).await;
+    fail_waiting_compounds(&mut compound_rx, terminal_error.clone()).await;
+    fail_waiting_operations(&mut operation_rx, terminal_error.clone()).await;
     if let Some(command) = waiting_operation {
         if let Some(terminal) = command.terminal {
             let _ = terminal.send(Err(terminal_error.clone()));
@@ -1357,7 +1353,7 @@ async fn owner_task(
         let _ = command.acknowledge.send(Err(terminal_error.clone()));
     }
     if let Some(command) = waiting_compound {
-        let _ = command.acknowledge.send(Err(terminal_error));
+        let _ = command.acknowledge.send(Err(terminal_error.clone()));
     }
     for queued in send_queue {
         queued.cancel_before_write.cancel();
@@ -1371,13 +1367,9 @@ async fn owner_task(
     authority.objects.lose_generation();
     let effects = authority
         .state
-        .reduce(OwnerEvent::Disconnect(if close_request.is_some() {
-            None
-        } else {
-            match &fatal {
-                Some(RuntimeError::Network(failure)) => Some(*failure),
-                _ => None,
-            }
+        .reduce(OwnerEvent::Disconnect(match &terminal_error {
+            RuntimeError::Network(failure) => Some(*failure),
+            _ => None,
         }));
     apply_operation_effects(
         &effects,
@@ -1386,11 +1378,11 @@ async fn owner_task(
     );
     apply_owner_effects(effects, &mut authority.terminals);
     for (_, terminal) in authority.terminals.drain() {
-        let _ = terminal.send(Err(fatal.clone().unwrap_or(RuntimeError::Closed)));
+        let _ = terminal.send(Err(terminal_error.clone()));
     }
     for (_, pending) in authority.operation_pending.drain() {
         if let Some(terminal) = pending.terminal {
-            let _ = terminal.send(Err(fatal.clone().unwrap_or(RuntimeError::Closed)));
+            let _ = terminal.send(Err(terminal_error.clone()));
         }
     }
 
@@ -1431,6 +1423,24 @@ async fn owner_task(
         cause,
         report,
     }
+}
+
+/// The first published reason owns teardown. An explicit close without an earlier
+/// published failure is intentional; a later pump error cannot change its meaning.
+fn publish_shutdown_reason(
+    reason: &OnceLock<RuntimeError>,
+    fatal: Option<&RuntimeError>,
+    explicitly_closed: bool,
+) -> RuntimeError {
+    reason
+        .get_or_init(|| {
+            if explicitly_closed {
+                RuntimeError::Closed
+            } else {
+                fatal.cloned().unwrap_or(RuntimeError::Closed)
+            }
+        })
+        .clone()
 }
 
 async fn finish_active_write(
@@ -3220,6 +3230,50 @@ mod tests {
         let mut encoded = Vec::new();
         response.write(&mut Cursor::new(&mut encoded)).unwrap();
         Bytes::from(encoded)
+    }
+
+    #[tokio::test]
+    async fn explicit_close_keeps_queued_admissions_non_network_when_read_fails() {
+        let (transport, control) = ScriptedTransport::new();
+        let clock = Arc::new(ManualClock::new());
+        let mut configuration = config();
+        configuration.initial_credits = 1;
+        let (handle, mut events) = start_generation(transport, clock.clone(), configuration);
+        let ticket = handle
+            .submit_operation(create_operation(), None)
+            .await
+            .unwrap();
+        wait_for_write(&mut events, ticket.key).await;
+        let (acknowledge, acknowledged) = oneshot::channel();
+        handle
+            .operations
+            .try_send(OperationAdmission {
+                operation: create_operation(),
+                deadline: None,
+                acknowledge,
+                terminal: None,
+            })
+            .unwrap();
+        let (reply, report) = oneshot::channel();
+        handle
+            .control
+            .try_send(ControlCommand::Close {
+                deadline: clock.now().saturating_add(Duration::from_secs(1)),
+                reply,
+            })
+            .unwrap();
+        control.fail_read_on(2, ErrorKind::ConnectionReset);
+        control.push_server_frame(create_error_response(ticket.key.message_id));
+        assert_eq!(
+            acknowledged.await.unwrap().unwrap_err(),
+            RuntimeError::Closed
+        );
+        assert_eq!(
+            ticket.completion().await.unwrap_err(),
+            RuntimeError::Terminal(TerminalOutcome::OutcomeUnknown)
+        );
+        report.await.unwrap().unwrap();
+        assert_eq!(handle.shutdown_reason(), Some(RuntimeError::Closed));
     }
 
     #[tokio::test]
