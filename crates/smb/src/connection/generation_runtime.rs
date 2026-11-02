@@ -2,7 +2,7 @@ use crate::clock::{Clock, TokioClock};
 use crate::command::{CommandRequest, CommandResponse, CommandSubmission, ResponseOptions};
 use crate::connection::connection_info::ConnectionInfo;
 use crate::connection::preauth_hash::PreauthHashValue;
-use crate::error::TimedOutTask;
+use crate::error::{NetworkFailure, TimedOutTask};
 use crate::runtime::{
     GenerationExit, GenerationId, ObjectKind, ObjectToken, OperationResult, RequestKey,
     ResponsePolicy, RuntimeConfig, RuntimeError, RuntimeHandle, TerminalOutcome, TypedOperation,
@@ -276,6 +276,11 @@ impl GenerationRuntime {
     }
 
     fn map_runtime_error(&self, error: RuntimeError) -> Error {
+        let error = if matches!(error, RuntimeError::Closed | RuntimeError::OwnerTerminated) {
+            self.runtime.shutdown_reason().unwrap_or(error)
+        } else {
+            error
+        };
         map_runtime_error_value(error, self.timeout)
     }
 }
@@ -287,14 +292,30 @@ fn map_runtime_error_value(error: RuntimeError, timeout: std::time::Duration) ->
             Error::OperationTimeout(TimedOutTask::ReceiveNextMessage, timeout)
         }
         RuntimeError::Terminal(TerminalOutcome::OutcomeUnknown) => Error::OutcomeUnknown,
+        RuntimeError::Terminal(TerminalOutcome::NetworkOutcomeUnknown(failure)) => {
+            Error::NetworkOutcomeUnknown(failure)
+        }
+        RuntimeError::Network(NetworkFailure::TimedOut) => {
+            Error::OperationTimeout(TimedOutTask::ReceiveNextMessage, timeout)
+        }
+        RuntimeError::Network(NetworkFailure::ConnectionLost) => Error::ConnectionStopped,
+        RuntimeError::Network(NetworkFailure::SessionInvalidated) => Error::SessionInvalidated,
+        RuntimeError::Transport("pump-panicked" | "generation-unhealthy") => {
+            Error::RuntimeTerminated
+        }
+        RuntimeError::Transport(code) => Error::InvalidState(format!("transport failed: {code}")),
         RuntimeError::Terminal(TerminalOutcome::SessionInvalidated) => Error::SessionInvalidated,
         RuntimeError::AdmissionBackpressure => Error::Backpressure("admission"),
         RuntimeError::ControlBackpressure => Error::Backpressure("control"),
         RuntimeError::EventBackpressure => Error::Backpressure("event"),
-        RuntimeError::Object(_) | RuntimeError::Terminal(TerminalOutcome::GenerationLost) => {
-            Error::StaleObject
+        RuntimeError::Terminal(TerminalOutcome::GenerationLost) => Error::ConnectionStopped,
+        RuntimeError::Object(_) => Error::StaleObject,
+        // A closed generation alone establishes no network failure. The instance mapper
+        // resolves its published cause; a missing owner remains an internal fault.
+        RuntimeError::Closed | RuntimeError::Terminal(TerminalOutcome::GenerationClosed) => {
+            Error::ConnectionClosed
         }
-        RuntimeError::Closed | RuntimeError::OwnerTerminated => Error::RuntimeTerminated,
+        RuntimeError::OwnerTerminated => Error::RuntimeTerminated,
         other => Error::InvalidState(other.to_string()),
     }
 }
@@ -312,6 +333,51 @@ impl fmt::Debug for GenerationRuntime {
 #[cfg(test)]
 mod public_error_mapping_tests {
     use super::*;
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn late_admission_keeps_the_actual_generation_shutdown_cause() {
+        use smb_transport::test_support::ScriptedTransport;
+        use std::io::ErrorKind;
+        for (kind, expected) in [
+            (ErrorKind::TimedOut, Some(NetworkFailure::TimedOut)),
+            (
+                ErrorKind::ConnectionReset,
+                Some(NetworkFailure::ConnectionLost),
+            ),
+            (ErrorKind::PermissionDenied, None),
+        ] {
+            let (transport, control) = ScriptedTransport::new();
+            control.fail_read_on(1, kind);
+            let runtime = GenerationRuntime::start_generation_at(
+                transport,
+                Duration::from_secs(1),
+                0,
+                1,
+                GenerationId::new(1),
+            )
+            .await
+            .unwrap();
+            runtime.exited().await;
+            let error = runtime.preauth_snapshot().await.unwrap_err();
+            assert_eq!(error.network_failure(), expected, "{kind:?}: {error:?}");
+            assert!(!error.outcome_unknown());
+        }
+        let (transport, _) = ScriptedTransport::new();
+        let runtime = GenerationRuntime::start_generation_at(
+            transport,
+            Duration::from_secs(1),
+            0,
+            1,
+            GenerationId::new(1),
+        )
+        .await
+        .unwrap();
+        runtime.stop().await.unwrap();
+        let error = runtime.preauth_snapshot().await.unwrap_err();
+        assert!(matches!(error, Error::ConnectionClosed));
+        assert_eq!(error.network_failure(), None);
+    }
 
     #[test]
     fn runtime_terminal_categories_remain_typed_at_the_public_boundary() {
@@ -332,8 +398,14 @@ mod public_error_mapping_tests {
                 RuntimeError::Terminal(TerminalOutcome::GenerationLost),
                 timeout,
             ),
-            Error::StaleObject
+            Error::ConnectionStopped
         ));
+        let closed = map_runtime_error_value(RuntimeError::Closed, timeout);
+        assert_eq!(closed.network_failure(), None);
+        assert!(
+            !closed.outcome_unknown(),
+            "a rejected admission sent no request"
+        );
         assert!(matches!(
             map_runtime_error_value(RuntimeError::OwnerTerminated, timeout),
             Error::RuntimeTerminated
