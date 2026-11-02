@@ -71,3 +71,9 @@ peer disconnected; malformed protocol and permission failures return `None`.
 
 `NetworkOutcomeUnknown` preserves a network cause together with uncertain operation
 effects. Inspect `outcome_unknown()` before deciding whether a write can be retried.
+
+Network classification also applies to requests rejected after a generation has
+closed: the recorded shutdown cause distinguishes transport loss from timeout.
+Explicit close, dropped handles, malformed frames, and internal task failures do
+not manufacture network evidence. A sent request without a definitive response
+still has an unknown effect; check `outcome_unknown()` before retrying mutations.

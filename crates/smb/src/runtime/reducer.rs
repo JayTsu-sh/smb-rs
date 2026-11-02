@@ -1,3 +1,4 @@
+use crate::error::NetworkFailure;
 use std::fmt;
 
 /// Identity of one physical connection generation.
@@ -65,9 +66,10 @@ pub(crate) enum TerminalOutcome {
     Cancelled,
     TimedOut,
     OutcomeUnknown,
-    NetworkOutcomeUnknown(crate::error::NetworkFailure),
+    NetworkOutcomeUnknown(NetworkFailure),
     PreparationFailed,
     GenerationLost,
+    GenerationClosed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,7 +88,7 @@ pub(crate) enum RequestEvent {
     RecoveryHint { key: RequestKey },
     Cancel,
     Deadline,
-    Disconnect,
+    Disconnect(Option<NetworkFailure>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -215,14 +217,22 @@ impl RequestRecord {
             }
             RequestEvent::Cancel => self.finish_without_response(TerminalOutcome::Cancelled),
             RequestEvent::Deadline => self.finish_without_response(TerminalOutcome::TimedOut),
-            RequestEvent::Disconnect => {
+            RequestEvent::Disconnect(network) => {
                 self.tombstone = false;
                 let outcome = if self.send.committed() {
-                    TerminalOutcome::NetworkOutcomeUnknown(
-                        crate::error::NetworkFailure::ConnectionLost,
+                    network.map_or(
+                        TerminalOutcome::OutcomeUnknown,
+                        TerminalOutcome::NetworkOutcomeUnknown,
                     )
                 } else {
-                    TerminalOutcome::GenerationLost
+                    match network {
+                        Some(NetworkFailure::ConnectionLost) => TerminalOutcome::GenerationLost,
+                        Some(NetworkFailure::TimedOut) => TerminalOutcome::TimedOut,
+                        Some(NetworkFailure::SessionInvalidated) => {
+                            TerminalOutcome::SessionInvalidated
+                        }
+                        None => TerminalOutcome::GenerationClosed,
+                    }
                 };
                 self.publish_once(outcome)
             }
@@ -233,7 +243,7 @@ impl RequestRecord {
         let outcome = if self.send.committed() {
             self.tombstone = self.response != ResponseProgress::Final;
             if uncommitted == TerminalOutcome::TimedOut {
-                TerminalOutcome::NetworkOutcomeUnknown(crate::error::NetworkFailure::TimedOut)
+                TerminalOutcome::NetworkOutcomeUnknown(NetworkFailure::TimedOut)
             } else {
                 TerminalOutcome::OutcomeUnknown
             }
@@ -275,7 +285,7 @@ mod tests {
             RequestEvent::FinalResponse { key: KEY },
             RequestEvent::Cancel,
             RequestEvent::Deadline,
-            RequestEvent::Disconnect,
+            RequestEvent::Disconnect(Some(NetworkFailure::ConnectionLost)),
         ];
         for ordering in permutations(&terminals) {
             let mut request = RequestRecord::new(KEY);
@@ -315,7 +325,7 @@ mod tests {
         assert_eq!(
             request.reduce(RequestEvent::Deadline),
             ReduceEffect::Publish(TerminalOutcome::NetworkOutcomeUnknown(
-                crate::error::NetworkFailure::TimedOut
+                NetworkFailure::TimedOut
             ))
         );
         assert!(request.is_tombstone());
@@ -327,7 +337,7 @@ mod tests {
         assert_eq!(
             request.caller(),
             CallerOutcome::Terminal(TerminalOutcome::NetworkOutcomeUnknown(
-                crate::error::NetworkFailure::TimedOut
+                NetworkFailure::TimedOut
             ))
         );
     }
@@ -337,9 +347,11 @@ mod tests {
         let mut request = RequestRecord::new(KEY);
         request.reduce(RequestEvent::WriteProgress { bytes: 1 });
         assert_eq!(
-            request.reduce(RequestEvent::Disconnect),
+            request.reduce(RequestEvent::Disconnect(Some(
+                NetworkFailure::ConnectionLost
+            ))),
             ReduceEffect::Publish(TerminalOutcome::NetworkOutcomeUnknown(
-                crate::error::NetworkFailure::ConnectionLost
+                NetworkFailure::ConnectionLost
             ))
         );
         assert!(!request.is_tombstone());

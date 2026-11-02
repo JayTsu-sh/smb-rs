@@ -12,6 +12,7 @@ use super::wire::WirePipeline;
 use crate::clock::{Clock, MonotonicTime};
 use crate::connection::connection_info::ConnectionInfo;
 use crate::connection::preauth_hash::PreauthHashValue;
+use crate::error::NetworkFailure;
 use crate::session::SessionAndChannel;
 use futures_core::future::BoxFuture;
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
@@ -21,8 +22,8 @@ use smb_transport::{
 use std::collections::{HashMap, VecDeque};
 use std::future::pending;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -101,6 +102,8 @@ pub(crate) enum RuntimeError {
     Admission(AdmissionError),
     #[error("generation runtime transport failed: {0}")]
     Transport(&'static str),
+    #[error("generation runtime network failure: {0:?}")]
+    Network(NetworkFailure),
     #[error("generation runtime event lane is full")]
     EventBackpressure,
     #[error("generation runtime wire pipeline failed: {0}")]
@@ -187,9 +190,14 @@ pub(crate) struct RuntimeHandle {
     owner_finished: CancellationToken,
     exit: watch::Receiver<Option<GenerationExit>>,
     connection_object: ObjectToken,
+    shutdown_reason: Arc<OnceLock<RuntimeError>>,
 }
 
 impl RuntimeHandle {
+    pub(crate) fn shutdown_reason(&self) -> Option<RuntimeError> {
+        self.shutdown_reason.get().cloned()
+    }
+
     pub(crate) const fn connection_object(&self) -> ObjectToken {
         self.connection_object
     }
@@ -496,6 +504,7 @@ pub(crate) fn start_generation(
     let owner_finished = CancellationToken::new();
     let (exit_tx, exit_rx) = watch::channel(None);
     let connection_object = ObjectRegistry::new(config.generation).connection();
+    let shutdown_reason = Arc::new(OnceLock::new());
     let handle = RuntimeHandle {
         admission: admission_tx,
         operations: operation_tx,
@@ -504,6 +513,7 @@ pub(crate) fn start_generation(
         owner_finished: owner_finished.clone(),
         exit: exit_rx,
         connection_object,
+        shutdown_reason: Arc::clone(&shutdown_reason),
     };
     tokio::spawn(async move {
         let exit = owner_task(
@@ -515,6 +525,7 @@ pub(crate) fn start_generation(
             compound_rx,
             control_rx,
             event_tx,
+            shutdown_reason,
         )
         .await;
         let _ = exit_tx.send(Some(exit));
@@ -830,9 +841,11 @@ async fn owner_task(
     mut compound_rx: mpsc::Receiver<CompoundAdmission>,
     mut control_rx: mpsc::Receiver<ControlCommand>,
     event_tx: mpsc::Sender<RuntimeEvent>,
+    shutdown_reason: Arc<OnceLock<RuntimeError>>,
 ) -> GenerationExit {
     let wire = Arc::new(WirePipeline::default());
     let Ok((read, write)) = transport.split() else {
+        let _ = shutdown_reason.set(RuntimeError::Transport("split"));
         fail_waiting_admissions(&mut admission_rx, RuntimeError::Transport("split")).await;
         fail_waiting_operations(&mut operation_rx, RuntimeError::Transport("split")).await;
         fail_waiting_compounds(&mut compound_rx, RuntimeError::Transport("split")).await;
@@ -956,6 +969,7 @@ async fn owner_task(
             )
             .await
             {
+                let _ = shutdown_reason.set(fatal.clone().unwrap_or(RuntimeError::Closed));
                 admission_rx.close();
                 operation_rx.close();
                 compound_rx.close();
@@ -1015,6 +1029,7 @@ async fn owner_task(
                     )
                     .await
                     {
+                        let _ = shutdown_reason.set(fatal.clone().unwrap_or(RuntimeError::Closed));
                         admission_rx.close();
                         operation_rx.close();
                         compound_rx.close();
@@ -1095,6 +1110,9 @@ async fn owner_task(
             command = control_rx.recv() => match command {
                 Some(command) => {
                     let close = handle_control(command, &wire, &mut authority, &mut send_queue, &mut close_request).await;
+                    if close {
+                        let _ = shutdown_reason.set(RuntimeError::Closed);
+                    }
                     close_admission_if(close, &mut admission_rx);
                     if close {
                         operation_rx.close();
@@ -1114,7 +1132,8 @@ async fn owner_task(
                             config.emit_events,
                             &mut fatal,
                         ) {
-                            admission_rx.close();
+                            let _ = shutdown_reason.set(fatal.clone().unwrap_or(RuntimeError::Closed));
+                admission_rx.close();
                             operation_rx.close();
                             compound_rx.close();
                         }
@@ -1148,7 +1167,8 @@ async fn owner_task(
                     }
                 }
                 if fatal.is_some() {
-                    admission_rx.close();
+                    let _ = shutdown_reason.set(fatal.clone().unwrap_or(RuntimeError::Closed));
+                admission_rx.close();
                     operation_rx.close();
                     compound_rx.close();
                 }
@@ -1222,7 +1242,8 @@ async fn owner_task(
                     }
                 }
                 if fatal.is_some() {
-                    admission_rx.close();
+                    let _ = shutdown_reason.set(fatal.clone().unwrap_or(RuntimeError::Closed));
+                admission_rx.close();
                     operation_rx.close();
                     compound_rx.close();
                 }
@@ -1249,7 +1270,8 @@ async fn owner_task(
                         &mut fatal,
                     ).await
                 {
-                    admission_rx.close();
+                    let _ = shutdown_reason.set(fatal.clone().unwrap_or(RuntimeError::Closed));
+                admission_rx.close();
                     operation_rx.close();
                     compound_rx.close();
                 }
@@ -1296,7 +1318,8 @@ async fn owner_task(
                 apply_owner_effects(effects, &mut authority.terminals);
                 if authority.state.is_unhealthy() {
                     fatal = Some(RuntimeError::Transport("generation-unhealthy"));
-                    admission_rx.close();
+                    let _ = shutdown_reason.set(fatal.clone().unwrap_or(RuntimeError::Closed));
+                admission_rx.close();
                     operation_rx.close();
                     compound_rx.close();
                 }
@@ -1304,6 +1327,7 @@ async fn owner_task(
         }
     }
 
+    let _ = shutdown_reason.set(fatal.clone().unwrap_or(RuntimeError::Closed));
     admission_rx.close();
     operation_rx.close();
     compound_rx.close();
@@ -1345,7 +1369,16 @@ async fn owner_task(
     // lifetimes. Revoke the complete hierarchy before publishing disconnect
     // effects so no token from this generation can survive transport loss.
     authority.objects.lose_generation();
-    let effects = authority.state.reduce(OwnerEvent::Disconnect);
+    let effects = authority
+        .state
+        .reduce(OwnerEvent::Disconnect(if close_request.is_some() {
+            None
+        } else {
+            match &fatal {
+                Some(RuntimeError::Network(failure)) => Some(*failure),
+                _ => None,
+            }
+        }));
     apply_operation_effects(
         &effects,
         &mut authority.operation_pending,
@@ -2109,7 +2142,7 @@ fn finish_prepared_inbound(
             if let Some(notifications) = &authority.notifications
                 && notifications.try_send(message).is_err()
             {
-                *fatal = Some(RuntimeError::EventBackpressure);
+                fatal.get_or_insert(RuntimeError::EventBackpressure);
             }
         } else if authority.early_responses.len() >= authority.state.operation_limit()
             || authority.early_responses.insert(key, message).is_some()
@@ -2124,7 +2157,7 @@ fn finish_prepared_inbound(
             })
             .is_err()
     {
-        *fatal = Some(RuntimeError::EventBackpressure);
+        fatal.get_or_insert(RuntimeError::EventBackpressure);
     }
     fatal.is_some()
 }
@@ -2208,7 +2241,10 @@ async fn process_io(
             Some(RuntimeEvent::WriteComplete { key })
         }
         IoEvent::Failed { pump, error } => {
-            *fatal = Some(RuntimeError::Transport(transport_error_code(&error)));
+            *fatal = Some(NetworkFailure::from_transport(&error).map_or_else(
+                || RuntimeError::Transport(transport_error_code(&error)),
+                RuntimeError::Network,
+            ));
             Some(RuntimeEvent::PumpFailed {
                 pump,
                 code: transport_error_code(&error),
@@ -2220,7 +2256,7 @@ async fn process_io(
         && let Some(event) = runtime_event
         && event_tx.try_send(event).is_err()
     {
-        *fatal = Some(RuntimeError::EventBackpressure);
+        fatal.get_or_insert(RuntimeError::EventBackpressure);
     }
     fatal.is_some()
 }
@@ -3187,6 +3223,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn committed_request_keeps_transport_timeout_reset_and_protocol_causes_distinct() {
+        for (kind, network) in [
+            (ErrorKind::TimedOut, Some(NetworkFailure::TimedOut)),
+            (
+                ErrorKind::ConnectionReset,
+                Some(NetworkFailure::ConnectionLost),
+            ),
+            (ErrorKind::PermissionDenied, None),
+        ] {
+            let (control, _clock, handle, mut events) = test_runtime();
+            let ticket = handle
+                .submit_operation(create_operation(), None)
+                .await
+                .unwrap();
+            wait_for_write(&mut events, ticket.key).await;
+            control.fail_read_on(2, kind);
+            control.push_server_frame(create_error_response(ticket.key.message_id));
+            let expected = network.map_or(
+                TerminalOutcome::OutcomeUnknown,
+                TerminalOutcome::NetworkOutcomeUnknown,
+            );
+            assert_eq!(
+                ticket.completion().await.unwrap_err(),
+                RuntimeError::Terminal(expected),
+                "{kind:?}"
+            );
+            handle.exited().await;
+        }
+        let (control, _clock, handle, mut events) = test_runtime();
+        let ticket = handle
+            .submit_operation(create_operation(), None)
+            .await
+            .unwrap();
+        wait_for_write(&mut events, ticket.key).await;
+        control.push_server_frame(Bytes::from_static(b"bad"));
+        assert_eq!(
+            ticket.completion().await.unwrap_err(),
+            RuntimeError::Terminal(TerminalOutcome::OutcomeUnknown)
+        );
+        handle.exited().await;
+    }
+
+    #[tokio::test]
     async fn same_command_server_error_is_returned_and_generation_remains_usable() {
         let (control, clock, handle, mut events) = test_runtime();
 
@@ -3485,9 +3564,7 @@ mod tests {
         assert_eq!(report.failed_tasks, 0);
         assert_eq!(
             ticket.completion().await,
-            Ok(TerminalOutcome::NetworkOutcomeUnknown(
-                crate::error::NetworkFailure::ConnectionLost
-            ))
+            Ok(TerminalOutcome::OutcomeUnknown)
         );
     }
 
@@ -3605,7 +3682,7 @@ mod tests {
         assert_eq!(
             ticket.completion().await,
             Ok(TerminalOutcome::NetworkOutcomeUnknown(
-                crate::error::NetworkFailure::TimedOut
+                NetworkFailure::TimedOut
             ))
         );
         let report = handle
@@ -3739,9 +3816,7 @@ mod tests {
         assert_eq!(report.joined_tasks + report.failed_tasks, 2);
         assert_eq!(
             ticket.completion().await,
-            Ok(TerminalOutcome::NetworkOutcomeUnknown(
-                crate::error::NetworkFailure::ConnectionLost
-            ))
+            Ok(TerminalOutcome::OutcomeUnknown)
         );
     }
 
@@ -3763,9 +3838,7 @@ mod tests {
         trigger.notify_one();
         assert_eq!(
             ticket.completion().await,
-            Ok(TerminalOutcome::NetworkOutcomeUnknown(
-                crate::error::NetworkFailure::ConnectionLost
-            ))
+            Ok(TerminalOutcome::OutcomeUnknown)
         );
         while tokio::time::timeout(Duration::from_secs(1), events.recv())
             .await
@@ -3819,7 +3892,7 @@ mod tests {
         );
         assert!(matches!(
             exit.cause,
-            GenerationExitCause::Transport(RuntimeError::Transport("io"))
+            GenerationExitCause::Transport(RuntimeError::Network(NetworkFailure::ConnectionLost))
         ));
         assert_eq!(exit.report.joined_tasks, 2);
         assert_eq!(exit.report.failed_tasks, 0);
@@ -3850,9 +3923,7 @@ mod tests {
         drop(handle);
         assert_eq!(
             ticket.completion().await,
-            Ok(TerminalOutcome::NetworkOutcomeUnknown(
-                crate::error::NetworkFailure::ConnectionLost
-            ))
+            Ok(TerminalOutcome::OutcomeUnknown)
         );
         while tokio::time::timeout(Duration::from_secs(1), events.recv())
             .await
@@ -3947,8 +4018,8 @@ mod tests {
 
         handle.cancel(cancelled_key, clock.now()).unwrap();
         assert!(matches!(
-            ticket.completion().await,
-            Err(RuntimeError::Terminal(TerminalOutcome::OutcomeUnknown))
+            ticket.completion().await.unwrap_err(),
+            RuntimeError::Terminal(TerminalOutcome::OutcomeUnknown)
         ));
         control.push_server_frame(pending_session_setup_response(cancelled_key.message_id, 77));
         control.push_server_frame(session_setup_response(cancelled_key.message_id));
@@ -4101,7 +4172,7 @@ mod tests {
         assert!(matches!(
             ticket.completion().await,
             Err(RuntimeError::Terminal(
-                TerminalOutcome::NetworkOutcomeUnknown(crate::error::NetworkFailure::TimedOut)
+                TerminalOutcome::NetworkOutcomeUnknown(NetworkFailure::TimedOut)
             ))
         ));
         let report = handle

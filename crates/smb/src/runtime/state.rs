@@ -3,6 +3,7 @@ use super::reducer::{
     ResponseProgress, TerminalOutcome,
 };
 use crate::clock::MonotonicTime;
+use crate::error::NetworkFailure;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::time::Duration;
@@ -89,7 +90,7 @@ pub(crate) enum OwnerEvent {
     AdvanceTime {
         now: MonotonicTime,
     },
-    Disconnect,
+    Disconnect(Option<NetworkFailure>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -221,7 +222,7 @@ impl GenerationState {
             } => self.response(key, event, credit_grant),
             OwnerEvent::RecoveryHint { key } => self.recovery_hint(key),
             OwnerEvent::AdvanceTime { now } => self.advance_time(now),
-            OwnerEvent::Disconnect => self.disconnect(),
+            OwnerEvent::Disconnect(network) => self.disconnect(network),
         }
     }
 
@@ -649,12 +650,12 @@ impl GenerationState {
         }
     }
 
-    fn disconnect(&mut self) -> Vec<OwnerEffect> {
+    fn disconnect(&mut self, network: Option<NetworkFailure>) -> Vec<OwnerEffect> {
         let keys = self.requests.keys().copied().collect::<Vec<_>>();
         let mut effects = Vec::with_capacity(keys.len() * 2);
         for key in keys {
             if let Some(request) = self.requests.get_mut(&key) {
-                let effect = request.lifecycle.reduce(RequestEvent::Disconnect);
+                let effect = request.lifecycle.reduce(RequestEvent::Disconnect(network));
                 effects.push(OwnerEffect::Request { key, effect });
             }
             self.release_request_ownership(key);
@@ -1326,7 +1327,7 @@ mod tests {
             event: ResponseEvent::Final,
             credit_grant: 1,
         });
-        let effects = state.reduce(OwnerEvent::Disconnect);
+        let effects = state.reduce(OwnerEvent::Disconnect(Some(NetworkFailure::ConnectionLost)));
         assert_eq!(
             effects
                 .iter()

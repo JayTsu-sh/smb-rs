@@ -1,4 +1,4 @@
-use std::{num::TryFromIntError, sync::PoisonError};
+use std::{io::ErrorKind, num::TryFromIntError, sync::PoisonError};
 
 use smb_transport::TransportError;
 use thiserror::Error;
@@ -79,6 +79,10 @@ pub enum Error {
 
     #[error("Operation outcome is unknown because the request may have committed")]
     OutcomeUnknown,
+
+    /// The generation closed without evidence of a network failure (for example explicit close).
+    #[error("Connection generation was closed")]
+    ConnectionClosed,
 
     /// A transport failure or deadline ended a request whose effect may already have committed.
     #[error("Operation outcome is unknown after {0:?}")]
@@ -231,6 +235,30 @@ pub enum NetworkFailure {
     SessionInvalidated,
 }
 
+impl NetworkFailure {
+    pub(crate) fn from_io_kind(kind: ErrorKind) -> Option<Self> {
+        match kind {
+            ErrorKind::TimedOut => Some(Self::TimedOut),
+            ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::NotConnected
+            | ErrorKind::ConnectionRefused => Some(Self::ConnectionLost),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn from_transport(error: &TransportError) -> Option<Self> {
+        match error {
+            TransportError::IoError(error) => Self::from_io_kind(error.kind()),
+            TransportError::Timeout(_) => Some(Self::TimedOut),
+            TransportError::NotConnected | TransportError::WriteZero => Some(Self::ConnectionLost),
+            _ => None,
+        }
+    }
+}
+
 impl Error {
     /// Classifies the structured error chain without inspecting server-controlled text.
     pub fn outcome_unknown(&self) -> bool {
@@ -251,22 +279,8 @@ impl Error {
             | Self::Setup(SetupError::Timeout { .. }) => Some(NetworkFailure::TimedOut),
             Self::SessionInvalidated => Some(NetworkFailure::SessionInvalidated),
             Self::ConnectionStopped => Some(NetworkFailure::ConnectionLost),
-            Self::IoError(error) | Self::TransportError(TransportError::IoError(error)) => {
-                match error.kind() {
-                    std::io::ErrorKind::TimedOut => Some(NetworkFailure::TimedOut),
-                    std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::UnexpectedEof
-                    | std::io::ErrorKind::NotConnected
-                    | std::io::ErrorKind::ConnectionRefused => Some(NetworkFailure::ConnectionLost),
-                    _ => None,
-                }
-            }
-            Self::TransportError(TransportError::Timeout(_)) => Some(NetworkFailure::TimedOut),
-            Self::TransportError(TransportError::NotConnected | TransportError::WriteZero) => {
-                Some(NetworkFailure::ConnectionLost)
-            }
+            Self::IoError(error) => NetworkFailure::from_io_kind(error.kind()),
+            Self::TransportError(error) => NetworkFailure::from_transport(error),
             Self::TransferFailed { source, .. } => source.network_failure(),
             _ => None,
         }
@@ -276,38 +290,33 @@ impl Error {
 #[cfg(test)]
 mod network_failure_tests {
     use super::*;
+    use std::io::Error as IoError;
+    use std::time::Duration;
     #[test]
     fn disconnect_and_timeout_are_distinct_and_protocol_errors_are_not_network_errors() {
         for kind in [
-            std::io::ErrorKind::ConnectionReset,
-            std::io::ErrorKind::UnexpectedEof,
-            std::io::ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::BrokenPipe,
         ] {
-            let error = Error::IoError(std::io::Error::new(kind, "redacted"));
+            let error = Error::IoError(IoError::new(kind, "redacted"));
             assert_eq!(
                 error.network_failure(),
                 Some(NetworkFailure::ConnectionLost)
             );
         }
         assert_eq!(
-            Error::OperationTimeout(
-                TimedOutTask::ReceiveNextMessage,
-                std::time::Duration::from_secs(5)
-            )
-            .network_failure(),
-            Some(NetworkFailure::TimedOut)
-        );
-        assert_eq!(
-            Error::TransportError(TransportError::Timeout(std::time::Duration::from_secs(1)))
+            Error::OperationTimeout(TimedOutTask::ReceiveNextMessage, Duration::from_secs(5))
                 .network_failure(),
             Some(NetworkFailure::TimedOut)
         );
         assert_eq!(
-            Error::IoError(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "redacted"
-            ))
-            .network_failure(),
+            Error::TransportError(TransportError::Timeout(Duration::from_secs(1)))
+                .network_failure(),
+            Some(NetworkFailure::TimedOut)
+        );
+        assert_eq!(
+            Error::IoError(IoError::new(ErrorKind::TimedOut, "redacted")).network_failure(),
             Some(NetworkFailure::TimedOut)
         );
         assert_eq!(
@@ -320,8 +329,7 @@ mod network_failure_tests {
             None
         );
         assert_eq!(
-            Error::IoError(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
-                .network_failure(),
+            Error::IoError(IoError::from(ErrorKind::PermissionDenied)).network_failure(),
             None
         );
     }
