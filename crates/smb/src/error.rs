@@ -250,9 +250,7 @@ impl Error {
             | Self::ResourceRecoveryWaitTimedOut
             | Self::Setup(SetupError::Timeout { .. }) => Some(NetworkFailure::TimedOut),
             Self::SessionInvalidated => Some(NetworkFailure::SessionInvalidated),
-            Self::ConnectionStopped | Self::RuntimeTerminated => {
-                Some(NetworkFailure::ConnectionLost)
-            }
+            Self::ConnectionStopped => Some(NetworkFailure::ConnectionLost),
             Self::IoError(error) | Self::TransportError(TransportError::IoError(error)) => {
                 match error.kind() {
                     std::io::ErrorKind::TimedOut => Some(NetworkFailure::TimedOut),
@@ -316,6 +314,7 @@ mod network_failure_tests {
             Error::SessionInvalidated.network_failure(),
             Some(NetworkFailure::SessionInvalidated)
         );
+        assert_eq!(Error::RuntimeTerminated.network_failure(), None);
         assert_eq!(
             Error::InvalidMessage("redacted".into()).network_failure(),
             None
