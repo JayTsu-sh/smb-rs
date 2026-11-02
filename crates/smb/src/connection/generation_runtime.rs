@@ -287,13 +287,20 @@ fn map_runtime_error_value(error: RuntimeError, timeout: std::time::Duration) ->
             Error::OperationTimeout(TimedOutTask::ReceiveNextMessage, timeout)
         }
         RuntimeError::Terminal(TerminalOutcome::OutcomeUnknown) => Error::OutcomeUnknown,
+        RuntimeError::Terminal(TerminalOutcome::NetworkOutcomeUnknown(failure)) => {
+            Error::NetworkOutcomeUnknown(failure)
+        }
+        RuntimeError::Transport("timeout") => {
+            Error::OperationTimeout(TimedOutTask::ReceiveNextMessage, timeout)
+        }
+        RuntimeError::Transport("io" | "not-connected" | "write-zero") => Error::ConnectionStopped,
+        RuntimeError::Transport(_) => Error::RuntimeTerminated,
         RuntimeError::Terminal(TerminalOutcome::SessionInvalidated) => Error::SessionInvalidated,
         RuntimeError::AdmissionBackpressure => Error::Backpressure("admission"),
         RuntimeError::ControlBackpressure => Error::Backpressure("control"),
         RuntimeError::EventBackpressure => Error::Backpressure("event"),
-        RuntimeError::Object(_) | RuntimeError::Terminal(TerminalOutcome::GenerationLost) => {
-            Error::StaleObject
-        }
+        RuntimeError::Terminal(TerminalOutcome::GenerationLost) => Error::ConnectionStopped,
+        RuntimeError::Object(_) => Error::StaleObject,
         RuntimeError::Closed | RuntimeError::OwnerTerminated => Error::RuntimeTerminated,
         other => Error::InvalidState(other.to_string()),
     }
@@ -332,7 +339,7 @@ mod public_error_mapping_tests {
                 RuntimeError::Terminal(TerminalOutcome::GenerationLost),
                 timeout,
             ),
-            Error::StaleObject
+            Error::ConnectionStopped
         ));
         assert!(matches!(
             map_runtime_error_value(RuntimeError::OwnerTerminated, timeout),

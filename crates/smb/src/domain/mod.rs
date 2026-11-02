@@ -1116,7 +1116,7 @@ impl FileCloseAuthority {
                 *state = FileCloseState::Confirmed;
                 Ok(CloseOutcome::Confirmed)
             }
-            Err(Error::OutcomeUnknown) => {
+            Err(error) if error.outcome_unknown() => {
                 *state = FileCloseState::OutcomeUnknown;
                 Ok(CloseOutcome::OutcomeUnknown)
             }

@@ -80,6 +80,10 @@ pub enum Error {
     #[error("Operation outcome is unknown because the request may have committed")]
     OutcomeUnknown,
 
+    /// A transport failure or deadline ended a request whose effect may already have committed.
+    #[error("Operation outcome is unknown after {0:?}")]
+    NetworkOutcomeUnknown(NetworkFailure),
+
     #[error("The server invalidated the authenticated session")]
     SessionInvalidated,
 
@@ -216,5 +220,110 @@ pub enum Error {
 impl<T> From<PoisonError<T>> for Error {
     fn from(_: PoisonError<T>) -> Self {
         Error::LockError
+    }
+}
+
+/// Portable network failure categories for callers; protocol and permission errors remain distinct.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetworkFailure {
+    ConnectionLost,
+    TimedOut,
+    SessionInvalidated,
+}
+
+impl Error {
+    /// Classifies the structured error chain without inspecting server-controlled text.
+    pub fn outcome_unknown(&self) -> bool {
+        match self {
+            Self::OutcomeUnknown | Self::NetworkOutcomeUnknown(_) => true,
+            Self::TransferFailed { source, .. } => source.outcome_unknown(),
+            _ => false,
+        }
+    }
+
+    pub fn network_failure(&self) -> Option<NetworkFailure> {
+        match self {
+            Self::NetworkOutcomeUnknown(failure) => Some(*failure),
+            Self::OperationTimeout(..)
+            | Self::SessionRecoveryWaitTimedOut
+            | Self::ShareRecoveryWaitTimedOut
+            | Self::ResourceRecoveryWaitTimedOut
+            | Self::Setup(SetupError::Timeout { .. }) => Some(NetworkFailure::TimedOut),
+            Self::SessionInvalidated => Some(NetworkFailure::SessionInvalidated),
+            Self::ConnectionStopped | Self::RuntimeTerminated => {
+                Some(NetworkFailure::ConnectionLost)
+            }
+            Self::IoError(error) | Self::TransportError(TransportError::IoError(error)) => {
+                match error.kind() {
+                    std::io::ErrorKind::TimedOut => Some(NetworkFailure::TimedOut),
+                    std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::ConnectionRefused => Some(NetworkFailure::ConnectionLost),
+                    _ => None,
+                }
+            }
+            Self::TransportError(TransportError::Timeout(_)) => Some(NetworkFailure::TimedOut),
+            Self::TransportError(TransportError::NotConnected | TransportError::WriteZero) => {
+                Some(NetworkFailure::ConnectionLost)
+            }
+            Self::TransferFailed { source, .. } => source.network_failure(),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod network_failure_tests {
+    use super::*;
+    #[test]
+    fn disconnect_and_timeout_are_distinct_and_protocol_errors_are_not_network_errors() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            let error = Error::IoError(std::io::Error::new(kind, "redacted"));
+            assert_eq!(
+                error.network_failure(),
+                Some(NetworkFailure::ConnectionLost)
+            );
+        }
+        assert_eq!(
+            Error::OperationTimeout(
+                TimedOutTask::ReceiveNextMessage,
+                std::time::Duration::from_secs(5)
+            )
+            .network_failure(),
+            Some(NetworkFailure::TimedOut)
+        );
+        assert_eq!(
+            Error::TransportError(TransportError::Timeout(std::time::Duration::from_secs(1)))
+                .network_failure(),
+            Some(NetworkFailure::TimedOut)
+        );
+        assert_eq!(
+            Error::IoError(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "redacted"
+            ))
+            .network_failure(),
+            Some(NetworkFailure::TimedOut)
+        );
+        assert_eq!(
+            Error::SessionInvalidated.network_failure(),
+            Some(NetworkFailure::SessionInvalidated)
+        );
+        assert_eq!(
+            Error::InvalidMessage("redacted".into()).network_failure(),
+            None
+        );
+        assert_eq!(
+            Error::IoError(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                .network_failure(),
+            None
+        );
     }
 }

@@ -3485,7 +3485,9 @@ mod tests {
         assert_eq!(report.failed_tasks, 0);
         assert_eq!(
             ticket.completion().await,
-            Ok(TerminalOutcome::OutcomeUnknown)
+            Ok(TerminalOutcome::NetworkOutcomeUnknown(
+                crate::error::NetworkFailure::ConnectionLost
+            ))
         );
     }
 
@@ -3602,7 +3604,9 @@ mod tests {
         clock.advance_to(deadline).await.unwrap();
         assert_eq!(
             ticket.completion().await,
-            Ok(TerminalOutcome::OutcomeUnknown)
+            Ok(TerminalOutcome::NetworkOutcomeUnknown(
+                crate::error::NetworkFailure::TimedOut
+            ))
         );
         let report = handle
             .close(deadline.saturating_add(Duration::from_secs(1)))
@@ -3735,7 +3739,9 @@ mod tests {
         assert_eq!(report.joined_tasks + report.failed_tasks, 2);
         assert_eq!(
             ticket.completion().await,
-            Ok(TerminalOutcome::OutcomeUnknown)
+            Ok(TerminalOutcome::NetworkOutcomeUnknown(
+                crate::error::NetworkFailure::ConnectionLost
+            ))
         );
     }
 
@@ -3757,7 +3763,9 @@ mod tests {
         trigger.notify_one();
         assert_eq!(
             ticket.completion().await,
-            Ok(TerminalOutcome::OutcomeUnknown)
+            Ok(TerminalOutcome::NetworkOutcomeUnknown(
+                crate::error::NetworkFailure::ConnectionLost
+            ))
         );
         while tokio::time::timeout(Duration::from_secs(1), events.recv())
             .await
@@ -3842,7 +3850,9 @@ mod tests {
         drop(handle);
         assert_eq!(
             ticket.completion().await,
-            Ok(TerminalOutcome::OutcomeUnknown)
+            Ok(TerminalOutcome::NetworkOutcomeUnknown(
+                crate::error::NetworkFailure::ConnectionLost
+            ))
         );
         while tokio::time::timeout(Duration::from_secs(1), events.recv())
             .await
@@ -4090,7 +4100,9 @@ mod tests {
         clock.advance(Duration::from_secs(1)).await.unwrap();
         assert!(matches!(
             ticket.completion().await,
-            Err(RuntimeError::Terminal(TerminalOutcome::OutcomeUnknown))
+            Err(RuntimeError::Terminal(
+                TerminalOutcome::NetworkOutcomeUnknown(crate::error::NetworkFailure::TimedOut)
+            ))
         ));
         let report = handle
             .close(clock.now().saturating_add(Duration::from_secs(1)))

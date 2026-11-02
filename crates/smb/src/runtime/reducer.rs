@@ -65,6 +65,7 @@ pub(crate) enum TerminalOutcome {
     Cancelled,
     TimedOut,
     OutcomeUnknown,
+    NetworkOutcomeUnknown(crate::error::NetworkFailure),
     PreparationFailed,
     GenerationLost,
 }
@@ -217,7 +218,9 @@ impl RequestRecord {
             RequestEvent::Disconnect => {
                 self.tombstone = false;
                 let outcome = if self.send.committed() {
-                    TerminalOutcome::OutcomeUnknown
+                    TerminalOutcome::NetworkOutcomeUnknown(
+                        crate::error::NetworkFailure::ConnectionLost,
+                    )
                 } else {
                     TerminalOutcome::GenerationLost
                 };
@@ -229,7 +232,11 @@ impl RequestRecord {
     fn finish_without_response(&mut self, uncommitted: TerminalOutcome) -> ReduceEffect {
         let outcome = if self.send.committed() {
             self.tombstone = self.response != ResponseProgress::Final;
-            TerminalOutcome::OutcomeUnknown
+            if uncommitted == TerminalOutcome::TimedOut {
+                TerminalOutcome::NetworkOutcomeUnknown(crate::error::NetworkFailure::TimedOut)
+            } else {
+                TerminalOutcome::OutcomeUnknown
+            }
         } else {
             uncommitted
         };
@@ -307,7 +314,9 @@ mod tests {
         request.reduce(RequestEvent::WriteProgress { bytes: 1 });
         assert_eq!(
             request.reduce(RequestEvent::Deadline),
-            ReduceEffect::Publish(TerminalOutcome::OutcomeUnknown)
+            ReduceEffect::Publish(TerminalOutcome::NetworkOutcomeUnknown(
+                crate::error::NetworkFailure::TimedOut
+            ))
         );
         assert!(request.is_tombstone());
         assert_eq!(
@@ -317,7 +326,9 @@ mod tests {
         assert!(!request.is_tombstone());
         assert_eq!(
             request.caller(),
-            CallerOutcome::Terminal(TerminalOutcome::OutcomeUnknown)
+            CallerOutcome::Terminal(TerminalOutcome::NetworkOutcomeUnknown(
+                crate::error::NetworkFailure::TimedOut
+            ))
         );
     }
 
@@ -327,7 +338,9 @@ mod tests {
         request.reduce(RequestEvent::WriteProgress { bytes: 1 });
         assert_eq!(
             request.reduce(RequestEvent::Disconnect),
-            ReduceEffect::Publish(TerminalOutcome::OutcomeUnknown)
+            ReduceEffect::Publish(TerminalOutcome::NetworkOutcomeUnknown(
+                crate::error::NetworkFailure::ConnectionLost
+            ))
         );
         assert!(!request.is_tombstone());
     }

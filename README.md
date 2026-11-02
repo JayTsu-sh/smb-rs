@@ -64,3 +64,10 @@ To set up a development environment, you may use any supported rust version.
 - It is highly recommended to use rust nightly, and install pre-commit hooks (using `pip install pre-commit && pre-commit install`)
 - Before committing your changes, run `cargo fmt` to format the code, and `cargo clippy` to check for linting issues.
 - Run crate tests once you are ready to commit. Read tests' README.md before proceeding!
+
+Use `Error::network_failure()` to distinguish `ConnectionLost`, `TimedOut`, and
+`SessionInvalidated` without parsing diagnostic text. Timeouts do not prove the
+peer disconnected; malformed protocol and permission failures return `None`.
+
+`NetworkOutcomeUnknown` preserves a network cause together with uncertain operation
+effects. Inspect `outcome_unknown()` before deciding whether a write can be retried.
