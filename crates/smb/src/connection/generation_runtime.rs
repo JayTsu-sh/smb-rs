@@ -301,7 +301,10 @@ fn map_runtime_error_value(error: RuntimeError, timeout: std::time::Duration) ->
         RuntimeError::EventBackpressure => Error::Backpressure("event"),
         RuntimeError::Terminal(TerminalOutcome::GenerationLost) => Error::ConnectionStopped,
         RuntimeError::Object(_) => Error::StaleObject,
-        RuntimeError::Closed | RuntimeError::OwnerTerminated => Error::RuntimeTerminated,
+        // Admission after a generation has closed means that connection is gone.
+        // An owner that disappears while processing a command is an internal fault.
+        RuntimeError::Closed => Error::ConnectionStopped,
+        RuntimeError::OwnerTerminated => Error::RuntimeTerminated,
         other => Error::InvalidState(other.to_string()),
     }
 }
@@ -341,6 +344,15 @@ mod public_error_mapping_tests {
             ),
             Error::ConnectionStopped
         ));
+        let closed = map_runtime_error_value(RuntimeError::Closed, timeout);
+        assert_eq!(
+            closed.network_failure(),
+            Some(crate::error::NetworkFailure::ConnectionLost)
+        );
+        assert!(
+            !closed.outcome_unknown(),
+            "a rejected admission sent no request"
+        );
         assert!(matches!(
             map_runtime_error_value(RuntimeError::OwnerTerminated, timeout),
             Error::RuntimeTerminated
