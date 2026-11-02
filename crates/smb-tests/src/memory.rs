@@ -113,9 +113,20 @@ fn update_peak(peak: &AtomicU64, candidate: u64) {
 }
 
 fn saturating_sub(value: &AtomicU64, amount: u64) {
-    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_sub(amount))
-    });
+    // Use a CAS loop to support the MSRV without relying on fetch_update,
+    // which is deprecated by newer toolchains in favor of try_update.
+    let mut observed = value.load(Ordering::Relaxed);
+    loop {
+        match value.compare_exchange_weak(
+            observed,
+            observed.saturating_sub(amount),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(actual) => observed = actual,
+        }
+    }
 }
 
 fn with_current_measurement(action: impl FnOnce(&MemoryCounters)) {
